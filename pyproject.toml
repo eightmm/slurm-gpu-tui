@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sgpu"
+version = "1.0.0"
+description = "SLURM GPU monitoring TUI"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "textual>=0.61.0",
+]
+
+[project.scripts]
+sgpu = "sgpu.tui:main"
+sgpu-collector = "sgpu.collector:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
