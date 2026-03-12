@@ -1,113 +1,115 @@
 # sgpu - SLURM GPU Monitor
 
-터미널에서 SLURM 클러스터의 GPU 사용 현황을 실시간으로 확인하는 TUI 도구입니다.
+A real-time TUI tool for monitoring GPU usage across your SLURM cluster, right from the terminal.
 
 ![Python](https://img.shields.io/badge/python-3.10+-blue)
 
-## 한눈에 보이는 것들
+[한국어 README](README_ko.md)
 
-- 노드별 GPU 상태 (사용률, VRAM, 온도, 전력)
-- CPU load / 메모리 사용량
-- 누가 어떤 GPU를 쓰고 있는지
-- 대기 중인 Job 목록
-- 사용자별 GPU 할당 요약
+## What You Get
+
+- Per-node GPU status (utilization, VRAM, temperature, power)
+- CPU load & memory usage (accurate values from `/proc/meminfo`)
+- Who's using which GPU
+- Pending job queue
+- Per-user GPU allocation summary
 
 ---
 
-## 설치
+## Install
 
-### 방법 1: 이미 설치된 서버에서 바로 사용
+### Option 1: Already set up by your admin
 
-관리자가 이미 설치해뒀다면 아래 명령어만 치면 됩니다:
+If your sysadmin already installed it, just run:
 
 ```bash
 sgpu
 ```
 
-끝입니다. 그냥 이것만 치면 GPU 현황이 뜹니다.
+That's it.
 
-### 방법 2: 직접 설치
+### Option 2: Install it yourself
 
 ```bash
 git clone https://github.com/eightmm/slurm-gpu-tui.git
 cd slurm-gpu-tui
 
-# 가상환경 만들고 설치
+# Create a venv and install
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
 
-# 실행
+# Run
 sgpu
 ```
 
-> **참고**: 가상환경 활성화(`source .venv/bin/activate`) 후에 `sgpu` 명령어를 사용할 수 있습니다.
+> **Note**: You need to activate the venv (`source .venv/bin/activate`) before using `sgpu`.
 
 ---
 
-## 사용법
+## Usage
 
 ```bash
-sgpu                # GPU 모니터 실행
+sgpu                # Launch GPU monitor
 ```
 
-### 화면 안에서 쓸 수 있는 키
+### Keyboard Shortcuts
 
-| 키 | 동작 |
-|----|------|
-| `r` | 즉시 새로고침 |
-| `f` | 빠른 갱신(1초) / 보통(3초) 전환 |
-| `e` | 현재 상태를 JSON 파일로 저장 |
-| `q` | 종료 |
+| Key | Action |
+|-----|--------|
+| `r` | Refresh now |
+| `f` | Toggle Fast (1s) / Normal (3s) refresh |
+| `e` | Export current snapshot as JSON |
+| `q` | Quit |
 
 ---
 
-## Collector 데몬 (선택사항)
+## Collector Daemon (Optional)
 
-데몬을 띄워두면 `sgpu` 실행 시 데이터를 즉시 불러옵니다.
-데몬 없이도 `sgpu`는 정상 동작하지만, 첫 로딩이 조금 느릴 수 있습니다.
+Running the collector daemon in the background makes `sgpu` load data instantly.
+Without it, `sgpu` still works but the first load may be slower.
 
 ```bash
-sgpu-collector --daemon    # 백그라운드로 데몬 시작
-sgpu-collector --status    # 돌고 있는지 확인
-sgpu-collector --stop      # 데몬 중지
+sgpu-collector --daemon    # Start in background
+sgpu-collector --status    # Check if running
+sgpu-collector --stop      # Stop daemon
 ```
 
 ---
 
-## 관리자용: 모든 유저가 쓸 수 있게 설치
+## Admin: System-wide Setup
 
 ```bash
-# 1. 설치 (아무 계정에서)
+# 1. Install (from any account)
 git clone https://github.com/eightmm/slurm-gpu-tui.git
 cd slurm-gpu-tui
 python3 -m venv .venv
 .venv/bin/pip install -e .
 
-# 2. 모든 유저가 쓸 수 있도록 wrapper 복사 (root 필요)
+# 2. Copy wrappers so all users can run it (requires root)
 sudo cp bin/sgpu /usr/local/bin/sgpu
 sudo cp bin/sgpu-collector /usr/local/bin/sgpu-collector
 sudo chmod +x /usr/local/bin/sgpu /usr/local/bin/sgpu-collector
 
-# 3. 데몬 띄우기 (root로 한 번만 - 모든 유저 공유)
+# 3. Start the daemon once (root, shared by all users)
 sudo sgpu-collector --daemon
 ```
 
-이후 모든 유저는 `sgpu`만 치면 바로 사용 가능합니다.
+After this, every user can simply run `sgpu`.
 
-> **주의**: `bin/sgpu` 안에 설치 경로가 하드코딩되어 있습니다.
-> 설치 위치를 바꾸면 `bin/sgpu`, `bin/sgpu-collector` 안의 경로도 수정해주세요.
+> **Note**: The wrapper scripts in `bin/` have hardcoded paths to the install directory.
+> If you move the install location, update the paths inside `bin/sgpu` and `bin/sgpu-collector`.
 
 ---
 
-## 환경 변수 (고급)
+## Environment Variables (Advanced)
 
-기본값으로 충분하지만, 필요하면 조정할 수 있습니다:
+Defaults work fine, but you can tweak if needed:
 
-| 변수 | 기본값 | 설명 |
-|------|--------|------|
-| `SLURM_GPU_TUI_REFRESH_SEC` | `3` | 화면 갱신 주기 (초) |
-| `SLURM_GPU_TUI_FAST_REFRESH_SEC` | `1` | Fast 모드 갱신 주기 |
-| `SLURM_GPU_TUI_COLLECTOR_SEC` | `3` | 데몬 수집 주기 |
-| `SLURM_GPU_TUI_NODE_TIMEOUT_SEC` | `30` | 노드 SSH 타임아웃 |
-| `SLURM_GPU_TUI_MAX_WORKERS` | `8` | 병렬 수집 워커 수 |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SLURM_GPU_TUI_REFRESH_SEC` | `3` | TUI refresh interval (seconds) |
+| `SLURM_GPU_TUI_FAST_REFRESH_SEC` | `1` | Fast mode refresh interval |
+| `SLURM_GPU_TUI_COLLECTOR_SEC` | `3` | Collector daemon interval |
+| `SLURM_GPU_TUI_NODE_TIMEOUT_SEC` | `30` | SSH timeout per node |
+| `SLURM_GPU_TUI_MAX_WORKERS` | `8` | Parallel SSH workers |
