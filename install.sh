@@ -19,6 +19,9 @@ echo "[1/3] Creating venv and installing..."
 uv venv "$VENV_DIR"
 uv pip install --python "$VENV_DIR/bin/python" -e "$INSTALL_DIR"
 
+# Make venv readable/executable by all users
+chmod -R a+rX "$VENV_DIR"
+
 # 2. Generate wrapper scripts
 echo "[2/3] Generating wrapper scripts..."
 mkdir -p "$INSTALL_DIR/bin"
