@@ -372,14 +372,15 @@ class SlurmGpuTui(App):
                     jobid = ""
                     jobname = ""
                     elapsed = ""
-                    # Map GPU index to job using SLURM GPU allocation counts
-                    gpu_idx = int(gpu.index) if gpu.index.isdigit() else i
-                    assigned = 0
-                    for j in node.jobs:
-                        if assigned + j.gpu_count > gpu_idx:
-                            user, jobid, jobname, elapsed = j.user, j.jobid, j.jobname, j.elapsed
-                            break
-                        assigned += j.gpu_count
+                    if gpu.users:
+                        user = ",".join(gpu.users)
+                        for j in node.jobs:
+                            if j.user in gpu.users:
+                                jobid, jobname, elapsed = j.jobid, j.jobname, j.elapsed
+                                break
+                    elif len(node.jobs) == 1:
+                        j = node.jobs[0]
+                        user, jobid, jobname, elapsed = j.user, j.jobid, j.jobname, j.elapsed
 
                     is_first = (i == 0)
                     self.tbl.add_row(

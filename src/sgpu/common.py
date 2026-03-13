@@ -236,10 +236,12 @@ def collect_nodes_basic() -> Tuple[List[dict], str]:
 
 
 def collect_node_data(node: str, timeout: int = 30) -> Tuple[List[GpuInfo], NodeMemInfo, str]:
-    """SSH to node: single nvidia-smi call + /proc/meminfo."""
+    """SSH to node: nvidia-smi metrics + pmon (PID→GPU) + ps (PID→user) + meminfo."""
     combined = (
         "nvidia-smi --query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total,"
         "temperature.gpu,power.draw,power.limit --format=csv,noheader,nounits 2>/dev/null; "
+        "echo '---SEP---'; "
+        "nvidia-smi pmon -c 1 -s m 2>/dev/null; "
         "echo '---SEP---'; "
         "awk '/^MemTotal:/{ t=$2 } /^MemAvailable:/{ a=$2 } "
         "END{ printf \"%d %d %d\", t/1024, (t-a)/1024, a/1024 }' /proc/meminfo"
@@ -250,21 +252,50 @@ def collect_node_data(node: str, timeout: int = 30) -> Tuple[List[GpuInfo], Node
 
     sections = out.split("---SEP---")
     metrics_raw = sections[0].strip() if len(sections) > 0 else ""
-    mem_raw = sections[1].strip() if len(sections) > 1 else ""
+    pmon_raw = sections[1].strip() if len(sections) > 1 else ""
+    mem_raw = sections[2].strip() if len(sections) > 2 else ""
 
     mem_info = NodeMemInfo()
     mem_parts = mem_raw.split()
     if len(mem_parts) >= 3:
         mem_info = NodeMemInfo(total=mem_parts[0], used=mem_parts[1], avail=mem_parts[2])
 
+    # Parse pmon: gpu_idx -> list of PIDs
+    gpu_pids: Dict[str, List[str]] = {}
+    for line in pmon_raw.splitlines():
+        line = line.strip()
+        if line.startswith("#") or not line:
+            continue
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] != "-":
+            gpu_pids.setdefault(parts[0], []).append(parts[1])
+
+    # Resolve PIDs to usernames via ps (single call for all PIDs)
+    all_pids = [pid for pids in gpu_pids.values() for pid in pids]
+    pid_to_user: Dict[str, str] = {}
+    if all_pids:
+        ps_cmd = "ps -o pid=,user= -p " + ",".join(all_pids) + " 2>/dev/null"
+        ps_ok, ps_out = ssh_cmd(node, ps_cmd, timeout=5)
+        if ps_ok:
+            for line in ps_out.splitlines():
+                ps_parts = line.split()
+                if len(ps_parts) >= 2:
+                    pid_to_user[ps_parts[0]] = ps_parts[1]
+
     gpus: List[GpuInfo] = []
     for line in metrics_raw.splitlines():
         p = [x.strip() for x in line.split(",")]
         if len(p) < 9:
             continue
+        idx = p[0]
+        pids = gpu_pids.get(idx, [])
+        users = list(dict.fromkeys(
+            pid_to_user[pid] for pid in pids if pid in pid_to_user
+        ))
         gpus.append(GpuInfo(
-            index=p[0], name=shorten_gpu_name(p[2]), util=p[3],
+            index=idx, name=shorten_gpu_name(p[2]), util=p[3],
             mem_used=p[4], mem_total=p[5], temp=p[6], power=p[7], power_cap=p[8],
+            pids=pids, users=users,
         ))
     return gpus, mem_info, ""
 
