@@ -16,7 +16,7 @@ fi
 
 # 1. Create venv and install
 echo "[1/2] Creating venv and installing..."
-uv venv --python python3 "$VENV_DIR"
+uv venv --python 3.12 "$VENV_DIR"
 uv pip install --python "$VENV_DIR/bin/python" -e "$INSTALL_DIR"
 
 # Make venv readable/executable by all users
