@@ -221,6 +221,9 @@ def collect_nodes_basic() -> Tuple[List[dict], str]:
         if name in seen:
             continue
         seen.add(name)
+        gres = p[6].strip()
+        if "gpu" not in gres.lower():
+            continue
         cpus_aiot = p[7].strip()
         cpu_alloc = ""
         parts = cpus_aiot.split("/")
