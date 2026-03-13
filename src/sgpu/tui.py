@@ -378,9 +378,6 @@ class SlurmGpuTui(App):
                             if j.user in gpu.users:
                                 jobid, jobname, elapsed = j.jobid, j.jobname, j.elapsed
                                 break
-                    elif len(node.jobs) == 1:
-                        j = node.jobs[0]
-                        user, jobid, jobname, elapsed = j.user, j.jobid, j.jobname, j.elapsed
 
                     is_first = (i == 0)
                     self.tbl.add_row(
