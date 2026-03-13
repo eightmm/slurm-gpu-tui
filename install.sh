@@ -9,8 +9,14 @@ echo ""
 
 # 1. Create venv and install
 echo "[1/3] Creating venv and installing..."
-python3 -m venv "$VENV_DIR"
-"$VENV_DIR/bin/pip" install --quiet -e "$INSTALL_DIR"
+if command -v uv &>/dev/null; then
+    echo "  -> Using uv"
+    uv venv "$VENV_DIR"
+    uv pip install --python "$VENV_DIR/bin/python" -e "$INSTALL_DIR"
+else
+    python3 -m venv "$VENV_DIR"
+    "$VENV_DIR/bin/pip" install --quiet -e "$INSTALL_DIR"
+fi
 
 # 2. Generate wrapper scripts
 echo "[2/3] Generating wrapper scripts..."
