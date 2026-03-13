@@ -33,17 +33,23 @@ That's it.
 ```bash
 git clone https://github.com/eightmm/slurm-gpu-tui.git
 cd slurm-gpu-tui
+bash install.sh
+```
 
-# Create a venv and install
-python3 -m venv .venv
+The installer automatically sets up a Python virtual environment and installs everything.
+It uses [uv](https://github.com/astral-sh/uv) for fast installation (auto-installed if not present).
+
+After installation:
+
+```bash
+# Activate the venv
 source .venv/bin/activate
-pip install -e .
 
 # Run
 sgpu
 ```
 
-> **Note**: You need to activate the venv (`source .venv/bin/activate`) before using `sgpu`.
+> **Note**: You need to activate the venv before using `sgpu`, unless installed system-wide.
 
 ---
 
@@ -79,20 +85,27 @@ sgpu-collector --stop      # Stop daemon
 
 ## Admin: System-wide Setup
 
+To make `sgpu` available to all users without activating a venv:
+
 ```bash
-# 1. Clone and run the installer
 git clone https://github.com/eightmm/slurm-gpu-tui.git
 cd slurm-gpu-tui
+
+# Install (creates venv, builds wrappers, copies to /usr/local/bin)
 sudo bash install.sh
 
-# 2. Start the daemon once (root, shared by all users)
+# Start the collector daemon (shared by all users)
 sudo sgpu-collector --daemon
 ```
 
-The installer automatically creates a venv, installs the package, generates wrapper scripts,
-and copies them to `/usr/local/bin` when run as root.
+**What `install.sh` does:**
 
-After this, every user can simply run `sgpu`.
+1. Installs [uv](https://github.com/astral-sh/uv) if not already present (no need for `python3-venv`)
+2. Creates a `.venv` and installs the package
+3. Generates wrapper scripts in `bin/`
+4. When run as root: copies wrappers to `/usr/local/bin` so all users can use `sgpu` directly
+
+After this, every user can simply run `sgpu` — no venv activation needed.
 
 > **Note**: If you move the install directory, re-run `sudo bash install.sh` to regenerate the wrapper scripts.
 
@@ -109,3 +122,12 @@ Defaults work fine, but you can tweak if needed:
 | `SLURM_GPU_TUI_COLLECTOR_SEC` | `3` | Collector daemon interval |
 | `SLURM_GPU_TUI_NODE_TIMEOUT_SEC` | `30` | SSH timeout per node |
 | `SLURM_GPU_TUI_MAX_WORKERS` | `8` | Parallel SSH workers |
+
+---
+
+## Requirements
+
+- Python 3.10+
+- SLURM cluster with `sinfo` / `squeue` commands available
+- SSH access from the master node to compute nodes (passwordless)
+- `nvidia-smi` installed on GPU nodes
