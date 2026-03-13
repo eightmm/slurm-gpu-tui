@@ -9,13 +9,13 @@ echo ""
 
 # 0. Ensure uv is available (install if missing)
 if ! command -v uv &>/dev/null; then
-    echo "[0/3] Installing uv..."
+    echo "[0/2] Installing uv..."
     curl -LsSf https://astral.sh/uv/install.sh | sh
     export PATH="$HOME/.local/bin:$PATH"
 fi
 
 # 1. Create venv and install
-echo "[1/3] Creating venv and installing..."
+echo "[1/2] Creating venv and installing..."
 uv venv --python python3 "$VENV_DIR"
 uv pip install --python "$VENV_DIR/bin/python" -e "$INSTALL_DIR"
 
@@ -23,7 +23,7 @@ uv pip install --python "$VENV_DIR/bin/python" -e "$INSTALL_DIR"
 chmod -R a+rX "$VENV_DIR"
 
 # 2. Generate wrapper scripts
-echo "[2/3] Generating wrapper scripts..."
+echo "[2/2] Generating wrapper scripts..."
 mkdir -p "$INSTALL_DIR/bin"
 
 cat > "$INSTALL_DIR/bin/sgpu" << EOF
@@ -38,26 +38,14 @@ EOF
 
 chmod +x "$INSTALL_DIR/bin/sgpu" "$INSTALL_DIR/bin/sgpu-collector"
 
-# 3. System-wide install (optional, needs root)
-echo "[3/3] Checking system-wide install..."
-if [ "$(id -u)" -eq 0 ]; then
-    cp "$INSTALL_DIR/bin/sgpu" /usr/local/bin/sgpu
-    cp "$INSTALL_DIR/bin/sgpu-collector" /usr/local/bin/sgpu-collector
-    chmod +x /usr/local/bin/sgpu /usr/local/bin/sgpu-collector
-    echo "  -> Installed to /usr/local/bin/ (all users can use sgpu)"
-else
-    echo "  -> Skipped (run as root to install system-wide)"
-    echo "     sudo cp $INSTALL_DIR/bin/sgpu /usr/local/bin/"
-    echo "     sudo cp $INSTALL_DIR/bin/sgpu-collector /usr/local/bin/"
-fi
-
 echo ""
 echo "=== Done! ==="
 echo ""
-echo "  sgpu                       # Launch TUI"
-echo "  sgpu-collector --daemon    # Start background collector (recommended)"
-echo "  sgpu-collector --stop      # Stop collector"
-echo "  sgpu-collector --status    # Check collector status"
+echo "To make sgpu available system-wide, run:"
+echo "  sudo ln -sf $INSTALL_DIR/bin/sgpu /usr/local/bin/sgpu"
+echo "  sudo ln -sf $INSTALL_DIR/bin/sgpu-collector /usr/local/bin/sgpu-collector"
 echo ""
-echo "For all users, start the collector as root once:"
+echo "Then start the collector daemon:"
 echo "  sudo sgpu-collector --daemon"
+echo ""
+echo "After that, all users can just run: sgpu"

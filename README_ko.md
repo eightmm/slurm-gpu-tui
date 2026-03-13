@@ -16,17 +16,15 @@
 
 ## 설치
 
-### 방법 1: 이미 설치된 서버에서 바로 사용
-
-관리자가 이미 설치해뒀다면 아래 명령어만 치면 됩니다:
+### 이미 설치된 서버?
 
 ```bash
 sgpu
 ```
 
-끝입니다. 그냥 이것만 치면 GPU 현황이 뜹니다.
+끝. 아래는 직접 설치하는 경우입니다.
 
-### 방법 2: 직접 설치
+### 개인 설치
 
 ```bash
 git clone https://github.com/eightmm/slurm-gpu-tui.git
@@ -34,20 +32,36 @@ cd slurm-gpu-tui
 bash install.sh
 ```
 
-설치 스크립트가 알아서 가상환경을 만들고 패키지를 설치합니다.
-[uv](https://github.com/astral-sh/uv)를 사용하며, 없으면 자동으로 설치합니다 (`python3-venv` 불필요).
+[uv](https://github.com/astral-sh/uv)로 가상환경을 만들고 패키지를 설치합니다 (없으면 자동 설치, `python3-venv` 불필요).
 
-설치 후:
+설치 후 가상환경 활성화해서 사용:
 
 ```bash
-# 가상환경 활성화
 source .venv/bin/activate
-
-# 실행
 sgpu
 ```
 
-> **참고**: 전역 설치가 아닌 경우 가상환경 활성화 후에 `sgpu`를 사용할 수 있습니다.
+### 관리자용: 모든 유저가 쓸 수 있게 설치
+
+일반 유저로 설치 후 sudo로 심볼릭 링크만 걸어줍니다:
+
+```bash
+# 1. 일반 유저로 설치
+git clone https://github.com/eightmm/slurm-gpu-tui.git
+cd slurm-gpu-tui
+bash install.sh
+
+# 2. 전역 심볼릭 링크 생성 (sudo 필요)
+sudo ln -sf $(pwd)/bin/sgpu /usr/local/bin/sgpu
+sudo ln -sf $(pwd)/bin/sgpu-collector /usr/local/bin/sgpu-collector
+
+# 3. 데몬 띄우기 (모든 유저 공유)
+sudo sgpu-collector --daemon
+```
+
+이후 모든 유저는 `sgpu`만 치면 됩니다. venv 활성화 필요 없음.
+
+> **참고**: 설치 위치를 옮기면 `bash install.sh` 다시 실행 후 심볼릭 링크를 다시 걸어주세요.
 
 ---
 
@@ -78,34 +92,6 @@ sgpu-collector --daemon    # 백그라운드로 데몬 시작
 sgpu-collector --status    # 돌고 있는지 확인
 sgpu-collector --stop      # 데몬 중지
 ```
-
----
-
-## 관리자용: 모든 유저가 쓸 수 있게 설치
-
-모든 유저가 venv 활성화 없이 바로 `sgpu`를 쓸 수 있게 하려면:
-
-```bash
-git clone https://github.com/eightmm/slurm-gpu-tui.git
-cd slurm-gpu-tui
-
-# 설치 (가상환경 생성 + wrapper 생성 + /usr/local/bin에 복사)
-sudo bash install.sh
-
-# 데몬 띄우기 (모든 유저 공유)
-sudo sgpu-collector --daemon
-```
-
-**`install.sh`가 하는 일:**
-
-1. [uv](https://github.com/astral-sh/uv)가 없으면 자동 설치 (`python3-venv` 패키지 불필요)
-2. `.venv` 생성 후 패키지 설치
-3. `bin/` 에 wrapper 스크립트 생성
-4. root로 실행 시: `/usr/local/bin`에 복사하여 모든 유저가 바로 사용 가능
-
-이후 모든 유저는 `sgpu`만 치면 됩니다.
-
-> **참고**: 설치 위치를 옮기면 `sudo bash install.sh`를 다시 실행하면 됩니다.
 
 ---
 

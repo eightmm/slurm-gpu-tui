@@ -18,17 +18,15 @@ A real-time TUI tool for monitoring GPU usage across your SLURM cluster, right f
 
 ## Install
 
-### Option 1: Already set up by your admin
-
-If your sysadmin already installed it, just run:
+### Already set up by your admin?
 
 ```bash
 sgpu
 ```
 
-That's it.
+That's it. If not, follow the steps below.
 
-### Option 2: Install it yourself
+### Personal Install
 
 ```bash
 git clone https://github.com/eightmm/slurm-gpu-tui.git
@@ -36,20 +34,36 @@ cd slurm-gpu-tui
 bash install.sh
 ```
 
-The installer automatically sets up a Python virtual environment and installs everything.
-It uses [uv](https://github.com/astral-sh/uv) for fast installation (auto-installed if not present).
+The installer uses [uv](https://github.com/astral-sh/uv) (auto-installed if not present) to set up a venv and install the package. No `python3-venv` package required.
 
-After installation:
+After installation, activate the venv to use:
 
 ```bash
-# Activate the venv
 source .venv/bin/activate
-
-# Run
 sgpu
 ```
 
-> **Note**: You need to activate the venv before using `sgpu`, unless installed system-wide.
+### System-wide Setup (for all users)
+
+Install as a regular user first, then create symlinks with sudo:
+
+```bash
+# 1. Install as your user
+git clone https://github.com/eightmm/slurm-gpu-tui.git
+cd slurm-gpu-tui
+bash install.sh
+
+# 2. Create system-wide symlinks (requires sudo)
+sudo ln -sf $(pwd)/bin/sgpu /usr/local/bin/sgpu
+sudo ln -sf $(pwd)/bin/sgpu-collector /usr/local/bin/sgpu-collector
+
+# 3. Start the collector daemon (shared by all users)
+sudo sgpu-collector --daemon
+```
+
+After this, every user can simply run `sgpu` — no venv activation needed.
+
+> **Note**: If you move the install directory, re-run `bash install.sh` and re-create the symlinks.
 
 ---
 
@@ -80,34 +94,6 @@ sgpu-collector --daemon    # Start in background
 sgpu-collector --status    # Check if running
 sgpu-collector --stop      # Stop daemon
 ```
-
----
-
-## Admin: System-wide Setup
-
-To make `sgpu` available to all users without activating a venv:
-
-```bash
-git clone https://github.com/eightmm/slurm-gpu-tui.git
-cd slurm-gpu-tui
-
-# Install (creates venv, builds wrappers, copies to /usr/local/bin)
-sudo bash install.sh
-
-# Start the collector daemon (shared by all users)
-sudo sgpu-collector --daemon
-```
-
-**What `install.sh` does:**
-
-1. Installs [uv](https://github.com/astral-sh/uv) if not already present (no need for `python3-venv`)
-2. Creates a `.venv` and installs the package
-3. Generates wrapper scripts in `bin/`
-4. When run as root: copies wrappers to `/usr/local/bin` so all users can use `sgpu` directly
-
-After this, every user can simply run `sgpu` — no venv activation needed.
-
-> **Note**: If you move the install directory, re-run `sudo bash install.sh` to regenerate the wrapper scripts.
 
 ---
 
