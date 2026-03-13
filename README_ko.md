@@ -78,25 +78,21 @@ sgpu-collector --stop      # 데몬 중지
 ## 관리자용: 모든 유저가 쓸 수 있게 설치
 
 ```bash
-# 1. 설치 (아무 계정에서)
+# 1. 클론 후 설치 스크립트 실행
 git clone https://github.com/eightmm/slurm-gpu-tui.git
 cd slurm-gpu-tui
-python3 -m venv .venv
-.venv/bin/pip install -e .
+sudo bash install.sh
 
-# 2. 모든 유저가 쓸 수 있도록 wrapper 복사 (root 필요)
-sudo cp bin/sgpu /usr/local/bin/sgpu
-sudo cp bin/sgpu-collector /usr/local/bin/sgpu-collector
-sudo chmod +x /usr/local/bin/sgpu /usr/local/bin/sgpu-collector
-
-# 3. 데몬 띄우기 (root로 한 번만 - 모든 유저 공유)
+# 2. 데몬 띄우기 (root로 한 번만 - 모든 유저 공유)
 sudo sgpu-collector --daemon
 ```
 
+설치 스크립트가 자동으로 가상환경 생성, 패키지 설치, wrapper 스크립트 생성,
+`/usr/local/bin`에 복사까지 해줍니다 (root로 실행 시).
+
 이후 모든 유저는 `sgpu`만 치면 바로 사용 가능합니다.
 
-> **주의**: `bin/sgpu` 안에 설치 경로가 하드코딩되어 있습니다.
-> 설치 위치를 바꾸면 `bin/sgpu`, `bin/sgpu-collector` 안의 경로도 수정해주세요.
+> **참고**: 설치 위치를 옮기면 `sudo bash install.sh`를 다시 실행하면 됩니다.
 
 ---
 

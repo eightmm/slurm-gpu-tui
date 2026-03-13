@@ -80,25 +80,21 @@ sgpu-collector --stop      # Stop daemon
 ## Admin: System-wide Setup
 
 ```bash
-# 1. Install (from any account)
+# 1. Clone and run the installer
 git clone https://github.com/eightmm/slurm-gpu-tui.git
 cd slurm-gpu-tui
-python3 -m venv .venv
-.venv/bin/pip install -e .
+sudo bash install.sh
 
-# 2. Copy wrappers so all users can run it (requires root)
-sudo cp bin/sgpu /usr/local/bin/sgpu
-sudo cp bin/sgpu-collector /usr/local/bin/sgpu-collector
-sudo chmod +x /usr/local/bin/sgpu /usr/local/bin/sgpu-collector
-
-# 3. Start the daemon once (root, shared by all users)
+# 2. Start the daemon once (root, shared by all users)
 sudo sgpu-collector --daemon
 ```
 
+The installer automatically creates a venv, installs the package, generates wrapper scripts,
+and copies them to `/usr/local/bin` when run as root.
+
 After this, every user can simply run `sgpu`.
 
-> **Note**: The wrapper scripts in `bin/` have hardcoded paths to the install directory.
-> If you move the install location, update the paths inside `bin/sgpu` and `bin/sgpu-collector`.
+> **Note**: If you move the install directory, re-run `sudo bash install.sh` to regenerate the wrapper scripts.
 
 ---
 
