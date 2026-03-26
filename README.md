@@ -22,9 +22,7 @@ A real-time TUI tool for monitoring GPU usage across your SLURM cluster, right f
 
 > **Already installed on your server?** Just run `sgpu`.
 
-### With sudo (System-wide, recommended for admins)
-
-Installs the collector as a systemd service so it starts automatically on boot, and makes `sgpu` available to every user on the system.
+### One-line install (auto-detects sudo)
 
 ```bash
 git clone https://github.com/eightmm/slurm-gpu-tui.git
@@ -32,79 +30,24 @@ cd slurm-gpu-tui
 bash install.sh
 ```
 
-`install.sh` handles everything automatically:
-1. Creates a Python 3.12 venv via [uv](https://github.com/astral-sh/uv) (auto-installed if missing)
-2. Installs the package into the venv
-3. Generates wrapper scripts in `bin/`
-4. Installs and starts `sgpu-collector` as a systemd service (requires sudo)
+`install.sh` detects your environment and handles everything automatically:
 
-After that, make `sgpu` available system-wide:
+| Situation | What install.sh does |
+|-----------|---------------------|
+| **sudo available** | systemd system service + `/usr/local/bin/sgpu` symlink for all users |
+| **no sudo, systemd --user works** | systemd user service (auto-starts on login) + PATH added to shell config |
+| **no sudo, no systemd** | background process + PATH added to shell config |
 
-```bash
-sudo ln -sf $(pwd)/bin/sgpu /usr/local/bin/sgpu
-```
-
-Every user can now run `sgpu` directly — no venv activation needed.
-
-> **Note:** If you move the install directory, re-run `bash install.sh` and recreate the symlink.
-
----
-
-### Without sudo (Personal install)
-
-If you don't have sudo access, install for your own account only.
-
-#### Step 1 — Install
+After install, apply PATH changes if prompted:
 
 ```bash
-git clone https://github.com/eightmm/slurm-gpu-tui.git
-cd slurm-gpu-tui
-
-# Install uv if not available
-curl -LsSf https://astral.sh/uv/install.sh | sh
-export PATH="$HOME/.local/bin:$PATH"
-
-# Create venv and install
-uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python -e .
+source ~/.bashrc   # or open a new terminal
+sgpu
 ```
 
-#### Step 2 — Add to PATH
+If sudo was available, the symlink is created automatically — no PATH change needed.
 
-```bash
-# Add to your shell config (~/.bashrc or ~/.zshrc)
-echo 'export PATH="$HOME/slurm-gpu-tui/bin:$PATH"' >> ~/.bashrc
-source ~/.bashrc
-```
-
-Replace `$HOME/slurm-gpu-tui` with your actual clone path.
-
-#### Step 3 — Start the collector daemon
-
-**Option A: Run manually in the background**
-
-```bash
-nohup bin/sgpu-collector > /tmp/sgpu-collector.log 2>&1 &
-```
-
-Add this to your `~/.bashrc` or a startup script so it persists across logins.
-
-**Option B: Use systemd user service** (if your system supports it)
-
-```bash
-# Edit the service file to set the correct ExecStart path
-sed "s|ExecStart=.*|ExecStart=$(pwd)/.venv/bin/sgpu-collector|" sgpu-collector.service \
-  > ~/.config/systemd/user/sgpu-collector.service
-
-systemctl --user daemon-reload
-systemctl --user enable sgpu-collector
-systemctl --user start sgpu-collector
-
-# Check status
-systemctl --user status sgpu-collector
-```
-
-> **Without the daemon:** `sgpu` still works — it falls back to direct SSH collection. The first load will be slower (a few seconds per node).
+> **Moving the install directory?** Re-run `bash install.sh`.
 
 ---
 
@@ -124,7 +67,7 @@ sgpu        # Launch the GPU monitor
 | `u` | Toggle "My Jobs" filter (highlight your jobs only) |
 | `i` | Toggle idle filter (show only nodes with free GPUs) |
 | `d` | Toggle detail columns (Temp / Power / JobID / JobName) |
-| `Space` | Collapse / expand node (cursor must be on node header) |
+| `Space` | Collapse / expand node (cursor on node header row) |
 | `/` | Search by node name or username — `Esc` to clear |
 | `j` / `k` | Move cursor down / up (vim-style) |
 | `e` | Export current snapshot as JSON |
@@ -140,10 +83,10 @@ sgpu        # Launch the GPU monitor
                0   H100    ████████░  91%   ███████  64/80G   78C   400W   jaemin  67890   10:15h
 ```
 
-- **Node header row** (dark green): shows node name, state, partition, CPU alloc/total, RAM
-- **GPU rows**: indented under the node header — utilization bar, VRAM, temperature, power, user, job
+- **Node header row** (dark green): node name, state symbol, partition, CPU alloc/total, RAM bar
+- **GPU rows**: indented — utilization bar, VRAM, temperature, power, user, job, time remaining
 - **State symbols**: `●` idle · `◐` mixed · `○` alloc · `✖` drain
-- **Stale nodes**: show error label instead of `~stale` (e.g., `~timeout`, `~unreachable`, `~smi_err`)
+- **Stale nodes**: specific error label (e.g., `~timeout`, `~unreachable`, `~smi_err`)
 
 ---
 
@@ -155,9 +98,145 @@ sgpu        # Launch the GPU monitor
 [sgpu TUI]        ──reads──┘   (instant, no SSH on launch)
 ```
 
-The collector daemon runs continuously in the background, polling SLURM and all GPU nodes via SSH. It writes a fresh JSON snapshot every few seconds. The TUI reads this file on each refresh — startup is instant regardless of cluster size.
+The collector daemon runs continuously in the background, polling SLURM and GPU nodes via SSH. The TUI reads its JSON output on each refresh — startup is instant regardless of cluster size.
 
-If the collector is not running, the TUI falls back to direct SSH collection (slower first load).
+Without the daemon, the TUI falls back to direct SSH collection (slower first load).
+
+---
+
+## Managing the Collector Daemon
+
+### With sudo (system service)
+
+```bash
+# Status
+sudo systemctl status sgpu-collector
+
+# Restart
+sudo systemctl restart sgpu-collector
+
+# Live logs
+sudo journalctl -u sgpu-collector -f
+
+# Recent logs
+sudo journalctl -u sgpu-collector --since "10 minutes ago"
+
+# Stop / disable
+sudo systemctl stop sgpu-collector
+sudo systemctl disable sgpu-collector
+```
+
+### Without sudo (user service)
+
+```bash
+# Status
+systemctl --user status sgpu-collector
+
+# Restart
+systemctl --user restart sgpu-collector
+
+# Live logs
+journalctl --user -u sgpu-collector -f
+
+# Stop / disable
+systemctl --user stop sgpu-collector
+systemctl --user disable sgpu-collector
+```
+
+### Without sudo (background process)
+
+```bash
+# Check if running
+pgrep -a -f sgpu-collector
+
+# Live log
+tail -f /tmp/sgpu-collector.log
+
+# Stop
+pkill -f sgpu-collector
+```
+
+---
+
+## Uninstall
+
+> The exact commands are printed at the end of `install.sh` — copy them then.
+
+### With sudo (system service)
+
+```bash
+sudo systemctl stop sgpu-collector
+sudo systemctl disable sgpu-collector
+sudo rm -f /etc/systemd/system/sgpu-collector.service
+sudo rm -f /usr/local/bin/sgpu /usr/local/bin/sgpu-collector
+sudo systemctl daemon-reload
+rm -rf /path/to/slurm-gpu-tui
+```
+
+### Without sudo (user service)
+
+```bash
+systemctl --user stop sgpu-collector
+systemctl --user disable sgpu-collector
+rm -f ~/.config/systemd/user/sgpu-collector.service
+systemctl --user daemon-reload
+# Remove the PATH line from ~/.bashrc
+rm -rf /path/to/slurm-gpu-tui
+```
+
+### Without sudo (background process)
+
+```bash
+pkill -f sgpu-collector
+# Remove the nohup and PATH lines from ~/.bashrc
+rm -rf /path/to/slurm-gpu-tui
+```
+
+---
+
+## Troubleshooting
+
+**`sgpu` not found**
+```bash
+ls ~/slurm-gpu-tui/bin/sgpu        # check wrapper exists
+export PATH="$HOME/slurm-gpu-tui/bin:$PATH"   # apply manually
+```
+
+**Slow startup / "loading GPUs..." on every launch**
+
+The collector daemon is not running. Check its status and restart:
+```bash
+sudo systemctl status sgpu-collector       # system service
+systemctl --user status sgpu-collector    # user service
+pgrep -a -f sgpu-collector                # background process
+```
+
+**Node shows `~timeout` or `~unreachable`**
+
+SSH from the master node to that compute node is failing:
+```bash
+ssh <node-name>       # test manually
+ssh -v <node-name>    # verbose output
+```
+
+**Node shows `~smi_err` or `~no_smi`**
+
+`nvidia-smi` is not working on that node:
+```bash
+ssh <node-name> nvidia-smi
+```
+
+**Collector keeps crashing**
+```bash
+sudo journalctl -u sgpu-collector -n 50 --no-pager    # system service
+journalctl --user -u sgpu-collector -n 50 --no-pager   # user service
+cat /tmp/sgpu-collector.log                             # background process
+```
+
+**Reinstall cleanly**
+```bash
+bash install.sh    # safe to re-run, overwrites venv and service
+```
 
 ---
 

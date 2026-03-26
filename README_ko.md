@@ -22,9 +22,7 @@
 
 > **이미 설치된 서버라면?** 그냥 `sgpu`만 치면 됩니다.
 
-### sudo 권한이 있는 경우 (관리자 설치, 권장)
-
-systemd 서비스로 Collector를 등록해 부팅 시 자동 시작하고, 서버의 모든 유저가 `sgpu`를 바로 쓸 수 있게 설정합니다.
+### 한 줄 설치 (sudo 유무 자동 감지)
 
 ```bash
 git clone https://github.com/eightmm/slurm-gpu-tui.git
@@ -32,79 +30,24 @@ cd slurm-gpu-tui
 bash install.sh
 ```
 
-`install.sh`가 자동으로 처리합니다:
-1. [uv](https://github.com/astral-sh/uv)로 Python 3.12 가상환경 생성 (없으면 자동 설치)
-2. 패키지 설치
-3. `bin/` 아래 래퍼 스크립트 생성
-4. `sgpu-collector`를 systemd 서비스로 설치 및 시작 (sudo 필요)
+`install.sh`가 환경을 자동으로 감지해서 전부 처리합니다:
 
-설치 후 모든 유저가 쓸 수 있도록 심볼릭 링크 생성:
+| 상황 | 자동 처리 내용 |
+|------|--------------|
+| **sudo 있음** | systemd 시스템 서비스 설치 + `/usr/local/bin/sgpu` 심볼릭 링크 생성 |
+| **sudo 없음, systemd --user 지원** | systemd 유저 서비스 설치 (로그인 시 자동 시작) |
+| **sudo 없음, systemd 없음** | 백그라운드 프로세스로 시작 + `~/.bashrc` 자동 추가 |
 
-```bash
-sudo ln -sf $(pwd)/bin/sgpu /usr/local/bin/sgpu
-```
-
-이후 모든 유저는 `sgpu`만 치면 됩니다. venv 활성화 필요 없음.
-
-> **참고:** 설치 디렉토리를 옮기면 `bash install.sh` 재실행 후 심볼릭 링크를 다시 걸어주세요.
-
----
-
-### sudo 권한이 없는 경우 (개인 설치)
-
-sudo 없이 본인 계정에만 설치합니다.
-
-#### 1단계 — 설치
+설치 후 PATH 반영 (sudo 없는 경우):
 
 ```bash
-git clone https://github.com/eightmm/slurm-gpu-tui.git
-cd slurm-gpu-tui
-
-# uv가 없으면 설치
-curl -LsSf https://astral.sh/uv/install.sh | sh
-export PATH="$HOME/.local/bin:$PATH"
-
-# 가상환경 생성 및 패키지 설치
-uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python -e .
+source ~/.bashrc   # 또는 터미널 새로 열기
+sgpu
 ```
 
-#### 2단계 — PATH 등록
+sudo가 있으면 `/usr/local/bin/sgpu` 심볼릭 링크가 자동으로 생성되므로 PATH 설정 불필요.
 
-```bash
-# ~/.bashrc 또는 ~/.zshrc에 추가
-echo 'export PATH="$HOME/slurm-gpu-tui/bin:$PATH"' >> ~/.bashrc
-source ~/.bashrc
-```
-
-`$HOME/slurm-gpu-tui` 부분을 실제 클론 경로로 바꿔주세요.
-
-#### 3단계 — Collector 데몬 시작
-
-**방법 A: 백그라운드로 직접 실행**
-
-```bash
-nohup bin/sgpu-collector > /tmp/sgpu-collector.log 2>&1 &
-```
-
-로그인 시 자동 시작하려면 `~/.bashrc`나 시작 스크립트에 추가하세요.
-
-**방법 B: systemd 유저 서비스로 등록** (시스템이 지원하는 경우)
-
-```bash
-# 실제 경로로 ExecStart 교체
-sed "s|ExecStart=.*|ExecStart=$(pwd)/.venv/bin/sgpu-collector|" sgpu-collector.service \
-  > ~/.config/systemd/user/sgpu-collector.service
-
-systemctl --user daemon-reload
-systemctl --user enable sgpu-collector
-systemctl --user start sgpu-collector
-
-# 상태 확인
-systemctl --user status sgpu-collector
-```
-
-> **데몬 없이도 됩니다:** `sgpu`는 데몬 없이도 동작합니다. 다만 첫 실행 시 노드당 SSH 연결이 필요해 로딩이 느릴 수 있습니다.
+> **설치 디렉토리를 옮기면?** `bash install.sh` 다시 실행하면 됩니다.
 
 ---
 
@@ -140,8 +83,8 @@ sgpu        # GPU 모니터 실행
                0   H100    ████████░  91%   ███████  64/80G   78C   400W   jaemin  67890   10:15h
 ```
 
-- **노드 헤더 행** (어두운 초록 배경): 노드명, 상태, 파티션, CPU 할당/전체, RAM
-- **GPU 행**: 헤더 아래 들여쓰기 — 사용률 바, VRAM, 온도, 전력, 유저, Job
+- **노드 헤더 행** (어두운 초록 배경): 노드명, 상태 기호, 파티션, CPU 할당/전체, RAM
+- **GPU 행**: 헤더 아래 들여쓰기 — 사용률 바, VRAM, 온도, 전력, 유저, Job, 잔여 시간
 - **상태 기호**: `●` idle · `◐` mixed · `○` alloc · `✖` drain
 - **오류 노드**: `~stale` 대신 구체적인 원인 표시 (예: `~timeout`, `~unreachable`, `~smi_err`)
 
@@ -158,6 +101,144 @@ sgpu        # GPU 모니터 실행
 Collector 데몬이 백그라운드에서 지속 실행되며, SLURM 명령어와 SSH로 각 GPU 노드를 주기적으로 수집합니다. TUI는 이 JSON 파일을 매 갱신 시 읽어들이므로 클러스터 규모에 관계없이 즉시 시작됩니다.
 
 데몬이 실행 중이지 않으면 TUI가 직접 SSH 수집으로 폴백합니다 (첫 로딩 느림).
+
+---
+
+## Collector 데몬 관리
+
+### sudo 있는 경우 (시스템 서비스)
+
+```bash
+# 상태 확인
+sudo systemctl status sgpu-collector
+
+# 재시작
+sudo systemctl restart sgpu-collector
+
+# 실시간 로그
+sudo journalctl -u sgpu-collector -f
+
+# 최근 로그
+sudo journalctl -u sgpu-collector --since "10 minutes ago"
+
+# 중지 / 비활성화
+sudo systemctl stop sgpu-collector
+sudo systemctl disable sgpu-collector
+```
+
+### sudo 없는 경우 (유저 서비스)
+
+```bash
+# 상태 확인
+systemctl --user status sgpu-collector
+
+# 재시작
+systemctl --user restart sgpu-collector
+
+# 실시간 로그
+journalctl --user -u sgpu-collector -f
+
+# 중지 / 비활성화
+systemctl --user stop sgpu-collector
+systemctl --user disable sgpu-collector
+```
+
+### sudo 없는 경우 (백그라운드 프로세스)
+
+```bash
+# 실행 중인지 확인
+pgrep -a -f sgpu-collector
+
+# 로그 확인
+tail -f /tmp/sgpu-collector.log
+
+# 중지
+pkill -f sgpu-collector
+```
+
+---
+
+## 제거
+
+### sudo 있는 경우 (시스템 서비스)
+
+```bash
+sudo systemctl stop sgpu-collector
+sudo systemctl disable sgpu-collector
+sudo rm -f /etc/systemd/system/sgpu-collector.service
+sudo rm -f /usr/local/bin/sgpu /usr/local/bin/sgpu-collector
+sudo systemctl daemon-reload
+rm -rf /path/to/slurm-gpu-tui
+```
+
+### sudo 없는 경우 (유저 서비스)
+
+```bash
+systemctl --user stop sgpu-collector
+systemctl --user disable sgpu-collector
+rm -f ~/.config/systemd/user/sgpu-collector.service
+systemctl --user daemon-reload
+# ~/.bashrc에서 PATH 줄 제거
+rm -rf /path/to/slurm-gpu-tui
+```
+
+### sudo 없는 경우 (백그라운드 프로세스)
+
+```bash
+pkill -f sgpu-collector
+# ~/.bashrc에서 nohup 줄 및 PATH 줄 제거
+rm -rf /path/to/slurm-gpu-tui
+```
+
+> 설치 시 출력되는 제거 명령어를 복사해두면 편합니다.
+
+---
+
+## 트러블슈팅
+
+**`sgpu` 명령을 못 찾는 경우**
+```bash
+# 래퍼 스크립트 확인
+ls ~/slurm-gpu-tui/bin/sgpu
+
+# PATH 임시 적용
+export PATH="$HOME/slurm-gpu-tui/bin:$PATH"
+```
+
+**처음 실행 시 느린 경우 ("loading GPUs..." 메시지)**
+
+Collector 데몬이 실행 중이지 않은 것입니다. 상태 확인 후 재시작하세요:
+```bash
+sudo systemctl status sgpu-collector      # 시스템 서비스
+systemctl --user status sgpu-collector   # 유저 서비스
+```
+
+**노드에 `~timeout` 또는 `~unreachable` 표시**
+
+해당 노드로 SSH 연결이 실패하는 것입니다:
+```bash
+ssh <노드명>        # 직접 접속 테스트
+ssh -v <노드명>     # 상세 오류 확인
+```
+
+**노드에 `~smi_err` 또는 `~no_smi` 표시**
+
+해당 노드에서 `nvidia-smi`가 동작하지 않는 것입니다:
+```bash
+ssh <노드명> nvidia-smi
+```
+
+**Collector가 계속 크래시되는 경우**
+```bash
+sudo journalctl -u sgpu-collector -n 50 --no-pager   # 시스템 서비스
+journalctl --user -u sgpu-collector -n 50 --no-pager  # 유저 서비스
+cat /tmp/sgpu-collector.log                            # 백그라운드
+```
+
+**재설치**
+```bash
+bash install.sh    # 기존 venv와 서비스를 덮어씁니다
+```
 
 ---
 
