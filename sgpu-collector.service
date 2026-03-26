@@ -1,0 +1,15 @@
+[Unit]
+Description=SLURM GPU Monitor Collector
+After=network.target
+
+[Service]
+Type=simple
+User=jaemin
+ExecStart=/home/jaemin/mgt/slurm-gpu-tui/.venv/bin/sgpu-collector
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

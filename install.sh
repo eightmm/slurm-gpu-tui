@@ -38,14 +38,26 @@ EOF
 
 chmod +x "$INSTALL_DIR/bin/sgpu" "$INSTALL_DIR/bin/sgpu-collector"
 
+# 3. Install systemd service
+echo "[3/3] Installing systemd service..."
+SERVICE_FILE="$INSTALL_DIR/sgpu-collector.service"
+
+# Rewrite ExecStart to use actual venv path
+sed "s|ExecStart=.*|ExecStart=$VENV_DIR/bin/sgpu-collector|" "$SERVICE_FILE" \
+    | sudo tee /etc/systemd/system/sgpu-collector.service > /dev/null
+
+sudo systemctl daemon-reload
+sudo systemctl enable sgpu-collector
+sudo systemctl restart sgpu-collector
+
 echo ""
 echo "=== Done! ==="
 echo ""
+echo "Collector daemon status:"
+sudo systemctl status sgpu-collector --no-pager -l || true
+echo ""
 echo "To make sgpu available system-wide, run:"
 echo "  sudo ln -sf $INSTALL_DIR/bin/sgpu /usr/local/bin/sgpu"
-echo "  sudo ln -sf $INSTALL_DIR/bin/sgpu-collector /usr/local/bin/sgpu-collector"
 echo ""
-echo "Then start the collector daemon:"
-echo "  sudo sgpu-collector --daemon"
-echo ""
-echo "After that, all users can just run: sgpu"
+echo "All users can now run: sgpu"
+echo "  (daemon auto-starts on boot via systemd)"

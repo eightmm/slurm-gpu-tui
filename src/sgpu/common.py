@@ -9,7 +9,20 @@ import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Dict, List, Tuple
+
+
+class NodeErrorKind(str, Enum):
+    OK = "ok"
+    SSH_TIMEOUT = "ssh_timeout"
+    SSH_UNREACHABLE = "ssh_unreachable"
+    SSH_AUTH = "ssh_auth"
+    NVIDIA_SMI_MISSING = "nvidia_smi_missing"
+    NVIDIA_SMI_FAILED = "nvidia_smi_failed"
+    PARSE_ERROR = "parse_error"
+    SLURM_DOWN = "slurm_down"
+    STALE_CACHED = "stale_cached"
 
 
 # ── Shell helpers ─────────────────────────────────────────────────────────
@@ -146,6 +159,7 @@ class NodeInfo:
     mem_used: str = ""
     mem_avail: str = ""
     stale: bool = False
+    error_kind: str = ""  # NodeErrorKind value as string
 
 
 @dataclass
@@ -153,6 +167,9 @@ class NodeSSHResult:
     gpus: List[GpuInfo] = field(default_factory=list)
     mem: NodeMemInfo = field(default_factory=NodeMemInfo)
     error: str = ""
+    error_kind: NodeErrorKind = NodeErrorKind.OK
+    consecutive_failures: int = 0
+    last_ok_ts: float = 0.0
 
 
 # ── GPU name shortening ──────────────────────────────────────────────────
@@ -165,10 +182,30 @@ def shorten_gpu_name(name: str) -> str:
     return name.strip()
 
 
+# ── Error classification ─────────────────────────────────────────────────
+
+def _classify_error(error_str: str, exc: Exception = None) -> NodeErrorKind:
+    if exc is not None and hasattr(exc, '__class__'):
+        if 'TimeoutExpired' in type(exc).__name__ or 'Timeout' in type(exc).__name__:
+            return NodeErrorKind.SSH_TIMEOUT
+    s = str(error_str).lower()
+    if "timed out" in s or "timeout" in s:
+        return NodeErrorKind.SSH_TIMEOUT
+    if "connection refused" in s or "no route to host" in s or "network is unreachable" in s:
+        return NodeErrorKind.SSH_UNREACHABLE
+    if "permission denied" in s or "publickey" in s:
+        return NodeErrorKind.SSH_AUTH
+    if "command not found" in s and "nvidia" in s:
+        return NodeErrorKind.NVIDIA_SMI_MISSING
+    if "nvidia-smi" in s and ("failed" in s or "error" in s):
+        return NodeErrorKind.NVIDIA_SMI_FAILED
+    return NodeErrorKind.SSH_UNREACHABLE  # default for unknown SSH errors
+
+
 # ── Data collection ──────────────────────────────────────────────────────
 
 def collect_jobs() -> Tuple[List[JobInfo], str]:
-    cmd = 'squeue -h -t R -o "%i|%u|%P|%j|%M|%R|%b|%l"'
+    cmd = 'squeue -h -t R -o "%i|%u|%P|%j|%M|%N|%b|%l"'
     ok, out = run_cmd(cmd)
     if not ok:
         return [], f"squeue failed: {out}"
@@ -247,16 +284,20 @@ def collect_node_data(node: str, timeout: int = 30) -> Tuple[List[GpuInfo], Node
         "nvidia-smi pmon -c 1 -s m 2>/dev/null; "
         "echo '---SEP---'; "
         "awk '/^MemTotal:/{ t=$2 } /^MemAvailable:/{ a=$2 } "
-        "END{ printf \"%d %d %d\", t/1024, (t-a)/1024, a/1024 }' /proc/meminfo"
+        "END{ printf \"%d %d %d\", t/1024, (t-a)/1024, a/1024 }' /proc/meminfo; "
+        "echo '---SEP---'; "
+        "PIDS=$(nvidia-smi pmon -c 1 -s u 2>/dev/null | awk 'NR>2 && $2!= \"-\" {print $2}' | tr '\\n' ','); "
+        "if [ -n \"$PIDS\" ]; then ps -p ${PIDS%,} -o pid=,user= 2>/dev/null; fi"
     )
     ok, out = ssh_cmd(node, combined, timeout=timeout)
     if not ok:
-        return [], NodeMemInfo(), "ssh failed"
+        return [], NodeMemInfo(), out if out else "ssh failed"
 
     sections = out.split("---SEP---")
     metrics_raw = sections[0].strip() if len(sections) > 0 else ""
     pmon_raw = sections[1].strip() if len(sections) > 1 else ""
     mem_raw = sections[2].strip() if len(sections) > 2 else ""
+    ps_raw = sections[3].strip() if len(sections) > 3 else ""
 
     mem_info = NodeMemInfo()
     mem_parts = mem_raw.split()
@@ -273,17 +314,12 @@ def collect_node_data(node: str, timeout: int = 30) -> Tuple[List[GpuInfo], Node
         if len(parts) >= 2 and parts[1] != "-":
             gpu_pids.setdefault(parts[0], []).append(parts[1])
 
-    # Resolve PIDs to usernames via ps (single call for all PIDs)
-    all_pids = [pid for pids in gpu_pids.values() for pid in pids]
+    # Resolve PIDs to usernames via ps output from combined SSH call
     pid_to_user: Dict[str, str] = {}
-    if all_pids:
-        ps_cmd = "ps -o pid=,user= -p " + ",".join(all_pids) + " 2>/dev/null"
-        ps_ok, ps_out = ssh_cmd(node, ps_cmd, timeout=5)
-        if ps_ok:
-            for line in ps_out.splitlines():
-                ps_parts = line.split()
-                if len(ps_parts) >= 2:
-                    pid_to_user[ps_parts[0]] = ps_parts[1]
+    for line in ps_raw.splitlines():
+        ps_parts = line.split()
+        if len(ps_parts) >= 2:
+            pid_to_user[ps_parts[0]] = ps_parts[1]
 
     gpus: List[GpuInfo] = []
     for line in metrics_raw.splitlines():
@@ -305,9 +341,13 @@ def collect_node_data(node: str, timeout: int = 30) -> Tuple[List[GpuInfo], Node
 
 def collect_basic() -> Tuple[List[dict], List[JobInfo], List[PendingJob], Dict[str, List[JobInfo]], str]:
     """Phase 1: fast local commands only (sinfo + squeue)."""
-    nodes_raw, e1 = collect_nodes_basic()
-    jobs, e2 = collect_jobs()
-    pending, e3 = collect_pending_jobs()
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        f_nodes = ex.submit(collect_nodes_basic)
+        f_jobs = ex.submit(collect_jobs)
+        f_pending = ex.submit(collect_pending_jobs)
+        nodes_raw, e1 = f_nodes.result()
+        jobs, e2 = f_jobs.result()
+        pending, e3 = f_pending.result()
     err = " | ".join(x for x in [e1, e2, e3] if x)
     node_jobs: Dict[str, List[JobInfo]] = {}
     for j in jobs:
@@ -335,6 +375,7 @@ def build_nodes(
             gpus=gpus, jobs=node_jobs.get(name, []), error=gerr,
             mem_used=mem.used, mem_avail=mem.avail,
             stale=(name in stale_nodes),
+            error_kind=r.error_kind.value if r and hasattr(r, 'error_kind') else "",
         ))
     return result
 
@@ -344,10 +385,10 @@ _node_cache: Dict[str, Tuple[List[GpuInfo], NodeMemInfo]] = {}
 
 
 def collect_node_data_parallel(
-    node_names: List[str], node_timeout: int = 30, max_workers: int = 8,
+    node_names: List[str], node_timeout: int = 30, max_workers: int = 8, cache=None,
 ) -> Tuple[Dict[str, NodeSSHResult], List[str], List[str]]:
     """Phase 2: SSH to nodes. Returns results, stale_nodes, errors."""
-    warmup_ssh(node_names, max_workers=max_workers)
+    active_cache = cache if cache is not None else _node_cache
 
     ssh_results: Dict[str, NodeSSHResult] = {}
     stale_nodes: List[str] = []
@@ -358,14 +399,19 @@ def collect_node_data_parallel(
         for fut in as_completed(futs):
             name = futs[fut]
             gpus, mem, err = fut.result()
-            if err and name in _node_cache:
-                cached_gpus, cached_mem = _node_cache[name]
-                ssh_results[name] = NodeSSHResult(cached_gpus, cached_mem, "")
+            if err:
+                gpus2, mem2, err2 = collect_node_data(name, node_timeout)
+                if not err2:
+                    gpus, mem, err = gpus2, mem2, err2
+            if err and name in active_cache:
+                cached_gpus, cached_mem = active_cache[name]
+                ssh_results[name] = NodeSSHResult(cached_gpus, cached_mem, "", error_kind=NodeErrorKind.STALE_CACHED)
                 stale_nodes.append(name)
             else:
-                ssh_results[name] = NodeSSHResult(gpus, mem, err)
+                kind = _classify_error(err) if err else NodeErrorKind.OK
+                ssh_results[name] = NodeSSHResult(gpus, mem, err, error_kind=kind)
                 if gpus or mem.total:
-                    _node_cache[name] = (gpus, mem)
+                    active_cache[name] = (gpus, mem)
                 if err:
                     errors.append(f"{name}: {err}")
 

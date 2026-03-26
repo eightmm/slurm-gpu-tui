@@ -10,12 +10,11 @@ from dataclasses import asdict
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 from .common import (
-    GpuInfo, JobInfo, NodeMemInfo, PendingJob,
-    collect_jobs, collect_pending_jobs, collect_nodes_basic,
-    collect_node_data, warmup_ssh, shorten_gpu_name,
+    GpuInfo, JobInfo, NodeErrorKind, NodeMemInfo, PendingJob,
+    collect_basic, collect_node_data, _classify_error,
 )
 
 # ── Config ────────────────────────────────────────────────────────────────
@@ -27,8 +26,48 @@ REFRESH_SEC = int(os.getenv("SLURM_GPU_TUI_COLLECTOR_SEC", "3"))
 NODE_TIMEOUT = int(os.getenv("SLURM_GPU_TUI_NODE_TIMEOUT_SEC", "30"))
 MAX_WORKERS = int(os.getenv("SLURM_GPU_TUI_MAX_WORKERS", "8"))
 
-# Cache for fallback
-_cache: Dict[str, Tuple[List[dict], dict]] = {}
+_collector_cache: Dict[str, Any] = {}
+
+# ── Long-lived executors ──────────────────────────────────────────────────
+
+_node_executor = ThreadPoolExecutor(max_workers=16)
+_basic_executor = ThreadPoolExecutor(max_workers=3)
+
+# ── Adaptive polling state ────────────────────────────────────────────────
+
+_node_poll_state: Dict[str, Dict] = {}
+_INTERVAL_HOT = 5    # active node: poll every 5s
+_INTERVAL_COLD = 20  # idle node: poll every 20s
+_INTERVAL_DOWN = 60  # down/drain node: poll every 60s
+
+
+def _should_poll_node(name: str, slurm_state: str) -> bool:
+    now = time.monotonic()
+    state = _node_poll_state.get(name, {"last_poll": 0.0, "interval": _INTERVAL_HOT})
+    return (now - state["last_poll"]) >= state["interval"]
+
+
+def _update_poll_state(name: str, success: bool, node_is_cold: bool, slurm_state: str) -> None:
+    now = time.monotonic()
+    state = _node_poll_state.setdefault(name, {
+        "last_poll": 0.0, "interval": _INTERVAL_HOT,
+        "consecutive_failures": 0, "last_ok": 0.0
+    })
+    state["last_poll"] = now
+    s = slurm_state.lower()
+    if "down" in s or "drain" in s:
+        state["interval"] = _INTERVAL_DOWN
+    elif not success:
+        state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
+        state["interval"] = min(_INTERVAL_DOWN, _INTERVAL_HOT * (2 ** state["consecutive_failures"]))
+    elif node_is_cold:
+        state["consecutive_failures"] = 0
+        state["last_ok"] = now
+        state["interval"] = _INTERVAL_COLD
+    else:
+        state["consecutive_failures"] = 0
+        state["last_ok"] = now
+        state["interval"] = _INTERVAL_HOT
 
 
 def _gpu_to_dict(gpu: GpuInfo) -> dict:
@@ -59,42 +98,57 @@ def _pending_to_dict(pj: PendingJob) -> dict:
 
 def collect_all() -> dict:
     """Full collection cycle. Returns JSON-serializable dict."""
-    nodes_raw, _ = collect_nodes_basic()
-    jobs, _ = collect_jobs()
-    pending, _ = collect_pending_jobs()
+    nodes_raw, jobs, pending, node_jobs_from_basic, basic_err = collect_basic()
 
-    node_jobs: Dict[str, List[dict]] = {}
-    for j in jobs:
-        node_jobs.setdefault(j.node, []).append(_job_to_dict(j))
+    node_jobs: Dict[str, List[dict]] = {
+        k: [_job_to_dict(j) for j in v] for k, v in node_jobs_from_basic.items()
+    }
 
-    node_names = [n["name"] for n in nodes_raw]
     stale_nodes: List[str] = []
 
-    # SSH collection
+    # SSH collection — skip nodes that don't need polling yet, use cache instead
     ssh_results: Dict[str, Tuple[List[dict], dict, str]] = {}
-    if node_names:
-        warmup_ssh(node_names, max_workers=MAX_WORKERS)
-        with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(node_names))) as ex:
-            futs = {ex.submit(collect_node_data, n, NODE_TIMEOUT): n for n in node_names}
-            for fut in as_completed(futs):
-                name = futs[fut]
-                gpus, mem, err = fut.result()
-                gpu_dicts = [_gpu_to_dict(g) for g in gpus]
-                mem_dict = {"total": mem.total, "used": mem.used, "avail": mem.avail}
-                if err and name in _cache:
-                    cached_gpus, cached_mem = _cache[name]
-                    ssh_results[name] = (cached_gpus, cached_mem, "")
-                    stale_nodes.append(name)
-                else:
-                    ssh_results[name] = (gpu_dicts, mem_dict, err)
-                    if gpu_dicts or mem.total:
-                        _cache[name] = (gpu_dicts, mem_dict)
+    nodes_to_poll = [n for n in nodes_raw if _should_poll_node(n["name"], n["state"])]
+    nodes_cached = [n for n in nodes_raw if not _should_poll_node(n["name"], n["state"])]
+
+    # Inject cached results for nodes we're skipping this cycle
+    for n in nodes_cached:
+        name = n["name"]
+        if name in _collector_cache:
+            cached_gpus, cached_mem = _collector_cache[name]
+            ssh_results[name] = (cached_gpus, cached_mem, "", NodeErrorKind.OK.value)
+
+    if nodes_to_poll:
+        futs = {_node_executor.submit(collect_node_data, n["name"], NODE_TIMEOUT): n for n in nodes_to_poll}
+        for fut in as_completed(futs):
+            n = futs[fut]
+            name = n["name"]
+            slurm_state = n["state"]
+            gpus, mem, err = fut.result()
+            gpu_dicts = [_gpu_to_dict(g) for g in gpus]
+            mem_dict = {"total": mem.total, "used": mem.used, "avail": mem.avail}
+            if err and name in _collector_cache:
+                cached_gpus, cached_mem = _collector_cache[name]
+                ssh_results[name] = (cached_gpus, cached_mem, "", NodeErrorKind.STALE_CACHED.value)
+                stale_nodes.append(name)
+                _update_poll_state(name, success=False, node_is_cold=False, slurm_state=slurm_state)
+            else:
+                kind = _classify_error(err).value if err else NodeErrorKind.OK.value
+                ssh_results[name] = (gpu_dicts, mem_dict, err, kind)
+                if gpu_dicts or mem.total:
+                    _collector_cache[name] = (gpu_dicts, mem_dict)
+                node_is_cold = (
+                    all(g.util in ("0", "", "N/A") for g in gpus)
+                    and name not in node_jobs
+                )
+                _update_poll_state(name, success=not err, node_is_cold=node_is_cold, slurm_state=slurm_state)
 
     # Build final node list
     result_nodes = []
     for n in nodes_raw:
         name = n["name"]
-        gpus, mem, err = ssh_results.get(name, ([], {}, ""))
+        raw = ssh_results.get(name, ([], {}, "", NodeErrorKind.OK.value))
+        gpus, mem, err, error_kind = raw if len(raw) == 4 else (*raw, NodeErrorKind.OK.value)
         result_nodes.append({
             "name": name, "state": n["state"], "cpus": n["cpus"],
             "cpu_alloc": n.get("cpu_alloc", ""), "cpu_load": n["cpu_load"],
@@ -102,6 +156,7 @@ def collect_all() -> dict:
             "mem_used": mem.get("used", ""), "mem_avail": mem.get("avail", ""),
             "gpus": gpus, "jobs": node_jobs.get(name, []),
             "error": err, "stale": name in stale_nodes,
+            "error_kind": error_kind,
         })
 
     return {
@@ -110,6 +165,7 @@ def collect_all() -> dict:
         "jobs": [_job_to_dict(j) for j in jobs],
         "pending": [_pending_to_dict(p) for p in pending],
         "stale_nodes": stale_nodes,
+        "errors": basic_err,
     }
 
 
