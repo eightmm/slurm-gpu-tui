@@ -316,7 +316,8 @@ def _job_to_dict(job: JobInfo) -> dict:
     return {
         "jobid": job.jobid, "user": job.user, "partition": job.partition,
         "jobname": job.jobname, "elapsed": job.elapsed, "node": job.node,
-        "gpu_count": job.gpu_count, "gres_raw": job.gres_raw,
+        "gpu_count": job.gpu_count, "cpu_count": job.cpu_count,
+        "gres_raw": job.gres_raw,
         "time_limit": job.time_limit,
     }
 

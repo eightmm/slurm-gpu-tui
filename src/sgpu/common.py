@@ -134,6 +134,7 @@ class JobInfo:
     elapsed: str = ""
     node: str = ""
     gpu_count: int = 0
+    cpu_count: int = 0
     gres_raw: str = ""
     time_limit: str = ""
     script: str = ""  # batch script when SHARE_SCRIPTS collector publishes it
@@ -221,7 +222,7 @@ def _classify_error(error_str: str, exc: Exception = None) -> NodeErrorKind:
 # ── Data collection ──────────────────────────────────────────────────────
 
 def collect_jobs() -> Tuple[List[JobInfo], str]:
-    cmd = 'squeue -h -t R -o "%i|%u|%P|%j|%M|%N|%b|%l"'
+    cmd = 'squeue -h -t R -o "%i|%u|%P|%j|%M|%N|%b|%l|%C"'
     ok, out = run_cmd(cmd)
     if not ok:
         return [], f"squeue failed: {out}"
@@ -236,7 +237,11 @@ def collect_jobs() -> Tuple[List[JobInfo], str]:
         if m:
             gc = int(m.group(1))
         tlimit = p[7].strip() if len(p) > 7 else ""
-        rows.append(JobInfo(p[0], p[1], p[2], p[3], p[4], p[5], gc, gres, tlimit))
+        try:
+            cc = int(p[8].strip()) if len(p) > 8 else 0
+        except ValueError:
+            cc = 0
+        rows.append(JobInfo(p[0], p[1], p[2], p[3], p[4], p[5], gc, cc, gres, tlimit))
     return rows, ""
 
 

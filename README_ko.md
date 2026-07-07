@@ -75,8 +75,8 @@ sgpu        # GPU 모니터 실행
 
 | 키 | 동작 |
 |----|------|
+| `1` `2` `3` | 탭 전환: GPU / CPU / Usage |
 | `r` | 즉시 새로고침 |
-| `f` | Fast(1초) / Normal(3초) 전환 |
 | `s` | 정렬 순환: 노드명 → 사용률 → 유저 → 빈 GPU |
 | `u` | 유저 필터 — 목록에서 선택 (내가 첫 항목); 다시 누르면 해제 |
 | `i` | 유휴 필터 토글 (빈 GPU 있는 노드만 표시) |
@@ -86,7 +86,7 @@ sgpu        # GPU 모니터 실행
 | `j` / `k` | 커서 아래 / 위 이동 (vim 스타일) |
 | `Enter` | Job / 노드 상세 팝업 (`scontrol show`) |
 | `w` | 낭비 GPU 팝업 (idle / parked, 심한 순) |
-| `g` | 유저별 GPU-hours (최근 7일) |
+| `g` | Usage 탭 열기 (유저별 GPU-hours) |
 | `e` | 현재 상태를 JSON 파일로 내보내기 |
 | `?` | 도움말 오버레이 |
 | `q` | 종료 |
@@ -305,7 +305,6 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstra
 | 변수 | 기본값 | 설명 |
 |------|--------|------|
 | `SLURM_GPU_TUI_REFRESH_SEC` | `3` | TUI 갱신 주기 (초) |
-| `SLURM_GPU_TUI_FAST_REFRESH_SEC` | `1` | Fast 모드 갱신 주기 |
 | `SLURM_GPU_TUI_COLLECTOR_SEC` | `3` | Collector 수집 주기 |
 | `SLURM_GPU_TUI_NODE_TIMEOUT_SEC` | `30` | 노드 SSH 타임아웃 |
 | `SLURM_GPU_TUI_MAX_WORKERS` | `8` | 병렬 SSH 워커 수 (폴백 모드) |

@@ -77,8 +77,8 @@ sgpu        # Launch the GPU monitor
 
 | Key | Action |
 |-----|--------|
+| `1` `2` `3` | Switch tabs: GPU / CPU / Usage |
 | `r` | Refresh now |
-| `f` | Toggle Fast (1s) / Normal (3s) refresh |
 | `s` | Cycle sort: Node → Utilization → User → Free |
 | `u` | Filter by user — pick from a list (me first); press again to clear |
 | `i` | Toggle idle filter (show only nodes with free GPUs) |
@@ -88,7 +88,7 @@ sgpu        # Launch the GPU monitor
 | `j` / `k` | Move cursor down / up (vim-style) |
 | `Enter` | Job / node details popup (`scontrol show`) |
 | `w` | Wasted GPUs popup (idle / parked, worst first) |
-| `g` | GPU-hours by user (last 7 days) |
+| `g` | Open the Usage tab (GPU-hours by user) |
 | `e` | Export current snapshot as JSON |
 | `?` | Help overlay |
 | `q` | Quit |
@@ -308,7 +308,6 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstra
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SLURM_GPU_TUI_REFRESH_SEC` | `3` | TUI refresh interval (seconds) |
-| `SLURM_GPU_TUI_FAST_REFRESH_SEC` | `1` | Fast mode refresh interval |
 | `SLURM_GPU_TUI_COLLECTOR_SEC` | `3` | Collector cycle interval |
 | `SLURM_GPU_TUI_NODE_TIMEOUT_SEC` | `30` | SSH timeout per node |
 | `SLURM_GPU_TUI_MAX_WORKERS` | `8` | Parallel SSH workers (fallback mode) |

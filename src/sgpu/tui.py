@@ -472,8 +472,8 @@ class DetailScreen(ModalScreen):
 
 
 HELP_TEXT = """\
+ 1/2/3    Tabs: GPU / CPU / Usage  (g also opens Usage)
  r        Refresh now
- f        Fast (1s) / Normal (3s) refresh
  s        Cycle sort: Node → Utilization → User → Free
  u        Filter by user (pick from list; u again clears)
  i        Idle filter (truly free GPUs only)
@@ -482,7 +482,6 @@ HELP_TEXT = """\
  Enter    Job / node details — Tab switches Info/Script
  /        Search node or user (Esc clears)
  w        Wasted GPUs (idle / parked, worst first)
- g        GPU-hours by user (last 7 days)
  j / k    Cursor down / up
  e        Export snapshot JSON
  ?        This help
@@ -500,7 +499,7 @@ HELP_TEXT = """\
    user !slurm      GPU process with no SLURM allocation
 
  Korean IME: same physical keys work without switching
- (ㅂ=q, ㄱ=r, ㄴ=s, ㅇ=d, ㅑ=i, ㅕ=u, ㄹ=f, ㄷ=e, ㅈ=w, ㅎ=g, ㅓ=j, ㅏ=k)
+ (ㅂ=q, ㄱ=r, ㄴ=s, ㅇ=d, ㅑ=i, ㅕ=u, ㄷ=e, ㅈ=w, ㅎ=g, ㅓ=j, ㅏ=k)
 """
 
 
@@ -547,48 +546,26 @@ class WasteScreen(ModalScreen):
         self.app.pop_screen()
 
 
-class UsageScreen(ModalScreen):
-    """Per-user GPU-hours over the last N days (from collector's usage.json)."""
-
-    BINDINGS = [("escape", "close", "Close"), ("q", "close", "Close"), ("g", "close", "Close")]
-    CSS = """
-    UsageScreen { align: center middle; }
-    #usage-box {
-        width: 64; max-height: 85%;
-        border: round $primary; background: $surface; padding: 1 2;
-    }
-    """
-
-    def __init__(self, days: int = 7) -> None:
-        super().__init__()
-        self._days = days
-
-    def compose(self) -> ComposeResult:
-        body = Text()
-        totals = load_usage_totals(self._days)
-        if totals is None:
-            body.append("No usage data (collector not running or too new).", style="dim")
-        elif not totals:
-            body.append("No GPU usage recorded in this window.", style="dim")
-        else:
-            body.append(f" {'user':<14}{'alloc':>9}{'busy':>9}{'eff':>6}\n", style="bold underline")
-            for user, alloc, busy in totals:
-                eff = busy / alloc if alloc > 0 else 0
-                eff_style = "green" if eff >= 0.7 else "yellow" if eff >= 0.4 else "red"
-                body.append(f" {user:<14}", style="magenta")
-                body.append(f"{alloc / 3600:>8.1f}h{busy / 3600:>8.1f}h", style="bold")
-                body.append(f"{eff:>6.0%}\n", style=eff_style)
-        with VerticalScroll(id="usage-box"):
-            yield Static(Text(f"GPU-hours by user — last {self._days} days", style="bold"))
-            yield Static(body)
-
-    def on_key(self, event) -> None:
-        if getattr(event, "character", None) == "ㅂ":
-            event.stop()
-            self.action_close()
-
-    def action_close(self) -> None:
-        self.app.pop_screen()
+def render_usage(days: int = 7) -> Text:
+    """Per-user GPU-hours table (Usage tab / former modal)."""
+    body = Text()
+    body.append(f"GPU-hours by user — last {days} days\n\n", style="bold")
+    totals = load_usage_totals(days)
+    if totals is None:
+        body.append("No usage data (collector not running or too new).", style="dim")
+        return body
+    if not totals:
+        body.append("No GPU usage recorded in this window.", style="dim")
+        return body
+    body.append(f" {'user':<14}{'alloc':>9}{'busy':>9}{'eff':>6}\n", style="bold underline")
+    for user, alloc, busy in totals:
+        eff = busy / alloc if alloc > 0 else 0
+        eff_style = "green" if eff >= 0.7 else "yellow" if eff >= 0.4 else "red"
+        body.append(f" {user:<14}", style="magenta")
+        body.append(f"{alloc / 3600:>8.1f}h{busy / 3600:>8.1f}h", style="bold")
+        body.append(f"{eff:>6.0%}\n", style=eff_style)
+    body.append("\nalloc = GPU held by your jobs · busy = GPU actually computing", style="dim")
+    return body
 
 
 def load_usage_totals(days: int) -> Optional[List[Tuple[str, float, float]]]:
@@ -683,7 +660,6 @@ class HelpScreen(ModalScreen):
 _JAMO_ACTIONS = {
     "ㅂ": "quit",          # q
     "ㄱ": "refresh",       # r
-    "ㄹ": "toggle_fast",   # f
     "ㄴ": "toggle_sort",   # s
     "ㅕ": "toggle_user_filter",  # u
     "ㅑ": "toggle_idle_filter",  # i
@@ -704,6 +680,9 @@ class SlurmGpuTui(App):
     Screen { layout: vertical; }
     #status { height: 1; background: $surface; color: $text-muted; padding: 0 1; }
     #summary { height: 3; padding: 0 1; background: $surface; }
+    #main-tabs { height: 1fr; }
+    #cpu-tbl { height: 1fr; }
+    #usage-scroll { height: 1fr; padding: 1 2; }
     #tbl-container { height: 1fr; layout: vertical; }
     #tbl { height: 1fr; }
     #pending-container { height: auto; max-height: 12; border-top: solid $primary; }
@@ -714,9 +693,8 @@ class SlurmGpuTui(App):
 
     BINDINGS = [
         ("r", "refresh", "Refresh"),
-        ("f", "toggle_fast", "Fast/Normal"),
         ("s", "toggle_sort", "Sort"),
-        ("u", "toggle_user_filter", "My Jobs"),
+        ("u", "toggle_user_filter", "User"),
         ("i", "toggle_idle_filter", "Idle Only"),
         ("space", "toggle_collapse", "Collapse"),
         ("d", "toggle_details", "Details"),
@@ -724,7 +702,10 @@ class SlurmGpuTui(App):
         ("k", "cursor_up", "↑"),
         ("slash", "start_search", "Search"),
         ("w", "show_waste", "Waste"),
-        ("g", "show_usage", "GPU-hours"),
+        ("g", "show_usage", "Usage"),
+        ("1", "tab_gpu", "GPU"),
+        ("2", "tab_cpu", "CPU"),
+        ("3", "tab_usage", "Usage"),
         ("e", "export_json", "Export JSON"),
         ("question_mark", "help", "Help"),
         ("q", "quit", "Quit"),
@@ -733,11 +714,18 @@ class SlurmGpuTui(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield Static("loading...", id="summary")
-        with Vertical(id="tbl-container"):
-            yield DataTable(id="tbl")
-            with Vertical(id="pending-container"):
-                yield Static(" PENDING JOBS ", id="pending-label")
-                yield DataTable(id="pending-tbl")
+        with TabbedContent(initial="pane-gpu", id="main-tabs"):
+            with TabPane("GPU [1]", id="pane-gpu"):
+                with Vertical(id="tbl-container"):
+                    yield DataTable(id="tbl")
+                    with Vertical(id="pending-container"):
+                        yield Static(" PENDING JOBS ", id="pending-label")
+                        yield DataTable(id="pending-tbl")
+            with TabPane("CPU [2]", id="pane-cpu"):
+                yield DataTable(id="cpu-tbl")
+            with TabPane("Usage [3]", id="pane-usage"):
+                with VerticalScroll(id="usage-scroll"):
+                    yield Static("", id="usage-view")
         yield Input(placeholder="/ filter: node or user (Esc to clear)", id="search-input")
         yield Static("", id="status")
         yield Footer()
@@ -745,8 +733,20 @@ class SlurmGpuTui(App):
     def on_mount(self) -> None:
         self.tbl = self.query_one("#tbl", DataTable)
         self.pending_tbl = self.query_one("#pending-tbl", DataTable)
+        self.cpu_tbl = self.query_one("#cpu-tbl", DataTable)
+        self.usage_view = self.query_one("#usage-view", Static)
         self.summary_w = self.query_one("#summary", Static)
         self.status_w = self.query_one("#status", Static)
+
+        self.cpu_tbl.add_column("Node", key="c_node", width=12)
+        self.cpu_tbl.add_column("State", key="c_state", width=10)
+        self.cpu_tbl.add_column("Partition", key="c_part", width=14)
+        self.cpu_tbl.add_column("CPU alloc", key="c_cpu", width=26)
+        self.cpu_tbl.add_column("Load", key="c_load", width=8)
+        self.cpu_tbl.add_column("RAM", key="c_ram", width=22)
+        self.cpu_tbl.add_column("CPU users (cores)", key="c_users")
+        self.cpu_tbl.cursor_type = "row"
+        self.cpu_tbl.zebra_stripes = True
         self.current_user = os.environ.get("USER", os.getlogin() if hasattr(os, "getlogin") else "user")
         self._node_cache: dict = {}
 
@@ -769,9 +769,7 @@ class SlurmGpuTui(App):
         self.pending_tbl.cursor_type = "row"
         self.pending_tbl.zebra_stripes = True
 
-        self.refresh_sec_normal = int(os.getenv("SLURM_GPU_TUI_REFRESH_SEC", "3"))
-        self.refresh_sec_fast = int(os.getenv("SLURM_GPU_TUI_FAST_REFRESH_SEC", "1"))
-        self.refresh_sec = self.refresh_sec_normal
+        self.refresh_sec = int(os.getenv("SLURM_GPU_TUI_REFRESH_SEC", "3"))
         self.node_timeout = int(os.getenv("SLURM_GPU_TUI_NODE_TIMEOUT_SEC", "30"))
         self.max_workers = int(os.getenv("SLURM_GPU_TUI_MAX_WORKERS", "8"))
         self.snapshot: dict = {}
@@ -806,14 +804,6 @@ class SlurmGpuTui(App):
         self.refresh_all()
 
     def action_refresh(self) -> None:
-        self._rerender()
-
-    def action_toggle_fast(self) -> None:
-        if self.refresh_sec == self.refresh_sec_normal:
-            self.refresh_sec = self.refresh_sec_fast
-        else:
-            self.refresh_sec = self.refresh_sec_normal
-        self._reset_timer(self.refresh_sec)
         self._rerender()
 
     def action_export_json(self) -> None:
@@ -909,8 +899,24 @@ class SlurmGpuTui(App):
     def action_show_waste(self) -> None:
         self.push_screen(WasteScreen(collect_waste(self._nodes_cache, WASTE_MIN_SEC)))
 
+    def _set_tab(self, pane: str) -> None:
+        self.query_one("#main-tabs", TabbedContent).active = pane
+        if pane == "pane-gpu":
+            self.tbl.focus()
+        elif pane == "pane-cpu":
+            self.cpu_tbl.focus()
+
+    def action_tab_gpu(self) -> None:
+        self._set_tab("pane-gpu")
+
+    def action_tab_cpu(self) -> None:
+        self._set_tab("pane-cpu")
+
+    def action_tab_usage(self) -> None:
+        self._set_tab("pane-usage")
+
     def action_show_usage(self) -> None:
-        self.push_screen(UsageScreen())
+        self._set_tab("pane-usage")
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         key = str(event.row_key.value)
@@ -1304,6 +1310,43 @@ class SlurmGpuTui(App):
                     self._row_job[job_key] = j.jobid
                     self.tbl.add_row(*row_cells, key=job_key)
 
+        # ── CPU tab ──
+        self.cpu_tbl.clear()
+        for node in sorted(nodes, key=lambda n: n.name):
+            try:
+                total_c = float(node.cpus)
+                alloc_c = float(node.cpu_alloc or 0)
+                cpct = alloc_c / total_c if total_c > 0 else 0.0
+            except (ValueError, TypeError):
+                total_c, alloc_c, cpct = 0.0, 0.0, 0.0
+            cbar = make_bar(cpct, width=10)
+            cbar.append(f" {node.cpu_alloc or 0}/{node.cpus} {cpct:.0%}", style=pct_color(cpct))
+            try:
+                load = float(node.cpu_load)
+                load_style = "red" if total_c and load > total_c else "yellow" if total_c and load > total_c * 0.8 else "green"
+                load_cell = Text(f"{load:.1f}", style=load_style)
+            except (ValueError, TypeError):
+                load_cell = Text(node.cpu_load or "-", style="bright_black")
+            user_cores: Dict[str, int] = {}
+            for j in node.jobs:
+                if j.cpu_count:
+                    user_cores[j.user] = user_cores.get(j.user, 0) + j.cpu_count
+            users_txt = Text()
+            for u, c in sorted(user_cores.items(), key=lambda x: -x[1]):
+                users_txt.append(f" {u}", style="bold magenta" if u == self.current_user else "magenta")
+                users_txt.append(f":{c}", style="bold")
+            cparts = sorted((p for p in node.partition.split(",") if p),
+                            key=lambda p: ("cpu" in p.lower(), p))
+            self.cpu_tbl.add_row(
+                node_cell(node.name), state_cell(node.state),
+                Text(ellipsize(",".join(cparts), 14), style="cyan"),
+                cbar, load_cell, mem_cell(node), users_txt,
+                key=f"hdr_{node.name}",
+            )
+
+        # ── Usage tab ──
+        self.usage_view.update(render_usage())
+
         # ── Pending Jobs Table ──
         self.query_one("#pending-container").display = bool(pending)
         for pj in pending:
@@ -1333,7 +1376,6 @@ class SlurmGpuTui(App):
         self._user_gpu_count = user_gpu_count
 
         ts = datetime.now().strftime("%H:%M:%S")
-        mode_label = Text(" FAST ", style="bold white on red") if self.refresh_sec == self.refresh_sec_fast else Text(" NORM ", style="bold white on blue")
         sort_label = Text(f" SORT:{self.sort_by.upper()} ", style="bold white on #444444")
 
         summary = Text()
@@ -1379,7 +1421,6 @@ class SlurmGpuTui(App):
         if pending:
             summary.append(" WAIT ", style="bold white on dark_orange3")
             summary.append(f" {len(pending)}  ", style="bold")
-        summary.append_text(mode_label)
         summary.append_text(sort_label)
         if self.filter_user:
             summary.append(f" USER:{self.filter_user} ", style="bold white on #666600")
