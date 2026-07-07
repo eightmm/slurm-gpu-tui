@@ -28,6 +28,10 @@ A real-time TUI tool for monitoring GPU usage across your SLURM cluster, right f
 curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstrap.sh | bash
 ```
 
+> **Recommended: run as root (or with passwordless sudo).** That installs a
+> system-wide service and `/usr/local/bin/sgpu` for every user on the login
+> node. A non-root install works too, but only sets up your own user.
+
 Run the same command again anytime to **upgrade in place**: it resets to the
 latest release, rebuilds the venv, restarts the collector, and running node
 agents are restarted automatically on the next collector cycle.

@@ -28,6 +28,10 @@
 curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstrap.sh | bash
 ```
 
+> **root(또는 passwordless sudo)로 실행 권장.** 시스템 서비스 + `/usr/local/bin/sgpu`가
+> 설치돼 로그인 노드의 모든 유저가 바로 쓸 수 있습니다. 일반 유저로 설치하면
+> 본인 계정용으로만 설정됩니다.
+
 이미 설치돼 있어도 같은 명령을 다시 실행하면 **그 자리에서 업그레이드**됩니다:
 최신 코드로 리셋 → venv 재구성 → collector 재시작, 노드의 push 에이전트도
 다음 collector 사이클에 자동 교체됩니다.
