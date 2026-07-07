@@ -8,7 +8,7 @@ import shlex
 import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Dict, List, Tuple
 
@@ -491,10 +491,26 @@ def collect_basic() -> Tuple[List[dict], List[JobInfo], List[PendingJob], Dict[s
     for n in nodes_raw:
         n["mem_alloc"] = mem_alloc.get(n["name"], "")
     err = " | ".join(x for x in [e1, e2, e3, e4, e5] if x)
+    return nodes_raw, jobs, pending, assign_node_jobs(jobs), gpu_alloc, err
+
+
+def assign_node_jobs(jobs: List[JobInfo]) -> Dict[str, List[JobInfo]]:
+    """Per-node job map. Multi-node jobs arrive as compressed nodelists
+    ('gpu[3-4]') — expand them, and split the job's total CPU count across
+    its nodes so per-node core sums stay correct."""
     node_jobs: Dict[str, List[JobInfo]] = {}
     for j in jobs:
-        node_jobs.setdefault(j.node, []).append(j)
-    return nodes_raw, jobs, pending, node_jobs, gpu_alloc, err
+        nodes = expand_nodelist(j.node) or ([j.node] if j.node else [])
+        n = len(nodes)
+        if n <= 1:
+            for node in nodes:
+                node_jobs.setdefault(node, []).append(j)
+            continue
+        base, rem = divmod(j.cpu_count, n)
+        for i, node in enumerate(nodes):
+            node_jobs.setdefault(node, []).append(
+                replace(j, cpu_count=base + (1 if i < rem else 0)))
+    return node_jobs
 
 
 def apply_gpu_alloc(

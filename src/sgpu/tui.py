@@ -391,6 +391,10 @@ def collect_waste(nodes: List[NodeInfo], min_sec: int) -> List[dict]:
 WASTE_MIN_SEC = int(os.getenv("SLURM_GPU_TUI_WASTE_MIN_SEC", "600"))
 
 
+def _waste_thr() -> str:
+    return fmt_span(WASTE_MIN_SEC) or f"{WASTE_MIN_SEC}s"
+
+
 def fmt_start_time(s: str) -> str:
     """Compact squeue %S estimate: '15:00' today, '07-08 15:00' otherwise."""
     if not s or s in ("N/A", "(null)"):
@@ -549,7 +553,7 @@ class WasteScreen(ModalScreen):
                 body.append(f" job {r['jobid']}", style="dim")
             body.append("\n")
         with VerticalScroll(id="waste-box"):
-            yield Static(Text(f"Wasted GPUs (≥{fmt_span(WASTE_MIN_SEC) or WASTE_MIN_SEC}) — idle: reserved w/o process · parked: VRAM held at 0% util", style="bold"))
+            yield Static(Text(f"Wasted GPUs (≥{_waste_thr()}) — idle: reserved w/o process · parked: VRAM held at 0% util", style="bold"))
             yield Static(body)
 
     def on_key(self, event) -> None:
@@ -565,10 +569,11 @@ def render_usage(days: int = 7) -> Text:
     """Per-user GPU-hours table (Usage tab / former modal)."""
     body = Text()
     body.append(f"GPU-hours by user — last {days} days\n\n", style="bold")
-    totals = load_usage_totals(days)
-    if totals is None:
+    loaded = load_usage_totals(days)
+    if loaded is None:
         body.append("No usage data (collector not running or too new).", style="dim")
         return body
+    totals, covered = loaded
     if not totals:
         body.append("No GPU usage recorded in this window.", style="dim")
         return body
@@ -580,11 +585,13 @@ def render_usage(days: int = 7) -> Text:
         body.append(f"{alloc / 3600:>8.1f}h{busy / 3600:>8.1f}h", style="bold")
         body.append(f"{eff:>6.0%}\n", style=eff_style)
     body.append("\nalloc = GPU held by your jobs · busy = GPU actually computing", style="dim")
+    body.append(f"\nsampling-based (collector observed {covered / 3600:.1f}h of this window)", style="dim")
     return body
 
 
-def load_usage_totals(days: int) -> Optional[List[Tuple[str, float, float]]]:
-    """Sum usage.json daily buckets: [(user, alloc_sec, busy_sec)], alloc desc."""
+def load_usage_totals(days: int) -> Optional[Tuple[List[Tuple[str, float, float]], float]]:
+    """Sum usage.json daily buckets over the window.
+    Returns ([(user, alloc_sec, busy_sec)] alloc desc, covered_seconds)."""
     state_dir = Path(os.getenv("SLURM_GPU_TUI_STATE_DIR", str(Path.home() / ".sgpu" / "state")))
     raw = None
     for p in (state_dir / "usage.json", _DAEMON_DATA_FILE.parent / "usage.json"):
@@ -604,7 +611,8 @@ def load_usage_totals(days: int) -> Optional[List[Tuple[str, float, float]]]:
             t = totals.setdefault(user, [0.0, 0.0])
             t[0] += u.get("alloc", 0)
             t[1] += u.get("busy", 0)
-    return sorted(((u, a, b) for u, (a, b) in totals.items()), key=lambda x: -x[1])
+    covered = sum(v for d, v in raw.get("meta", {}).items() if d >= cutoff)
+    return sorted(((u, a, b) for u, (a, b) in totals.items()), key=lambda x: -x[1]), covered
 
 
 class UserSelectScreen(ModalScreen):
@@ -711,7 +719,7 @@ class SlurmGpuTui(App):
         ("r", "refresh", "Refresh"),
         ("s", "toggle_sort", "Sort"),
         ("u", "toggle_user_filter", "User"),
-        ("i", "toggle_idle_filter", "Idle Only"),
+        ("i", "toggle_idle_filter", "Free GPUs"),
         ("space", "toggle_collapse", "Collapse"),
         ("d", "toggle_details", "Details"),
         ("j", "cursor_down", "↓"),
@@ -802,6 +810,7 @@ class SlurmGpuTui(App):
         self._row_job: Dict[str, str] = {}  # table row key -> jobid for detail popup
         self._nodes_cache: List[NodeInfo] = []  # last applied nodes (waste view)
         self._jobs_by_id: Dict[str, JobInfo] = {}  # for detail popup scripts
+        self._auto_collapsed = False  # big clusters start collapsed, once
 
         self._timer: Timer | None = None
         self._reset_timer(self.refresh_sec)
@@ -901,7 +910,7 @@ class SlurmGpuTui(App):
 
     def action_toggle_idle_filter(self) -> None:
         self.idle_filter_only = not self.idle_filter_only
-        status = "Idle Nodes Only" if self.idle_filter_only else "All Nodes"
+        status = "Nodes with free GPUs only" if self.idle_filter_only else "All Nodes"
         self.status_w.update(status)
         self._rerender()
 
@@ -1082,6 +1091,15 @@ class SlurmGpuTui(App):
 
         self._nodes_cache = nodes
         self._jobs_by_id = {j.jobid: j for j in jobs}
+
+        # Big clusters: start with every node collapsed (one line per node),
+        # Space expands. Only on first data, never after user interaction.
+        if not self._auto_collapsed:
+            self._auto_collapsed = True
+            limit = int(os.getenv("SLURM_GPU_TUI_AUTO_COLLAPSE_NODES", "12"))
+            gpu_nodes_n = sum(1 for n in nodes if n.has_gpu)
+            if gpu_nodes_n >= limit:
+                self._collapsed = {n.name for n in nodes if n.has_gpu}
 
         # Pre-classify every GPU (header strips, FREE chip, sorting, filters)
         node_classes: Dict[str, List[str]] = {
@@ -1483,6 +1501,14 @@ class SlurmGpuTui(App):
             style = "bold yellow underline" if u == self.current_user else "bold magenta"
             summary.append(f" {u}", style=style)
             summary.append(f":{g} ", style="bold")
+        # compact legend for the glyph/marker vocabulary
+        summary.append("\n ")
+        for glyph, label, style in (
+            ("█", "busy", "green"), ("▅", "parked", "blue"), ("▂", "rsv-idle", "yellow"),
+            ("▁", "free", "bold cyan"), ("!", "rogue", "bold red"), ("?", "no-data", "bright_black"),
+        ):
+            summary.append(glyph, style=style)
+            summary.append(f" {label}  ", style="dim")
 
         self.summary_w.update(summary)
 
@@ -1591,24 +1617,31 @@ def _snapshot_nodes() -> List[NodeInfo]:
     return nodes
 
 
-def _cli_waste() -> int:
+def _cli_waste(verbose: bool = False) -> int:
     rows = collect_waste(_snapshot_nodes(), WASTE_MIN_SEC)
     if not rows:
-        print("no wasted GPUs over threshold")
+        print(f"no wasted GPUs over threshold ({_waste_thr()})")
         return 0
+    print(f"threshold {_waste_thr()} (SLURM_GPU_TUI_WASTE_MIN_SEC)")
     for r in rows:
         job = f"  job {r['jobid']}" if r["jobid"] else ""
         span = "-" if r["kind"] in ("rogue", "no-gres") else (fmt_span(r["sec"]) or "<1m")
         print(f"{r['node']}/{r['gpu']}  {r['kind']:<7} {span:>7}  {r['user']}{job}")
+        if verbose and r["jobid"]:
+            ok, out = run_cmd(f"scontrol show job {r['jobid']}", timeout=10)
+            if ok:
+                for m in re.finditer(r"(JobName|Command|WorkDir)=(\S+)", out):
+                    print(f"    {m.group(1)}: {m.group(2)}")
     return 1  # non-zero so cron/scripts can alert on it
 
 
 def _cli_usage(days: int) -> int:
-    totals = load_usage_totals(days)
-    if totals is None:
+    loaded = load_usage_totals(days)
+    if loaded is None:
         print("no usage data (collector not running or too new)")
         return 1
-    print(f"{'user':<14}{'alloc':>9}{'busy':>9}{'eff':>6}   (last {days}d)")
+    totals, covered = loaded
+    print(f"{'user':<14}{'alloc':>9}{'busy':>9}{'eff':>6}   (last {days}d, sampled {covered / 3600:.1f}h)")
     for user, alloc, busy in totals:
         eff = busy / alloc if alloc > 0 else 0
         print(f"{user:<14}{alloc / 3600:>8.1f}h{busy / 3600:>8.1f}h{eff:>6.0%}")
@@ -1626,6 +1659,73 @@ def _cli_wait_free(want: int, partition: str, interval: int) -> int:
             print(f"{free} free GPU(s) available" + (f" in {partition}" if partition else ""))
             return 0
         time.sleep(interval)
+
+
+def _cli_doctor() -> int:
+    """Self-diagnosis: is the data trustworthy, and if not, why."""
+    problems = 0
+
+    def report(ok: Optional[bool], name: str, detail: str) -> None:
+        nonlocal problems
+        mark = "OK  " if ok else ("WARN" if ok is None else "FAIL")
+        if ok is False:  # WARN is informational, only FAIL flips the exit code
+            problems += 1
+        print(f"[{mark}] {name:<22} {detail}")
+
+    # slurm commands
+    for cmd in ("sinfo -h -o %N", "squeue -h -o %i", "scontrol show config"):
+        ok, out = run_cmd(cmd, timeout=10)
+        report(ok, cmd.split()[0], "reachable" if ok else out.splitlines()[0][:70])
+
+    # collector data
+    try:
+        age = time.time() - _DAEMON_DATA_FILE.stat().st_mtime
+        raw = json.loads(_DAEMON_DATA_FILE.read_text())
+        fresh = age <= _DAEMON_MAX_AGE
+        report(fresh, "collector data", f"{_DAEMON_DATA_FILE} age {age:.0f}s"
+               + ("" if fresh else " — STALE, is sgpu-collector running?"))
+        srcs: Dict[str, int] = {}
+        for n in raw.get("nodes", []):
+            srcs[n.get("source", "?")] = srcs.get(n.get("source", "?"), 0) + 1
+        stale_n = srcs.get("stale", 0)
+        report(stale_n == 0 if srcs else None, "node sources",
+               " ".join(f"{k}:{v}" for k, v in sorted(srcs.items())) or "no nodes")
+    except (OSError, ValueError):
+        report(False, "collector data", f"{_DAEMON_DATA_FILE} missing — collector not running (TUI falls back to slow SSH)")
+
+    # push agents
+    agent_dir = Path(os.getenv("SLURM_GPU_TUI_AGENT_DIR", str(Path.home() / ".sgpu" / "nodes")))
+    files = sorted(agent_dir.glob("*.json")) if agent_dir.is_dir() else []
+    if files:
+        ages = {f.stem: time.time() - f.stat().st_mtime for f in files}
+        old = [f"{k}({v:.0f}s)" for k, v in ages.items() if v > 60]
+        report(not old, "push agents",
+               f"{len(files)} payloads in {agent_dir}" + (f", stale: {', '.join(old)}" if old else ", all fresh"))
+    else:
+        report(None, "push agents", f"none in {agent_dir} (SSH pull mode)")
+
+    # persistent state
+    state_dir = Path(os.getenv("SLURM_GPU_TUI_STATE_DIR", str(Path.home() / ".sgpu" / "state")))
+    usage = state_dir / "usage.json"
+    if usage.exists():
+        report(True, "usage history", f"{usage} age {(time.time() - usage.stat().st_mtime):.0f}s")
+    else:
+        report(None, "usage history", "not started yet (collector writes it)")
+
+    # script sharing (sudoers)
+    ok, out = run_cmd("sudo -n scontrol write batch_script 999999999 -", timeout=10)
+    if "Invalid job id" in out or ok:
+        report(True, "script sharing", "sudoers rule active (all-user script view)")
+    else:
+        report(None, "script sharing", "not configured (own jobs only) — rerun installer to enable")
+
+    # prometheus
+    prom = _DAEMON_DATA_FILE.parent / "metrics.prom"
+    report(True if prom.exists() else None, "prometheus",
+           str(prom) if prom.exists() else "no metrics file yet")
+
+    print(f"\n{'all checks passed' if problems == 0 else f'{problems} problem(s) found'}")
+    return 0 if problems == 0 else 1
 
 
 def _arg_value(argv: List[str], flag: str, default: str) -> str:
@@ -1646,8 +1746,10 @@ def main():
             else:
                 _print_once(data)
             return
+        if "--doctor" in argv or "doctor" in argv:
+            sys.exit(_cli_doctor())
         if "--waste" in argv:
-            sys.exit(_cli_waste())
+            sys.exit(_cli_waste(verbose="-v" in argv or "--verbose" in argv))
         if "--usage" in argv:
             v = _arg_value(argv, "--usage", "7")
             sys.exit(_cli_usage(int(v) if v.isdigit() else 7))
@@ -1657,14 +1759,16 @@ def main():
             interval = int(_arg_value(argv, "--interval", "10"))
             sys.exit(_cli_wait_free(want, part, interval))
         if argv and argv[0] in ("-h", "--help"):
-            print("usage: sgpu [--json | --once | --waste | --usage [days] | --wait-free N]\n"
+            print("usage: sgpu [--json | --once | --waste [-v] | --usage [days] | --wait-free N | doctor]\n"
                   "  (no args)      interactive TUI\n"
                   "  --json         print snapshot as JSON and exit\n"
                   "  --once         print snapshot as plain text and exit\n"
-                  "  --waste        list idle/parked GPUs; exit 1 if any (cron-friendly)\n"
+                  "  --waste [-v]   list idle/parked/rogue GPUs; exit 1 if any (cron-friendly)\n"
+                  "                 -v adds JobName/Command/WorkDir per offender\n"
                   "  --usage [N]    per-user GPU-hours over last N days (default 7)\n"
                   "  --wait-free N  block until N GPUs are free\n"
-                  "                 [--partition P] [--interval sec]")
+                  "                 [--partition P] [--interval sec]\n"
+                  "  doctor         self-diagnosis: data freshness, agents, slurm, sharing")
             return
     finally:
         if argv:

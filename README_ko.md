@@ -79,7 +79,7 @@ sgpu        # GPU 모니터 실행
 | `r` | 즉시 새로고침 |
 | `s` | 정렬 순환: 노드명 → 사용률 → 유저 → 빈 GPU |
 | `u` | 유저 필터 — 목록에서 선택 (내가 첫 항목); 다시 누르면 해제 |
-| `i` | 유휴 필터 토글 (빈 GPU 있는 노드만 표시) |
+| `i` | 빈 GPU 필터 (진짜 빈 GPU 있는 노드만) |
 | `d` | 상세 컬럼 토글 (온도 / 전력 / JobID / JobName) |
 | `Space` | 노드 접기 / 펼치기 (노드 헤더 행에 커서 위치 필요) |
 | `/` | 노드명 또는 유저명으로 검색 — `Esc`로 초기화 |
@@ -96,7 +96,8 @@ sgpu        # GPU 모니터 실행
 ```bash
 sgpu --once          # 텍스트 스냅샷 (빠른 확인 / 로그용)
 sgpu --json          # JSON 스냅샷 (스크립트용: sgpu --json | jq ...)
-sgpu --waste         # 유휴/parked GPU 목록; 있으면 exit 1 — cron/알림용
+sgpu --waste [-v]    # 유휴/parked/rogue GPU 목록; 있으면 exit 1 — -v는 Command/WorkDir 추가
+sgpu doctor          # 자가진단: 데이터 신선도, 에이전트, slurm, 스크립트 공유
 sgpu --usage [일수]  # 유저별 GPU-hours + 효율 (기본 7일)
 sgpu --wait-free 2 --partition heavy   # 빈 GPU 2개 생길 때까지 대기 후 exit 0
 chkgpu               # 클래식 원샷 유저×노드 GPU/CPU 매트릭스 + 노드별 next-free 예상시각
@@ -317,6 +318,7 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstra
 | `SLURM_GPU_TUI_AGENT_REPAIR_SEC` | `180` | 노드당 에이전트 수리 최소 간격 |
 | `SLURM_GPU_TUI_AGENT_DISABLE` | (없음) | 설정 시 push 에이전트 비활성화 |
 | `SLURM_GPU_TUI_WASTE_MIN_SEC` | `600` | 낭비 뷰 / `--waste` 임계값 |
+| `SLURM_GPU_TUI_AUTO_COLLAPSE_NODES` | `12` | GPU 노드가 이 수 이상이면 접힌 상태로 시작 |
 | `SLURM_GPU_TUI_USAGE_KEEP_DAYS` | `30` | GPU-hour 히스토리 보존 기간 |
 | `SLURM_GPU_TUI_ROGUE_IGNORE` | `root,gdm,xdm` | rogue로 안 잡을 유저 목록 |
 | `SLURM_GPU_TUI_SHARE_SCRIPTS` | (없음) | collector가 전체 잡의 batch script를 공유 — 모든 유저가 Enter 팝업에서 봄. **스크립트 내용(비밀키 포함 가능)이 전원에게 공개됨.** 설치 시 `[Y/n]`으로 물어봄; `SGPU_SHARE_SCRIPTS=0/1`이면 질문 생략 |

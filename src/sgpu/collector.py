@@ -248,6 +248,9 @@ def _accumulate_usage(result_nodes: List[dict], now: float) -> None:
     if not (0 < dt <= 60):
         return  # collector was paused; don't credit the gap
     day = datetime.now().strftime("%Y-%m-%d")
+    # coverage meta: how many seconds this sampling accounting actually saw
+    meta = _usage.setdefault("meta", {})
+    meta[day] = meta.get(day, 0) + dt
     bucket = _usage["days"].setdefault(day, {})
     for n in result_nodes:
         for g in n.get("gpus", []):
@@ -264,6 +267,8 @@ def _accumulate_usage(result_nodes: List[dict], now: float) -> None:
     cutoff = (datetime.now() - timedelta(days=USAGE_KEEP_DAYS)).strftime("%Y-%m-%d")
     for d in [d for d in _usage["days"] if d < cutoff]:
         del _usage["days"][d]
+    for d in [d for d in _usage.get("meta", {}) if d < cutoff]:
+        del _usage["meta"][d]
 
 
 # ── Adaptive polling state ────────────────────────────────────────────────

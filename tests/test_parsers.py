@@ -1,7 +1,8 @@
 """Parser tests against captured real-cluster output."""
 from sgpu.common import (
-    NodeErrorKind, _classify_error, _expand_idx, expand_nodelist,
-    parse_gpu_alloc, parse_gres_models, parse_node_payload, shorten_gpu_name,
+    NodeErrorKind, _classify_error, _expand_idx, assign_node_jobs,
+    expand_nodelist, parse_gpu_alloc, parse_gres_models, parse_node_payload,
+    shorten_gpu_name,
 )
 from sgpu.common import GpuInfo, JobInfo, NodeInfo
 from sgpu.tui import (
@@ -16,6 +17,20 @@ def test_expand_nodelist():
     assert expand_nodelist("gpu4") == ["gpu4"]
     assert expand_nodelist("gpu[1-3,5],node7") == ["gpu1", "gpu2", "gpu3", "gpu5", "node7"]
     assert expand_nodelist("gpu[01-03]") == ["gpu01", "gpu02", "gpu03"]
+
+
+def test_assign_node_jobs_multinode():
+    # squeue %N compresses multi-node jobs ('cpu[5-8]') — the map must expand
+    # them and split the job's total CPUs across its nodes
+    jobs = [
+        JobInfo(jobid="1", user="a", node="gpu3", cpu_count=8),
+        JobInfo(jobid="2", user="b", node="cpu[5-8]", cpu_count=256),
+        JobInfo(jobid="3", user="c", node="cpu[1-2]", cpu_count=5),
+    ]
+    m = assign_node_jobs(jobs)
+    assert [j.jobid for j in m["gpu3"]] == ["1"] and m["gpu3"][0].cpu_count == 8
+    assert all(m[f"cpu{i}"][0].cpu_count == 64 for i in range(5, 9))
+    assert m["cpu1"][0].cpu_count == 3 and m["cpu2"][0].cpu_count == 2
 
 
 def test_expand_idx():

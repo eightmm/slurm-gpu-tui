@@ -81,7 +81,7 @@ sgpu        # Launch the GPU monitor
 | `r` | Refresh now |
 | `s` | Cycle sort: Node → Utilization → User → Free |
 | `u` | Filter by user — pick from a list (me first); press again to clear |
-| `i` | Toggle idle filter (show only nodes with free GPUs) |
+| `i` | Free-GPU filter (only nodes with truly free GPUs) |
 | `d` | Toggle detail columns (Temp / Power / JobID / JobName) |
 | `Space` | Collapse / expand node (cursor on node header row) |
 | `/` | Search by node name or username — `Esc` to clear |
@@ -98,7 +98,8 @@ sgpu        # Launch the GPU monitor
 ```bash
 sgpu --once          # plain-text snapshot (for quick checks / logs)
 sgpu --json          # JSON snapshot (for scripts: sgpu --json | jq ...)
-sgpu --waste         # list idle/parked GPUs; exit 1 if any — cron/Slack friendly
+sgpu --waste [-v]    # idle/parked/rogue GPUs; exit 1 if any — -v adds Command/WorkDir
+sgpu doctor          # self-diagnosis: data freshness, agents, slurm, script sharing
 sgpu --usage [days]  # per-user GPU-hours + efficiency (default 7 days)
 sgpu --wait-free 2 --partition heavy   # block until 2 GPUs are free, then exit 0
 chkgpu               # classic one-shot user x node GPU/CPU matrix with per-node next-free ETA
@@ -320,6 +321,7 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstra
 | `SLURM_GPU_TUI_AGENT_REPAIR_SEC` | `180` | Min interval between agent repairs per node |
 | `SLURM_GPU_TUI_AGENT_DISABLE` | (unset) | Set to disable push agents entirely |
 | `SLURM_GPU_TUI_WASTE_MIN_SEC` | `600` | Threshold for the waste view / `--waste` |
+| `SLURM_GPU_TUI_AUTO_COLLAPSE_NODES` | `12` | Start with nodes collapsed when the cluster has at least this many GPU nodes |
 | `SLURM_GPU_TUI_USAGE_KEEP_DAYS` | `30` | GPU-hour history retention |
 | `SLURM_GPU_TUI_ROGUE_IGNORE` | `root,gdm,xdm` | Users never flagged as rogue |
 | `SLURM_GPU_TUI_SHARE_SCRIPTS` | (unset) | Collector publishes every job's batch script so all users see them in the Enter popup. **Shares script contents (and any secrets in them) with everyone** — the installer asks about this (`[Y/n]`); `SGPU_SHARE_SCRIPTS=0/1` skips the question |
