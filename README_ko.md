@@ -99,6 +99,7 @@ sgpu --json          # JSON 스냅샷 (스크립트용: sgpu --json | jq ...)
 sgpu --waste         # 유휴/parked GPU 목록; 있으면 exit 1 — cron/알림용
 sgpu --usage [일수]  # 유저별 GPU-hours + 효율 (기본 7일)
 sgpu --wait-free 2 --partition heavy   # 빈 GPU 2개 생길 때까지 대기 후 exit 0
+chkgpu               # 클래식 원샷 유저×노드 GPU/CPU 매트릭스 + 노드별 next-free 예상시각
 ```
 
 `--waste`를 cron+메일에 걸면 설정 없이 GPU 사재기 일일 다이제스트가 됩니다.

@@ -58,7 +58,7 @@ pkill -f "bin/[s]gpu-collector" 2>/dev/null
 
 # ── Remove symlinks, data, install dir ──────────────────────────────────────
 if $HAS_SUDO; then
-    $SUDO rm -f /usr/local/bin/sgpu /usr/local/bin/sgpu-collector /etc/sudoers.d/sgpu
+    $SUDO rm -f /usr/local/bin/sgpu /usr/local/bin/sgpu-collector /usr/local/bin/chkgpu /etc/sudoers.d/sgpu
 fi
 rm -rf "${SLURM_GPU_TUI_DATA_DIR:-/tmp/slurm-gpu-tui}" "$HOME/.sgpu/nodes" \
        "${SLURM_GPU_TUI_STATE_DIR:-$HOME/.sgpu/state}"

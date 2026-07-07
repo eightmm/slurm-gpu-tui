@@ -101,6 +101,7 @@ sgpu --json          # JSON snapshot (for scripts: sgpu --json | jq ...)
 sgpu --waste         # list idle/parked GPUs; exit 1 if any — cron/Slack friendly
 sgpu --usage [days]  # per-user GPU-hours + efficiency (default 7 days)
 sgpu --wait-free 2 --partition heavy   # block until 2 GPUs are free, then exit 0
+chkgpu               # classic one-shot user x node GPU/CPU matrix with per-node next-free ETA
 ```
 
 `--waste` in a daily cron + mail is a zero-setup GPU-hoarding digest.

@@ -62,7 +62,13 @@ cat > "$INSTALL_DIR/bin/sgpu-collector" << EOF
 exec "$VENV_DIR/bin/sgpu-collector" "\$@"
 EOF
 
-chmod +x "$INSTALL_DIR/bin/sgpu" "$INSTALL_DIR/bin/sgpu-collector"
+# chkgpu: bundled one-shot user x node GPU/CPU matrix (stdlib only)
+cat > "$INSTALL_DIR/bin/chkgpu" << EOF
+#!/bin/bash
+exec "$VENV_DIR/bin/python" "$INSTALL_DIR/chkgpu" "\$@"
+EOF
+
+chmod +x "$INSTALL_DIR/bin/sgpu" "$INSTALL_DIR/bin/sgpu-collector" "$INSTALL_DIR/bin/chkgpu"
 
 # ── Step 3: Collector daemon ───────────────────────────────────────────────
 
@@ -135,6 +141,7 @@ if $HAS_SUDO; then
     # System-wide symlinks — available to all users immediately
     $SUDO ln -sf "$INSTALL_DIR/bin/sgpu" /usr/local/bin/sgpu
     $SUDO ln -sf "$INSTALL_DIR/bin/sgpu-collector" /usr/local/bin/sgpu-collector
+    $SUDO ln -sf "$INSTALL_DIR/bin/chkgpu" /usr/local/bin/chkgpu
 else
     # Add bin/ to user's shell config if not already present
     SHELL_RC=""
