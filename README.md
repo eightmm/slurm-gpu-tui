@@ -22,19 +22,34 @@ A real-time TUI tool for monitoring GPU usage across your SLURM cluster, right f
 
 > **Already installed on your server?** Just run `sgpu`.
 
-### One-line install (auto-detects sudo)
+### One-line install / upgrade
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstrap.sh | bash
+```
+
+Run the same command again anytime to **upgrade in place**: it resets to the
+latest release, rebuilds the venv, restarts the collector, and running node
+agents are restarted automatically on the next collector cycle.
+
+Install dir defaults to `~/.sgpu/app` (override with `SGPU_INSTALL_DIR=...`).
+Pick a shared-filesystem path so compute nodes can run the push agents.
+
+<details>
+<summary>Manual install from a clone</summary>
 
 ```bash
 git clone https://github.com/eightmm/slurm-gpu-tui.git
 cd slurm-gpu-tui
 bash install.sh
 ```
+</details>
 
 `install.sh` detects your environment and handles everything automatically:
 
 | Situation | What install.sh does |
 |-----------|---------------------|
-| **sudo available** | systemd system service + `/usr/local/bin/sgpu` symlink for all users |
+| **root or sudo** | systemd system service + `/usr/local/bin/sgpu` symlink for all users |
 | **no sudo, systemd --user works** | systemd user service (auto-starts on login) + PATH added to shell config |
 | **no sudo, no systemd** | background process + PATH added to shell config |
 

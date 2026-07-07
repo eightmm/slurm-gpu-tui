@@ -31,6 +31,14 @@ LOG_MAX_BYTES = 2 * 1024 * 1024
 
 AGENT_PAYLOAD_VERSION = 1
 
+# Fingerprint of the agent source (shared FS ⇒ same value on all hosts).
+# The collector compares this against agent.py's current mtime and restarts
+# agents left running with older code — upgrades propagate automatically.
+try:
+    AGENT_BUILD = str(int(os.path.getmtime(__file__)))
+except OSError:
+    AGENT_BUILD = "0"
+
 _running = True
 
 
@@ -48,6 +56,7 @@ def collect_local() -> dict:
     gpus, mem = parse_node_payload(out)
     return {
         "agent_version": AGENT_PAYLOAD_VERSION,
+        "agent_build": AGENT_BUILD,
         "ts": time.time(),
         "hostname": socket.gethostname().split(".")[0],
         "gpus": [asdict(g) for g in gpus],

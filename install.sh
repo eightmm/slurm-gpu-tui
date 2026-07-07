@@ -7,9 +7,13 @@ VENV_DIR="$INSTALL_DIR/.venv"
 echo "=== sgpu installer ==="
 echo ""
 
-# ── Detect sudo availability ───────────────────────────────────────────────
+# ── Detect privileges (root or passwordless sudo) ──────────────────────────
 HAS_SUDO=false
-if sudo -n true 2>/dev/null; then
+SUDO="sudo"
+if [ "$(id -u)" = "0" ]; then
+    HAS_SUDO=true
+    SUDO=""
+elif sudo -n true 2>/dev/null; then
     HAS_SUDO=true
 fi
 
@@ -22,7 +26,7 @@ fi
 
 # ── Step 1: Create venv and install package ────────────────────────────────
 echo "[1] Creating venv and installing..."
-uv venv --python 3.12 "$VENV_DIR"
+uv venv --clear --python 3.12 "$VENV_DIR"
 uv pip install --python "$VENV_DIR/bin/python" -e "$INSTALL_DIR"
 chmod -R a+rX "$VENV_DIR"
 
@@ -52,10 +56,10 @@ SYSTEMD_MODE="none"
 
 if $HAS_SUDO; then
     echo "[3] Installing systemd service (system-wide)..."
-    sudo cp "$GENERATED_SERVICE" /etc/systemd/system/sgpu-collector.service
-    sudo systemctl daemon-reload
-    sudo systemctl enable sgpu-collector
-    sudo systemctl restart sgpu-collector
+    $SUDO cp "$GENERATED_SERVICE" /etc/systemd/system/sgpu-collector.service
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl enable sgpu-collector
+    $SUDO systemctl restart sgpu-collector
     SYSTEMD_MODE="system"
 else
     USER_SERVICE_DIR="$HOME/.config/systemd/user"
@@ -63,7 +67,7 @@ else
     cp "$GENERATED_SERVICE" "$USER_SERVICE_DIR/sgpu-collector.service"
     if systemctl --user daemon-reload 2>/dev/null && \
        systemctl --user enable sgpu-collector 2>/dev/null && \
-       systemctl --user start sgpu-collector 2>/dev/null; then
+       systemctl --user restart sgpu-collector 2>/dev/null; then
         SYSTEMD_MODE="user"
     else
         rm -f "$USER_SERVICE_DIR/sgpu-collector.service"
@@ -80,9 +84,9 @@ echo "[4] Setting up PATH..."
 PATH_ADDED=false
 
 if $HAS_SUDO; then
-    # System-wide symlink — available to all users immediately
-    sudo ln -sf "$INSTALL_DIR/bin/sgpu" /usr/local/bin/sgpu
-    sudo ln -sf "$INSTALL_DIR/bin/sgpu-collector" /usr/local/bin/sgpu-collector
+    # System-wide symlinks — available to all users immediately
+    $SUDO ln -sf "$INSTALL_DIR/bin/sgpu" /usr/local/bin/sgpu
+    $SUDO ln -sf "$INSTALL_DIR/bin/sgpu-collector" /usr/local/bin/sgpu-collector
 else
     # Add bin/ to user's shell config if not already present
     SHELL_RC=""
@@ -111,7 +115,7 @@ echo ""
 # Daemon status
 if [ "$SYSTEMD_MODE" = "system" ]; then
     echo "Collector daemon (system service):"
-    sudo systemctl status sgpu-collector --no-pager -l || true
+    $SUDO systemctl status sgpu-collector --no-pager -l || true
 elif [ "$SYSTEMD_MODE" = "user" ]; then
     echo "Collector daemon (user service):"
     systemctl --user status sgpu-collector --no-pager -l || true

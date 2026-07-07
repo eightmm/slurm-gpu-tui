@@ -22,13 +22,28 @@
 
 > **이미 설치된 서버라면?** 그냥 `sgpu`만 치면 됩니다.
 
-### 한 줄 설치 (sudo 유무 자동 감지)
+### 한 줄 설치 / 업그레이드
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstrap.sh | bash
+```
+
+이미 설치돼 있어도 같은 명령을 다시 실행하면 **그 자리에서 업그레이드**됩니다:
+최신 코드로 리셋 → venv 재구성 → collector 재시작, 노드의 push 에이전트도
+다음 collector 사이클에 자동 교체됩니다.
+
+설치 위치 기본값 `~/.sgpu/app` (`SGPU_INSTALL_DIR=...`로 변경).
+push 에이전트를 쓰려면 계산 노드에서 보이는 공유 파일시스템 경로로.
+
+<details>
+<summary>클론해서 수동 설치</summary>
 
 ```bash
 git clone https://github.com/eightmm/slurm-gpu-tui.git
 cd slurm-gpu-tui
 bash install.sh
 ```
+</details>
 
 `install.sh`가 환경을 자동으로 감지해서 전부 처리합니다:
 

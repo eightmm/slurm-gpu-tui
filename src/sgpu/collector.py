@@ -19,6 +19,7 @@ from .common import (
     _classify_error,
 )
 from .agent import AGENT_PAYLOAD_VERSION
+from . import agent as _agent_module
 
 # ── Config ────────────────────────────────────────────────────────────────
 
@@ -203,6 +204,15 @@ def _pending_to_dict(pj: PendingJob) -> dict:
     }
 
 
+def _expected_agent_build() -> str:
+    """Current agent.py fingerprint, read live so upgrades are noticed even
+    if this collector predates them (relaunched agents then match again)."""
+    try:
+        return str(int(os.path.getmtime(_agent_module.__file__)))
+    except OSError:
+        return "0"
+
+
 def _read_agent_payload(name: str) -> dict | None:
     """Return a node's push-agent payload if fresh and version-compatible."""
     p = AGENT_DIR / f"{name}.json"
@@ -213,6 +223,8 @@ def _read_agent_payload(name: str) -> dict | None:
         payload = json.loads(p.read_text())
         if payload.get("agent_version") != AGENT_PAYLOAD_VERSION:
             return None  # old agent — treated as stale, repair will upgrade it
+        if not AGENT_DISABLE and payload.get("agent_build") != _expected_agent_build():
+            return None  # agent runs outdated code — repair restarts it
         return payload
     except Exception:
         return None
