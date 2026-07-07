@@ -3,7 +3,11 @@ from sgpu.common import (
     NodeErrorKind, _classify_error, _expand_idx, expand_nodelist,
     parse_gpu_alloc, parse_gres_models, parse_node_payload, shorten_gpu_name,
 )
-from sgpu.tui import fmt_idle_age, fmt_start_time, parse_slurm_duration
+from sgpu.common import GpuInfo, NodeInfo
+from sgpu.tui import (
+    classify_gpu, collect_waste, fmt_idle_age, fmt_span, fmt_start_time,
+    parse_slurm_duration,
+)
 
 
 # ── nodelist / index expansion ────────────────────────────────────────────
@@ -114,6 +118,27 @@ def test_fmt_idle_age():
     assert fmt_idle_age(30) == "idle"
     assert fmt_idle_age(120) == "idle 2m"
     assert fmt_idle_age(11520) == "idle 3.2h"
+    assert fmt_span(59) == ""
+    assert fmt_span(7200) == "2.0h"
+
+
+def test_classify_gpu():
+    assert classify_gpu(GpuInfo(util="85")) == "busy"
+    assert classify_gpu(GpuInfo(util="0", mem_used="40000", mem_total="48000")) == "parked"
+    assert classify_gpu(GpuInfo(util="0", alloc_jobid="1")) == "idle"
+    assert classify_gpu(GpuInfo(util="0")) == "free"
+    assert classify_gpu(GpuInfo(util="")) == "unknown"
+
+
+def test_collect_waste():
+    nodes = [NodeInfo(name="n1", gpus=[
+        GpuInfo(index="0", idle_sec=7200, alloc_user="a", alloc_jobid="10"),
+        GpuInfo(index="1", parked_sec=900, users=["b"]),
+        GpuInfo(index="2", idle_sec=30),  # below threshold
+    ])]
+    rows = collect_waste(nodes, 600)
+    assert [(r["kind"], r["user"]) for r in rows] == [("idle", "a"), ("parked", "b")]
+    assert rows[0]["sec"] == 7200
 
 
 def test_fmt_start_time():

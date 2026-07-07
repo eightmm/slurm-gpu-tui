@@ -85,6 +85,8 @@ sgpu        # GPU 모니터 실행
 | `/` | 노드명 또는 유저명으로 검색 — `Esc`로 초기화 |
 | `j` / `k` | 커서 아래 / 위 이동 (vim 스타일) |
 | `Enter` | Job / 노드 상세 팝업 (`scontrol show`) |
+| `w` | 낭비 GPU 팝업 (idle / parked, 심한 순) |
+| `g` | 유저별 GPU-hours (최근 7일) |
 | `e` | 현재 상태를 JSON 파일로 내보내기 |
 | `?` | 도움말 오버레이 |
 | `q` | 종료 |
@@ -92,9 +94,15 @@ sgpu        # GPU 모니터 실행
 ### 원샷 CLI 모드
 
 ```bash
-sgpu --once   # 텍스트 스냅샷 (빠른 확인 / 로그용)
-sgpu --json   # JSON 스냅샷 (스크립트용: sgpu --json | jq ...)
+sgpu --once          # 텍스트 스냅샷 (빠른 확인 / 로그용)
+sgpu --json          # JSON 스냅샷 (스크립트용: sgpu --json | jq ...)
+sgpu --waste         # 유휴/parked GPU 목록; 있으면 exit 1 — cron/알림용
+sgpu --usage [일수]  # 유저별 GPU-hours + 효율 (기본 7일)
+sgpu --wait-free 2 --partition heavy   # 빈 GPU 2개 생길 때까지 대기 후 exit 0
 ```
+
+`--waste`를 cron+메일에 걸면 설정 없이 GPU 사재기 일일 다이제스트가 됩니다.
+`--wait-free`로 자리 나는 순간 잡 제출 스크립트를 짤 수 있습니다.
 
 ### 화면 구성
 
@@ -297,6 +305,8 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstra
 | `SLURM_GPU_TUI_AGENT_MAX_AGE_SEC` | `45` | 에이전트 데이터 신선도 한계 |
 | `SLURM_GPU_TUI_AGENT_REPAIR_SEC` | `180` | 노드당 에이전트 수리 최소 간격 |
 | `SLURM_GPU_TUI_AGENT_DISABLE` | (없음) | 설정 시 push 에이전트 비활성화 |
+| `SLURM_GPU_TUI_WASTE_MIN_SEC` | `600` | 낭비 뷰 / `--waste` 임계값 |
+| `SLURM_GPU_TUI_USAGE_KEEP_DAYS` | `30` | GPU-hour 히스토리 보존 기간 |
 
 ---
 

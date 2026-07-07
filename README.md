@@ -87,6 +87,8 @@ sgpu        # Launch the GPU monitor
 | `/` | Search by node name or username — `Esc` to clear |
 | `j` / `k` | Move cursor down / up (vim-style) |
 | `Enter` | Job / node details popup (`scontrol show`) |
+| `w` | Wasted GPUs popup (idle / parked, worst first) |
+| `g` | GPU-hours by user (last 7 days) |
 | `e` | Export current snapshot as JSON |
 | `?` | Help overlay |
 | `q` | Quit |
@@ -94,9 +96,15 @@ sgpu        # Launch the GPU monitor
 ### One-shot CLI mode
 
 ```bash
-sgpu --once   # plain-text snapshot (for quick checks / logs)
-sgpu --json   # JSON snapshot (for scripts: sgpu --json | jq ...)
+sgpu --once          # plain-text snapshot (for quick checks / logs)
+sgpu --json          # JSON snapshot (for scripts: sgpu --json | jq ...)
+sgpu --waste         # list idle/parked GPUs; exit 1 if any — cron/Slack friendly
+sgpu --usage [days]  # per-user GPU-hours + efficiency (default 7 days)
+sgpu --wait-free 2 --partition heavy   # block until 2 GPUs are free, then exit 0
 ```
+
+`--waste` in a daily cron + mail is a zero-setup GPU-hoarding digest.
+`--wait-free` lets scripts submit the moment capacity opens.
 
 ### Reading the Display
 
@@ -299,6 +307,8 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstra
 | `SLURM_GPU_TUI_AGENT_MAX_AGE_SEC` | `45` | Agent payload freshness limit |
 | `SLURM_GPU_TUI_AGENT_REPAIR_SEC` | `180` | Min interval between agent repairs per node |
 | `SLURM_GPU_TUI_AGENT_DISABLE` | (unset) | Set to disable push agents entirely |
+| `SLURM_GPU_TUI_WASTE_MIN_SEC` | `600` | Threshold for the waste view / `--waste` |
+| `SLURM_GPU_TUI_USAGE_KEEP_DAYS` | `30` | GPU-hour history retention |
 
 ---
 

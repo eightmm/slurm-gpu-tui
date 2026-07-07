@@ -8,7 +8,7 @@ import signal
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List
@@ -50,12 +50,15 @@ _results_lock = threading.Lock()
 _node_results: Dict[str, dict] = {}
 _inflight: set = set()
 
-# ── Idle-age tracking ─────────────────────────────────────────────────────
-# "node:gpu_index" -> {"jobid": str, "since": float} while GPU is allocated
-# with no process. Persisted so collector restarts don't reset ages.
+# ── Waste-age tracking (idle / parked) ────────────────────────────────────
+# "node:gpu_index" -> {"jobid"/"owner": str, "since": float}.
+# idle   = allocated with no GPU process.
+# parked = VRAM held (>=30%) at ~0% utilization by someone.
+# Persisted so collector restarts don't reset ages.
 
 IDLE_STATE_FILE = DATA_DIR / "idle_state.json"
 _idle_since: Dict[str, dict] = {}
+_parked_since: Dict[str, dict] = {}
 
 # ── GPU inventory ─────────────────────────────────────────────────────────
 # Hardware per node barely changes: remember index/name/mem_total from the
@@ -112,7 +115,12 @@ def _skeleton_gpus(name: str, gres: str) -> List[dict]:
 
 def _load_idle_state() -> None:
     try:
-        _idle_since.update(json.loads(IDLE_STATE_FILE.read_text()))
+        raw = json.loads(IDLE_STATE_FILE.read_text())
+        if "idle" in raw or "parked" in raw:
+            _idle_since.update(raw.get("idle", {}))
+            _parked_since.update(raw.get("parked", {}))
+        else:  # pre-parked flat format
+            _idle_since.update(raw)
     except Exception:
         pass
 
@@ -120,16 +128,17 @@ def _load_idle_state() -> None:
 def _save_idle_state() -> None:
     try:
         tmp = IDLE_STATE_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(_idle_since))
+        tmp.write_text(json.dumps({"idle": _idle_since, "parked": _parked_since}))
         tmp.rename(IDLE_STATE_FILE)
     except Exception:
         pass
 
 
-def _track_idle(node: str, gpu: dict, now: float) -> None:
-    """Set gpu['idle_sec'] from allocated-but-no-process duration."""
+def _track_waste(node: str, gpu: dict, now: float) -> None:
+    """Set gpu['idle_sec'] and gpu['parked_sec'] waste durations."""
     key = f"{node}:{gpu.get('index', '')}"
     jid = gpu.get("alloc_jobid", "")
+
     if jid and not gpu.get("users"):
         st = _idle_since.get(key)
         if not st or st.get("jobid") != jid:
@@ -139,6 +148,82 @@ def _track_idle(node: str, gpu: dict, now: float) -> None:
     else:
         _idle_since.pop(key, None)
         gpu["idle_sec"] = 0
+
+    try:
+        util = float(gpu.get("util") or -1)
+    except (ValueError, TypeError):
+        util = -1.0
+    try:
+        total = float(gpu.get("mem_total") or 0)
+        vram_pct = float(gpu.get("mem_used") or 0) / total if total > 0 else 0.0
+    except (ValueError, TypeError):
+        vram_pct = 0.0
+    owner = jid or ",".join(gpu.get("users") or [])
+    if 0 <= util <= 5 and vram_pct >= 0.3 and owner:
+        st = _parked_since.get(key)
+        if not st or st.get("owner") != owner:
+            st = {"owner": owner, "since": now}
+            _parked_since[key] = st
+        gpu["parked_sec"] = int(now - st["since"])
+    else:
+        _parked_since.pop(key, None)
+        gpu["parked_sec"] = 0
+
+# ── Per-user GPU-hour accounting ──────────────────────────────────────────
+# Daily buckets: {"days": {"YYYY-MM-DD": {user: {"alloc": sec, "busy": sec}}}}
+# alloc = GPU allocated to the user's job; busy = that GPU actually computing.
+# Rolling window, persisted each cycle. No slurmdbd needed.
+
+USAGE_FILE = DATA_DIR / "usage.json"
+USAGE_KEEP_DAYS = int(os.getenv("SLURM_GPU_TUI_USAGE_KEEP_DAYS", "30"))
+_usage: Dict[str, dict] = {"days": {}}
+_last_usage_ts: float | None = None
+
+
+def _load_usage() -> None:
+    try:
+        raw = json.loads(USAGE_FILE.read_text())
+        if isinstance(raw.get("days"), dict):
+            _usage["days"] = raw["days"]
+    except Exception:
+        pass
+
+
+def _save_usage() -> None:
+    try:
+        tmp = USAGE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(_usage))
+        tmp.rename(USAGE_FILE)
+    except Exception:
+        pass
+
+
+def _accumulate_usage(result_nodes: List[dict], now: float) -> None:
+    global _last_usage_ts
+    prev, _last_usage_ts = _last_usage_ts, now
+    if prev is None:
+        return
+    dt = now - prev
+    if not (0 < dt <= 60):
+        return  # collector was paused; don't credit the gap
+    day = datetime.now().strftime("%Y-%m-%d")
+    bucket = _usage["days"].setdefault(day, {})
+    for n in result_nodes:
+        for g in n.get("gpus", []):
+            user = g.get("alloc_user") or (g.get("users") or [""])[0]
+            if not user:
+                continue
+            u = bucket.setdefault(user, {"alloc": 0, "busy": 0})
+            u["alloc"] += dt
+            try:
+                if float(g.get("util") or 0) > 5:
+                    u["busy"] += dt
+            except (ValueError, TypeError):
+                pass
+    cutoff = (datetime.now() - timedelta(days=USAGE_KEEP_DAYS)).strftime("%Y-%m-%d")
+    for d in [d for d in _usage["days"] if d < cutoff]:
+        del _usage["days"][d]
+
 
 # ── Adaptive polling state ────────────────────────────────────────────────
 
@@ -324,11 +409,13 @@ def collect_all() -> dict:
 
     # Prefer push-agent payloads (local NFS read, every cycle). Nodes without
     # a live agent fall back to async SSH polls + agent repair.
+    agent_nodes: set = set()
     for n in nodes_raw:
         name = n["name"]
         has_jobs = name in node_jobs_from_basic
         payload = _read_agent_payload(name)
         if payload is not None:
+            agent_nodes.add(name)
             gpu_dicts = payload.get("gpus", [])
             with _results_lock:
                 _node_results[name] = {
@@ -376,19 +463,26 @@ def collect_all() -> dict:
             g["alloc_jobid"] = jid
             g["alloc_user"] = jobid_user.get(jid, "")
             if skeleton_mode:
-                # Placeholder rows carry no process info — show a previously
-                # tracked idle age but never start or reset the timer.
-                st = _idle_since.get(f"{name}:{g.get('index', '')}")
-                if st and jid and st.get("jobid") == jid:
-                    g["idle_sec"] = int(now - st["since"])
-                else:
-                    g["idle_sec"] = 0
+                # Placeholder rows carry no process info — show previously
+                # tracked waste ages but never start or reset the timers.
+                key = f"{name}:{g.get('index', '')}"
+                st = _idle_since.get(key)
+                g["idle_sec"] = int(now - st["since"]) if st and jid and st.get("jobid") == jid else 0
+                st = _parked_since.get(key)
+                g["parked_sec"] = int(now - st["since"]) if st else 0
             else:
-                _track_idle(name, g, now)
+                _track_waste(name, g, now)
             gpus.append(g)
         mem = r["mem"]
+        if name in agent_nodes:
+            source = "agent"
+        elif r["stale"]:
+            source = "stale"
+        else:
+            source = "ssh"
         result_nodes.append({
             "name": name, "state": n["state"], "partition": n.get("partition", ""),
+            "source": source,
             "cpus": n["cpus"],
             "cpu_alloc": n.get("cpu_alloc", ""), "cpu_load": n["cpu_load"],
             "mem_total": n["mem_total"], "mem_free": n["mem_free"], "gres": n["gres"],
@@ -397,6 +491,8 @@ def collect_all() -> dict:
             "error": r["error"], "stale": r["stale"],
             "error_kind": r["error_kind"],
         })
+
+    _accumulate_usage(result_nodes, time.time())
 
     return {
         "version": 1,
@@ -454,6 +550,7 @@ def _write_metrics(data: dict) -> None:
             user = _prom_escape(g.get("alloc_user", ""))
             lines.append(f'sgpu_gpu_allocated{{{lbl},user="{user}"}} {1 if g.get("alloc_jobid") else 0}')
             lines.append(f"sgpu_gpu_idle_seconds{{{lbl}}} {g.get('idle_sec', 0)}")
+            lines.append(f"sgpu_gpu_parked_seconds{{{lbl}}} {g.get('parked_sec', 0)}")
     try:
         tmp = METRICS_FILE.with_suffix(".tmp")
         tmp.write_text("\n".join(lines) + "\n")
@@ -514,6 +611,7 @@ def run_collector():
     PID_FILE.write_text(str(os.getpid()))
     _load_idle_state()
     _load_inventory()
+    _load_usage()
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
@@ -532,6 +630,7 @@ def run_collector():
             tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
             tmp.rename(DATA_FILE)
             _save_idle_state()
+            _save_usage()
             _write_metrics(data)
 
             n_gpus = sum(len(n.get("gpus", [])) for n in data["nodes"])

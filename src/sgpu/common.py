@@ -121,7 +121,8 @@ class GpuInfo:
     users: List[str] = field(default_factory=list)
     alloc_jobid: str = ""  # job holding this GPU per SLURM allocation
     alloc_user: str = ""
-    idle_sec: int = 0  # how long allocated with no GPU process (collector only)
+    idle_sec: int = 0    # how long allocated with no GPU process (collector only)
+    parked_sec: int = 0  # how long VRAM held at ~0% util (collector only)
 
 
 @dataclass
@@ -162,6 +163,7 @@ class NodeInfo:
     name: str = ""
     state: str = ""
     partition: str = ""  # comma-joined partitions from sinfo
+    source: str = ""     # data origin: agent / ssh / stale (collector only)
     cpus: str = ""
     cpu_alloc: str = ""
     cpu_load: str = ""
