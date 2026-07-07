@@ -136,6 +136,7 @@ class JobInfo:
     gpu_count: int = 0
     gres_raw: str = ""
     time_limit: str = ""
+    script: str = ""  # batch script when SHARE_SCRIPTS collector publishes it
 
 
 @dataclass

@@ -319,6 +319,7 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstra
 | `SLURM_GPU_TUI_WASTE_MIN_SEC` | `600` | 낭비 뷰 / `--waste` 임계값 |
 | `SLURM_GPU_TUI_USAGE_KEEP_DAYS` | `30` | GPU-hour 히스토리 보존 기간 |
 | `SLURM_GPU_TUI_ROGUE_IGNORE` | `root,gdm,xdm` | rogue로 안 잡을 유저 목록 |
+| `SLURM_GPU_TUI_SHARE_SCRIPTS` | (없음) | collector가 전체 잡의 batch script를 공유 — 모든 유저가 Enter 팝업에서 봄. root collector 필요. **스크립트 내용(비밀키 포함 가능)이 전원에게 공개됨** — 신뢰 랩에서만 |
 
 ---
 

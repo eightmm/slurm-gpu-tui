@@ -15,7 +15,7 @@ from typing import Dict, List
 
 from .common import (
     GpuInfo, JobInfo, NodeErrorKind, NodeMemInfo, PendingJob,
-    collect_basic, collect_node_data, parse_gres_models, ssh_cmd,
+    collect_basic, collect_node_data, parse_gres_models, run_cmd, ssh_cmd,
     _classify_error,
 )
 from .agent import AGENT_PAYLOAD_VERSION
@@ -42,6 +42,13 @@ AGENT_DIR = Path(os.getenv("SLURM_GPU_TUI_AGENT_DIR", str(Path.home() / ".sgpu" 
 AGENT_MAX_AGE = int(os.getenv("SLURM_GPU_TUI_AGENT_MAX_AGE_SEC", "45"))
 AGENT_REPAIR_SEC = int(os.getenv("SLURM_GPU_TUI_AGENT_REPAIR_SEC", "180"))
 AGENT_DISABLE = bool(os.getenv("SLURM_GPU_TUI_AGENT_DISABLE", ""))
+
+# Opt-in: publish every running job's batch script in data.json so all users
+# can view them in the TUI. Requires a collector that may read them (root).
+# OFF by default — scripts can contain secrets; enabling shares them with
+# everyone who can read data.json.
+SHARE_SCRIPTS = bool(os.getenv("SLURM_GPU_TUI_SHARE_SCRIPTS", ""))
+SCRIPT_MAX_BYTES = 16384
 
 # ── Long-lived executors / shared node results ───────────────────────────
 
@@ -179,6 +186,28 @@ def _track_waste(node: str, gpu: dict, now: float) -> None:
     else:
         _parked_since.pop(key, None)
         gpu["parked_sec"] = 0
+
+# ── Batch-script sharing (opt-in) ─────────────────────────────────────────
+
+_script_cache: Dict[str, str] = {}  # jobid -> script text ("" = unreadable)
+
+
+def _fetch_scripts(jobs: List[JobInfo]) -> Dict[str, str]:
+    """Fetch each running job's batch script once (needs privileges)."""
+    if not SHARE_SCRIPTS:
+        return {}
+    live = {j.jobid for j in jobs}
+    for jid in [j for j in _script_cache if j not in live]:
+        del _script_cache[jid]
+    for j in jobs:
+        if j.jobid in _script_cache:
+            continue
+        ok, out = run_cmd(f"scontrol write batch_script {j.jobid} -")
+        out = out.strip()
+        good = ok and out and not out.startswith("job script retrieval failed")
+        _script_cache[j.jobid] = out[:SCRIPT_MAX_BYTES] if good else ""
+    return _script_cache
+
 
 # ── Per-user GPU-hour accounting ──────────────────────────────────────────
 # Daily buckets: {"days": {"YYYY-MM-DD": {user: {"alloc": sec, "busy": sec}}}}
@@ -502,11 +531,12 @@ def collect_all() -> dict:
 
     _accumulate_usage(result_nodes, time.time())
 
+    scripts = _fetch_scripts(jobs)
     return {
         "version": 1,
         "ts": datetime.now().isoformat(),
         "nodes": result_nodes,
-        "jobs": [_job_to_dict(j) for j in jobs],
+        "jobs": [dict(_job_to_dict(j), script=scripts.get(j.jobid, "")) for j in jobs],
         "pending": [_pending_to_dict(p) for p in pending],
         "stale_nodes": stale_nodes,
         "errors": basic_err,

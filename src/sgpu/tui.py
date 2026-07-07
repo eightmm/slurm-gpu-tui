@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from dataclasses import asdict
@@ -52,7 +53,7 @@ def read_daemon_data(max_age: float = _DAEMON_MAX_AGE) -> Optional[Tuple[List[No
             partition=j.get("partition", ""), jobname=j.get("jobname", ""),
             elapsed=j.get("elapsed", ""), node=j.get("node", ""),
             gpu_count=j.get("gpu_count", 0), gres_raw=j.get("gres_raw", ""),
-            time_limit=j.get("time_limit", ""),
+            time_limit=j.get("time_limit", ""), script=j.get("script", ""),
         ))
 
     pending: List[PendingJob] = []
@@ -737,6 +738,7 @@ class SlurmGpuTui(App):
         self._force_render = False
         self._row_job: Dict[str, str] = {}  # table row key -> jobid for detail popup
         self._nodes_cache: List[NodeInfo] = []  # last applied nodes (waste view)
+        self._jobs_by_id: Dict[str, JobInfo] = {}  # for detail popup scripts
 
         self._timer: Timer | None = None
         self._reset_timer(self.refresh_sec)
@@ -879,12 +881,28 @@ class SlurmGpuTui(App):
         if not ok:
             out = f"scontrol failed: {out}"
         if kind == "job":
-            # Batch script is only readable for your own jobs; slurm reports
-            # the failure as text with exit 0, so filter by content
-            ok2, script = run_cmd(f"scontrol write batch_script {name} -")
-            script = script.strip()
-            if ok2 and script and not script.startswith("job script retrieval failed"):
-                out += "\n\n─── batch script " + "─" * 43 + "\n" + script
+            script, src = "", ""
+            # 1) collector-shared script (SHARE_SCRIPTS on a privileged collector)
+            j = self._jobs_by_id.get(name)
+            if j is not None and j.script:
+                script, src = j.script, "shared by collector"
+            # 2) own job via scontrol (slurm reports failure as text, exit 0)
+            if not script:
+                ok2, s = run_cmd(f"scontrol write batch_script {name} -")
+                s = s.strip()
+                if ok2 and s and not s.startswith("job script retrieval failed"):
+                    script, src = s, "scontrol"
+            # 3) the submitted file itself, if its permissions allow
+            if not script:
+                m = re.search(r"Command=(\S+)", out)
+                if m and m.group(1) != "(null)":
+                    try:
+                        script = Path(m.group(1)).read_text(errors="replace")[:16384]
+                        src = m.group(1)
+                    except OSError:
+                        out += "\n\n(batch script not readable: not your job and file permissions deny it)"
+            if script:
+                out += f"\n\n─── batch script ({src}) " + "─" * 30 + "\n" + script
         self.call_from_thread(self.push_screen, DetailScreen(f"{kind} {name}", out))
 
     def action_cursor_down(self) -> None:
@@ -987,6 +1005,7 @@ class SlurmGpuTui(App):
         self._row_job.clear()
 
         self._nodes_cache = nodes
+        self._jobs_by_id = {j.jobid: j for j in jobs}
 
         # Pre-classify every GPU (header strips, FREE chip, sorting, filters)
         node_classes: Dict[str, List[str]] = {
