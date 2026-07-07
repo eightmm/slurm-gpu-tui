@@ -28,7 +28,21 @@ fi
 echo "[1] Creating venv and installing..."
 uv venv --clear --python 3.12 "$VENV_DIR"
 uv pip install --python "$VENV_DIR/bin/python" -e "$INSTALL_DIR"
-chmod -R a+rX "$VENV_DIR"
+chmod -R a+rX "$INSTALL_DIR"
+
+# Every path component must be world-traversable or other users can't run
+# the /usr/local/bin symlinks (classic trap: install under /root)
+p="$INSTALL_DIR"
+while [ "$p" != "/" ]; do
+    if [ ! -x "$p" ] || ! stat -c %A "$p" | grep -q "x$"; then
+        echo ""
+        echo "WARNING: $p is not world-traversable — other users won't be able"
+        echo "         to run sgpu from here. Reinstall with e.g.:"
+        echo "         SGPU_INSTALL_DIR=/opt/sgpu bash install.sh"
+        break
+    fi
+    p="$(dirname "$p")"
+done
 
 # ── Step 2: Generate wrapper scripts ──────────────────────────────────────
 echo "[2] Generating wrapper scripts..."

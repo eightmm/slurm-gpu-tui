@@ -11,7 +11,17 @@
 set -e
 
 REPO="https://github.com/eightmm/slurm-gpu-tui.git"
-DIR="${SGPU_INSTALL_DIR:-$HOME/.sgpu/app}"
+
+# Default install dir. As root, $HOME is /root (mode 700) — other users could
+# not traverse it, so use /opt/sgpu instead. For push-mode agents prefer a
+# shared-FS path via SGPU_INSTALL_DIR (nodes must exec the venv from it).
+if [ -n "$SGPU_INSTALL_DIR" ]; then
+    DIR="$SGPU_INSTALL_DIR"
+elif [ "$(id -u)" = "0" ]; then
+    DIR="/opt/sgpu"
+else
+    DIR="$HOME/.sgpu/app"
+fi
 
 if [ -d "$DIR/.git" ]; then
     echo "[bootstrap] updating existing install at $DIR"

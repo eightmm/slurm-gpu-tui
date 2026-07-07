@@ -36,8 +36,10 @@ Run the same command again anytime to **upgrade in place**: it resets to the
 latest release, rebuilds the venv, restarts the collector, and running node
 agents are restarted automatically on the next collector cycle.
 
-Install dir defaults to `~/.sgpu/app` (override with `SGPU_INSTALL_DIR=...`).
-Pick a shared-filesystem path so compute nodes can run the push agents.
+Install dir defaults to `~/.sgpu/app` (as root: `/opt/sgpu`, since `/root` is
+not readable by other users). Override with `SGPU_INSTALL_DIR=...` — pick a
+shared-filesystem path if you want push-mode agents (compute nodes must be
+able to run the venv from it; otherwise SSH-pull mode is used automatically).
 
 The installer detects your environment and handles everything automatically:
 

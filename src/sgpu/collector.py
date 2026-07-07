@@ -255,6 +255,13 @@ def _maybe_repair_agent(name: str) -> None:
         ssh_cmd(name, 'pkill -f "bin/[s]gpu-agent" 2>/dev/null || true', timeout=15)
         time.sleep(1)
         ok, out = ssh_cmd(name, f"{_AGENT_BIN} --daemon", timeout=25)
+        if not ok and "No such file" in out:
+            # Install dir isn't visible from this node (not a shared FS):
+            # push mode can't work there — stop retrying, SSH pull covers it
+            _agent_repair_ts[name] = float("inf")
+            print(f"[collector] agent repair {name}: venv not on node, "
+                  "push disabled for this node (SSH pull fallback)", flush=True)
+            return
         print(f"[collector] agent repair {name}: {'ok' if ok else out}", flush=True)
 
     _node_executor.submit(_run)
