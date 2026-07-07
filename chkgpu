@@ -336,22 +336,32 @@ user_node_cpu, node_used_cpu, user_total_cpu = compute_thread_usage(squeue)
 total_used = sum(node_usage.get(n, 0) for n in gpu_nodes)
 total_all  = sum(gpu_nums)
 
-# 노드 컬럼 폭: 파티션명 / 노드명 중 긴 것 기준으로 동적 계산
+# 노드 컬럼 폭: 노드명 기준 (파티션명은 폭에 맞게 축약 — veryshort 같은
+# 접미사 때문에 표가 옆으로 터지는 것 방지)
 _node_col_w = max(
     max((len(f'GPU{n}') for n in gpu_nodes), default=4),
-    max((len(node_partition.get(n, '')) for n in gpu_nodes), default=0),
-    4
+    7,
 ) + 2  # 양쪽 여백
 
 def gcell(content):
     return ncell(content, _node_col_w)
+
+def fmt_part(part, w=None):
+    """파티션명을 컬럼 폭에 맞춤: 안 맞으면 '_' 앞 접두어, 그래도 길면 '…'."""
+    fit = (w or _node_col_w) - 2
+    if len(part) <= fit:
+        return part
+    prefix = part.split('_')[0]
+    if len(prefix) <= fit:
+        return prefix
+    return prefix[:fit - 1] + '…'
 
 print(f'{C_BOLD}─── GPU Usage ───{C_RST}')
 
 # 파티션 행 (헤더 위에 표시)
 print(hdr('Part'.rjust(USER_W - 1) + '|'), end='')
 for node in gpu_nodes:
-    part  = node_partition.get(node, '')
+    part  = fmt_part(node_partition.get(node, ''))
     state = node_status.get(node, '')
     warn  = any(s in state for s in ('down', 'drain'))
     print(hdr(gcell(part), warn=warn), end='')
