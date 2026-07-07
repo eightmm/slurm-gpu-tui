@@ -45,7 +45,8 @@ chmod +x "$INSTALL_DIR/bin/sgpu" "$INSTALL_DIR/bin/sgpu-collector"
 # ── Step 3: Collector daemon ───────────────────────────────────────────────
 SERVICE_FILE="$INSTALL_DIR/sgpu-collector.service"
 GENERATED_SERVICE="$(mktemp)"
-sed "s|ExecStart=.*|ExecStart=$VENV_DIR/bin/sgpu-collector|" "$SERVICE_FILE" > "$GENERATED_SERVICE"
+sed -e "s|ExecStart=.*|ExecStart=$VENV_DIR/bin/sgpu-collector|" \
+    -e "s|User=.*|User=$(id -un)|" "$SERVICE_FILE" > "$GENERATED_SERVICE"
 
 SYSTEMD_MODE="none"
 

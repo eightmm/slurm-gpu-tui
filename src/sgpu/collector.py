@@ -1,37 +1,143 @@
 """Background collector daemon for sgpu."""
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import signal
 import sys
+import threading
 import time
-from dataclasses import asdict
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Dict, List
 
 from .common import (
     GpuInfo, JobInfo, NodeErrorKind, NodeMemInfo, PendingJob,
-    collect_basic, collect_node_data, _classify_error,
+    collect_basic, collect_node_data, parse_gres_models, ssh_cmd,
+    _classify_error,
 )
+from .agent import AGENT_PAYLOAD_VERSION
 
 # ── Config ────────────────────────────────────────────────────────────────
 
 DATA_DIR = Path(os.getenv("SLURM_GPU_TUI_DATA_DIR", "/tmp/slurm-gpu-tui"))
 DATA_FILE = DATA_DIR / "data.json"
 PID_FILE = DATA_DIR / "collector.pid"
+LOCK_FILE = DATA_DIR / "collector.lock"
 REFRESH_SEC = int(os.getenv("SLURM_GPU_TUI_COLLECTOR_SEC", "3"))
 NODE_TIMEOUT = int(os.getenv("SLURM_GPU_TUI_NODE_TIMEOUT_SEC", "30"))
 MAX_WORKERS = int(os.getenv("SLURM_GPU_TUI_MAX_WORKERS", "8"))
+LOG_MAX_BYTES = int(os.getenv("SLURM_GPU_TUI_LOG_MAX_BYTES", str(5 * 1024 * 1024)))
 
-_collector_cache: Dict[str, Any] = {}
+# Push-mode agents: nodes write their own payloads to this shared-FS dir
+# (master is the NFS server, so reads here are local and cache-free).
+AGENT_DIR = Path(os.getenv("SLURM_GPU_TUI_AGENT_DIR", str(Path.home() / ".sgpu" / "nodes")))
+# Generous: nvidia-smi pmon on a busy node can stretch one agent cycle to ~20s
+AGENT_MAX_AGE = int(os.getenv("SLURM_GPU_TUI_AGENT_MAX_AGE_SEC", "45"))
+AGENT_REPAIR_SEC = int(os.getenv("SLURM_GPU_TUI_AGENT_REPAIR_SEC", "180"))
+AGENT_DISABLE = bool(os.getenv("SLURM_GPU_TUI_AGENT_DISABLE", ""))
 
-# ── Long-lived executors ──────────────────────────────────────────────────
+# ── Long-lived executors / shared node results ───────────────────────────
 
 _node_executor = ThreadPoolExecutor(max_workers=16)
-_basic_executor = ThreadPoolExecutor(max_workers=3)
+
+# Latest per-node SSH results, updated by background pollers.
+# name -> {"gpus": [dict], "mem": dict, "error": str, "error_kind": str, "stale": bool}
+_results_lock = threading.Lock()
+_node_results: Dict[str, dict] = {}
+_inflight: set = set()
+
+# ── Idle-age tracking ─────────────────────────────────────────────────────
+# "node:gpu_index" -> {"jobid": str, "since": float} while GPU is allocated
+# with no process. Persisted so collector restarts don't reset ages.
+
+IDLE_STATE_FILE = DATA_DIR / "idle_state.json"
+_idle_since: Dict[str, dict] = {}
+
+# ── GPU inventory ─────────────────────────────────────────────────────────
+# Hardware per node barely changes: remember index/name/mem_total from the
+# last successful poll so the full GPU layout renders even when a node is
+# cold-starting or unreachable. Auto-refreshes on every successful poll.
+
+INVENTORY_FILE = DATA_DIR / "inventory.json"
+_inventory: Dict[str, List[dict]] = {}
+
+
+def _load_inventory() -> None:
+    try:
+        _inventory.update(json.loads(INVENTORY_FILE.read_text()))
+    except Exception:
+        pass
+
+
+def _update_inventory(name: str, gpu_dicts: List[dict]) -> None:
+    """Refresh a node's static GPU info; persist when changed or file missing."""
+    static = [
+        {"index": g["index"], "name": g["name"], "mem_total": g["mem_total"]}
+        for g in gpu_dicts
+    ]
+    if not static:
+        return
+    if _inventory.get(name) == static and INVENTORY_FILE.exists():
+        return
+    _inventory[name] = static
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = INVENTORY_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(_inventory, ensure_ascii=False))
+        tmp.rename(INVENTORY_FILE)
+    except Exception:
+        pass
+
+
+def _skeleton_gpus(name: str, gres: str) -> List[dict]:
+    """Placeholder GPU rows: learned inventory, else sinfo GRES models."""
+    inv = _inventory.get(name)
+    if inv:
+        base = [dict(g) for g in inv]
+    else:
+        base = [
+            {"index": str(i), "name": model, "mem_total": ""}
+            for i, model in enumerate(parse_gres_models(gres))
+        ]
+    for g in base:
+        g.setdefault("mem_total", "")
+        g.update(util="", mem_used="", temp="", power="", power_cap="",
+                 pids=[], users=[])
+    return base
+
+
+def _load_idle_state() -> None:
+    try:
+        _idle_since.update(json.loads(IDLE_STATE_FILE.read_text()))
+    except Exception:
+        pass
+
+
+def _save_idle_state() -> None:
+    try:
+        tmp = IDLE_STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(_idle_since))
+        tmp.rename(IDLE_STATE_FILE)
+    except Exception:
+        pass
+
+
+def _track_idle(node: str, gpu: dict, now: float) -> None:
+    """Set gpu['idle_sec'] from allocated-but-no-process duration."""
+    key = f"{node}:{gpu.get('index', '')}"
+    jid = gpu.get("alloc_jobid", "")
+    if jid and not gpu.get("users"):
+        st = _idle_since.get(key)
+        if not st or st.get("jobid") != jid:
+            st = {"jobid": jid, "since": now}
+            _idle_since[key] = st
+        gpu["idle_sec"] = int(now - st["since"])
+    else:
+        _idle_since.pop(key, None)
+        gpu["idle_sec"] = 0
 
 # ── Adaptive polling state ────────────────────────────────────────────────
 
@@ -93,73 +199,188 @@ def _pending_to_dict(pj: PendingJob) -> dict:
         "jobid": pj.jobid, "user": pj.user, "partition": pj.partition,
         "jobname": pj.jobname, "time_limit": pj.time_limit,
         "gpu_count": pj.gpu_count, "reason": pj.reason, "priority": pj.priority,
+        "start_time": pj.start_time,
     }
 
 
+def _read_agent_payload(name: str) -> dict | None:
+    """Return a node's push-agent payload if fresh and version-compatible."""
+    p = AGENT_DIR / f"{name}.json"
+    try:
+        # mtime is stamped by the NFS server (= this host), so no clock skew
+        if time.time() - p.stat().st_mtime > AGENT_MAX_AGE:
+            return None
+        payload = json.loads(p.read_text())
+        if payload.get("agent_version") != AGENT_PAYLOAD_VERSION:
+            return None  # old agent — treated as stale, repair will upgrade it
+        return payload
+    except Exception:
+        return None
+
+
+_agent_repair_ts: Dict[str, float] = {}
+_AGENT_BIN = Path(sys.executable).parent / "sgpu-agent"
+
+
+def _maybe_repair_agent(name: str) -> None:
+    """(Re)launch the push agent on a node via SSH, rate-limited per node.
+
+    The venv lives on the shared FS, so nodes exec the same binary path.
+    Also upgrades agents left running with an old payload version.
+    """
+    if AGENT_DISABLE or not _AGENT_BIN.exists():
+        return
+    now = time.monotonic()
+    if now - _agent_repair_ts.get(name, 0.0) < AGENT_REPAIR_SEC:
+        return
+    _agent_repair_ts[name] = now
+
+    def _run() -> None:
+        # Kill and launch MUST be separate ssh commands: combined, the launch
+        # path 'bin/sgpu-agent' appears in the shell's own cmdline and pkill
+        # kills the shell (and with it the relaunch). The [s] bracket keeps
+        # the kill command itself from self-matching.
+        ssh_cmd(name, 'pkill -f "bin/[s]gpu-agent" 2>/dev/null || true', timeout=15)
+        time.sleep(1)
+        ok, out = ssh_cmd(name, f"{_AGENT_BIN} --daemon", timeout=25)
+        print(f"[collector] agent repair {name}: {'ok' if ok else out}", flush=True)
+
+    _node_executor.submit(_run)
+
+
+def _poll_node_bg(n: dict, has_jobs: bool) -> None:
+    """Submit a background SSH poll for one node unless one is already in flight."""
+    name, slurm_state = n["name"], n["state"]
+    with _results_lock:
+        if name in _inflight:
+            return
+        _inflight.add(name)
+
+    def _run() -> None:
+        try:
+            gpus, mem, err = collect_node_data(name, NODE_TIMEOUT)
+        except Exception as e:
+            gpus, mem, err = [], NodeMemInfo(), f"collect failed: {e}"
+        gpu_dicts = [_gpu_to_dict(g) for g in gpus]
+        mem_dict = {"total": mem.total, "used": mem.used, "avail": mem.avail}
+        node_is_cold = False
+        with _results_lock:
+            prev = _node_results.get(name)
+            if err and prev and not prev.get("error"):
+                # Keep last good data, mark stale
+                prev["stale"] = True
+                prev["error_kind"] = NodeErrorKind.STALE_CACHED.value
+            elif err:
+                _node_results[name] = {
+                    "gpus": [], "mem": {}, "error": err,
+                    "error_kind": _classify_error(err).value, "stale": False,
+                }
+            else:
+                _node_results[name] = {
+                    "gpus": gpu_dicts, "mem": mem_dict, "error": "",
+                    "error_kind": NodeErrorKind.OK.value, "stale": False,
+                }
+                _update_inventory(name, gpu_dicts)
+                node_is_cold = (
+                    all(g.util in ("0", "", "N/A") for g in gpus) and not has_jobs
+                )
+            _update_poll_state(name, success=not err, node_is_cold=node_is_cold, slurm_state=slurm_state)
+            _inflight.discard(name)
+
+    _node_executor.submit(_run)
+
+
 def collect_all() -> dict:
-    """Full collection cycle. Returns JSON-serializable dict."""
-    nodes_raw, jobs, pending, node_jobs_from_basic, basic_err = collect_basic()
+    """One collection cycle: fast local data + latest async node results.
+
+    Node SSH polls run in the background and never block this cycle — a dead
+    node only goes stale, it cannot stall data for healthy nodes.
+    """
+    nodes_raw, jobs, pending, node_jobs_from_basic, gpu_alloc, basic_err = collect_basic()
 
     node_jobs: Dict[str, List[dict]] = {
         k: [_job_to_dict(j) for j in v] for k, v in node_jobs_from_basic.items()
     }
+    jobid_user = {j.jobid: j.user for j in jobs}
+
+    # Prefer push-agent payloads (local NFS read, every cycle). Nodes without
+    # a live agent fall back to async SSH polls + agent repair.
+    for n in nodes_raw:
+        name = n["name"]
+        has_jobs = name in node_jobs_from_basic
+        payload = _read_agent_payload(name)
+        if payload is not None:
+            gpu_dicts = payload.get("gpus", [])
+            with _results_lock:
+                _node_results[name] = {
+                    "gpus": gpu_dicts, "mem": payload.get("mem", {}),
+                    "error": "", "error_kind": NodeErrorKind.OK.value, "stale": False,
+                }
+                node_is_cold = (
+                    all(g.get("util") in ("0", "", "N/A") for g in gpu_dicts)
+                    and not has_jobs
+                )
+                # Mark polled so the SSH path stays quiet while the agent lives
+                _update_poll_state(name, success=True, node_is_cold=node_is_cold, slurm_state=n["state"])
+            _update_inventory(name, gpu_dicts)
+            continue
+        if _should_poll_node(name, n["state"]):
+            _poll_node_bg(n, has_jobs=has_jobs)
+        _maybe_repair_agent(name)
+
+    with _results_lock:
+        results = {name: dict(r) for name, r in _node_results.items()}
 
     stale_nodes: List[str] = []
-
-    # SSH collection — skip nodes that don't need polling yet, use cache instead
-    ssh_results: Dict[str, Tuple[List[dict], dict, str]] = {}
-    nodes_to_poll = [n for n in nodes_raw if _should_poll_node(n["name"], n["state"])]
-    nodes_cached = [n for n in nodes_raw if not _should_poll_node(n["name"], n["state"])]
-
-    # Inject cached results for nodes we're skipping this cycle
-    for n in nodes_cached:
-        name = n["name"]
-        if name in _collector_cache:
-            cached_gpus, cached_mem = _collector_cache[name]
-            ssh_results[name] = (cached_gpus, cached_mem, "", NodeErrorKind.OK.value)
-
-    if nodes_to_poll:
-        futs = {_node_executor.submit(collect_node_data, n["name"], NODE_TIMEOUT): n for n in nodes_to_poll}
-        for fut in as_completed(futs):
-            n = futs[fut]
-            name = n["name"]
-            slurm_state = n["state"]
-            gpus, mem, err = fut.result()
-            gpu_dicts = [_gpu_to_dict(g) for g in gpus]
-            mem_dict = {"total": mem.total, "used": mem.used, "avail": mem.avail}
-            if err and name in _collector_cache:
-                cached_gpus, cached_mem = _collector_cache[name]
-                ssh_results[name] = (cached_gpus, cached_mem, "", NodeErrorKind.STALE_CACHED.value)
-                stale_nodes.append(name)
-                _update_poll_state(name, success=False, node_is_cold=False, slurm_state=slurm_state)
-            else:
-                kind = _classify_error(err).value if err else NodeErrorKind.OK.value
-                ssh_results[name] = (gpu_dicts, mem_dict, err, kind)
-                if gpu_dicts or mem.total:
-                    _collector_cache[name] = (gpu_dicts, mem_dict)
-                node_is_cold = (
-                    all(g.util in ("0", "", "N/A") for g in gpus)
-                    and name not in node_jobs
-                )
-                _update_poll_state(name, success=not err, node_is_cold=node_is_cold, slurm_state=slurm_state)
-
-    # Build final node list
     result_nodes = []
     for n in nodes_raw:
         name = n["name"]
-        raw = ssh_results.get(name, ([], {}, "", NodeErrorKind.OK.value))
-        gpus, mem, err, error_kind = raw if len(raw) == 4 else (*raw, NodeErrorKind.OK.value)
+        r = results.get(name, {"gpus": [], "mem": {}, "error": "", "error_kind": NodeErrorKind.OK.value, "stale": False})
+        skeleton_mode = False
+        if not r["gpus"]:
+            # No live data (cold start or unreachable node): render the known
+            # GPU layout as placeholders instead of dropping the rows.
+            skeleton = _skeleton_gpus(name, n.get("gres", ""))
+            if skeleton:
+                r = dict(r, gpus=skeleton, stale=True)
+                skeleton_mode = True
+                if r["error_kind"] == NodeErrorKind.OK.value:
+                    r["error_kind"] = NodeErrorKind.STALE_CACHED.value
+        if r["stale"]:
+            stale_nodes.append(name)
+        node_alloc = gpu_alloc.get(name, {})
+        now = time.time()
+        gpus = []
+        for g in r["gpus"]:
+            g = dict(g)
+            jid = node_alloc.get(g.get("index", ""), "")
+            g["alloc_jobid"] = jid
+            g["alloc_user"] = jobid_user.get(jid, "")
+            if skeleton_mode:
+                # Placeholder rows carry no process info — show a previously
+                # tracked idle age but never start or reset the timer.
+                st = _idle_since.get(f"{name}:{g.get('index', '')}")
+                if st and jid and st.get("jobid") == jid:
+                    g["idle_sec"] = int(now - st["since"])
+                else:
+                    g["idle_sec"] = 0
+            else:
+                _track_idle(name, g, now)
+            gpus.append(g)
+        mem = r["mem"]
         result_nodes.append({
-            "name": name, "state": n["state"], "cpus": n["cpus"],
+            "name": name, "state": n["state"], "partition": n.get("partition", ""),
+            "cpus": n["cpus"],
             "cpu_alloc": n.get("cpu_alloc", ""), "cpu_load": n["cpu_load"],
             "mem_total": n["mem_total"], "mem_free": n["mem_free"], "gres": n["gres"],
             "mem_used": mem.get("used", ""), "mem_avail": mem.get("avail", ""),
             "gpus": gpus, "jobs": node_jobs.get(name, []),
-            "error": err, "stale": name in stale_nodes,
-            "error_kind": error_kind,
+            "error": r["error"], "stale": r["stale"],
+            "error_kind": r["error_kind"],
         })
 
     return {
+        "version": 1,
         "ts": datetime.now().isoformat(),
         "nodes": result_nodes,
         "jobs": [_job_to_dict(j) for j in jobs],
@@ -169,9 +390,64 @@ def collect_all() -> dict:
     }
 
 
+# ── Prometheus textfile exporter ──────────────────────────────────────────
+
+METRICS_FILE = DATA_DIR / "metrics.prom"
+
+
+def _prom_escape(s: str) -> str:
+    return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "")
+
+
+def _write_metrics(data: dict) -> None:
+    """Write a Prometheus textfile snapshot next to data.json."""
+    def num(v):
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            return None
+
+    lines = [
+        "# HELP sgpu_gpu_util GPU utilization percent",
+        "# HELP sgpu_gpu_idle_seconds Seconds GPU has been allocated with no process",
+    ]
+    n_run = len(data.get("jobs", []))
+    n_pend = len(data.get("pending", []))
+    lines.append(f"sgpu_jobs_running {n_run}")
+    lines.append(f"sgpu_jobs_pending {n_pend}")
+    for n in data.get("nodes", []):
+        node = _prom_escape(n["name"])
+        up = 0 if n.get("error") else 1
+        lines.append(f'sgpu_node_up{{node="{node}"}} {up}')
+        lines.append(f'sgpu_node_stale{{node="{node}"}} {1 if n.get("stale") else 0}')
+        for g in n.get("gpus", []):
+            lbl = f'node="{node}",gpu="{_prom_escape(g.get("index", ""))}"'
+            for metric, key in (
+                ("sgpu_gpu_util", "util"),
+                ("sgpu_gpu_mem_used_mib", "mem_used"),
+                ("sgpu_gpu_mem_total_mib", "mem_total"),
+                ("sgpu_gpu_temp_celsius", "temp"),
+                ("sgpu_gpu_power_watts", "power"),
+            ):
+                v = num(g.get(key))
+                if v is not None:
+                    lines.append(f"{metric}{{{lbl}}} {v:g}")
+            user = _prom_escape(g.get("alloc_user", ""))
+            lines.append(f'sgpu_gpu_allocated{{{lbl},user="{user}"}} {1 if g.get("alloc_jobid") else 0}')
+            lines.append(f"sgpu_gpu_idle_seconds{{{lbl}}} {g.get('idle_sec', 0)}")
+    try:
+        tmp = METRICS_FILE.with_suffix(".tmp")
+        tmp.write_text("\n".join(lines) + "\n")
+        tmp.rename(METRICS_FILE)
+    except Exception:
+        pass
+
+
 # ── Daemon ────────────────────────────────────────────────────────────────
 
 _running = True
+_lock_fd = None
+_log_path: Path | None = None
 
 
 def _handle_signal(signum, frame):
@@ -179,16 +455,54 @@ def _handle_signal(signum, frame):
     _running = False
 
 
+def _rotate_log_if_big() -> None:
+    """Rotate collector.log to collector.log.1 when it exceeds LOG_MAX_BYTES."""
+    if _log_path is None:
+        return
+    try:
+        if not _log_path.exists() or _log_path.stat().st_size <= LOG_MAX_BYTES:
+            return
+        reopen = sys.stdout is not sys.__stdout__
+        if reopen:
+            sys.stdout.close()
+        _log_path.rename(_log_path.with_name("collector.log.1"))
+        if reopen:
+            sys.stdout = open(_log_path, "a")
+            sys.stderr = sys.stdout
+    except Exception:
+        pass
+
+
 def run_collector():
     """Main loop: collect and write data file every REFRESH_SEC."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Single-instance guard: two collectors would race on data.json.
+    # Retry briefly so a restart can overlap the old instance's shutdown.
+    global _lock_fd
+    _lock_fd = open(LOCK_FILE, "w")
+    lock_deadline = time.time() + 10
+    while True:
+        try:
+            fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if time.time() >= lock_deadline:
+                print("[collector] another collector is already running, exiting")
+                sys.exit(1)
+            time.sleep(0.5)
+
     PID_FILE.write_text(str(os.getpid()))
+    _load_idle_state()
+    _load_inventory()
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
     print(f"[collector] started (pid={os.getpid()}, interval={REFRESH_SEC}s, data={DATA_FILE})")
 
+    # First cycle writes immediately: skeleton GPU rows (inventory / sinfo
+    # GRES) render the full layout while real polls land asynchronously.
     while _running:
         try:
             t0 = time.time()
@@ -198,14 +512,17 @@ def run_collector():
             tmp = DATA_FILE.with_suffix(".tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
             tmp.rename(DATA_FILE)
+            _save_idle_state()
+            _write_metrics(data)
 
             n_gpus = sum(len(n.get("gpus", [])) for n in data["nodes"])
             print(f"[collector] {data['ts']} nodes={len(data['nodes'])} "
                   f"gpus={n_gpus} jobs={len(data['jobs'])} pending={len(data['pending'])} "
-                  f"({elapsed:.1f}s)")
+                  f"({elapsed:.1f}s)", flush=True)
         except Exception as e:
-            print(f"[collector] error: {e}")
+            print(f"[collector] error: {e}", flush=True)
 
+        _rotate_log_if_big()
         deadline = time.time() + REFRESH_SEC
         while _running and time.time() < deadline:
             time.sleep(0.5)
@@ -227,6 +544,9 @@ def daemonize():
     sys.stdin = open(os.devnull, "r")
     log = DATA_DIR / "collector.log"
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    global _log_path
+    _log_path = log
+    _rotate_log_if_big()
     sys.stdout = open(log, "a")
     sys.stderr = sys.stdout
     run_collector()

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from dataclasses import asdict
 from datetime import datetime
@@ -12,14 +13,16 @@ from typing import Dict, List, Optional, Tuple
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
-from textual.containers import Vertical
+from textual.containers import Vertical, VerticalScroll
 from textual.coordinate import Coordinate
+from textual.screen import ModalScreen
 from textual.timer import Timer
 from textual.widgets import DataTable, Footer, Header, Input, Static
 
 from .common import (
     GpuInfo, JobInfo, NodeInfo, NodeMemInfo, NodeSSHResult, PendingJob,
-    build_nodes, cleanup_ssh_pool, collect_basic, collect_node_data_parallel,
+    apply_gpu_alloc, build_nodes, cleanup_ssh_pool, collect_basic,
+    collect_node_data_parallel, run_cmd,
 )
 
 
@@ -58,6 +61,7 @@ def read_daemon_data(max_age: float = _DAEMON_MAX_AGE) -> Optional[Tuple[List[No
             partition=p.get("partition", ""), jobname=p.get("jobname", ""),
             time_limit=p.get("time_limit", ""), gpu_count=p.get("gpu_count", 0),
             reason=p.get("reason", ""), priority=p.get("priority", ""),
+            start_time=p.get("start_time", ""),
         ))
 
     stale_nodes = set(raw.get("stale_nodes", []))
@@ -71,6 +75,8 @@ def read_daemon_data(max_age: float = _DAEMON_MAX_AGE) -> Optional[Tuple[List[No
                 mem_total=g.get("mem_total", ""), temp=g.get("temp", ""),
                 power=g.get("power", ""), power_cap=g.get("power_cap", ""),
                 pids=g.get("pids", []), users=g.get("users", []),
+                alloc_jobid=g.get("alloc_jobid", ""), alloc_user=g.get("alloc_user", ""),
+                idle_sec=g.get("idle_sec", 0),
             )
             for g in n.get("gpus", [])
         ]
@@ -86,6 +92,7 @@ def read_daemon_data(max_age: float = _DAEMON_MAX_AGE) -> Optional[Tuple[List[No
         ]
         nodes.append(NodeInfo(
             name=n.get("name", ""), state=n.get("state", ""),
+            partition=n.get("partition", ""),
             cpus=n.get("cpus", ""), cpu_alloc=n.get("cpu_alloc", ""),
             cpu_load=n.get("cpu_load", ""), mem_total=n.get("mem_total", ""),
             mem_free=n.get("mem_free", ""), gres=n.get("gres", ""),
@@ -127,6 +134,8 @@ def make_bar(pct: float, width: int = 20) -> Text:
 
 
 def util_cell(util_str: str) -> Text:
+    if not util_str:
+        return Text("-", style="bright_black")
     try:
         val = float(util_str)
         pct = val / 100.0
@@ -208,6 +217,8 @@ def mem_cell(node: NodeInfo) -> Text:
             used_mb = total_mb - float(node.mem_avail)
         else:
             used_mb = total_mb - float(node.mem_free)
+        # sinfo free_mem can exceed configured total; clamp to sane range
+        used_mb = min(max(used_mb, 0.0), total_mb)
         pct = used_mb / total_mb if total_mb > 0 else 0
         used_gb = used_mb / 1024
         total_gb = total_mb / 1024
@@ -239,6 +250,67 @@ def parse_slurm_duration(s: str) -> int:
         return -1
 
 
+def classify_gpu(g: GpuInfo) -> str:
+    """One of: busy / parked (VRAM held, no compute) / idle (reserved, no
+    process) / free / unknown (no data yet)."""
+    try:
+        util = float(g.util)
+    except (ValueError, TypeError):
+        return "unknown"
+    if util > 5:
+        return "busy"
+    try:
+        total = float(g.mem_total)
+        vram_pct = float(g.mem_used) / total if total > 0 else 0.0
+    except (ValueError, TypeError):
+        vram_pct = 0.0
+    if vram_pct >= 0.3:
+        return "parked"
+    if g.alloc_jobid or g.users:
+        return "idle"
+    return "free"
+
+
+_CLASS_GLYPH = {
+    "busy": ("█", "green"),
+    "parked": ("▅", "blue"),
+    "idle": ("▂", "yellow"),
+    "free": ("▁", "bold cyan"),
+    "unknown": ("?", "bright_black"),
+}
+
+
+def gpu_strip(classes: List[str]) -> Text:
+    """One glyph per GPU: at-a-glance node state, useful when collapsed."""
+    strip = Text()
+    for c in classes:
+        ch, style = _CLASS_GLYPH.get(c, ("?", "bright_black"))
+        strip.append(ch, style=style)
+    return strip
+
+
+def fmt_idle_age(sec: int) -> str:
+    """'idle 3.2h' / 'idle 12m' / 'idle' for short/unknown durations."""
+    if sec >= 3600:
+        return f"idle {sec / 3600:.1f}h"
+    if sec >= 60:
+        return f"idle {sec // 60}m"
+    return "idle"
+
+
+def fmt_start_time(s: str) -> str:
+    """Compact squeue %S estimate: '15:00' today, '07-08 15:00' otherwise."""
+    if not s or s in ("N/A", "(null)"):
+        return ""
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return s
+    if dt.date() == datetime.now().date():
+        return dt.strftime("%H:%M")
+    return dt.strftime("%m-%d %H:%M")
+
+
 def remaining_cell(elapsed: str, time_limit: str) -> Text:
     """Show time remaining in job. Red <1h, yellow <12h, green otherwise."""
     elapsed_s = parse_slurm_duration(elapsed)
@@ -257,6 +329,118 @@ def remaining_cell(elapsed: str, time_limit: str) -> Text:
         return Text(label, style="yellow")
     else:
         return Text(label, style="dim green")
+
+
+# ── Modal screens ─────────────────────────────────────────────────────────
+
+class DetailScreen(ModalScreen):
+    """Scrollable modal showing scontrol output for a job or node."""
+
+    BINDINGS = [
+        ("escape", "close", "Close"),
+        ("q", "close", "Close"),
+        ("enter", "close", "Close"),
+    ]
+    CSS = """
+    DetailScreen { align: center middle; }
+    #detail-box {
+        width: 90%; max-height: 85%;
+        border: round $primary; background: $surface; padding: 1 2;
+    }
+    #detail-title { text-style: bold; color: $accent; }
+    """
+
+    def on_key(self, event) -> None:
+        if getattr(event, "character", None) == "ㅂ":
+            event.stop()
+            self.action_close()
+
+    def __init__(self, title: str, body: str) -> None:
+        super().__init__()
+        self._title = title
+        self._body = body
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="detail-box"):
+            yield Static(self._title, id="detail-title")
+            # Text() so shell scripts with [brackets] aren't parsed as markup
+            yield Static(Text(self._body))
+
+    def action_close(self) -> None:
+        self.app.pop_screen()
+
+
+HELP_TEXT = """\
+ r        Refresh now
+ f        Fast (1s) / Normal (3s) refresh
+ s        Cycle sort: Node → Utilization → User → Free
+ u        My Jobs filter
+ i        Idle filter (truly free GPUs only)
+ d        Detail columns (Temp / Power / JobID / JobName)
+ Space    Collapse / expand node (on header row)
+ Enter    Job / node details (scontrol)
+ /        Search node or user (Esc clears)
+ j / k    Cursor down / up
+ e        Export snapshot JSON
+ ?        This help
+ q        Quit
+
+ Node header GPU strip (one glyph per GPU):
+   █ busy   ▅ parked (VRAM held, no compute)
+   ▂ idle (reserved, no process)   ▁ free   ? no data
+
+ User column markers:
+   bold user        process running on GPU
+   user idle 3.2h   allocated but no process (wasted)
+   parked           VRAM held at ~0% util
+
+ Korean IME: same physical keys work without switching
+ (ㅂ=q, ㄱ=r, ㄴ=s, ㅇ=d, ㅑ=i, ㅕ=u, ㄹ=f, ㄷ=e, ㅓ=j, ㅏ=k)
+"""
+
+
+class HelpScreen(ModalScreen):
+    BINDINGS = [
+        ("escape", "close", "Close"),
+        ("q", "close", "Close"),
+        ("question_mark", "close", "Close"),
+    ]
+    CSS = """
+    HelpScreen { align: center middle; }
+    #help-box {
+        width: 60; max-height: 90%;
+        border: round $primary; background: $surface; padding: 1 2;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="help-box"):
+            yield Static(Text("Keyboard Shortcuts", style="bold"))
+            yield Static(HELP_TEXT)
+
+    def on_key(self, event) -> None:
+        if getattr(event, "character", None) == "ㅂ":
+            event.stop()
+            self.action_close()
+
+    def action_close(self) -> None:
+        self.app.pop_screen()
+
+
+# Korean 2-set layout: jamo typed where the latin binding key sits.
+# Lets every shortcut work without switching IME back to English.
+_JAMO_ACTIONS = {
+    "ㅂ": "quit",          # q
+    "ㄱ": "refresh",       # r
+    "ㄹ": "toggle_fast",   # f
+    "ㄴ": "toggle_sort",   # s
+    "ㅕ": "toggle_user_filter",  # u
+    "ㅑ": "toggle_idle_filter",  # i
+    "ㅇ": "toggle_details",      # d
+    "ㄷ": "export_json",         # e
+    "ㅓ": "cursor_down",         # j
+    "ㅏ": "cursor_up",           # k
+}
 
 
 # ── TUI App ───────────────────────────────────────────────────────────────
@@ -287,6 +471,7 @@ class SlurmGpuTui(App):
         ("k", "cursor_up", "↑"),
         ("slash", "start_search", "Search"),
         ("e", "export_json", "Export JSON"),
+        ("question_mark", "help", "Help"),
         ("q", "quit", "Quit"),
     ]
 
@@ -325,6 +510,7 @@ class SlurmGpuTui(App):
         self.pending_tbl.add_column("JobName", key="p_name")
         self.pending_tbl.add_column("Reason", key="p_reason")
         self.pending_tbl.add_column("Priority", key="p_pri")
+        self.pending_tbl.add_column("Est.Start", key="p_start")
         self.pending_tbl.cursor_type = "row"
         self.pending_tbl.zebra_stripes = True
 
@@ -338,6 +524,9 @@ class SlurmGpuTui(App):
         self.sort_by = "node"  # "node", "util", "user"
         self.user_filter_only = False
         self._collapsed: set = set()  # node names that are collapsed
+        self._last_data_mtime: float | None = None
+        self._force_render = False
+        self._row_job: Dict[str, str] = {}  # table row key -> jobid for detail popup
 
         self._timer: Timer | None = None
         self._reset_timer(self.refresh_sec)
@@ -353,8 +542,13 @@ class SlurmGpuTui(App):
         cleanup_ssh_pool()
         self.exit()
 
-    def action_refresh(self) -> None:
+    def _rerender(self) -> None:
+        """Force a re-render even if daemon data is unchanged (UI state changed)."""
+        self._force_render = True
         self.refresh_all()
+
+    def action_refresh(self) -> None:
+        self._rerender()
 
     def action_toggle_fast(self) -> None:
         if self.refresh_sec == self.refresh_sec_normal:
@@ -362,7 +556,7 @@ class SlurmGpuTui(App):
         else:
             self.refresh_sec = self.refresh_sec_normal
         self._reset_timer(self.refresh_sec)
-        self.refresh_all()
+        self._rerender()
 
     def action_export_json(self) -> None:
         import json as _json
@@ -371,17 +565,17 @@ class SlurmGpuTui(App):
         self.status_w.update(Text(f" Exported → {out} ", style="bold green"))
 
     def action_toggle_sort(self) -> None:
-        choices = ["node", "util", "user"]
+        choices = ["node", "util", "user", "free"]
         idx = choices.index(self.sort_by)
         self.sort_by = choices[(idx + 1) % len(choices)]
         self.status_w.update(f"Sort by: {self.sort_by}")
-        self.refresh_all()
+        self._rerender()
 
     def action_toggle_user_filter(self) -> None:
         self.user_filter_only = not self.user_filter_only
         status = "My Jobs Only" if self.user_filter_only else "All Jobs"
         self.status_w.update(status)
-        self.refresh_all()
+        self._rerender()
 
     def action_toggle_collapse(self) -> None:
         if self.tbl.row_count == 0:
@@ -399,7 +593,7 @@ class SlurmGpuTui(App):
             self._collapsed.discard(node_name)
         else:
             self._collapsed.add(node_name)
-        self.refresh_all()
+        self._rerender()
 
     def _setup_columns(self) -> None:
         self.tbl.clear(columns=True)
@@ -415,7 +609,7 @@ class SlurmGpuTui(App):
         if self.show_details:
             self.tbl.add_column("T", key="temp")
             self.tbl.add_column("Power", key="power")
-        self.tbl.add_column("User", key="user", width=12)
+        self.tbl.add_column("User", key="user", width=17)
         if self.show_details:
             self.tbl.add_column("JobID", key="jobid")
             self.tbl.add_column("JobName", key="jobname")
@@ -425,14 +619,42 @@ class SlurmGpuTui(App):
         self.idle_filter_only = not self.idle_filter_only
         status = "Idle Nodes Only" if self.idle_filter_only else "All Nodes"
         self.status_w.update(status)
-        self.refresh_all()
+        self._rerender()
 
     def action_toggle_details(self) -> None:
         self.show_details = not self.show_details
         status = "Details: ON" if self.show_details else "Details: OFF"
         self.status_w.update(status)
         self._setup_columns()
-        self.refresh_all()
+        self._rerender()
+
+    def action_help(self) -> None:
+        self.push_screen(HelpScreen())
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        key = str(event.row_key.value)
+        if key.startswith("hdr_"):
+            self._show_detail("node", key[4:])
+        elif key.startswith("pend_"):
+            self._show_detail("job", key[5:])
+        else:
+            jid = self._row_job.get(key, "")
+            if jid:
+                self._show_detail("job", jid)
+
+    @work(thread=True)
+    def _show_detail(self, kind: str, name: str) -> None:
+        ok, out = run_cmd(f"scontrol show {kind} {name}")
+        if not ok:
+            out = f"scontrol failed: {out}"
+        if kind == "job":
+            # Batch script is only readable for your own jobs; slurm reports
+            # the failure as text with exit 0, so filter by content
+            ok2, script = run_cmd(f"scontrol write batch_script {name} -")
+            script = script.strip()
+            if ok2 and script and not script.startswith("job script retrieval failed"):
+                out += "\n\n─── batch script " + "─" * 43 + "\n" + script
+        self.call_from_thread(self.push_screen, DetailScreen(f"{kind} {name}", out))
 
     def action_cursor_down(self) -> None:
         self.tbl.action_scroll_down()
@@ -448,7 +670,7 @@ class SlurmGpuTui(App):
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "search-input":
             self.search_text = event.value.strip().lower()
-            self.refresh_all()
+            self._rerender()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "search-input":
@@ -462,19 +684,35 @@ class SlurmGpuTui(App):
                 w.display = False
                 self.search_text = ""
                 self.tbl.focus()
-                self.refresh_all()
+                self._rerender()
+            return
+        ch = getattr(event, "character", None)
+        if ch in _JAMO_ACTIONS and not self.query_one("#search-input", Input).has_focus:
+            getattr(self, f"action_{_JAMO_ACTIONS[ch]}")()
+            event.stop()
 
     @work(exclusive=True, thread=True)
     def refresh_all(self) -> None:
+        force = self._force_render
+        self._force_render = False
+
         # Try daemon data first (instant)
-        daemon_data = read_daemon_data()
-        if daemon_data is not None:
-            nodes, jobs, pending, daemon_err = daemon_data
-            self.call_from_thread(self._apply, nodes, jobs, pending, daemon_err)
-            return
+        try:
+            mtime = _DAEMON_DATA_FILE.stat().st_mtime
+        except OSError:
+            mtime = None
+        if mtime is not None and (time.time() - mtime) <= _DAEMON_MAX_AGE:
+            if not force and mtime == self._last_data_mtime:
+                return  # data unchanged, keep current render
+            daemon_data = read_daemon_data()
+            if daemon_data is not None:
+                self._last_data_mtime = mtime
+                nodes, jobs, pending, daemon_err = daemon_data
+                self.call_from_thread(self._apply, nodes, jobs, pending, daemon_err)
+                return
 
         # Fallback: direct collection (2-phase)
-        nodes_raw, jobs, pending, node_jobs, err1 = collect_basic()
+        nodes_raw, jobs, pending, node_jobs, gpu_alloc, err1 = collect_basic()
         node_names = [n["name"] for n in nodes_raw]
 
         # Show basic data immediately (use cache or empty)
@@ -486,6 +724,7 @@ class SlurmGpuTui(App):
                 cached_results[name] = NodeSSHResult(gpus, mem, "")
                 stale_now.append(name)
         phase1_nodes = build_nodes(nodes_raw, node_jobs, cached_results, stale_now)
+        apply_gpu_alloc(phase1_nodes, gpu_alloc, jobs)
         loading_msg = f"loading GPUs from {len(node_names)} nodes..."
         self.call_from_thread(self._apply, phase1_nodes, jobs, pending, loading_msg if node_names else err1)
 
@@ -497,6 +736,7 @@ class SlurmGpuTui(App):
             )
             all_errors = [x for x in [err1] + ssh_errors if x]
             phase2_nodes = build_nodes(nodes_raw, node_jobs, ssh_results, stale_nodes)
+            apply_gpu_alloc(phase2_nodes, gpu_alloc, jobs)
             self.call_from_thread(self._apply, phase2_nodes, jobs, pending, " | ".join(all_errors) if all_errors else "")
 
     def _apply(self, nodes: List[NodeInfo], jobs: List[JobInfo], pending: List[PendingJob], err: str) -> None:
@@ -504,9 +744,21 @@ class SlurmGpuTui(App):
         saved_col = self.tbl.cursor_column
         saved_scroll_x = self.tbl.scroll_x
         saved_scroll_y = self.tbl.scroll_y
+        saved_key = None
+        try:
+            cell_key = self.tbl.coordinate_to_cell_key(Coordinate(saved_row, 0))
+            saved_key = cell_key.row_key.value
+        except Exception:
+            pass
 
         self.tbl.clear()
         self.pending_tbl.clear()
+        self._row_job.clear()
+
+        # Pre-classify every GPU (header strips, FREE chip, sorting, filters)
+        node_classes: Dict[str, List[str]] = {
+            n.name: [classify_gpu(g) for g in n.gpus] for n in nodes
+        }
 
         # Sorting nodes logic (simplistic)
         if self.sort_by == "util":
@@ -515,6 +767,8 @@ class SlurmGpuTui(App):
         elif self.sort_by == "user":
             # Nodes with current user first
             nodes.sort(key=lambda n: any(self.current_user in g.users for g in n.gpus), reverse=True)
+        elif self.sort_by == "free":
+            nodes.sort(key=lambda n: node_classes[n.name].count("free"), reverse=True)
         else:
             nodes.sort(key=lambda n: n.name)
 
@@ -528,34 +782,30 @@ class SlurmGpuTui(App):
         for node in nodes:
             # Filter logic
             if self.user_filter_only:
-                has_my_job = any(self.current_user in g.users for g in node.gpus)
+                has_my_job = any(self.current_user in g.users or self.current_user == g.alloc_user for g in node.gpus)
                 has_my_job = has_my_job or any(j.user == self.current_user for j in node.jobs)
                 if not has_my_job:
                     continue
 
             if self.idle_filter_only:
-                has_idle = False
-                for g in node.gpus:
-                    try:
-                        if float(g.util) <= 5:
-                            has_idle = True
-                            break
-                    except (ValueError, TypeError):
-                        pass
-                if not has_idle:
+                if "free" not in node_classes[node.name]:
                     continue
 
             if self.search_text:
                 node_users = set()
                 for g in node.gpus:
                     node_users.update(g.users)
+                    if g.alloc_user:
+                        node_users.add(g.alloc_user)
                 for j in node.jobs:
                     node_users.add(j.user)
                 if (self.search_text not in node.name.lower() and
                         not any(self.search_text in u.lower() for u in node_users)):
                     continue
 
-            node_partition = node.jobs[0].partition if node.jobs else ""
+            node_partition = node.partition or (node.jobs[0].partition if node.jobs else "")
+            # Stats: prefer the partition jobs actually run in over sinfo's first listing
+            partition_stat_key = node.jobs[0].partition if node.jobs else node_partition.split(",")[0]
 
             alloc = node.cpu_alloc or "0"
             cpu_text = Text()
@@ -574,24 +824,49 @@ class SlurmGpuTui(App):
                 "parse_error": "~parse_err",
                 "slurm_down": "~down",
                 "stale_cached": "~stale",
+                "unknown": "~err",
             }
             nname = Text(f"{arrow} {node.name}", style="bold white")
             if node.stale:
                 label = _ERROR_LABELS.get(node.error_kind, "~stale")
                 nname.append(f" {label}", style="dim yellow")
+
+            # Partition cell: first partition + "+n" beats a hard truncation
+            parts = [p for p in node_partition.split(",") if p]
+            part_disp = parts[0] + (f"+{len(parts) - 1}" if len(parts) > 1 else "") if parts else ""
+
+            # Per-GPU glyph strip + waste/free counts — the node summary
+            # stays informative even when the node is collapsed
+            classes = node_classes[node.name]
+            strip = gpu_strip(classes)
+            n_busy, n_free = classes.count("busy"), classes.count("free")
+            n_parked, n_rsv = classes.count("parked"), classes.count("idle")
+            use_txt = Text()
+            if n_busy:
+                use_txt.append(f"{n_busy} busy", style="green")
+            if n_free:
+                use_txt.append("  " if n_busy else "")
+                use_txt.append(f"{n_free} free", style="bold cyan")
+            waste_txt = Text()
+            if n_parked:
+                waste_txt.append(f"{n_parked} parked", style="blue")
+            if n_rsv:
+                waste_txt.append("  " if n_parked else "")
+                waste_txt.append(f"{n_rsv} idle", style="yellow")
+
             if self.show_details:
                 hdr_cells = [
-                    nname, state_cell(node.state), Text(node_partition, style="cyan"),
+                    nname, state_cell(node.state), Text(part_disp, style="cyan"),
                     cpu_text, mem_cell(node),
-                    Text(""), Text(""), Text(""), Text(""),
+                    Text(""), strip, use_txt, waste_txt,
                     Text(""), Text(""), Text(""), Text(""),
                     Text(""), Text(""),
                 ]
             else:
                 hdr_cells = [
-                    nname, state_cell(node.state), Text(node_partition, style="cyan"),
+                    nname, state_cell(node.state), Text(part_disp, style="cyan"),
                     cpu_text, mem_cell(node),
-                    Text(""), Text(""), Text(""), Text(""), Text(""), Text(""),
+                    Text(""), strip, use_txt, waste_txt, Text(""), Text(""),
                 ]
             for cell in hdr_cells:
                 cell.stylize(_HDR_BG)
@@ -600,7 +875,7 @@ class SlurmGpuTui(App):
             if is_collapsed:
                 pass
             elif node.gpus:
-                for gpu in node.gpus:
+                for gpu_i, gpu in enumerate(node.gpus):
                     total_gpus += 1
                     gpu_busy = False
                     try:
@@ -610,46 +885,77 @@ class SlurmGpuTui(App):
                     except (ValueError, TypeError):
                         pass
 
-                    if node_partition not in partition_gpu_stats:
-                        partition_gpu_stats[node_partition] = [0, 0]
-                    partition_gpu_stats[node_partition][1] += 1
+                    if partition_stat_key not in partition_gpu_stats:
+                        partition_gpu_stats[partition_stat_key] = [0, 0]
+                    partition_gpu_stats[partition_stat_key][1] += 1
                     if gpu_busy:
-                        partition_gpu_stats[node_partition][0] += 1
+                        partition_gpu_stats[partition_stat_key][0] += 1
 
                     user = ""
                     jobid = ""
                     jobname = ""
                     elapsed = ""
                     is_me = False
+                    reserved_idle = False
                     matched_job = None
                     if gpu.users:
                         user = ",".join(gpu.users)
                         is_me = self.current_user in gpu.users
+                    elif gpu.alloc_user:
+                        # Allocated by SLURM but no GPU process — reserved, sitting
+                        # idle. On stale placeholder rows process info is unknown,
+                        # so only claim idle when a tracked age says so.
+                        user = gpu.alloc_user
+                        reserved_idle = gpu.idle_sec > 0 or not node.stale
+                        is_me = gpu.alloc_user == self.current_user
+                    # Exact job match via SLURM allocation, fallback to user match
+                    if gpu.alloc_jobid:
                         for j in node.jobs:
-                            if j.user in gpu.users:
-                                jobid, jobname, elapsed = j.jobid, j.jobname, j.elapsed
+                            if j.jobid == gpu.alloc_jobid:
                                 matched_job = j
                                 break
+                    if matched_job is None and gpu.users:
+                        for j in node.jobs:
+                            if j.user in gpu.users:
+                                matched_job = j
+                                break
+                    if matched_job:
+                        jobid, jobname, elapsed = matched_job.jobid, matched_job.jobname, matched_job.elapsed
 
+                    vcell = vram_cell(gpu.mem_used, gpu.mem_total)
+                    if classes[gpu_i] == "parked":
+                        vcell = vcell + Text(" parked", style="bold blue")
                     row_cells = [
                         Text(""), Text(""), Text(""),  # node, state, part
                         Text(""), Text(""),             # cpu, ram
                         Text(f"  {gpu.index}", style="bold"),
                         Text(gpu.name),
                         util_cell(gpu.util),
-                        vram_cell(gpu.mem_used, gpu.mem_total),
+                        vcell,
                     ]
                     if self.show_details:
                         row_cells.append(temp_cell(gpu.temp))
                         row_cells.append(power_cell(gpu.power, gpu.power_cap))
-                    row_cells.append(Text(user, style="bold magenta") if user else Text(""))
+                    if user and reserved_idle:
+                        user_cell = Text(f"{user} ", style="magenta")
+                        age = fmt_idle_age(gpu.idle_sec)
+                        user_cell.append(age, style="bold yellow" if gpu.idle_sec >= 3600 else "dim yellow")
+                        row_cells.append(user_cell)
+                    elif user:
+                        row_cells.append(Text(user, style="bold magenta"))
+                    else:
+                        row_cells.append(Text(""))
                     if self.show_details:
                         row_cells.append(Text(jobid, style="dim") if jobid else Text(""))
                         row_cells.append(Text(jobname) if jobname else Text(""))
                     row_cells.append(remaining_cell(elapsed, matched_job.time_limit) if matched_job else Text("", style="dim"))
                     if is_me:
                         highlight_row(row_cells)
-                    self.tbl.add_row(*row_cells)
+                    gpu_key = f"gpu_{node.name}_{gpu.index}"
+                    detail_jid = jobid or gpu.alloc_jobid
+                    if detail_jid:
+                        self._row_job[gpu_key] = detail_jid
+                    self.tbl.add_row(*row_cells, key=gpu_key)
 
             elif node.jobs:
                 for j in node.jobs:
@@ -672,7 +978,9 @@ class SlurmGpuTui(App):
                     row_cells.append(remaining_cell(j.elapsed, j.time_limit))
                     if is_me:
                         highlight_row(row_cells)
-                    self.tbl.add_row(*row_cells)
+                    job_key = f"job_{node.name}_{j.jobid}"
+                    self._row_job[job_key] = j.jobid
+                    self.tbl.add_row(*row_cells, key=job_key)
 
         # ── Pending Jobs Table ──
         self.query_one("#pending-container").display = bool(pending)
@@ -690,10 +998,11 @@ class SlurmGpuTui(App):
                 Text(pj.jobname),
                 Text(pj.reason, style=reason_style),
                 Text(pj.priority, style="dim"),
+                Text(fmt_start_time(pj.start_time), style="cyan"),
             ]
             if is_me:
                 highlight_row(row_cells)
-            self.pending_tbl.add_row(*row_cells)
+            self.pending_tbl.add_row(*row_cells, key=f"pend_{pj.jobid}")
 
         # Update Summary
         for j in jobs:
@@ -707,6 +1016,20 @@ class SlurmGpuTui(App):
         summary = Text()
         summary.append(" GPU ", style="bold white on dark_green")
         summary.append(f" {busy_gpus}/{total_gpus} active  ", style="bold")
+        # FREE chip answers "where can I submit" without scanning rows.
+        # Computed over ALL nodes (pre-filter) so filters don't hide capacity.
+        free_by_node = sorted(
+            ((name, cl.count("free")) for name, cl in node_classes.items() if cl.count("free")),
+            key=lambda x: -x[1],
+        )
+        total_free = sum(c for _, c in free_by_node)
+        summary.append(" FREE ", style="bold black on cyan")
+        summary.append(f" {total_free} ", style="bold cyan")
+        for nn, cnt in free_by_node[:4]:
+            summary.append(f" {nn}×{cnt}", style="cyan")
+        if len(free_by_node) > 4:
+            summary.append(" …", style="dim cyan")
+        summary.append("  ")
         # Per-partition GPU breakdown
         if partition_gpu_stats:
             for part, (pbsy, ptot) in sorted(partition_gpu_stats.items()):
@@ -743,7 +1066,15 @@ class SlurmGpuTui(App):
             self.status_w.update(Text(f" OK [{ts}] ", style="dim"))
 
         if self.tbl.row_count > 0:
-            self.tbl.move_cursor(row=min(saved_row, self.tbl.row_count - 1), column=saved_col, animate=False)
+            row = None
+            if saved_key is not None:
+                try:
+                    row = self.tbl.get_row_index(saved_key)
+                except Exception:
+                    row = None
+            if row is None:
+                row = min(saved_row, self.tbl.row_count - 1)
+            self.tbl.move_cursor(row=row, column=saved_col, animate=False)
         self.tbl.scroll_to(x=saved_scroll_x, y=saved_scroll_y, animate=False)
 
         self.snapshot = {
@@ -754,5 +1085,74 @@ class SlurmGpuTui(App):
         }
 
 
+# ── One-shot CLI mode ─────────────────────────────────────────────────────
+
+def _oneshot_snapshot() -> dict:
+    """Fresh snapshot dict: daemon file if recent, else direct collection."""
+    try:
+        age = time.time() - _DAEMON_DATA_FILE.stat().st_mtime
+        if age <= _DAEMON_MAX_AGE:
+            return json.loads(_DAEMON_DATA_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
+    nodes_raw, jobs, pending, node_jobs, gpu_alloc, err = collect_basic()
+    node_names = [n["name"] for n in nodes_raw]
+    ssh_results, stale_nodes, ssh_errors = collect_node_data_parallel(node_names)
+    nodes = build_nodes(nodes_raw, node_jobs, ssh_results, stale_nodes)
+    apply_gpu_alloc(nodes, gpu_alloc, jobs)
+    return {
+        "version": 1,
+        "ts": datetime.now().isoformat(),
+        "nodes": [asdict(n) for n in nodes],
+        "jobs": [asdict(j) for j in jobs],
+        "pending": [asdict(p) for p in pending],
+        "stale_nodes": stale_nodes,
+        "errors": " | ".join(x for x in [err] + ssh_errors if x),
+    }
+
+
+def _print_once(data: dict) -> None:
+    print(f"sgpu {data.get('ts', '')}")
+    for n in data.get("nodes", []):
+        stale = " ~stale" if n.get("stale") else ""
+        err = f" ERROR: {n['error']}" if n.get("error") else ""
+        print(f"\n{n['name']}  {n['state']}  [{n.get('partition', '')}]  "
+              f"CPU {n.get('cpu_alloc') or '0'}/{n.get('cpus', '?')}{stale}{err}")
+        for g in n.get("gpus", []):
+            user = ",".join(g.get("users", []))
+            note = ""
+            if not user and g.get("alloc_user"):
+                user = g["alloc_user"]
+                note = f"  [{fmt_idle_age(g.get('idle_sec', 0)).upper()}]"
+            job = f"  job {g['alloc_jobid']}" if g.get("alloc_jobid") else ""
+            print(f"  GPU{g.get('index', '?')}  {g.get('name', ''):<14} "
+                  f"util {g.get('util', '?'):>3}%  "
+                  f"{mb_to_gb(g.get('mem_used', '')):>6}/{mb_to_gb(g.get('mem_total', ''))}G"
+                  f"  {user}{note}{job}")
+    pending = data.get("pending", [])
+    if pending:
+        print(f"\nPENDING ({len(pending)}):")
+        for p in pending:
+            start = fmt_start_time(p.get("start_time", ""))
+            start = f"  est.start {start}" if start else ""
+            print(f"  {p['jobid']}  {p['user']}  x{p.get('gpu_count', 0)}  "
+                  f"{p.get('partition', '')}  {p.get('reason', '')}{start}")
+
+
 def main():
+    argv = sys.argv[1:]
+    if "--json" in argv or "--once" in argv:
+        data = _oneshot_snapshot()
+        if "--json" in argv:
+            print(json.dumps(data, ensure_ascii=False, indent=2))
+        else:
+            _print_once(data)
+        cleanup_ssh_pool()
+        return
+    if argv and argv[0] in ("-h", "--help"):
+        print("usage: sgpu [--json | --once]\n"
+              "  (no args)  interactive TUI\n"
+              "  --json     print snapshot as JSON and exit\n"
+              "  --once     print snapshot as plain text and exit")
+        return
     SlurmGpuTui().run()

@@ -63,15 +63,24 @@ sgpu        # Launch the GPU monitor
 |-----|--------|
 | `r` | Refresh now |
 | `f` | Toggle Fast (1s) / Normal (3s) refresh |
-| `s` | Cycle sort: Node → Utilization → User |
+| `s` | Cycle sort: Node → Utilization → User → Free |
 | `u` | Toggle "My Jobs" filter (highlight your jobs only) |
 | `i` | Toggle idle filter (show only nodes with free GPUs) |
 | `d` | Toggle detail columns (Temp / Power / JobID / JobName) |
 | `Space` | Collapse / expand node (cursor on node header row) |
 | `/` | Search by node name or username — `Esc` to clear |
 | `j` / `k` | Move cursor down / up (vim-style) |
+| `Enter` | Job / node details popup (`scontrol show`) |
 | `e` | Export current snapshot as JSON |
+| `?` | Help overlay |
 | `q` | Quit |
+
+### One-shot CLI mode
+
+```bash
+sgpu --once   # plain-text snapshot (for quick checks / logs)
+sgpu --json   # JSON snapshot (for scripts: sgpu --json | jq ...)
+```
 
 ### Reading the Display
 
@@ -83,9 +92,12 @@ sgpu        # Launch the GPU monitor
                0   H100    ████████░  91%   ███████  64/80G   78C   400W   jaemin  67890   10:15h
 ```
 
-- **Node header row** (dark green): node name, state symbol, partition, CPU alloc/total, RAM bar
+- **Node header row** (dark green): node name, state, partition, CPU alloc/total, RAM bar, plus a per-GPU glyph strip (`█` busy · `▅` parked · `▂` reserved-idle · `▁` free) with busy/free/waste counts — collapse nodes (`Space`) for a one-line-per-node cluster overview
+- **FREE chip** (summary bar): total free GPUs and which nodes have them
+- **`parked` badge**: VRAM held at ~0% utilization (memory hog, no compute)
 - **GPU rows**: indented — utilization bar, VRAM, temperature, power, user, job, time remaining
 - **State symbols**: `●` idle · `◐` mixed · `○` alloc · `✖` drain
+- **`user idle 3.2h` marker**: GPU allocated to that user's job but no process running on it, with how long it has sat idle (bold yellow after 1h — reclaim candidates)
 - **Stale nodes**: specific error label (e.g., `~timeout`, `~unreachable`, `~smi_err`)
 
 ---
@@ -93,14 +105,22 @@ sgpu        # Launch the GPU monitor
 ## Architecture
 
 ```
-[sgpu-collector]  ──→  /tmp/slurm-gpu-tui/data.json
-                              ↑
-[sgpu TUI]        ──reads──┘   (instant, no SSH on launch)
+[sgpu-agent @ each node]  ──3s──→  ~/.sgpu/nodes/<node>.json   (shared FS push)
+                                          │
+[sgpu-collector @ master] ──merge──→  /tmp/slurm-gpu-tui/data.json
+                                          ↑
+[sgpu TUI]                ──reads──┘   (instant, no SSH on launch)
 ```
 
-The collector daemon runs continuously in the background, polling SLURM and GPU nodes via SSH. The TUI reads its JSON output on each refresh — startup is instant regardless of cluster size.
+**Push mode (preferred):** each GPU node runs a tiny resident `sgpu-agent` that writes its own stats to a shared-filesystem directory every few seconds. The collector on the master reads those files locally — no SSH in the hot path, so a flaky sshd or busy node can't stall collection.
 
-Without the daemon, the TUI falls back to direct SSH collection (slower first load).
+**Self-healing:** the collector deploys and repairs agents automatically. If a node's file goes stale (agent died, node rebooted, old agent version), the collector re-launches the agent over SSH — rate-limited per node. No per-node installation needed; the shared venv is executed directly.
+
+**SSH pull fallback:** nodes without a live agent are polled via SSH (ControlMaster-pooled, async per node) exactly as before. The two modes mix freely during migration.
+
+The TUI reads the merged JSON on each refresh — startup is instant regardless of cluster size. Without the collector, the TUI falls back to direct SSH collection (slower first load).
+
+The collector also writes `/tmp/slurm-gpu-tui/metrics.prom` (Prometheus textfile format: GPU util/memory/temp/power, allocation, idle seconds, node health) — point node_exporter's textfile collector or any scraper at it for Grafana dashboards.
 
 ---
 

@@ -23,6 +23,7 @@ class NodeErrorKind(str, Enum):
     PARSE_ERROR = "parse_error"
     SLURM_DOWN = "slurm_down"
     STALE_CACHED = "stale_cached"
+    UNKNOWN = "unknown"
 
 
 # ── Shell helpers ─────────────────────────────────────────────────────────
@@ -68,14 +69,30 @@ def ssh_ensure_master(node: str) -> None:
     init_ssh_pool()
     sock = f"{_SSH_CONTROL_DIR}/{os.getenv('USER', 'user')}@{node}"
     if os.path.exists(sock):
-        return
+        try:
+            alive = subprocess.call(
+                ["ssh", "-o", f"ControlPath={sock}", "-O", "check", node],
+                stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=5,
+            ) == 0
+        except Exception:
+            alive = False
+        if alive:
+            return
+        # Dead master leaves a stale socket behind; remove it so we reconnect
+        try:
+            os.unlink(sock)
+        except OSError:
+            pass
     cmd = (
         f"ssh -o ControlMaster=yes {_SSH_BASE_OPTS} "
         f"-o ConnectTimeout=10 -o ControlPersist=1800 -fN {node}"
     )
-    subprocess.call(
-        shlex.split(cmd), stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=20,
-    )
+    try:
+        subprocess.call(
+            shlex.split(cmd), stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=20,
+        )
+    except Exception:
+        pass  # per-command ssh will surface the real error
 
 
 def ssh_cmd(node: str, inner_cmd: str, timeout: int = 10) -> Tuple[bool, str]:
@@ -109,6 +126,9 @@ class GpuInfo:
     power_cap: str = ""  # W
     pids: List[str] = field(default_factory=list)
     users: List[str] = field(default_factory=list)
+    alloc_jobid: str = ""  # job holding this GPU per SLURM allocation
+    alloc_user: str = ""
+    idle_sec: int = 0  # how long allocated with no GPU process (collector only)
 
 
 @dataclass
@@ -134,6 +154,7 @@ class PendingJob:
     gpu_count: int = 0
     reason: str = ""
     priority: str = ""
+    start_time: str = ""  # scheduler's estimated start (squeue %S)
 
 
 @dataclass
@@ -147,6 +168,7 @@ class NodeMemInfo:
 class NodeInfo:
     name: str = ""
     state: str = ""
+    partition: str = ""  # comma-joined partitions from sinfo
     cpus: str = ""
     cpu_alloc: str = ""
     cpu_load: str = ""
@@ -199,7 +221,7 @@ def _classify_error(error_str: str, exc: Exception = None) -> NodeErrorKind:
         return NodeErrorKind.NVIDIA_SMI_MISSING
     if "nvidia-smi" in s and ("failed" in s or "error" in s):
         return NodeErrorKind.NVIDIA_SMI_FAILED
-    return NodeErrorKind.SSH_UNREACHABLE  # default for unknown SSH errors
+    return NodeErrorKind.UNKNOWN
 
 
 # ── Data collection ──────────────────────────────────────────────────────
@@ -225,7 +247,7 @@ def collect_jobs() -> Tuple[List[JobInfo], str]:
 
 
 def collect_pending_jobs() -> Tuple[List[PendingJob], str]:
-    cmd = 'squeue -h -t PD -o "%i|%u|%P|%j|%l|%b|%r|%Q"'
+    cmd = 'squeue -h -t PD -o "%i|%u|%P|%j|%l|%b|%r|%Q|%S"'
     ok, out = run_cmd(cmd)
     if not ok:
         return [], f"squeue PD failed: {out}"
@@ -239,25 +261,30 @@ def collect_pending_jobs() -> Tuple[List[PendingJob], str]:
         m = re.search(r"gpu(?::[^:,]+)?:(\d+)", gres)
         if m:
             gc = int(m.group(1))
-        rows.append(PendingJob(p[0], p[1], p[2], p[3], p[4], gc, p[6].strip(), p[7].strip()))
+        start = p[8].strip() if len(p) > 8 else ""
+        rows.append(PendingJob(p[0], p[1], p[2], p[3], p[4], gc, p[6].strip(), p[7].strip(), start))
     return rows, ""
 
 
 def collect_nodes_basic() -> Tuple[List[dict], str]:
-    cmd = 'sinfo -N -h -o "%N|%T|%c|%O|%m|%e|%G|%C"'
+    cmd = 'sinfo -N -h -o "%N|%T|%c|%O|%m|%e|%G|%C|%P"'
     ok, out = run_cmd(cmd)
     if not ok:
         return [], f"sinfo failed: {out}"
-    rows = []
-    seen = set()
+    rows: List[dict] = []
+    by_name: Dict[str, dict] = {}
     for line in out.splitlines():
         p = line.split("|")
-        if len(p) < 8:
+        if len(p) < 9:
             continue
         name = p[0].strip()
-        if name in seen:
+        partition = p[8].strip().rstrip("*")
+        if name in by_name:
+            # Node listed once per partition — accumulate partitions
+            row = by_name[name]
+            if partition and partition not in row["partition"].split(","):
+                row["partition"] = f"{row['partition']},{partition}" if row["partition"] else partition
             continue
-        seen.add(name)
         gres = p[6].strip()
         if "gpu" not in gres.lower():
             continue
@@ -266,33 +293,128 @@ def collect_nodes_basic() -> Tuple[List[dict], str]:
         parts = cpus_aiot.split("/")
         if len(parts) >= 4:
             cpu_alloc = parts[0]
-        rows.append({
+        row = {
             "name": name, "state": p[1].strip(), "cpus": p[2].strip(),
             "cpu_load": p[3].strip(), "mem_total": p[4].strip(),
             "mem_free": p[5].strip(), "gres": p[6].strip(),
-            "cpu_alloc": cpu_alloc,
-        })
+            "cpu_alloc": cpu_alloc, "partition": partition,
+        }
+        by_name[name] = row
+        rows.append(row)
     return rows, ""
 
 
+def expand_nodelist(expr: str) -> List[str]:
+    """Expand a SLURM nodelist like 'gpu[1-3,5],node7' into hostnames."""
+    hosts: List[str] = []
+    for part in re.findall(r"[^,\[\]]+(?:\[[^\]]*\])?", expr):
+        m = re.match(r"^(.*?)\[([^\]]+)\]$", part)
+        if not m:
+            if part:
+                hosts.append(part)
+            continue
+        prefix, ranges = m.group(1), m.group(2)
+        for r in ranges.split(","):
+            if "-" in r:
+                a, b = r.split("-", 1)
+                width = len(a)
+                for i in range(int(a), int(b) + 1):
+                    hosts.append(f"{prefix}{str(i).zfill(width)}")
+            else:
+                hosts.append(f"{prefix}{r}")
+    return hosts
+
+
+def _expand_idx(spec: str) -> List[str]:
+    """Expand a GPU index spec like '0-1,3' into ['0','1','3']."""
+    out: List[str] = []
+    for r in spec.split(","):
+        r = r.strip()
+        if not r or r.upper() == "N/A":
+            continue
+        if "-" in r:
+            a, b = r.split("-", 1)
+            out.extend(str(i) for i in range(int(a), int(b) + 1))
+        else:
+            out.append(r)
+    return out
+
+
+def parse_gres_models(gres: str) -> List[str]:
+    """Expand sinfo GRES like 'gpu:h100:1(S:0-1),gpu:3' into per-GPU model names."""
+    out: List[str] = []
+    for part in gres.split(","):
+        m = re.match(r"gpu(?::([^:(]+))?:(\d+)", part.strip())
+        if m:
+            model = (m.group(1) or "").strip()
+            out.extend([model] * int(m.group(2)))
+    return out
+
+
+def parse_gpu_alloc(out: str) -> Dict[str, Dict[str, str]]:
+    """Parse `scontrol -o show job -d` output: node -> gpu index -> jobid.
+
+    Reads per-node detail segments like 'Nodes=gpu4 CPU_IDs=... Mem=... GRES=gpu:1(IDX:0)'.
+    """
+    alloc: Dict[str, Dict[str, str]] = {}
+    for line in out.splitlines():
+        if "JobState=RUNNING" not in line:
+            continue
+        m_id = re.search(r"JobId=(\d+)", line)
+        if not m_id:
+            continue
+        jobid = m_id.group(1)
+        for m in re.finditer(r"Nodes=(\S+)\s+CPU_IDs=\S+\s+Mem=\S+\s+GRES=(\S+)", line):
+            nodes_expr, gres = m.group(1), m.group(2)
+            gm = re.search(r"gpu[^(]*\(IDX:([^)]+)\)", gres)
+            if not gm:
+                continue
+            idxs = _expand_idx(gm.group(1))
+            for node in expand_nodelist(nodes_expr):
+                d = alloc.setdefault(node, {})
+                for i in idxs:
+                    d[i] = jobid
+    return alloc
+
+
+def collect_gpu_alloc() -> Tuple[Dict[str, Dict[str, str]], str]:
+    """Exact GPU allocation from scontrol: node -> gpu index -> jobid."""
+    ok, out = run_cmd("scontrol -o show job -d")
+    if not ok:
+        if "no jobs" in out.lower():
+            return {}, ""
+        return {}, f"scontrol failed: {out}"
+    return parse_gpu_alloc(out), ""
+
+
+# Combined node-side payload command: nvidia-smi metrics + pmon (PID→GPU)
+# + meminfo + ps (PID→user). Run remotely via SSH (pull) or locally by the
+# resident agent (push).
+NODE_PAYLOAD_CMD = (
+    "nvidia-smi --query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total,"
+    "temperature.gpu,power.draw,power.limit --format=csv,noheader,nounits 2>/dev/null; "
+    "echo '---SEP---'; "
+    "nvidia-smi pmon -c 1 -s m 2>/dev/null; "
+    "echo '---SEP---'; "
+    "awk '/^MemTotal:/{ t=$2 } /^MemAvailable:/{ a=$2 } "
+    "END{ printf \"%d %d %d\", t/1024, (t-a)/1024, a/1024 }' /proc/meminfo; "
+    "echo '---SEP---'; "
+    "PIDS=$(nvidia-smi pmon -c 1 -s u 2>/dev/null | awk 'NR>2 && $2!= \"-\" {print $2}' | tr '\\n' ','); "
+    "if [ -n \"$PIDS\" ]; then ps -p ${PIDS%,} -o pid=,user= 2>/dev/null; fi"
+)
+
+
 def collect_node_data(node: str, timeout: int = 30) -> Tuple[List[GpuInfo], NodeMemInfo, str]:
-    """SSH to node: nvidia-smi metrics + pmon (PID→GPU) + ps (PID→user) + meminfo."""
-    combined = (
-        "nvidia-smi --query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total,"
-        "temperature.gpu,power.draw,power.limit --format=csv,noheader,nounits 2>/dev/null; "
-        "echo '---SEP---'; "
-        "nvidia-smi pmon -c 1 -s m 2>/dev/null; "
-        "echo '---SEP---'; "
-        "awk '/^MemTotal:/{ t=$2 } /^MemAvailable:/{ a=$2 } "
-        "END{ printf \"%d %d %d\", t/1024, (t-a)/1024, a/1024 }' /proc/meminfo; "
-        "echo '---SEP---'; "
-        "PIDS=$(nvidia-smi pmon -c 1 -s u 2>/dev/null | awk 'NR>2 && $2!= \"-\" {print $2}' | tr '\\n' ','); "
-        "if [ -n \"$PIDS\" ]; then ps -p ${PIDS%,} -o pid=,user= 2>/dev/null; fi"
-    )
-    ok, out = ssh_cmd(node, combined, timeout=timeout)
+    """SSH to node and run the combined payload command."""
+    ok, out = ssh_cmd(node, NODE_PAYLOAD_CMD, timeout=timeout)
     if not ok:
         return [], NodeMemInfo(), out if out else "ssh failed"
+    gpus, mem_info = parse_node_payload(out)
+    return gpus, mem_info, ""
 
+
+def parse_node_payload(out: str) -> Tuple[List[GpuInfo], NodeMemInfo]:
+    """Parse the combined SSH payload (metrics/pmon/meminfo/ps sections)."""
     sections = out.split("---SEP---")
     metrics_raw = sections[0].strip() if len(sections) > 0 else ""
     pmon_raw = sections[1].strip() if len(sections) > 1 else ""
@@ -336,23 +458,38 @@ def collect_node_data(node: str, timeout: int = 30) -> Tuple[List[GpuInfo], Node
             mem_used=p[4], mem_total=p[5], temp=p[6], power=p[7], power_cap=p[8],
             pids=pids, users=users,
         ))
-    return gpus, mem_info, ""
+    return gpus, mem_info
 
 
-def collect_basic() -> Tuple[List[dict], List[JobInfo], List[PendingJob], Dict[str, List[JobInfo]], str]:
-    """Phase 1: fast local commands only (sinfo + squeue)."""
-    with ThreadPoolExecutor(max_workers=3) as ex:
+def collect_basic() -> Tuple[List[dict], List[JobInfo], List[PendingJob], Dict[str, List[JobInfo]], Dict[str, Dict[str, str]], str]:
+    """Phase 1: fast local commands only (sinfo + squeue + scontrol)."""
+    with ThreadPoolExecutor(max_workers=4) as ex:
         f_nodes = ex.submit(collect_nodes_basic)
         f_jobs = ex.submit(collect_jobs)
         f_pending = ex.submit(collect_pending_jobs)
+        f_alloc = ex.submit(collect_gpu_alloc)
         nodes_raw, e1 = f_nodes.result()
         jobs, e2 = f_jobs.result()
         pending, e3 = f_pending.result()
-    err = " | ".join(x for x in [e1, e2, e3] if x)
+        gpu_alloc, e4 = f_alloc.result()
+    err = " | ".join(x for x in [e1, e2, e3, e4] if x)
     node_jobs: Dict[str, List[JobInfo]] = {}
     for j in jobs:
         node_jobs.setdefault(j.node, []).append(j)
-    return nodes_raw, jobs, pending, node_jobs, err
+    return nodes_raw, jobs, pending, node_jobs, gpu_alloc, err
+
+
+def apply_gpu_alloc(
+    nodes: List[NodeInfo], gpu_alloc: Dict[str, Dict[str, str]], jobs: List[JobInfo],
+) -> None:
+    """Annotate GPUs with the job/user that holds them per SLURM allocation."""
+    jobid_user = {j.jobid: j.user for j in jobs}
+    for node in nodes:
+        node_alloc = gpu_alloc.get(node.name, {})
+        for g in node.gpus:
+            jid = node_alloc.get(g.index, "")
+            g.alloc_jobid = jid
+            g.alloc_user = jobid_user.get(jid, "")
 
 
 def build_nodes(
@@ -369,7 +506,7 @@ def build_nodes(
         gerr = r.error if r else ""
         mem = r.mem if r else NodeMemInfo()
         result.append(NodeInfo(
-            name=name, state=n["state"], cpus=n["cpus"],
+            name=name, state=n["state"], partition=n.get("partition", ""), cpus=n["cpus"],
             cpu_alloc=n.get("cpu_alloc", ""), cpu_load=n["cpu_load"],
             mem_total=n["mem_total"], mem_free=n["mem_free"], gres=n["gres"],
             gpus=gpus, jobs=node_jobs.get(name, []), error=gerr,
@@ -398,7 +535,10 @@ def collect_node_data_parallel(
         futs = {ex.submit(collect_node_data, n, node_timeout): n for n in node_names}
         for fut in as_completed(futs):
             name = futs[fut]
-            gpus, mem, err = fut.result()
+            try:
+                gpus, mem, err = fut.result()
+            except Exception as e:
+                gpus, mem, err = [], NodeMemInfo(), f"collect failed: {e}"
             if err:
                 gpus2, mem2, err2 = collect_node_data(name, node_timeout)
                 if not err2:
