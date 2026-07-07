@@ -17,7 +17,8 @@ from textual.containers import Vertical, VerticalScroll
 from textual.coordinate import Coordinate
 from textual.screen import ModalScreen
 from textual.timer import Timer
-from textual.widgets import DataTable, Footer, Header, Input, Static
+from textual.widgets import DataTable, Footer, Header, Input, OptionList, Static
+from textual.widgets.option_list import Option
 
 from .common import (
     GpuInfo, JobInfo, NodeInfo, NodeSSHResult, PendingJob,
@@ -250,9 +251,19 @@ def parse_slurm_duration(s: str) -> int:
         return -1
 
 
+# GPU processes by these users never count as rogue (system daemons)
+_ROGUE_IGNORE = {
+    u for u in os.getenv("SLURM_GPU_TUI_ROGUE_IGNORE", "root,gdm,xdm").split(",") if u
+}
+
+
 def classify_gpu(g: GpuInfo) -> str:
-    """One of: busy / parked (VRAM held, no compute) / idle (reserved, no
-    process) / free / unknown (no data yet)."""
+    """One of: rogue (GPU process outside any SLURM allocation) / busy /
+    parked (VRAM held, no compute) / idle (reserved, no process) / free /
+    unknown (no data yet)."""
+    real_users = [u for u in g.users if u not in _ROGUE_IGNORE]
+    if real_users and not g.alloc_jobid:
+        return "rogue"
     try:
         util = float(g.util)
     except (ValueError, TypeError):
@@ -266,7 +277,7 @@ def classify_gpu(g: GpuInfo) -> str:
         vram_pct = 0.0
     if vram_pct >= 0.3:
         return "parked"
-    if g.alloc_jobid or g.users:
+    if g.alloc_jobid or real_users:
         return "idle"
     return "free"
 
@@ -276,6 +287,7 @@ _CLASS_GLYPH = {
     "parked": ("▅", "blue"),
     "idle": ("▂", "yellow"),
     "free": ("▁", "bold cyan"),
+    "rogue": ("!", "bold red"),
     "unknown": ("?", "bright_black"),
 }
 
@@ -309,7 +321,13 @@ def collect_waste(nodes: List[NodeInfo], min_sec: int) -> List[dict]:
     rows: List[dict] = []
     for n in nodes:
         for g in n.gpus:
-            if g.idle_sec >= min_sec:
+            real_users = [u for u in g.users if u not in _ROGUE_IGNORE]
+            if real_users and not g.alloc_jobid:
+                rows.append({
+                    "node": n.name, "gpu": g.index, "kind": "rogue",
+                    "sec": 0, "user": ",".join(real_users), "jobid": "",
+                })
+            elif g.idle_sec >= min_sec:
                 rows.append({
                     "node": n.name, "gpu": g.index, "kind": "idle",
                     "sec": g.idle_sec, "user": g.alloc_user,
@@ -322,7 +340,8 @@ def collect_waste(nodes: List[NodeInfo], min_sec: int) -> List[dict]:
                     "user": g.alloc_user or ",".join(g.users),
                     "jobid": g.alloc_jobid,
                 })
-    rows.sort(key=lambda r: -r["sec"])
+    # rogue first (GPU use outside SLURM), then worst waste
+    rows.sort(key=lambda r: (r["kind"] != "rogue", -r["sec"]))
     return rows
 
 
@@ -405,7 +424,7 @@ HELP_TEXT = """\
  r        Refresh now
  f        Fast (1s) / Normal (3s) refresh
  s        Cycle sort: Node → Utilization → User → Free
- u        My Jobs filter
+ u        Filter by user (pick from list; u again clears)
  i        Idle filter (truly free GPUs only)
  d        Detail columns (Temp / Power / JobID / JobName)
  Space    Collapse / expand node (on header row)
@@ -420,12 +439,14 @@ HELP_TEXT = """\
 
  Node header GPU strip (one glyph per GPU):
    █ busy   ▅ parked (VRAM held, no compute)
-   ▂ idle (reserved, no process)   ▁ free   ? no data
+   ▂ idle (reserved, no process)   ▁ free
+   ! rogue (GPU use outside SLURM)   ? no data
 
  User column markers:
    bold user        process running on GPU
    user idle 3.2h   allocated but no process (wasted)
    parked           VRAM held at ~0% util
+   user !slurm      GPU process with no SLURM allocation
 
  Korean IME: same physical keys work without switching
  (ㅂ=q, ㄱ=r, ㄴ=s, ㅇ=d, ㅑ=i, ㅕ=u, ㄹ=f, ㄷ=e, ㅈ=w, ㅎ=g, ㅓ=j, ㅏ=k)
@@ -454,9 +475,10 @@ class WasteScreen(ModalScreen):
             body.append("No wasted GPUs over threshold. Nice cluster.", style="green")
         for r in self._rows:
             body.append(f" {r['node']}/{r['gpu']:<3}", style="bold cyan")
-            style = "yellow" if r["kind"] == "idle" else "blue"
+            style = {"idle": "yellow", "parked": "blue", "rogue": "red"}.get(r["kind"], "white")
             body.append(f" {r['kind']:<7}", style=f"bold {style}")
-            body.append(f" {fmt_span(r['sec']) or '<1m':>7} ", style="bold")
+            span = "-" if r["kind"] == "rogue" else (fmt_span(r["sec"]) or "<1m")
+            body.append(f" {span:>7} ", style="bold")
             body.append(f" {r['user']:<12}", style="magenta")
             if r["jobid"]:
                 body.append(f" job {r['jobid']}", style="dim")
@@ -520,10 +542,15 @@ class UsageScreen(ModalScreen):
 
 def load_usage_totals(days: int) -> Optional[List[Tuple[str, float, float]]]:
     """Sum usage.json daily buckets: [(user, alloc_sec, busy_sec)], alloc desc."""
-    usage_file = _DAEMON_DATA_FILE.parent / "usage.json"
-    try:
-        raw = json.loads(usage_file.read_text())
-    except (OSError, ValueError):
+    state_dir = Path(os.getenv("SLURM_GPU_TUI_STATE_DIR", str(Path.home() / ".sgpu" / "state")))
+    raw = None
+    for p in (state_dir / "usage.json", _DAEMON_DATA_FILE.parent / "usage.json"):
+        try:
+            raw = json.loads(p.read_text())
+            break
+        except (OSError, ValueError):
+            continue
+    if raw is None:
         return None
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     totals: Dict[str, List[float]] = {}
@@ -535,6 +562,41 @@ def load_usage_totals(days: int) -> Optional[List[Tuple[str, float, float]]]:
             t[0] += u.get("alloc", 0)
             t[1] += u.get("busy", 0)
     return sorted(((u, a, b) for u, (a, b) in totals.items()), key=lambda x: -x[1])
+
+
+class UserSelectScreen(ModalScreen):
+    """Pick a user to filter the view by (Enter selects, Esc cancels)."""
+
+    BINDINGS = [("escape", "cancel", "Cancel"), ("q", "cancel", "Cancel")]
+    CSS = """
+    UserSelectScreen { align: center middle; }
+    #user-box {
+        width: 44; max-height: 80%;
+        border: round $primary; background: $surface; padding: 1 2;
+    }
+    """
+
+    def __init__(self, users: List[Tuple[str, int]]) -> None:
+        super().__init__()
+        self._users = users
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="user-box"):
+            yield Static(Text("Filter by user", style="bold"))
+            yield OptionList(*[
+                Option(f"{u:<16} {c} GPU", id=u) for u, c in self._users
+            ])
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(str(event.option.id))
+
+    def on_key(self, event) -> None:
+        if getattr(event, "character", None) == "ㅂ":
+            event.stop()
+            self.action_cancel()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class HelpScreen(ModalScreen):
@@ -663,8 +725,9 @@ class SlurmGpuTui(App):
         self.max_workers = int(os.getenv("SLURM_GPU_TUI_MAX_WORKERS", "8"))
         self.snapshot: dict = {}
 
-        self.sort_by = "node"  # "node", "util", "user"
-        self.user_filter_only = False
+        self.sort_by = "node"  # "node", "util", "user", "free"
+        self.filter_user = ""  # show only this user's jobs ("" = everyone)
+        self._user_gpu_count: Dict[str, int] = {}
         self._collapsed: set = set()  # node names that are collapsed
         self._last_data_mtime: float | None = None
         self._force_render = False
@@ -715,10 +778,25 @@ class SlurmGpuTui(App):
         self._rerender()
 
     def action_toggle_user_filter(self) -> None:
-        self.user_filter_only = not self.user_filter_only
-        status = "My Jobs Only" if self.user_filter_only else "All Jobs"
-        self.status_w.update(status)
-        self._rerender()
+        if self.filter_user:
+            self.filter_user = ""
+            self.status_w.update("All Jobs")
+            self._rerender()
+            return
+        # Me first, then heaviest GPU users
+        entries = [(self.current_user, self._user_gpu_count.get(self.current_user, 0))]
+        entries += sorted(
+            ((u, c) for u, c in self._user_gpu_count.items() if u != self.current_user),
+            key=lambda x: -x[1],
+        )
+
+        def _apply_filter(sel: Optional[str]) -> None:
+            if sel:
+                self.filter_user = sel
+                self.status_w.update(f"Filter: {sel}'s jobs (u to clear)")
+                self._rerender()
+
+        self.push_screen(UserSelectScreen(entries), _apply_filter)
 
     def action_toggle_collapse(self) -> None:
         if self.tbl.row_count == 0:
@@ -932,10 +1010,11 @@ class SlurmGpuTui(App):
 
         for node in nodes:
             # Filter logic
-            if self.user_filter_only:
-                has_my_job = any(self.current_user in g.users or self.current_user == g.alloc_user for g in node.gpus)
-                has_my_job = has_my_job or any(j.user == self.current_user for j in node.jobs)
-                if not has_my_job:
+            if self.filter_user:
+                fu = self.filter_user
+                has_user = any(fu in g.users or fu == g.alloc_user for g in node.gpus)
+                has_user = has_user or any(j.user == fu for j in node.jobs)
+                if not has_user:
                     continue
 
             if self.idle_filter_only:
@@ -999,10 +1078,14 @@ class SlurmGpuTui(App):
                 use_txt.append("  " if n_busy else "")
                 use_txt.append(f"{n_free} free", style="bold cyan")
             waste_txt = Text()
+            n_rogue = classes.count("rogue")
+            if n_rogue:
+                waste_txt.append(f"{n_rogue} rogue", style="bold red")
             if n_parked:
+                waste_txt.append("  " if waste_txt else "")
                 waste_txt.append(f"{n_parked} parked", style="blue")
             if n_rsv:
-                waste_txt.append("  " if n_parked else "")
+                waste_txt.append("  " if waste_txt else "")
                 waste_txt.append(f"{n_rsv} idle", style="yellow")
 
             if self.show_details:
@@ -1088,7 +1171,11 @@ class SlurmGpuTui(App):
                     if self.show_details:
                         row_cells.append(temp_cell(gpu.temp))
                         row_cells.append(power_cell(gpu.power, gpu.power_cap))
-                    if user and reserved_idle:
+                    if user and classes[gpu_i] == "rogue":
+                        user_cell = Text(user, style="bold red")
+                        user_cell.append(" !slurm", style="bold red reverse")
+                        row_cells.append(user_cell)
+                    elif user and reserved_idle:
                         user_cell = Text(f"{user} ", style="magenta")
                         age = fmt_idle_age(gpu.idle_sec)
                         user_cell.append(age, style="bold yellow" if gpu.idle_sec >= 3600 else "dim yellow")
@@ -1112,7 +1199,7 @@ class SlurmGpuTui(App):
             elif node.jobs:
                 for j in node.jobs:
                     is_me = (j.user == self.current_user)
-                    if self.user_filter_only and not is_me:
+                    if self.filter_user and j.user != self.filter_user:
                         continue
                     row_cells = [
                         Text(""), Text(""), Text(""),
@@ -1138,7 +1225,7 @@ class SlurmGpuTui(App):
         self.query_one("#pending-container").display = bool(pending)
         for pj in pending:
             is_me = (pj.user == self.current_user)
-            if self.user_filter_only and not is_me:
+            if self.filter_user and pj.user != self.filter_user:
                 continue
             reason_style = "bold red" if pj.reason == "Resources" else "yellow" if pj.reason == "Priority" else "dim"
             gpu_txt = f"x{pj.gpu_count}" if pj.gpu_count else "-"
@@ -1160,6 +1247,7 @@ class SlurmGpuTui(App):
         for j in jobs:
             if j.gpu_count > 0:
                 user_gpu_count[j.user] = user_gpu_count.get(j.user, 0) + j.gpu_count
+        self._user_gpu_count = user_gpu_count
 
         ts = datetime.now().strftime("%H:%M:%S")
         mode_label = Text(" FAST ", style="bold white on red") if self.refresh_sec == self.refresh_sec_fast else Text(" NORM ", style="bold white on blue")
@@ -1186,6 +1274,10 @@ class SlurmGpuTui(App):
         n_agent = sum(1 for n in nodes if n.source == "agent")
         n_ssh = sum(1 for n in nodes if n.source == "ssh")
         n_stale = sum(1 for n in nodes if n.source == "stale" or (n.stale and not n.source))
+        n_rogue_total = sum(cl.count("rogue") for cl in node_classes.values())
+        if n_rogue_total:
+            summary.append(" ROGUE ", style="bold white on red")
+            summary.append(f" {n_rogue_total} ", style="bold red")
         if n_agent or n_ssh or n_stale:
             summary.append(" SRC ", style="bold white on grey37")
             summary.append(f" agent:{n_agent}", style="green" if n_agent else "dim")
@@ -1206,8 +1298,8 @@ class SlurmGpuTui(App):
             summary.append(f" {len(pending)}  ", style="bold")
         summary.append_text(mode_label)
         summary.append_text(sort_label)
-        if self.user_filter_only:
-            summary.append(" MY JOBS ", style="bold white on #666600")
+        if self.filter_user:
+            summary.append(f" USER:{self.filter_user} ", style="bold white on #666600")
         if self.idle_filter_only:
             summary.append(" IDLE ", style="bold white on dark_cyan")
         if self.search_text:
@@ -1331,7 +1423,8 @@ def _cli_waste() -> int:
         return 0
     for r in rows:
         job = f"  job {r['jobid']}" if r["jobid"] else ""
-        print(f"{r['node']}/{r['gpu']}  {r['kind']:<7} {fmt_span(r['sec']) or '<1m':>7}  {r['user']}{job}")
+        span = "-" if r["kind"] == "rogue" else (fmt_span(r["sec"]) or "<1m")
+        print(f"{r['node']}/{r['gpu']}  {r['kind']:<7} {span:>7}  {r['user']}{job}")
     return 1  # non-zero so cron/scripts can alert on it
 
 

@@ -80,7 +80,7 @@ sgpu        # Launch the GPU monitor
 | `r` | Refresh now |
 | `f` | Toggle Fast (1s) / Normal (3s) refresh |
 | `s` | Cycle sort: Node → Utilization → User → Free |
-| `u` | Toggle "My Jobs" filter (highlight your jobs only) |
+| `u` | Filter by user — pick from a list (me first); press again to clear |
 | `i` | Toggle idle filter (show only nodes with free GPUs) |
 | `d` | Toggle detail columns (Temp / Power / JobID / JobName) |
 | `Space` | Collapse / expand node (cursor on node header row) |
@@ -116,7 +116,8 @@ sgpu --wait-free 2 --partition heavy   # block until 2 GPUs are free, then exit 
                0   H100    ████████░  91%   ███████  64/80G   78C   400W   jaemin  67890   10:15h
 ```
 
-- **Node header row** (dark green): node name, state, partition, CPU alloc/total, RAM bar, plus a per-GPU glyph strip (`█` busy · `▅` parked · `▂` reserved-idle · `▁` free) with busy/free/waste counts — collapse nodes (`Space`) for a one-line-per-node cluster overview
+- **Node header row** (dark green): node name, state, partition, CPU alloc/total, RAM bar, plus a per-GPU glyph strip (`█` busy · `▅` parked · `▂` reserved-idle · `▁` free · `!` rogue) with busy/free/waste counts — collapse nodes (`Space`) for a one-line-per-node cluster overview
+- **`user !slurm` marker (red)**: GPU process running **outside any SLURM allocation** — someone bypassed the scheduler. Also flagged in the `w` popup, `--waste`, and a red ROGUE chip in the summary bar. System daemons are ignored (`SLURM_GPU_TUI_ROGUE_IGNORE`, default `root,gdm,xdm`)
 - **FREE chip** (summary bar): total free GPUs and which nodes have them
 - **`parked` badge**: VRAM held at ~0% utilization (memory hog, no compute)
 - **GPU rows**: indented — utilization bar, VRAM, temperature, power, user, job, time remaining
@@ -312,6 +313,7 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstra
 | `SLURM_GPU_TUI_NODE_TIMEOUT_SEC` | `30` | SSH timeout per node |
 | `SLURM_GPU_TUI_MAX_WORKERS` | `8` | Parallel SSH workers (fallback mode) |
 | `SLURM_GPU_TUI_DATA_DIR` | `/tmp/slurm-gpu-tui` | Daemon JSON output directory |
+| `SLURM_GPU_TUI_STATE_DIR` | `~/.sgpu/state` | Persistent state (usage history, waste ages, inventory) — survives reboots |
 | `SLURM_GPU_TUI_AGENT_DIR` | `~/.sgpu/nodes` | Push-agent payload directory (shared FS) |
 | `SLURM_GPU_TUI_AGENT_SEC` | `3` | Agent collect interval on nodes |
 | `SLURM_GPU_TUI_AGENT_MAX_AGE_SEC` | `45` | Agent payload freshness limit |
@@ -319,6 +321,7 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstra
 | `SLURM_GPU_TUI_AGENT_DISABLE` | (unset) | Set to disable push agents entirely |
 | `SLURM_GPU_TUI_WASTE_MIN_SEC` | `600` | Threshold for the waste view / `--waste` |
 | `SLURM_GPU_TUI_USAGE_KEEP_DAYS` | `30` | GPU-hour history retention |
+| `SLURM_GPU_TUI_ROGUE_IGNORE` | `root,gdm,xdm` | Users never flagged as rogue |
 
 ---
 

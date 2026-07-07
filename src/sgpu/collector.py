@@ -24,6 +24,9 @@ from . import agent as _agent_module
 # ── Config ────────────────────────────────────────────────────────────────
 
 DATA_DIR = Path(os.getenv("SLURM_GPU_TUI_DATA_DIR", "/tmp/slurm-gpu-tui"))
+# Persistent state (usage history, waste ages, inventory) must survive
+# reboots, so it lives under the home dir — NOT in /tmp like the live data
+STATE_DIR = Path(os.getenv("SLURM_GPU_TUI_STATE_DIR", str(Path.home() / ".sgpu" / "state")))
 DATA_FILE = DATA_DIR / "data.json"
 PID_FILE = DATA_DIR / "collector.pid"
 LOCK_FILE = DATA_DIR / "collector.lock"
@@ -56,7 +59,7 @@ _inflight: set = set()
 # parked = VRAM held (>=30%) at ~0% utilization by someone.
 # Persisted so collector restarts don't reset ages.
 
-IDLE_STATE_FILE = DATA_DIR / "idle_state.json"
+IDLE_STATE_FILE = STATE_DIR / "idle_state.json"
 _idle_since: Dict[str, dict] = {}
 _parked_since: Dict[str, dict] = {}
 
@@ -65,15 +68,24 @@ _parked_since: Dict[str, dict] = {}
 # last successful poll so the full GPU layout renders even when a node is
 # cold-starting or unreachable. Auto-refreshes on every successful poll.
 
-INVENTORY_FILE = DATA_DIR / "inventory.json"
+INVENTORY_FILE = STATE_DIR / "inventory.json"
 _inventory: Dict[str, List[dict]] = {}
 
 
+def _read_state_json(path: Path):
+    """Load a state file, falling back to its pre-STATE_DIR /tmp location."""
+    for p in (path, DATA_DIR / path.name):
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            continue
+    return None
+
+
 def _load_inventory() -> None:
-    try:
-        _inventory.update(json.loads(INVENTORY_FILE.read_text()))
-    except Exception:
-        pass
+    raw = _read_state_json(INVENTORY_FILE)
+    if isinstance(raw, dict):
+        _inventory.update(raw)
 
 
 def _update_inventory(name: str, gpu_dicts: List[dict]) -> None:
@@ -88,7 +100,7 @@ def _update_inventory(name: str, gpu_dicts: List[dict]) -> None:
         return
     _inventory[name] = static
     try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
         tmp = INVENTORY_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(_inventory, ensure_ascii=False))
         tmp.rename(INVENTORY_FILE)
@@ -114,15 +126,14 @@ def _skeleton_gpus(name: str, gres: str) -> List[dict]:
 
 
 def _load_idle_state() -> None:
-    try:
-        raw = json.loads(IDLE_STATE_FILE.read_text())
-        if "idle" in raw or "parked" in raw:
-            _idle_since.update(raw.get("idle", {}))
-            _parked_since.update(raw.get("parked", {}))
-        else:  # pre-parked flat format
-            _idle_since.update(raw)
-    except Exception:
-        pass
+    raw = _read_state_json(IDLE_STATE_FILE)
+    if not isinstance(raw, dict):
+        return
+    if "idle" in raw or "parked" in raw:
+        _idle_since.update(raw.get("idle", {}))
+        _parked_since.update(raw.get("parked", {}))
+    else:  # pre-parked flat format
+        _idle_since.update(raw)
 
 
 def _save_idle_state() -> None:
@@ -174,19 +185,16 @@ def _track_waste(node: str, gpu: dict, now: float) -> None:
 # alloc = GPU allocated to the user's job; busy = that GPU actually computing.
 # Rolling window, persisted each cycle. No slurmdbd needed.
 
-USAGE_FILE = DATA_DIR / "usage.json"
+USAGE_FILE = STATE_DIR / "usage.json"
 USAGE_KEEP_DAYS = int(os.getenv("SLURM_GPU_TUI_USAGE_KEEP_DAYS", "30"))
 _usage: Dict[str, dict] = {"days": {}}
 _last_usage_ts: float | None = None
 
 
 def _load_usage() -> None:
-    try:
-        raw = json.loads(USAGE_FILE.read_text())
-        if isinstance(raw.get("days"), dict):
-            _usage["days"] = raw["days"]
-    except Exception:
-        pass
+    raw = _read_state_json(USAGE_FILE)
+    if isinstance(raw, dict) and isinstance(raw.get("days"), dict):
+        _usage["days"] = raw["days"]
 
 
 def _save_usage() -> None:
@@ -609,6 +617,7 @@ def run_collector():
             time.sleep(0.5)
 
     PID_FILE.write_text(str(os.getpid()))
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
     _load_idle_state()
     _load_inventory()
     _load_usage()

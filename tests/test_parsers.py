@@ -128,17 +128,30 @@ def test_classify_gpu():
     assert classify_gpu(GpuInfo(util="0", alloc_jobid="1")) == "idle"
     assert classify_gpu(GpuInfo(util="0")) == "free"
     assert classify_gpu(GpuInfo(util="")) == "unknown"
+    # GPU process without any SLURM allocation = rogue (root daemons ignored)
+    assert classify_gpu(GpuInfo(util="90", users=["someone"])) == "rogue"
+    assert classify_gpu(GpuInfo(util="90", users=["someone"], alloc_jobid="5")) == "busy"
+    assert classify_gpu(GpuInfo(util="2", users=["root"])) == "free"
 
 
 def test_collect_waste():
     nodes = [NodeInfo(name="n1", gpus=[
         GpuInfo(index="0", idle_sec=7200, alloc_user="a", alloc_jobid="10"),
-        GpuInfo(index="1", parked_sec=900, users=["b"]),
+        GpuInfo(index="1", parked_sec=900, users=["b"], alloc_jobid="11"),
         GpuInfo(index="2", idle_sec=30),  # below threshold
     ])]
     rows = collect_waste(nodes, 600)
     assert [(r["kind"], r["user"]) for r in rows] == [("idle", "a"), ("parked", "b")]
     assert rows[0]["sec"] == 7200
+
+
+def test_collect_waste_rogue_first():
+    nodes = [NodeInfo(name="n1", gpus=[
+        GpuInfo(index="0", idle_sec=7200, alloc_user="a", alloc_jobid="10"),
+        GpuInfo(index="1", users=["intruder"]),  # no alloc -> rogue
+    ])]
+    rows = collect_waste(nodes, 600)
+    assert rows[0]["kind"] == "rogue" and rows[0]["user"] == "intruder"
 
 
 def test_fmt_start_time():

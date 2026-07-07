@@ -60,7 +60,8 @@ pkill -f "bin/[s]gpu-collector" 2>/dev/null
 if $HAS_SUDO; then
     $SUDO rm -f /usr/local/bin/sgpu /usr/local/bin/sgpu-collector
 fi
-rm -rf "${SLURM_GPU_TUI_DATA_DIR:-/tmp/slurm-gpu-tui}" "$HOME/.sgpu/nodes"
+rm -rf "${SLURM_GPU_TUI_DATA_DIR:-/tmp/slurm-gpu-tui}" "$HOME/.sgpu/nodes" \
+       "${SLURM_GPU_TUI_STATE_DIR:-$HOME/.sgpu/state}"
 
 if [ -n "$INSTALL_DIR" ] && [ -e "$INSTALL_DIR/bin/sgpu" ]; then
     # Marker check above keeps a bad INSTALL_DIR from deleting the wrong tree
