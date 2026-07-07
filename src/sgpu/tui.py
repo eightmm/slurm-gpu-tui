@@ -20,7 +20,7 @@ from textual.timer import Timer
 from textual.widgets import DataTable, Footer, Header, Input, Static
 
 from .common import (
-    GpuInfo, JobInfo, NodeInfo, NodeMemInfo, NodeSSHResult, PendingJob,
+    GpuInfo, JobInfo, NodeInfo, NodeSSHResult, PendingJob,
     apply_gpu_alloc, build_nodes, cleanup_ssh_pool, collect_basic,
     collect_node_data_parallel, run_cmd,
 )

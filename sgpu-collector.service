@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-User=jaemin
+User=REPLACED_BY_INSTALLER
 ExecStart=/home/jaemin/mgt/slurm-gpu-tui/.venv/bin/sgpu-collector
 Restart=on-failure
 RestartSec=10

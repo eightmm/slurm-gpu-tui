@@ -214,6 +214,14 @@ systemctl --user daemon-reload
 rm -rf ~/.sgpu/app    # 또는 SGPU_INSTALL_DIR 경로
 ```
 
+### 노드 에이전트 (공통)
+
+```bash
+# push 에이전트 중지 + 데이터 삭제
+for n in $(sinfo -N -h -o %N | sort -u); do ssh "$n" 'pkill -f "bin/[s]gpu-agent"' 2>/dev/null; done
+rm -rf ~/.sgpu/nodes
+```
+
 ### sudo 없는 경우 (백그라운드 프로세스)
 
 ```bash
@@ -280,9 +288,15 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstra
 |------|--------|------|
 | `SLURM_GPU_TUI_REFRESH_SEC` | `3` | TUI 갱신 주기 (초) |
 | `SLURM_GPU_TUI_FAST_REFRESH_SEC` | `1` | Fast 모드 갱신 주기 |
+| `SLURM_GPU_TUI_COLLECTOR_SEC` | `3` | Collector 수집 주기 |
 | `SLURM_GPU_TUI_NODE_TIMEOUT_SEC` | `30` | 노드 SSH 타임아웃 |
 | `SLURM_GPU_TUI_MAX_WORKERS` | `8` | 병렬 SSH 워커 수 (폴백 모드) |
 | `SLURM_GPU_TUI_DATA_DIR` | `/tmp/slurm-gpu-tui` | 데몬 JSON 출력 경로 |
+| `SLURM_GPU_TUI_AGENT_DIR` | `~/.sgpu/nodes` | push 에이전트 데이터 경로 (공유 FS) |
+| `SLURM_GPU_TUI_AGENT_SEC` | `3` | 노드 에이전트 수집 주기 |
+| `SLURM_GPU_TUI_AGENT_MAX_AGE_SEC` | `45` | 에이전트 데이터 신선도 한계 |
+| `SLURM_GPU_TUI_AGENT_REPAIR_SEC` | `180` | 노드당 에이전트 수리 최소 간격 |
+| `SLURM_GPU_TUI_AGENT_DISABLE` | (없음) | 설정 시 push 에이전트 비활성화 |
 
 ---
 

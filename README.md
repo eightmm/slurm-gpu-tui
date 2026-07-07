@@ -220,6 +220,14 @@ systemctl --user daemon-reload
 rm -rf ~/.sgpu/app    # or your SGPU_INSTALL_DIR
 ```
 
+### Node agents (all modes)
+
+```bash
+# Stop push agents and remove their data
+for n in $(sinfo -N -h -o %N | sort -u); do ssh "$n" 'pkill -f "bin/[s]gpu-agent"' 2>/dev/null; done
+rm -rf ~/.sgpu/nodes
+```
+
 ### Without sudo (background process)
 
 ```bash
@@ -282,9 +290,15 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstra
 |----------|---------|-------------|
 | `SLURM_GPU_TUI_REFRESH_SEC` | `3` | TUI refresh interval (seconds) |
 | `SLURM_GPU_TUI_FAST_REFRESH_SEC` | `1` | Fast mode refresh interval |
+| `SLURM_GPU_TUI_COLLECTOR_SEC` | `3` | Collector cycle interval |
 | `SLURM_GPU_TUI_NODE_TIMEOUT_SEC` | `30` | SSH timeout per node |
 | `SLURM_GPU_TUI_MAX_WORKERS` | `8` | Parallel SSH workers (fallback mode) |
 | `SLURM_GPU_TUI_DATA_DIR` | `/tmp/slurm-gpu-tui` | Daemon JSON output directory |
+| `SLURM_GPU_TUI_AGENT_DIR` | `~/.sgpu/nodes` | Push-agent payload directory (shared FS) |
+| `SLURM_GPU_TUI_AGENT_SEC` | `3` | Agent collect interval on nodes |
+| `SLURM_GPU_TUI_AGENT_MAX_AGE_SEC` | `45` | Agent payload freshness limit |
+| `SLURM_GPU_TUI_AGENT_REPAIR_SEC` | `180` | Min interval between agent repairs per node |
+| `SLURM_GPU_TUI_AGENT_DISABLE` | (unset) | Set to disable push agents entirely |
 
 ---
 

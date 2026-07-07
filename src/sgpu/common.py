@@ -105,13 +105,6 @@ def ssh_cmd(node: str, inner_cmd: str, timeout: int = 10) -> Tuple[bool, str]:
     return run_cmd(wrapped, timeout=timeout)
 
 
-def warmup_ssh(nodes: List[str], max_workers: int = 8) -> None:
-    """Pre-establish SSH ControlMaster connections in parallel."""
-    init_ssh_pool()
-    with ThreadPoolExecutor(max_workers=min(max_workers, max(len(nodes), 1))) as ex:
-        list(ex.map(ssh_ensure_master, nodes))
-
-
 # ── Data models ───────────────────────────────────────────────────────────
 
 @dataclass
@@ -190,8 +183,6 @@ class NodeSSHResult:
     mem: NodeMemInfo = field(default_factory=NodeMemInfo)
     error: str = ""
     error_kind: NodeErrorKind = NodeErrorKind.OK
-    consecutive_failures: int = 0
-    last_ok_ts: float = 0.0
 
 
 # ── GPU name shortening ──────────────────────────────────────────────────
@@ -539,10 +530,6 @@ def collect_node_data_parallel(
                 gpus, mem, err = fut.result()
             except Exception as e:
                 gpus, mem, err = [], NodeMemInfo(), f"collect failed: {e}"
-            if err:
-                gpus2, mem2, err2 = collect_node_data(name, node_timeout)
-                if not err2:
-                    gpus, mem, err = gpus2, mem2, err2
             if err and name in active_cache:
                 cached_gpus, cached_mem = active_cache[name]
                 ssh_results[name] = NodeSSHResult(cached_gpus, cached_mem, "", error_kind=NodeErrorKind.STALE_CACHED)

@@ -177,3 +177,6 @@ else
     echo "  pkill -f sgpu-collector"
     echo "  rm -rf $INSTALL_DIR"
 fi
+echo "  # stop node agents + data:"
+echo "  for n in \$(sinfo -N -h -o %N | sort -u); do ssh \"\$n\" 'pkill -f \"bin/[s]gpu-agent\"'; done"
+echo "  rm -rf ~/.sgpu/nodes"
