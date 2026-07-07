@@ -2,9 +2,20 @@
 
 A real-time TUI tool for monitoring GPU usage across your SLURM cluster, right from the terminal.
 
+![CI](https://github.com/eightmm/slurm-gpu-tui/actions/workflows/test.yml/badge.svg)
 ![Python](https://img.shields.io/badge/python-3.10+-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
 
 [한국어 README](README_ko.md)
+
+<p align="center"><img src="docs/tab-gpu.svg" alt="sgpu GPU tab" width="100%"></p>
+
+| Wasted-GPU popup (`w`) | CPU tab (`2`) |
+|---|---|
+| <img src="docs/waste.svg" alt="waste popup"> | <img src="docs/tab-cpu.svg" alt="CPU tab"> |
+| **Detail columns (`d`)** | **GPU-hours by user (`3`)** |
+| <img src="docs/tab-gpu-details.svg" alt="details"> | <img src="docs/tab-usage.svg" alt="usage tab"> |
+
 
 ## What You Get
 

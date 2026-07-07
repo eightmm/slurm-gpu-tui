@@ -2,9 +2,20 @@
 
 터미널에서 SLURM 클러스터의 GPU 사용 현황을 실시간으로 확인하는 TUI 도구입니다.
 
+![CI](https://github.com/eightmm/slurm-gpu-tui/actions/workflows/test.yml/badge.svg)
 ![Python](https://img.shields.io/badge/python-3.10+-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
 
 [English README](README.md)
+
+<p align="center"><img src="docs/tab-gpu.svg" alt="sgpu GPU tab" width="100%"></p>
+
+| Wasted-GPU popup (`w`) | CPU tab (`2`) |
+|---|---|
+| <img src="docs/waste.svg" alt="waste popup"> | <img src="docs/tab-cpu.svg" alt="CPU tab"> |
+| **Detail columns (`d`)** | **GPU-hours by user (`3`)** |
+| <img src="docs/tab-gpu-details.svg" alt="details"> | <img src="docs/tab-usage.svg" alt="usage tab"> |
+
 
 ## 한눈에 보이는 것들
 
