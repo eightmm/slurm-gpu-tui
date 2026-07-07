@@ -26,6 +26,10 @@ fi
 
 # ── Step 1: Create venv and install package ────────────────────────────────
 echo "[1] Creating venv and installing..."
+# Keep the uv-managed interpreter inside the install dir: the default
+# (~/.local/share/uv) is unreadable by other users when installing as root,
+# and invisible to compute nodes when the home dir isn't the shared FS.
+export UV_PYTHON_INSTALL_DIR="$INSTALL_DIR/python"
 uv venv --clear --python 3.12 "$VENV_DIR"
 uv pip install --python "$VENV_DIR/bin/python" -e "$INSTALL_DIR"
 chmod -R a+rX "$INSTALL_DIR"
