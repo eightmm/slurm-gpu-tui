@@ -39,17 +39,7 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstra
 설치 위치 기본값 `~/.sgpu/app` (`SGPU_INSTALL_DIR=...`로 변경).
 push 에이전트를 쓰려면 계산 노드에서 보이는 공유 파일시스템 경로로.
 
-<details>
-<summary>클론해서 수동 설치</summary>
-
-```bash
-git clone https://github.com/eightmm/slurm-gpu-tui.git
-cd slurm-gpu-tui
-bash install.sh
-```
-</details>
-
-`install.sh`가 환경을 자동으로 감지해서 전부 처리합니다:
+설치 스크립트가 환경을 자동으로 감지해서 전부 처리합니다:
 
 | 상황 | 자동 처리 내용 |
 |------|--------------|
@@ -66,7 +56,7 @@ sgpu
 
 sudo가 있으면 `/usr/local/bin/sgpu` 심볼릭 링크가 자동으로 생성되므로 PATH 설정 불필요.
 
-> **설치 디렉토리를 옮기면?** `bash install.sh` 다시 실행하면 됩니다.
+> **설치 디렉토리를 옮기면?** 위 설치 명령을 다시 실행하면 됩니다.
 
 ---
 
@@ -205,7 +195,7 @@ sudo systemctl disable sgpu-collector
 sudo rm -f /etc/systemd/system/sgpu-collector.service
 sudo rm -f /usr/local/bin/sgpu /usr/local/bin/sgpu-collector
 sudo systemctl daemon-reload
-rm -rf /path/to/slurm-gpu-tui
+rm -rf ~/.sgpu/app    # 또는 SGPU_INSTALL_DIR 경로
 ```
 
 ### sudo 없는 경우 (유저 서비스)
@@ -216,7 +206,7 @@ systemctl --user disable sgpu-collector
 rm -f ~/.config/systemd/user/sgpu-collector.service
 systemctl --user daemon-reload
 # ~/.bashrc에서 PATH 줄 제거
-rm -rf /path/to/slurm-gpu-tui
+rm -rf ~/.sgpu/app    # 또는 SGPU_INSTALL_DIR 경로
 ```
 
 ### sudo 없는 경우 (백그라운드 프로세스)
@@ -224,7 +214,7 @@ rm -rf /path/to/slurm-gpu-tui
 ```bash
 pkill -f sgpu-collector
 # ~/.bashrc에서 nohup 줄 및 PATH 줄 제거
-rm -rf /path/to/slurm-gpu-tui
+rm -rf ~/.sgpu/app    # 또는 SGPU_INSTALL_DIR 경로
 ```
 
 > 설치 시 출력되는 제거 명령어를 복사해두면 편합니다.
@@ -236,10 +226,10 @@ rm -rf /path/to/slurm-gpu-tui
 **`sgpu` 명령을 못 찾는 경우**
 ```bash
 # 래퍼 스크립트 확인
-ls ~/slurm-gpu-tui/bin/sgpu
+ls ~/.sgpu/app/bin/sgpu
 
 # PATH 임시 적용
-export PATH="$HOME/slurm-gpu-tui/bin:$PATH"
+export PATH="$HOME/.sgpu/app/bin:$PATH"
 ```
 
 **처음 실행 시 느린 경우 ("loading GPUs..." 메시지)**
@@ -274,7 +264,7 @@ cat /tmp/sgpu-collector.log                            # 백그라운드
 
 **재설치**
 ```bash
-bash install.sh    # 기존 venv와 서비스를 덮어씁니다
+curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstrap.sh | bash
 ```
 
 ---

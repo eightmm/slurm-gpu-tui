@@ -39,19 +39,9 @@ agents are restarted automatically on the next collector cycle.
 Install dir defaults to `~/.sgpu/app` (override with `SGPU_INSTALL_DIR=...`).
 Pick a shared-filesystem path so compute nodes can run the push agents.
 
-<details>
-<summary>Manual install from a clone</summary>
+The installer detects your environment and handles everything automatically:
 
-```bash
-git clone https://github.com/eightmm/slurm-gpu-tui.git
-cd slurm-gpu-tui
-bash install.sh
-```
-</details>
-
-`install.sh` detects your environment and handles everything automatically:
-
-| Situation | What install.sh does |
+| Situation | What the installer does |
 |-----------|---------------------|
 | **root or sudo** | systemd system service + `/usr/local/bin/sgpu` symlink for all users |
 | **no sudo, systemd --user works** | systemd user service (auto-starts on login) + PATH added to shell config |
@@ -66,7 +56,7 @@ sgpu
 
 If sudo was available, the symlink is created automatically — no PATH change needed.
 
-> **Moving the install directory?** Re-run `bash install.sh`.
+> **Moving the install directory?** Re-run the install command above.
 
 ---
 
@@ -199,7 +189,7 @@ pkill -f sgpu-collector
 
 ## Uninstall
 
-> The exact commands are printed at the end of `install.sh` — copy them then.
+> The exact commands are printed at the end of the install run — copy them then.
 
 ### With sudo (system service)
 
@@ -209,7 +199,7 @@ sudo systemctl disable sgpu-collector
 sudo rm -f /etc/systemd/system/sgpu-collector.service
 sudo rm -f /usr/local/bin/sgpu /usr/local/bin/sgpu-collector
 sudo systemctl daemon-reload
-rm -rf /path/to/slurm-gpu-tui
+rm -rf ~/.sgpu/app    # or your SGPU_INSTALL_DIR
 ```
 
 ### Without sudo (user service)
@@ -220,7 +210,7 @@ systemctl --user disable sgpu-collector
 rm -f ~/.config/systemd/user/sgpu-collector.service
 systemctl --user daemon-reload
 # Remove the PATH line from ~/.bashrc
-rm -rf /path/to/slurm-gpu-tui
+rm -rf ~/.sgpu/app    # or your SGPU_INSTALL_DIR
 ```
 
 ### Without sudo (background process)
@@ -228,7 +218,7 @@ rm -rf /path/to/slurm-gpu-tui
 ```bash
 pkill -f sgpu-collector
 # Remove the nohup and PATH lines from ~/.bashrc
-rm -rf /path/to/slurm-gpu-tui
+rm -rf ~/.sgpu/app    # or your SGPU_INSTALL_DIR
 ```
 
 ---
@@ -237,8 +227,8 @@ rm -rf /path/to/slurm-gpu-tui
 
 **`sgpu` not found**
 ```bash
-ls ~/slurm-gpu-tui/bin/sgpu        # check wrapper exists
-export PATH="$HOME/slurm-gpu-tui/bin:$PATH"   # apply manually
+ls ~/.sgpu/app/bin/sgpu            # check wrapper exists
+export PATH="$HOME/.sgpu/app/bin:$PATH"   # apply manually
 ```
 
 **Slow startup / "loading GPUs..." on every launch**
@@ -274,7 +264,7 @@ cat /tmp/sgpu-collector.log                             # background process
 
 **Reinstall cleanly**
 ```bash
-bash install.sh    # safe to re-run, overwrites venv and service
+curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstrap.sh | bash
 ```
 
 ---
