@@ -2,6 +2,7 @@
 # ==============================================
 # IMPORT
 # ==============================================
+import os
 import re
 import subprocess
 import subprocess as sp
@@ -42,29 +43,61 @@ def readInputFile(f):
     return open(f, 'r').readlines()
 
 
-def identify_gpunodes(slurm_cfg='/etc/slurm/slurm.conf'):
-    slurm_conf = readInputFile(slurm_cfg)
-    return [int(i.split()[0].replace('NodeName=gpu', ''))
-            for i in slurm_conf if i.startswith('NodeName=gpu')]
+def find_slurm_conf():
+    """Locate slurm.conf: $SLURM_CONF, scontrol, then common package paths."""
+    cand = [os.environ.get('SLURM_CONF', '')]
+    try:
+        out = sp.run('scontrol show config', shell=True,
+                     stdout=subprocess.PIPE, text=True, timeout=10).stdout
+        for line in out.splitlines():
+            if line.startswith('SLURM_CONF'):
+                cand.append(line.split('=', 1)[1].strip())
+    except Exception:
+        pass
+    cand += ['/etc/slurm/slurm.conf', '/etc/slurm-llnl/slurm.conf',
+             '/usr/local/etc/slurm.conf', '/opt/slurm/etc/slurm.conf']
+    for p in cand:
+        if p and os.path.isfile(p) and os.access(p, os.R_OK):
+            return p
+    return None
 
 
-def get_ngpus(slurm_cfg='/etc/slurm/slurm.conf'):
-    slurm_conf = readInputFile(slurm_cfg)
-    n_gpus = []
-    for line in slurm_conf:
+def _expand_gpu_node_field(name_field):
+    """'gpu3' -> [3]; 'gpu[1-4,7]' -> [1,2,3,4,7]; other names -> []."""
+    m = re.match(r'gpu\[([^\]]+)\]$', name_field)
+    if m:
+        nums = []
+        for part in m.group(1).split(','):
+            if '-' in part:
+                a, b = part.split('-', 1)
+                nums.extend(range(int(a), int(b) + 1))
+            else:
+                nums.append(int(part))
+        return nums
+    m = re.match(r'gpu(\d+)$', name_field)
+    return [int(m.group(1))] if m else []
+
+
+def parse_gpu_nodes(slurm_cfg):
+    """NodeName=gpu... lines -> (node numbers, gpus per node), ranges expanded."""
+    pairs = []
+    for line in readInputFile(slurm_cfg):
         if not line.startswith('NodeName=gpu'):
             continue
-        parts     = line.split()
+        parts = line.split()
+        nums  = _expand_gpu_node_field(parts[0].replace('NodeName=', ''))
+        if not nums:
+            continue
         gres_part = next((p for p in parts if p.startswith('Gres=')), '')
-        total     = 0
-        if gres_part:
-            for item in gres_part.replace('Gres=', '').split(','):
-                try:
-                    total += int(item.split(':')[-1])
-                except ValueError:
-                    pass
-        n_gpus.append(total)
-    return n_gpus
+        total = 0
+        for item in gres_part.replace('Gres=', '').split(','):
+            try:
+                total += int(item.split(':')[-1])
+            except ValueError:
+                pass
+        pairs.extend((n, total) for n in nums)
+    pairs.sort()
+    return [n for n, _ in pairs], [g for _, g in pairs]
 
 
 def extract_gpu_count(tres_str):
@@ -215,10 +248,12 @@ def print_thread_section(title, nodes, users_sorted,
 # ==============================================
 print(datetime.now().strftime('%Y/%m/%d %H:%M:%S'))
 
-gpu_nodes = identify_gpunodes()
-gpu_nums  = get_ngpus()
-if len(gpu_nodes) > len(gpu_nums):
-    gpu_nums += [0] * (len(gpu_nodes) - len(gpu_nums))
+SLURM_CFG = find_slurm_conf()
+if SLURM_CFG:
+    gpu_nodes, gpu_nums = parse_gpu_nodes(SLURM_CFG)
+else:
+    print(f'{C_WARN}slurm.conf not found (set $SLURM_CONF); GPU section skipped{C_RST}')
+    gpu_nodes, gpu_nums = [], []
 
 # squeue / sinfo 병렬 호출
 cmd_squeue = "squeue -o '%.13i %.12P %.10j %.15u %.8T %.8M %.4D %.3C %.10p %Q %b %e %R'"
