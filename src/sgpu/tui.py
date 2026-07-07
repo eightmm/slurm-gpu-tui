@@ -153,19 +153,25 @@ def util_cell(util_str: str) -> Text:
 
 def vram_cell(used_str: str, total_str: str) -> Text:
     try:
-        u_gb = float(used_str) / 1024
         t_gb = float(total_str) / 1024
+    except (ValueError, TypeError):
+        t_gb = 0.0
+    try:
+        u_gb = float(used_str) / 1024
         if t_gb <= 0:
             return Text("?")
         pct = u_gb / t_gb
     except (ValueError, TypeError):
-        return Text("?")
+        # no live reading — still show the capacity when inventory knows it
+        return Text(f"-/{t_gb:.0f}G" if t_gb > 0 else "-", style="bright_black")
     bar = make_bar(pct, width=12)
     label = Text(f" {u_gb:.1f}/{t_gb:.0f}G {pct:.0%}", style=f"bold {pct_color(pct)}")
     return bar + label
 
 
 def temp_cell(temp_str: str) -> Text:
+    if not temp_str:
+        return Text("-", style="bright_black")
     try:
         t = float(temp_str)
     except (ValueError, TypeError):
@@ -178,6 +184,8 @@ def temp_cell(temp_str: str) -> Text:
 
 
 def power_cell(power_str: str, cap_str: str) -> Text:
+    if not power_str:
+        return Text("-", style="bright_black")
     try:
         pw = float(power_str)
         cap = float(cap_str)
@@ -189,17 +197,29 @@ def power_cell(power_str: str, cap_str: str) -> Text:
     return bar + label
 
 
+# Long slurm state names get cut by the column — shorten, keep meaning
+_STATE_SHORT = {"allocated": "alloc", "draining": "drain↓", "drained": "drain",
+                "completing": "compl", "reserved": "resvd"}
+
+
 def state_cell(state: str) -> Text:
     s = state.lower()
+    disp = state
+    for long, short in _STATE_SHORT.items():
+        disp = disp.replace(long, short)
     if "idle" in s:
-        return Text(f"● {state}", style="bold green")
+        return Text(f"● {disp}", style="bold green")
     if "mix" in s:
-        return Text(f"◐ {state}", style="bold yellow")
+        return Text(f"◐ {disp}", style="bold yellow")
     if "alloc" in s:
-        return Text(f"○ {state}", style="bold blue")
+        return Text(f"○ {disp}", style="bold blue")
     if "down" in s or "drain" in s:
-        return Text(f"✖ {state}", style="bold bright_black")
-    return Text(state)
+        return Text(f"✖ {disp}", style="bold bright_black")
+    return Text(disp)
+
+
+def ellipsize(s: str, n: int = 20) -> str:
+    return s if len(s) <= n else s[: n - 1] + "…"
 
 
 def highlight_row(cells: list) -> list:
@@ -229,7 +249,7 @@ def mem_cell(node: NodeInfo) -> Text:
         total_gb = total_mb / 1024
     except (ValueError, TypeError):
         return Text("?")
-    bar = make_bar(pct, width=8)
+    bar = make_bar(pct, width=6)
     label = Text(f" {used_gb:.0f}/{total_gb:.0f}G {pct:.0%}", style=f"{pct_color(pct)}")
     return bar + label
 
@@ -459,7 +479,7 @@ HELP_TEXT = """\
  i        Idle filter (truly free GPUs only)
  d        Detail columns (Temp / Power / JobID / JobName)
  Space    Collapse / expand node (on header row)
- Enter    Job / node details (scontrol)
+ Enter    Job / node details — Tab switches Info/Script
  /        Search node or user (Esc clears)
  w        Wasted GPUs (idle / parked, worst first)
  g        GPU-hours by user (last 7 days)
@@ -853,8 +873,10 @@ class SlurmGpuTui(App):
         self.tbl.add_column("Node", key="node", width=12)
         self.tbl.add_column("State", key="state", width=10)
         self.tbl.add_column("Part", key="part", width=9)
-        self.tbl.add_column("CPU a/t", key="cpu", width=8)
-        self.tbl.add_column("RAM", key="ram", width=18)
+        if not self.show_details:
+            # details mode trades the CPU/RAM columns for Temp/Power/Job info
+            self.tbl.add_column("CPU a/t", key="cpu", width=8)
+            self.tbl.add_column("RAM", key="ram", width=20)
         self.tbl.add_column("GPU#", key="gpu_idx")
         self.tbl.add_column("GPU Name", key="gpu_name")
         self.tbl.add_column("Util", key="util")
@@ -862,7 +884,7 @@ class SlurmGpuTui(App):
         if self.show_details:
             self.tbl.add_column("T", key="temp")
             self.tbl.add_column("Power", key="power")
-        self.tbl.add_column("User", key="user", width=17)
+        self.tbl.add_column("User", key="user", width=14 if self.show_details else 17)
         if self.show_details:
             self.tbl.add_column("JobID", key="jobid")
             self.tbl.add_column("JobName", key="jobname")
@@ -1086,8 +1108,13 @@ class SlurmGpuTui(App):
                     continue
 
             node_partition = node.partition or (node.jobs[0].partition if node.jobs else "")
+            # GPU-ish partitions first so "cpu_only" doesn't hog the display
+            parts_sorted = sorted(
+                (p for p in node_partition.split(",") if p),
+                key=lambda p: ("cpu" in p.lower(), p),
+            )
             # Stats: prefer the partition jobs actually run in over sinfo's first listing
-            partition_stat_key = node.jobs[0].partition if node.jobs else node_partition.split(",")[0]
+            partition_stat_key = node.jobs[0].partition if node.jobs else (parts_sorted[0] if parts_sorted else "")
 
             alloc = node.cpu_alloc or "0"
             cpu_text = Text()
@@ -1113,9 +1140,8 @@ class SlurmGpuTui(App):
                 label = _ERROR_LABELS.get(node.error_kind, "~stale")
                 nname.append(f" {label}", style="dim yellow")
 
-            # Partition cell: first partition + "+n" beats a hard truncation
-            parts = [p for p in node_partition.split(",") if p]
-            part_disp = parts[0] + (f"+{len(parts) - 1}" if len(parts) > 1 else "") if parts else ""
+            # Partition cell: first (GPU-ish) partition + "+n" beats truncation
+            part_disp = parts_sorted[0] + (f"+{len(parts_sorted) - 1}" if len(parts_sorted) > 1 else "") if parts_sorted else ""
 
             # Per-GPU glyph strip + waste/free counts — the node summary
             # stays informative even when the node is collapsed
@@ -1143,7 +1169,6 @@ class SlurmGpuTui(App):
             if self.show_details:
                 hdr_cells = [
                     nname, state_cell(node.state), Text(part_disp, style="cyan"),
-                    cpu_text, mem_cell(node),
                     Text(""), strip, use_txt, waste_txt,
                     Text(""), Text(""), Text(""), Text(""),
                     Text(""), Text(""),
@@ -1212,11 +1237,12 @@ class SlurmGpuTui(App):
                     if classes[gpu_i] == "parked":
                         age = fmt_span(gpu.parked_sec)
                         vcell = vcell + Text(f" parked {age}".rstrip(), style="bold blue")
-                    row_cells = [
-                        Text(""), Text(""), Text(""),  # node, state, part
-                        Text(""), Text(""),             # cpu, ram
+                    gutter = [Text(""), Text(""), Text("")]  # node, state, part
+                    if not self.show_details:
+                        gutter += [Text(""), Text("")]       # cpu, ram
+                    row_cells = gutter + [
                         Text(f"  {gpu.index}", style="bold"),
-                        Text(gpu.name),
+                        Text(gpu.name) if gpu.name else Text("?", style="bright_black"),
                         util_cell(gpu.util),
                         vcell,
                     ]
@@ -1242,7 +1268,7 @@ class SlurmGpuTui(App):
                         row_cells.append(Text(""))
                     if self.show_details:
                         row_cells.append(Text(jobid, style="dim") if jobid else Text(""))
-                        row_cells.append(Text(jobname) if jobname else Text(""))
+                        row_cells.append(Text(ellipsize(jobname, 16)) if jobname else Text(""))
                     row_cells.append(remaining_cell(elapsed, matched_job.time_limit) if matched_job else Text("", style="dim"))
                     if is_me:
                         highlight_row(row_cells)
@@ -1257,9 +1283,10 @@ class SlurmGpuTui(App):
                     is_me = (j.user == self.current_user)
                     if self.filter_user and j.user != self.filter_user:
                         continue
-                    row_cells = [
-                        Text(""), Text(""), Text(""),
-                        Text(""), Text(""),
+                    gutter = [Text(""), Text(""), Text("")]
+                    if not self.show_details:
+                        gutter += [Text(""), Text("")]
+                    row_cells = gutter + [
                         Text(""), Text("-", style="dim"),
                         Text("-", style="dim"), Text("-", style="dim"),
                     ]
@@ -1269,7 +1296,7 @@ class SlurmGpuTui(App):
                     row_cells.append(Text(j.user, style="bold magenta"))
                     if self.show_details:
                         row_cells.append(Text(j.jobid, style="dim"))
-                        row_cells.append(Text(j.jobname))
+                        row_cells.append(Text(ellipsize(j.jobname, 16)))
                     row_cells.append(remaining_cell(j.elapsed, j.time_limit))
                     if is_me:
                         highlight_row(row_cells)
@@ -1290,7 +1317,7 @@ class SlurmGpuTui(App):
                 Text(pj.user, style="bold magenta"),
                 Text(gpu_txt, style="bold"),
                 Text(pj.partition, style="dim"),
-                Text(pj.jobname),
+                Text(ellipsize(pj.jobname, 24)),
                 Text(pj.reason, style=reason_style),
                 Text(pj.priority, style="dim"),
                 Text(fmt_start_time(pj.start_time), style="cyan"),
