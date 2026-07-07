@@ -200,6 +200,15 @@ pkill -f sgpu-collector
 
 ## 제거
 
+한 줄 — collector·노드 에이전트 중지, 서비스·심링크·데이터·설치 디렉토리 전부 삭제:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/uninstall.sh | bash
+```
+
+<details>
+<summary>수동 절차 (스크립트가 하는 일)</summary>
+
 ### sudo 있는 경우 (시스템 서비스)
 
 ```bash
@@ -238,7 +247,7 @@ pkill -f sgpu-collector
 rm -rf ~/.sgpu/app    # 또는 SGPU_INSTALL_DIR 경로
 ```
 
-> 설치 시 출력되는 제거 명령어를 복사해두면 편합니다.
+</details>
 
 ---
 

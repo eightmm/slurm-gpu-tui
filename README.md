@@ -204,7 +204,15 @@ pkill -f sgpu-collector
 
 ## Uninstall
 
-> The exact commands are printed at the end of the install run — copy them then.
+One line — stops the collector and node agents, removes services, symlinks,
+data, and the install directory:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/uninstall.sh | bash
+```
+
+<details>
+<summary>Manual steps (what the script does)</summary>
 
 ### With sudo (system service)
 
@@ -243,6 +251,8 @@ pkill -f sgpu-collector
 # Remove the nohup and PATH lines from ~/.bashrc
 rm -rf ~/.sgpu/app    # or your SGPU_INSTALL_DIR
 ```
+
+</details>
 
 ---
 

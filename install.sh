@@ -159,24 +159,5 @@ fi
 echo ""
 
 # Uninstall instructions
-echo "--- Uninstall ---"
-if [ "$SYSTEMD_MODE" = "system" ]; then
-    echo "  sudo systemctl stop sgpu-collector"
-    echo "  sudo systemctl disable sgpu-collector"
-    echo "  sudo rm /etc/systemd/system/sgpu-collector.service"
-    echo "  sudo rm -f /usr/local/bin/sgpu /usr/local/bin/sgpu-collector"
-    echo "  sudo systemctl daemon-reload"
-    echo "  rm -rf $INSTALL_DIR"
-elif [ "$SYSTEMD_MODE" = "user" ]; then
-    echo "  systemctl --user stop sgpu-collector"
-    echo "  systemctl --user disable sgpu-collector"
-    echo "  rm ~/.config/systemd/user/sgpu-collector.service"
-    echo "  systemctl --user daemon-reload"
-    echo "  rm -rf $INSTALL_DIR"
-else
-    echo "  pkill -f sgpu-collector"
-    echo "  rm -rf $INSTALL_DIR"
-fi
-echo "  # stop node agents + data:"
-echo "  for n in \$(sinfo -N -h -o %N | sort -u); do ssh \"\$n\" 'pkill -f \"bin/[s]gpu-agent\"'; done"
-echo "  rm -rf ~/.sgpu/nodes"
+echo "--- Uninstall (one line) ---"
+echo "  curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/uninstall.sh | bash"
