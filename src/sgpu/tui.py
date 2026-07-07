@@ -90,7 +90,8 @@ def read_daemon_data(max_age: float = _DAEMON_MAX_AGE) -> Optional[Tuple[List[No
                 jobid=j.get("jobid", ""), user=j.get("user", ""),
                 partition=j.get("partition", ""), jobname=j.get("jobname", ""),
                 elapsed=j.get("elapsed", ""), node=j.get("node", ""),
-                gpu_count=j.get("gpu_count", 0), gres_raw=j.get("gres_raw", ""),
+                gpu_count=j.get("gpu_count", 0), cpu_count=j.get("cpu_count", 0),
+                gres_raw=j.get("gres_raw", ""),
                 time_limit=j.get("time_limit", ""),
             )
             for j in n.get("jobs", [])
@@ -98,6 +99,7 @@ def read_daemon_data(max_age: float = _DAEMON_MAX_AGE) -> Optional[Tuple[List[No
         nodes.append(NodeInfo(
             name=n.get("name", ""), state=n.get("state", ""),
             partition=n.get("partition", ""), source=n.get("source", ""),
+            has_gpu=n.get("has_gpu", True),
             cpus=n.get("cpus", ""), cpu_alloc=n.get("cpu_alloc", ""),
             cpu_load=n.get("cpu_load", ""), mem_total=n.get("mem_total", ""),
             mem_free=n.get("mem_free", ""), gres=n.get("gres", ""),
@@ -681,6 +683,7 @@ class SlurmGpuTui(App):
     #status { height: 1; background: $surface; color: $text-muted; padding: 0 1; }
     #summary { height: 3; padding: 0 1; background: $surface; }
     #main-tabs { height: 1fr; }
+    #cpu-summary { height: 2; padding: 0 1; background: $surface; }
     #cpu-tbl { height: 1fr; }
     #usage-scroll { height: 1fr; padding: 1 2; }
     #tbl-container { height: 1fr; layout: vertical; }
@@ -722,7 +725,9 @@ class SlurmGpuTui(App):
                         yield Static(" PENDING JOBS ", id="pending-label")
                         yield DataTable(id="pending-tbl")
             with TabPane("CPU [2]", id="pane-cpu"):
-                yield DataTable(id="cpu-tbl")
+                with Vertical():
+                    yield Static("", id="cpu-summary")
+                    yield DataTable(id="cpu-tbl")
             with TabPane("Usage [3]", id="pane-usage"):
                 with VerticalScroll(id="usage-scroll"):
                     yield Static("", id="usage-view")
@@ -734,6 +739,7 @@ class SlurmGpuTui(App):
         self.tbl = self.query_one("#tbl", DataTable)
         self.pending_tbl = self.query_one("#pending-tbl", DataTable)
         self.cpu_tbl = self.query_one("#cpu-tbl", DataTable)
+        self.cpu_summary = self.query_one("#cpu-summary", Static)
         self.usage_view = self.query_one("#usage-view", Static)
         self.summary_w = self.query_one("#summary", Static)
         self.status_w = self.query_one("#status", Static)
@@ -741,7 +747,7 @@ class SlurmGpuTui(App):
         self.cpu_tbl.add_column("Node", key="c_node", width=12)
         self.cpu_tbl.add_column("State", key="c_state", width=10)
         self.cpu_tbl.add_column("Partition", key="c_part", width=14)
-        self.cpu_tbl.add_column("CPU alloc", key="c_cpu", width=26)
+        self.cpu_tbl.add_column("CPU alloc", key="c_cpu", width=34)
         self.cpu_tbl.add_column("Load", key="c_load", width=8)
         self.cpu_tbl.add_column("RAM", key="c_ram", width=22)
         self.cpu_tbl.add_column("CPU users (cores)", key="c_users")
@@ -1089,6 +1095,8 @@ class SlurmGpuTui(App):
         partition_gpu_stats: Dict[str, List[int]] = {}  # partition -> [busy, total]
 
         for node in nodes:
+            if not node.has_gpu:
+                continue  # CPU-only nodes live on the CPU tab
             # Filter logic
             if self.filter_user:
                 fu = self.filter_user
@@ -1310,39 +1318,64 @@ class SlurmGpuTui(App):
                     self._row_job[job_key] = j.jobid
                     self.tbl.add_row(*row_cells, key=job_key)
 
-        # ── CPU tab ──
+        # ── CPU tab (all nodes, CPU-only included) ──
         self.cpu_tbl.clear()
-        for node in sorted(nodes, key=lambda n: n.name):
+        cpu_rows = []
+        cluster_cores = cluster_alloc = 0
+        all_user_cores: Dict[str, int] = {}
+        for node in nodes:
             try:
                 total_c = float(node.cpus)
                 alloc_c = float(node.cpu_alloc or 0)
                 cpct = alloc_c / total_c if total_c > 0 else 0.0
             except (ValueError, TypeError):
                 total_c, alloc_c, cpct = 0.0, 0.0, 0.0
-            cbar = make_bar(cpct, width=10)
-            cbar.append(f" {node.cpu_alloc or 0}/{node.cpus} {cpct:.0%}", style=pct_color(cpct))
+            cluster_cores += int(total_c)
+            cluster_alloc += int(alloc_c)
+            user_cores: Dict[str, int] = {}
+            for j in node.jobs:
+                if j.cpu_count:
+                    user_cores[j.user] = user_cores.get(j.user, 0) + j.cpu_count
+                    all_user_cores[j.user] = all_user_cores.get(j.user, 0) + j.cpu_count
+            cpu_rows.append((cpct, node, user_cores, total_c))
+
+        for cpct, node, user_cores, total_c in sorted(cpu_rows, key=lambda r: (-r[0], r[1].name)):
+            cbar = make_bar(cpct, width=20)
+            cbar.append(f" {node.cpu_alloc or 0}/{node.cpus} {cpct:.0%}", style=f"bold {pct_color(cpct)}")
             try:
                 load = float(node.cpu_load)
                 load_style = "red" if total_c and load > total_c else "yellow" if total_c and load > total_c * 0.8 else "green"
                 load_cell = Text(f"{load:.1f}", style=load_style)
             except (ValueError, TypeError):
                 load_cell = Text(node.cpu_load or "-", style="bright_black")
-            user_cores: Dict[str, int] = {}
-            for j in node.jobs:
-                if j.cpu_count:
-                    user_cores[j.user] = user_cores.get(j.user, 0) + j.cpu_count
             users_txt = Text()
             for u, c in sorted(user_cores.items(), key=lambda x: -x[1]):
                 users_txt.append(f" {u}", style="bold magenta" if u == self.current_user else "magenta")
                 users_txt.append(f":{c}", style="bold")
             cparts = sorted((p for p in node.partition.split(",") if p),
                             key=lambda p: ("cpu" in p.lower(), p))
+            marker = "" if node.has_gpu else " ·cpu"
+            nname_cell = Text(node.name, style="bold cyan")
+            if marker:
+                nname_cell.append(marker, style="dim")
             self.cpu_tbl.add_row(
-                node_cell(node.name), state_cell(node.state),
+                nname_cell, state_cell(node.state),
                 Text(ellipsize(",".join(cparts), 14), style="cyan"),
                 cbar, load_cell, mem_cell(node), users_txt,
                 key=f"hdr_{node.name}",
             )
+
+        cpu_sum = Text()
+        cpu_sum.append(" CPU ", style="bold white on dark_green")
+        cpct_all = cluster_alloc / cluster_cores if cluster_cores else 0
+        cpu_sum.append(f" {cluster_alloc}/{cluster_cores} cores ", style="bold")
+        cpu_sum.append_text(make_bar(cpct_all, width=20))
+        cpu_sum.append(f" {cpct_all:.0%}\n", style=f"bold {pct_color(cpct_all)}")
+        cpu_sum.append(" TOP ", style="bold white on purple")
+        for u, c in sorted(all_user_cores.items(), key=lambda x: -x[1])[:10]:
+            cpu_sum.append(f" {u}", style="bold yellow underline" if u == self.current_user else "bold magenta")
+            cpu_sum.append(f":{c}", style="bold")
+        self.cpu_summary.update(cpu_sum)
 
         # ── Usage tab ──
         self.usage_view.update(render_usage())

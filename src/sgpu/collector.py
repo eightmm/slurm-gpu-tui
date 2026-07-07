@@ -524,7 +524,7 @@ def collect_all() -> dict:
             source = "ssh"
         result_nodes.append({
             "name": name, "state": n["state"], "partition": n.get("partition", ""),
-            "source": source,
+            "source": source, "has_gpu": n.get("has_gpu", True),
             "cpus": n["cpus"],
             "cpu_alloc": n.get("cpu_alloc", ""), "cpu_load": n["cpu_load"],
             "mem_total": n["mem_total"], "mem_free": n["mem_free"], "gres": n["gres"],

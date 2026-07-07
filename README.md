@@ -77,7 +77,7 @@ sgpu        # Launch the GPU monitor
 
 | Key | Action |
 |-----|--------|
-| `1` `2` `3` | Switch tabs: GPU / CPU / Usage |
+| `1` `2` `3` | Switch tabs: GPU / CPU / Usage — the CPU tab includes CPU-only nodes, with a cluster core summary and per-user core TOP |
 | `r` | Refresh now |
 | `s` | Cycle sort: Node → Utilization → User → Free |
 | `u` | Filter by user — pick from a list (me first); press again to clear |

@@ -166,6 +166,7 @@ class NodeInfo:
     state: str = ""
     partition: str = ""  # comma-joined partitions from sinfo
     source: str = ""     # data origin: agent / ssh / stale (collector only)
+    has_gpu: bool = True  # False for CPU-only nodes (shown on the CPU tab only)
     cpus: str = ""
     cpu_alloc: str = ""
     cpu_load: str = ""
@@ -285,8 +286,6 @@ def collect_nodes_basic() -> Tuple[List[dict], str]:
                 row["partition"] = f"{row['partition']},{partition}" if row["partition"] else partition
             continue
         gres = p[6].strip()
-        if "gpu" not in gres.lower():
-            continue
         cpus_aiot = p[7].strip()
         cpu_alloc = ""
         parts = cpus_aiot.split("/")
@@ -295,7 +294,8 @@ def collect_nodes_basic() -> Tuple[List[dict], str]:
         row = {
             "name": name, "state": p[1].strip(), "cpus": p[2].strip(),
             "cpu_load": p[3].strip(), "mem_total": p[4].strip(),
-            "mem_free": p[5].strip(), "gres": p[6].strip(),
+            "mem_free": p[5].strip(), "gres": gres,
+            "has_gpu": "gpu" in gres.lower(),
             "cpu_alloc": cpu_alloc, "partition": partition,
         }
         by_name[name] = row
