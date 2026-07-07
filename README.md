@@ -37,9 +37,14 @@ latest release, rebuilds the venv, restarts the collector, and running node
 agents are restarted automatically on the next collector cycle.
 
 Install dir defaults to `~/.sgpu/app` (as root: `/opt/sgpu`, since `/root` is
-not readable by other users). Override with `SGPU_INSTALL_DIR=...` — pick a
-shared-filesystem path if you want push-mode agents (compute nodes must be
-able to run the venv from it; otherwise SSH-pull mode is used automatically).
+not readable by other users). To override, put the variable on the `bash` side
+of the pipe — pick a shared-filesystem path if you want push-mode agents
+(compute nodes must be able to run the venv from it; otherwise SSH-pull mode
+is used automatically):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstrap.sh | SGPU_INSTALL_DIR=/shared/path/sgpu bash
+```
 
 The installer detects your environment and handles everything automatically:
 

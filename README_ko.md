@@ -37,8 +37,12 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstra
 다음 collector 사이클에 자동 교체됩니다.
 
 설치 위치 기본값 `~/.sgpu/app` (root면 `/opt/sgpu` — `/root`는 다른 유저가 못 읽음).
-`SGPU_INSTALL_DIR=...`로 변경 가능 — push 에이전트를 쓰려면 계산 노드에서 venv를
-실행할 수 있는 공유 파일시스템 경로로 (아니면 자동으로 SSH pull 모드로 동작).
+변경하려면 변수를 파이프의 `bash` 쪽에 붙일 것 — push 에이전트를 쓰려면 계산
+노드에서 venv를 실행할 수 있는 공유 파일시스템 경로로 (아니면 자동 SSH pull 모드):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstrap.sh | SGPU_INSTALL_DIR=/공유경로/sgpu bash
+```
 
 설치 스크립트가 환경을 자동으로 감지해서 전부 처리합니다:
 
