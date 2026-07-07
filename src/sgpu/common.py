@@ -172,6 +172,7 @@ class NodeInfo:
     cpu_load: str = ""
     mem_total: str = ""
     mem_free: str = ""
+    mem_alloc: str = ""  # slurm AllocMem (MB) — works without node access
     gres: str = ""
     gpus: List[GpuInfo] = field(default_factory=list)
     jobs: List[JobInfo] = field(default_factory=list)
@@ -460,18 +461,36 @@ def parse_node_payload(out: str) -> Tuple[List[GpuInfo], NodeMemInfo]:
     return gpus, mem_info
 
 
+def collect_mem_alloc() -> Tuple[Dict[str, str], str]:
+    """Slurm-allocated memory (MB) per node from scontrol — no SSH needed."""
+    ok, out = run_cmd("scontrol -o show node")
+    if not ok:
+        return {}, f"scontrol node failed: {out}"
+    res: Dict[str, str] = {}
+    for line in out.splitlines():
+        m = re.search(r"NodeName=(\S+)", line)
+        a = re.search(r"AllocMem=(\d+)", line)
+        if m and a:
+            res[m.group(1)] = a.group(1)
+    return res, ""
+
+
 def collect_basic() -> Tuple[List[dict], List[JobInfo], List[PendingJob], Dict[str, List[JobInfo]], Dict[str, Dict[str, str]], str]:
     """Phase 1: fast local commands only (sinfo + squeue + scontrol)."""
-    with ThreadPoolExecutor(max_workers=4) as ex:
+    with ThreadPoolExecutor(max_workers=5) as ex:
         f_nodes = ex.submit(collect_nodes_basic)
         f_jobs = ex.submit(collect_jobs)
         f_pending = ex.submit(collect_pending_jobs)
         f_alloc = ex.submit(collect_gpu_alloc)
+        f_mem = ex.submit(collect_mem_alloc)
         nodes_raw, e1 = f_nodes.result()
         jobs, e2 = f_jobs.result()
         pending, e3 = f_pending.result()
         gpu_alloc, e4 = f_alloc.result()
-    err = " | ".join(x for x in [e1, e2, e3, e4] if x)
+        mem_alloc, e5 = f_mem.result()
+    for n in nodes_raw:
+        n["mem_alloc"] = mem_alloc.get(n["name"], "")
+    err = " | ".join(x for x in [e1, e2, e3, e4, e5] if x)
     node_jobs: Dict[str, List[JobInfo]] = {}
     for j in jobs:
         node_jobs.setdefault(j.node, []).append(j)
@@ -507,7 +526,8 @@ def build_nodes(
         result.append(NodeInfo(
             name=name, state=n["state"], partition=n.get("partition", ""), cpus=n["cpus"],
             cpu_alloc=n.get("cpu_alloc", ""), cpu_load=n["cpu_load"],
-            mem_total=n["mem_total"], mem_free=n["mem_free"], gres=n["gres"],
+            mem_total=n["mem_total"], mem_free=n["mem_free"],
+            mem_alloc=n.get("mem_alloc", ""), gres=n["gres"],
             gpus=gpus, jobs=node_jobs.get(name, []), error=gerr,
             mem_used=mem.used, mem_avail=mem.avail,
             stale=(name in stale_nodes),

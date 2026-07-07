@@ -6,7 +6,7 @@ from sgpu.common import (
 from sgpu.common import GpuInfo, JobInfo, NodeInfo
 from sgpu.tui import (
     classify_gpu, collect_waste, fmt_idle_age, fmt_span, fmt_start_time,
-    parse_slurm_duration,
+    mem_cell, parse_slurm_duration,
 )
 
 
@@ -163,6 +163,15 @@ def test_collect_waste_gresless_job_linked():
     )]
     rows = collect_waste(nodes, 600)
     assert rows[0]["kind"] == "no-gres" and rows[0]["jobid"] == "77"
+
+
+def test_mem_cell_fallbacks():
+    # OS meminfo > sinfo FreeMem > slurm AllocMem (approx, '~') > nothing
+    assert "60%" in str(mem_cell(NodeInfo(mem_total="1000", mem_avail="400")))
+    assert "30%" in str(mem_cell(NodeInfo(mem_total="1000", mem_free="700")))
+    t3 = str(mem_cell(NodeInfo(mem_total="1000", mem_free="N/A", mem_alloc="250")))
+    assert "~" in t3 and "25%" in t3
+    assert str(mem_cell(NodeInfo(mem_total="1000", mem_free="N/A"))) == "-/1G"
 
 
 def test_fmt_start_time():

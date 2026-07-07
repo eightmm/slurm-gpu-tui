@@ -102,7 +102,8 @@ def read_daemon_data(max_age: float = _DAEMON_MAX_AGE) -> Optional[Tuple[List[No
             has_gpu=n.get("has_gpu", True),
             cpus=n.get("cpus", ""), cpu_alloc=n.get("cpu_alloc", ""),
             cpu_load=n.get("cpu_load", ""), mem_total=n.get("mem_total", ""),
-            mem_free=n.get("mem_free", ""), gres=n.get("gres", ""),
+            mem_free=n.get("mem_free", ""), mem_alloc=n.get("mem_alloc", ""),
+            gres=n.get("gres", ""),
             gpus=gpus, jobs=node_jobs, error=n.get("error", ""),
             mem_used=n.get("mem_used", ""), mem_avail=n.get("mem_avail", ""),
             stale=n.get("name", "") in stale_nodes,
@@ -237,23 +238,35 @@ def node_cell(name: str) -> Text:
 
 
 def mem_cell(node: NodeInfo) -> Text:
-    """Show memory: used = total - avail."""
+    """Memory bar. Sources, best first: OS meminfo from the node's agent/SSH
+    payload, sinfo FreeMem, then slurm AllocMem ('~' prefix — allocation, not
+    live usage — but always available, e.g. Ubuntu slurm without FreeMem)."""
     try:
         total_mb = float(node.mem_total)
-        if node.mem_avail:
-            used_mb = total_mb - float(node.mem_avail)
-        else:
-            used_mb = total_mb - float(node.mem_free)
-        # sinfo free_mem can exceed configured total; clamp to sane range
-        used_mb = min(max(used_mb, 0.0), total_mb)
-        pct = used_mb / total_mb if total_mb > 0 else 0
-        used_gb = used_mb / 1024
-        total_gb = total_mb / 1024
     except (ValueError, TypeError):
         return Text("?")
-    bar = make_bar(pct, width=6)
-    label = Text(f" {used_gb:.0f}/{total_gb:.0f}G {pct:.0%}", style=f"{pct_color(pct)}")
-    return bar + label
+    used_mb = None
+    approx = False
+    for src in (node.mem_avail, node.mem_free):
+        try:
+            used_mb = total_mb - float(src)
+            break
+        except (ValueError, TypeError):
+            continue
+    if used_mb is None:
+        try:
+            used_mb = float(node.mem_alloc)
+            approx = True
+        except (ValueError, TypeError):
+            return Text(f"-/{total_mb / 1024:.0f}G", style="bright_black")
+    # sinfo free_mem can exceed configured total; clamp to sane range
+    used_mb = min(max(used_mb, 0.0), total_mb)
+    pct = used_mb / total_mb if total_mb > 0 else 0
+    cell = make_bar(pct, width=6)
+    prefix = "~" if approx else ""
+    cell.append(f" {prefix}{used_mb / 1024:.0f}/{total_mb / 1024:.0f}G {pct:.0%}",
+                style=f"{pct_color(pct)}")
+    return cell
 
 
 def parse_slurm_duration(s: str) -> int:
