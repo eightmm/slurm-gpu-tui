@@ -10,11 +10,17 @@ A real-time TUI tool for monitoring GPU usage across your SLURM cluster, right f
 
 <p align="center"><img src="docs/tab-gpu.svg" alt="sgpu GPU tab" width="100%"></p>
 
-| Wasted-GPU popup (`w`) | CPU tab (`2`) |
-|---|---|
-| <img src="docs/waste.svg" alt="waste popup"> | <img src="docs/tab-cpu.svg" alt="CPU tab"> |
-| **Detail columns (`d`)** | **GPU-hours by user (`3`)** |
-| <img src="docs/tab-gpu-details.svg" alt="details"> | <img src="docs/tab-usage.svg" alt="usage tab"> |
+**Wasted-GPU popup (`w`)** — idle / parked / rogue, worst first
+<p><img src="docs/waste.svg" alt="waste popup" width="100%"></p>
+
+**CPU tab (`2`)** — every node incl. CPU-only, core allocation, per-user cores
+<p><img src="docs/tab-cpu.svg" alt="CPU tab" width="100%"></p>
+
+**Detail columns (`d`)** — temperature, power, JobID, job name
+<p><img src="docs/tab-gpu-details.svg" alt="details" width="100%"></p>
+
+**GPU-hours by user (`3`)** — allocation vs actual compute, efficiency %
+<p><img src="docs/tab-usage.svg" alt="usage tab" width="100%"></p>
 
 
 ## What You Get

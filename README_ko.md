@@ -10,11 +10,17 @@
 
 <p align="center"><img src="docs/tab-gpu.svg" alt="sgpu GPU tab" width="100%"></p>
 
-| Wasted-GPU popup (`w`) | CPU tab (`2`) |
-|---|---|
-| <img src="docs/waste.svg" alt="waste popup"> | <img src="docs/tab-cpu.svg" alt="CPU tab"> |
-| **Detail columns (`d`)** | **GPU-hours by user (`3`)** |
-| <img src="docs/tab-gpu-details.svg" alt="details"> | <img src="docs/tab-usage.svg" alt="usage tab"> |
+**낭비 GPU 팝업 (`w`)** — idle / parked / rogue, 심한 순
+<p><img src="docs/waste.svg" alt="waste popup" width="100%"></p>
+
+**CPU 탭 (`2`)** — CPU 전용 노드 포함, 코어 할당, 유저별 코어
+<p><img src="docs/tab-cpu.svg" alt="CPU tab" width="100%"></p>
+
+**상세 열 (`d`)** — 온도, 전력, JobID, 잡 이름
+<p><img src="docs/tab-gpu-details.svg" alt="details" width="100%"></p>
+
+**유저별 GPU-hours (`3`)** — 할당 vs 실제 연산, 효율 %
+<p><img src="docs/tab-usage.svg" alt="usage tab" width="100%"></p>
 
 
 ## 한눈에 보이는 것들
