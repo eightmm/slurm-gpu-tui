@@ -323,9 +323,13 @@ def collect_waste(nodes: List[NodeInfo], min_sec: int) -> List[dict]:
         for g in n.gpus:
             real_users = [u for u in g.users if u not in _ROGUE_IGNORE]
             if real_users and not g.alloc_jobid:
+                # Link to the culprit job when it's a gres-less SLURM job
+                jid = next((j.jobid for j in n.jobs
+                            if j.user in real_users and j.gpu_count == 0), "")
                 rows.append({
-                    "node": n.name, "gpu": g.index, "kind": "rogue",
-                    "sec": 0, "user": ",".join(real_users), "jobid": "",
+                    "node": n.name, "gpu": g.index,
+                    "kind": "no-gres" if jid else "rogue",
+                    "sec": 0, "user": ",".join(real_users), "jobid": jid,
                 })
             elif g.idle_sec >= min_sec:
                 rows.append({
@@ -340,8 +344,8 @@ def collect_waste(nodes: List[NodeInfo], min_sec: int) -> List[dict]:
                     "user": g.alloc_user or ",".join(g.users),
                     "jobid": g.alloc_jobid,
                 })
-    # rogue first (GPU use outside SLURM), then worst waste
-    rows.sort(key=lambda r: (r["kind"] != "rogue", -r["sec"]))
+    # unauthorized GPU use first (rogue / gres-less job), then worst waste
+    rows.sort(key=lambda r: (r["kind"] not in ("rogue", "no-gres"), -r["sec"]))
     return rows
 
 
@@ -475,9 +479,9 @@ class WasteScreen(ModalScreen):
             body.append("No wasted GPUs over threshold. Nice cluster.", style="green")
         for r in self._rows:
             body.append(f" {r['node']}/{r['gpu']:<3}", style="bold cyan")
-            style = {"idle": "yellow", "parked": "blue", "rogue": "red"}.get(r["kind"], "white")
+            style = {"idle": "yellow", "parked": "blue", "rogue": "red", "no-gres": "red"}.get(r["kind"], "white")
             body.append(f" {r['kind']:<7}", style=f"bold {style}")
-            span = "-" if r["kind"] == "rogue" else (fmt_span(r["sec"]) or "<1m")
+            span = "-" if r["kind"] in ("rogue", "no-gres") else (fmt_span(r["sec"]) or "<1m")
             body.append(f" {span:>7} ", style="bold")
             body.append(f" {r['user']:<12}", style="magenta")
             if r["jobid"]:
@@ -1172,8 +1176,12 @@ class SlurmGpuTui(App):
                         row_cells.append(temp_cell(gpu.temp))
                         row_cells.append(power_cell(gpu.power, gpu.power_cap))
                     if user and classes[gpu_i] == "rogue":
+                        # A same-user job on this node with no gres means the
+                        # job simply skipped --gres; otherwise it's a raw
+                        # process outside SLURM entirely
+                        tag = "!gres" if (matched_job and matched_job.gpu_count == 0) else "!slurm"
                         user_cell = Text(user, style="bold red")
-                        user_cell.append(" !slurm", style="bold red reverse")
+                        user_cell.append(f" {tag}", style="bold red reverse")
                         row_cells.append(user_cell)
                     elif user and reserved_idle:
                         user_cell = Text(f"{user} ", style="magenta")
@@ -1409,9 +1417,14 @@ def _snapshot_nodes() -> List[NodeInfo]:
             )})
             for g in n.get("gpus", [])
         ]
+        node_jobs = [
+            JobInfo(jobid=j.get("jobid", ""), user=j.get("user", ""),
+                    gpu_count=j.get("gpu_count", 0))
+            for j in n.get("jobs", [])
+        ]
         nodes.append(NodeInfo(
             name=n.get("name", ""), state=n.get("state", ""),
-            partition=n.get("partition", ""), gpus=gpus,
+            partition=n.get("partition", ""), gpus=gpus, jobs=node_jobs,
         ))
     return nodes
 
@@ -1423,7 +1436,7 @@ def _cli_waste() -> int:
         return 0
     for r in rows:
         job = f"  job {r['jobid']}" if r["jobid"] else ""
-        span = "-" if r["kind"] == "rogue" else (fmt_span(r["sec"]) or "<1m")
+        span = "-" if r["kind"] in ("rogue", "no-gres") else (fmt_span(r["sec"]) or "<1m")
         print(f"{r['node']}/{r['gpu']}  {r['kind']:<7} {span:>7}  {r['user']}{job}")
     return 1  # non-zero so cron/scripts can alert on it
 

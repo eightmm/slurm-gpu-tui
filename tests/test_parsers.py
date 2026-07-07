@@ -3,7 +3,7 @@ from sgpu.common import (
     NodeErrorKind, _classify_error, _expand_idx, expand_nodelist,
     parse_gpu_alloc, parse_gres_models, parse_node_payload, shorten_gpu_name,
 )
-from sgpu.common import GpuInfo, NodeInfo
+from sgpu.common import GpuInfo, JobInfo, NodeInfo
 from sgpu.tui import (
     classify_gpu, collect_waste, fmt_idle_age, fmt_span, fmt_start_time,
     parse_slurm_duration,
@@ -152,6 +152,17 @@ def test_collect_waste_rogue_first():
     ])]
     rows = collect_waste(nodes, 600)
     assert rows[0]["kind"] == "rogue" and rows[0]["user"] == "intruder"
+
+
+def test_collect_waste_gresless_job_linked():
+    # Same-user SLURM job without gres on the node -> flagged as no-gres + jobid
+    nodes = [NodeInfo(
+        name="n1",
+        gpus=[GpuInfo(index="0", users=["c"], util="95")],
+        jobs=[JobInfo(jobid="77", user="c", gpu_count=0)],
+    )]
+    rows = collect_waste(nodes, 600)
+    assert rows[0]["kind"] == "no-gres" and rows[0]["jobid"] == "77"
 
 
 def test_fmt_start_time():

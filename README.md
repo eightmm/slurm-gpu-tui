@@ -117,7 +117,7 @@ sgpu --wait-free 2 --partition heavy   # block until 2 GPUs are free, then exit 
 ```
 
 - **Node header row** (dark green): node name, state, partition, CPU alloc/total, RAM bar, plus a per-GPU glyph strip (`█` busy · `▅` parked · `▂` reserved-idle · `▁` free · `!` rogue) with busy/free/waste counts — collapse nodes (`Space`) for a one-line-per-node cluster overview
-- **`user !slurm` marker (red)**: GPU process running **outside any SLURM allocation** — someone bypassed the scheduler. Also flagged in the `w` popup, `--waste`, and a red ROGUE chip in the summary bar. System daemons are ignored (`SLURM_GPU_TUI_ROGUE_IGNORE`, default `root,gdm,xdm`)
+- **`user !gres` / `user !slurm` markers (red)**: GPU process with **no SLURM allocation for that GPU**. `!gres` = the user has a job on the node that skipped `--gres` (jobid linked in the `w` popup); `!slurm` = raw process outside SLURM entirely. Both raise the red ROGUE chip and top the `--waste` list. System daemons are ignored (`SLURM_GPU_TUI_ROGUE_IGNORE`, default `root,gdm,xdm`)
 - **FREE chip** (summary bar): total free GPUs and which nodes have them
 - **`parked` badge**: VRAM held at ~0% utilization (memory hog, no compute)
 - **GPU rows**: indented — utilization bar, VRAM, temperature, power, user, job, time remaining
