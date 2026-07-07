@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from rich.syntax import Syntax
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
@@ -18,7 +19,9 @@ from textual.containers import Vertical, VerticalScroll
 from textual.coordinate import Coordinate
 from textual.screen import ModalScreen
 from textual.timer import Timer
-from textual.widgets import DataTable, Footer, Header, Input, OptionList, Static
+from textual.widgets import (
+    DataTable, Footer, Header, Input, OptionList, Static, TabbedContent, TabPane,
+)
 from textual.widgets.option_list import Option
 
 from .common import (
@@ -389,20 +392,23 @@ def remaining_cell(elapsed: str, time_limit: str) -> Text:
 # ── Modal screens ─────────────────────────────────────────────────────────
 
 class DetailScreen(ModalScreen):
-    """Scrollable modal showing scontrol output for a job or node."""
+    """Modal for a job or node: scontrol info, plus a Script tab for jobs."""
 
     BINDINGS = [
         ("escape", "close", "Close"),
         ("q", "close", "Close"),
         ("enter", "close", "Close"),
+        ("tab", "switch_tab", "Info/Script"),
     ]
     CSS = """
     DetailScreen { align: center middle; }
     #detail-box {
-        width: 90%; max-height: 85%;
+        width: 90%; height: 85%;
         border: round $primary; background: $surface; padding: 1 2;
     }
-    #detail-title { text-style: bold; color: $accent; }
+    #detail-title { text-style: bold; color: $accent; height: 1; }
+    DetailScreen TabbedContent { height: 1fr; }
+    DetailScreen VerticalScroll { height: 1fr; }
     """
 
     def on_key(self, event) -> None:
@@ -410,16 +416,36 @@ class DetailScreen(ModalScreen):
             event.stop()
             self.action_close()
 
-    def __init__(self, title: str, body: str) -> None:
+    def __init__(self, title: str, body: str, script: str = "", script_src: str = "") -> None:
         super().__init__()
         self._title = title
         self._body = body
+        self._script = script
+        self._script_src = script_src
 
     def compose(self) -> ComposeResult:
-        with VerticalScroll(id="detail-box"):
+        with Vertical(id="detail-box"):
             yield Static(self._title, id="detail-title")
             # Text() so shell scripts with [brackets] aren't parsed as markup
-            yield Static(Text(self._body))
+            if self._script:
+                with TabbedContent(initial="tab-info"):
+                    with TabPane("Job Info", id="tab-info"):
+                        with VerticalScroll():
+                            yield Static(Text(self._body))
+                    with TabPane(f"Script ({self._script_src})", id="tab-script"):
+                        with VerticalScroll():
+                            yield Static(Syntax(self._script, "bash",
+                                                line_numbers=True, word_wrap=True))
+            else:
+                with VerticalScroll():
+                    yield Static(Text(self._body))
+
+    def action_switch_tab(self) -> None:
+        try:
+            tc = self.query_one(TabbedContent)
+        except Exception:
+            return
+        tc.active = "tab-script" if tc.active == "tab-info" else "tab-info"
 
     def action_close(self) -> None:
         self.app.pop_screen()
@@ -901,8 +927,11 @@ class SlurmGpuTui(App):
                         src = m.group(1)
                     except OSError:
                         out += "\n\n(batch script not readable: not your job and file permissions deny it)"
-            if script:
-                out += f"\n\n─── batch script ({src}) " + "─" * 30 + "\n" + script
+            self.call_from_thread(
+                self.push_screen,
+                DetailScreen(f"{kind} {name}", out, script=script, script_src=src),
+            )
+            return
         self.call_from_thread(self.push_screen, DetailScreen(f"{kind} {name}", out))
 
     def action_cursor_down(self) -> None:
