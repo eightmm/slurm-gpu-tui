@@ -65,10 +65,40 @@ EOF
 chmod +x "$INSTALL_DIR/bin/sgpu" "$INSTALL_DIR/bin/sgpu-collector"
 
 # ── Step 3: Collector daemon ───────────────────────────────────────────────
+
+# Batch-script sharing: with a root collector, every user can read every
+# job's submit script in the TUI (Enter popup). Asked interactively; set
+# SGPU_SHARE_SCRIPTS=1/0 to skip the question. Headless runs default to no.
+SHARE="${SGPU_SHARE_SCRIPTS:-}"
+if [ -z "$SHARE" ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    printf "Share all jobs' batch scripts with every user in the TUI? (needs root collector) [Y/n] " > /dev/tty
+    read -r ans < /dev/tty || ans=""
+    case "$ans" in n|N|no) SHARE="" ;; *) SHARE=1 ;; esac
+fi
+
+if [ -n "$SHARE" ] && [ "$SHARE" != "0" ]; then
+    if $HAS_SUDO; then
+        # Narrow sudoers grant: the collector user may run exactly
+        # 'scontrol write batch_script' as root — nothing else. This keeps
+        # the collector (and its push agents / state paths) non-root.
+        SCONTROL_BIN="$(command -v scontrol || echo /usr/bin/scontrol)"
+        echo "$(id -un) ALL=(root) NOPASSWD: $SCONTROL_BIN write batch_script *" \
+            | $SUDO tee /etc/sudoers.d/sgpu >/dev/null
+        $SUDO chmod 440 /etc/sudoers.d/sgpu
+        echo "[3a] Script sharing enabled (sudoers.d/sgpu)"
+    else
+        echo "NOTE: script sharing needs sudo to provision — skipping."
+        SHARE=""
+    fi
+fi
+
 SERVICE_FILE="$INSTALL_DIR/sgpu-collector.service"
 GENERATED_SERVICE="$(mktemp)"
 sed -e "s|ExecStart=.*|ExecStart=$VENV_DIR/bin/sgpu-collector|" \
     -e "s|User=.*|User=$(id -un)|" "$SERVICE_FILE" > "$GENERATED_SERVICE"
+if [ -n "$SHARE" ] && [ "$SHARE" != "0" ]; then
+    sed -i "/^User=/a Environment=SLURM_GPU_TUI_SHARE_SCRIPTS=1" "$GENERATED_SERVICE"
+fi
 
 SYSTEMD_MODE="none"
 

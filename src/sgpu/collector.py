@@ -202,7 +202,11 @@ def _fetch_scripts(jobs: List[JobInfo]) -> Dict[str, str]:
     for j in jobs:
         if j.jobid in _script_cache:
             continue
-        ok, out = run_cmd(f"scontrol write batch_script {j.jobid} -")
+        cmd = f"scontrol write batch_script {j.jobid} -"
+        if os.geteuid() != 0:
+            # install.sh provisions a sudoers rule for exactly this command
+            cmd = "sudo -n " + cmd
+        ok, out = run_cmd(cmd)
         out = out.strip()
         good = ok and out and not out.startswith("job script retrieval failed")
         _script_cache[j.jobid] = out[:SCRIPT_MAX_BYTES] if good else ""
