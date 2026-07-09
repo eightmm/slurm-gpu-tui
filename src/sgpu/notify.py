@@ -5,6 +5,7 @@ Config: ~/.sgpu/webhook.json (or SLURM_GPU_TUI_WEBHOOK_URL for URL only)
   "url": "https://hooks.slack.com/services/...",   # Slack-compatible {"text": ...}
   "sender_name": "AI-master",     # identity in the alert footer/username
   "node_health": true,            # node down/recovered alerts
+  "down_grace_sec": 180,          # down must persist this long before alerting
   "waste_alert_hours": 2,         # GPU idle/parked >= N hours (0 = off)
   "rogue_alert": true,            # GPU used outside SLURM
   "job_done_users": ["alice"],    # notify when these users' jobs finish
@@ -68,10 +69,14 @@ class Notifier:
             st = json.loads(self._state_file.read_text())
         except (OSError, ValueError):
             pass
-        self._down: Dict[str, bool] = st.get("down", {})
+        self._down: Dict[str, float] = st.get("down", {})
         self._jobs: Dict[str, dict] = st.get("jobs", {})
         self._last_sent: Dict[str, float] = st.get("last_sent", {})
         self._free_was_below = bool(st.get("free_was_below", True))
+        # first-seen ts of an unconfirmed down; deliberately NOT persisted so
+        # a collector restart re-starts the grace clock (cold start looks
+        # exactly like an outage for the first cycles)
+        self._pending_down: Dict[str, float] = {}
 
     def _load_config(self) -> None:
         cfg: dict = {}
@@ -86,6 +91,7 @@ class Notifier:
         self.free_gpus_min: int = int(cfg.get("free_gpus_min", 0))
         self.waste_alert_hours: float = float(cfg.get("waste_alert_hours", 0))
         self.rogue_alert: bool = bool(cfg.get("rogue_alert", False))
+        self.down_grace_sec: float = float(cfg.get("down_grace_sec", 180))
         # sender is the single identity in alerts — the real hostname is NOT
         # included ("master" here is also a compute node name; confusing)
         self.sender: str = cfg.get("sender_name", "AI-master")
@@ -119,26 +125,34 @@ class Notifier:
                 name = n["name"]
                 down = bool(n.get("stale")) or bool(n.get("error")) \
                     or any(s in n.get("state", "") for s in ("down", "drain", "fail"))
-                # _down: 0/absent = up, else timestamp it went down
-                # (older state files stored bools; coerce)
+                # _down: 0/absent = up, else ts of the CONFIRMED (alerted)
+                # outage start (older state files stored bools; coerce)
                 was = self._down.get(name, 0)
-                down_since = float(was) if not isinstance(was, bool) else (now if was else 0)
-                if down and not down_since and self._ok_to_send(f"down:{name}", now):
-                    why = n.get("error") or n.get("state", "unreachable")
-                    njobs = n.get("jobs", [])
-                    users: Dict[str, int] = {}
-                    for j in njobs:
-                        users[j.get("user", "?")] = users.get(j.get("user", "?"), 0) + 1
-                    detail = (f"partition {n.get('partition', '?')} · "
-                              f"{len(n.get('gpus', []))} GPUs · "
-                              f"{len(njobs)} running job(s)")
-                    if users:
-                        detail += " — " + ", ".join(f"{u}×{c}" for u, c in sorted(users.items()))
-                    self._post(f":rotating_light: *node {name} down* — {why[:120]}\n{detail}")
-                elif down_since and not down:
-                    self._post(f":white_check_mark: *node {name} recovered* "
-                               f"after {_fmt_dur(now - down_since)}")
-                self._down[name] = (down_since or now) if down else 0
+                confirmed = float(was) if not isinstance(was, bool) else (now if was else 0)
+                if down:
+                    first = self._pending_down.setdefault(name, now)
+                    # grace: cold starts and transient SSH/agent staleness
+                    # look identical to an outage for a few cycles
+                    if not confirmed and now - first >= self.down_grace_sec \
+                            and self._ok_to_send(f"down:{name}", now):
+                        why = n.get("error") or n.get("state", "unreachable")
+                        njobs = n.get("jobs", [])
+                        users: Dict[str, int] = {}
+                        for j in njobs:
+                            users[j.get("user", "?")] = users.get(j.get("user", "?"), 0) + 1
+                        detail = (f"partition {n.get('partition', '?')} · "
+                                  f"{len(n.get('gpus', []))} GPUs · "
+                                  f"{len(njobs)} running job(s)")
+                        if users:
+                            detail += " — " + ", ".join(f"{u}×{c}" for u, c in sorted(users.items()))
+                        self._post(f":rotating_light: *node {name} down* — {why[:120]}\n{detail}")
+                        self._down[name] = first
+                else:
+                    self._pending_down.pop(name, None)
+                    if confirmed:
+                        self._post(f":white_check_mark: *node {name} recovered* "
+                                   f"after {_fmt_dur(now - confirmed)}")
+                    self._down[name] = 0
 
         if self.job_done_users:
             current = {j["jobid"]: j for j in data.get("jobs", [])

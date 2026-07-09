@@ -132,6 +132,7 @@ if [ -n "$WEBHOOK_URL" ]; then
   "url": "$WEBHOOK_URL",
   "sender_name": "$SENDER",
   "node_health": true,
+  "down_grace_sec": 180,
   "waste_alert_hours": 2,
   "rogue_alert": true,
   "job_done_users": [],
