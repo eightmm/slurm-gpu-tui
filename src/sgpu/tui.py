@@ -2065,8 +2065,10 @@ def _cli_doctor() -> int:
     else:
         report(None, "usage history", "not started yet (collector writes it)")
 
-    # slurmdbd backfill (alloc GPU-hours survive collector downtime)
-    ok, out = run_cmd("sacct -a -X --noheader -S now-1hour --format=JobID", timeout=10)
+    # slurmdbd backfill (alloc GPU-hours survive collector downtime).
+    # Absolute -S time: Slurm < 20.11 rejects relative forms like "now-1hour".
+    since = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    ok, out = run_cmd(f"sacct -a -X --noheader -S {since} --format=JobID", timeout=10)
     if not ok:
         report(None, "sacct backfill", "sacct unavailable — alloc is sampling-only "
                + (out.splitlines()[0][:50] if out else ""))
@@ -2096,8 +2098,11 @@ def _cli_doctor() -> int:
     try:
         nf = Notifier(state_dir)
         if nf.enabled:
-            report(True, "webhook", f"configured (node_health={nf.node_health}, "
-                   f"job_done_users={len(nf.job_done_users)}, free_gpus_min={nf.free_gpus_min})")
+            mode = f"bot→{nf.channel} daily-thread" if nf._bot_mode else "incoming-webhook"
+            on = [k for k, v in (("node", nf.node_health), ("collect", nf.collect_alert),
+                                 ("waste", nf.waste_alert_hours > 0), ("rogue", nf.rogue_alert),
+                                 ("ecc", nf.ecc_alert), ("temp", nf.temp_alert_c > 0)) if v]
+            report(True, "webhook", f"{mode}, lang={nf.lang}, alerts: {'+'.join(on) or 'none'}")
         else:
             report(None, "webhook", "not configured (optional) — ~/.sgpu/webhook.json")
     except Exception as e:

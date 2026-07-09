@@ -27,11 +27,18 @@ A real-time TUI tool for monitoring GPU usage across your SLURM cluster, right f
 
 - Per-node GPU status (utilization, VRAM, temperature, power)
 - CPU allocation & memory usage per node
-- Who's using which GPU (matched to SLURM jobs)
-- Pending job queue with reason codes
-- Per-user GPU allocation summary
+- Who's using which GPU (matched to SLURM jobs, correct even when the driver's
+  probe order differs from `/dev/nvidiaN`)
+- Pending job queue with reason codes and estimated start times
+- Per-user GPU-hours, efficiency, and wasted (idle/parked) hours, with a
+  per-day cluster trend — backfilled from slurmdbd so figures survive
+  collector downtime
+- Job history and monthly reports (outcomes, GPU-hours, queue waits) — `--jobs`, `--report`
+- Cancel your own jobs from the TUI (`x`)
 - Collapsible nodes, idle-only filter, real-time search
 - Collector daemon for instant startup — no SSH wait on launch
+- Slack alerts: node down/recovered, GPU health (temp/ECC), wasted/rogue GPUs,
+  and lost collection — grouped into a daily thread, in English or Korean
 
 ---
 
@@ -119,7 +126,7 @@ While the TUI is open it also pops toast notifications: your jobs starting/finis
 sgpu --once          # plain-text snapshot (for quick checks / logs)
 sgpu --json          # JSON snapshot (for scripts: sgpu --json | jq ...)
 sgpu --waste [-v]    # idle/parked/rogue GPUs; exit 1 if any — -v adds Command/WorkDir
-sgpu doctor          # self-diagnosis: data freshness, agents, slurm, script sharing
+sgpu doctor          # self-diagnosis: data freshness, agents, slurm, sacct, webhook, sharing
 sgpu --usage [days]  # per-user GPU-hours + efficiency + waste (default 7 days)
 sgpu --usage 7 --daily                 # adds per-day cluster GPU-hours trend bars
 sgpu --jobs [days] [--user U]          # job history: outcomes, GPU-hours sunk, queue waits
@@ -149,6 +156,56 @@ chkgpu               # classic one-shot user x node GPU/CPU matrix with per-node
 - **State symbols**: `●` idle · `◐` mixed · `○` alloc · `✖` drain
 - **`user idle 3.2h` marker**: GPU allocated to that user's job but no process running on it, with how long it has sat idle (bold yellow after 1h — reclaim candidates)
 - **Stale nodes**: specific error label (e.g., `~timeout`, `~unreachable`, `~smi_err`)
+
+---
+
+## Slack Alerts
+
+The collector can push cluster alerts to Slack. Config lives in
+`~/.sgpu/webhook.json` (root's `/root/.sgpu/webhook.json` for a system
+service) and is **hot-reloaded** — edit and save, no restart needed. The
+installer offers to set it up; `sgpu doctor` shows the active mode.
+
+**Setup.** Two delivery modes:
+
+- **Incoming webhook** (simplest): create a Slack incoming webhook, paste the
+  `https://hooks.slack.com/services/...` URL when the installer asks. Alerts
+  post as individual messages.
+- **Bot mode** (recommended): create a Slack app with the `chat:write` scope,
+  install it, invite it to the channel (`/invite @your-bot`), and give the
+  installer the bot token (`xoxb-...`) and channel. Alerts then post as
+  replies under **one parent message per day** (`📅 GPU cluster alerts — date`),
+  keeping the channel tidy. Incoming webhooks cannot thread.
+
+Non-interactive: `SGPU_WEBHOOK_URL`, `SGPU_WEBHOOK_SENDER`, `SGPU_WEBHOOK_LANG`,
+`SGPU_SLACK_BOT_TOKEN`, `SGPU_SLACK_CHANNEL` skip the matching prompts.
+
+**Config keys** (`~/.sgpu/webhook.json`):
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `url` | — | Slack incoming-webhook URL |
+| `bot_token` / `channel` | — | Bot token + channel → daily-thread grouping |
+| `sender_name` | `AI-master` | Identity shown in every alert (set per cluster to tell them apart) |
+| `lang` | `en` | Alert language: `en` or `ko` |
+| `node_health` | `true` | Node down/recovered, judged by **SLURM state** (not sgpu's own SSH/collection errors) |
+| `down_grace_sec` | `180` | Down must persist this long before alerting (rides out cold starts / blips) |
+| `collect_alert` | `true` | A GPU node that was reporting goes blind (dead agent / hung node) while SLURM still shows it up |
+| `collect_grace_sec` | `600` | Blind must persist this long (longer than the agent auto-repair cycle) |
+| `waste_alert_hours` | `2` | GPU idle/parked ≥ N hours (`0` = off) |
+| `rogue_alert` | `true` | GPU used outside SLURM |
+| `temp_alert_c` | `0` | GPU temperature ≥ N °C (`0` = off; ~90 typical) |
+| `ecc_alert` | `true` | Uncorrectable ECC errors — silent hardware failure; alert carries UUID / PCI bus / serial for RMA |
+| `job_done_users` | `[]` | Notify when these users' jobs finish |
+| `free_gpus_min` | `0` | Notify when free-GPU count reaches N (`0` = off) |
+
+Repeated conditions are debounced (30 min for events, 6 h for standing
+conditions like waste/temp/ECC). Node-health and collection alerts are for
+**GPU nodes and SLURM state only** — SSH-pull clusters routinely can't reach
+CPU/GPU-less nodes, and those collection failures never raise a false "down".
+
+The TUI shows the same job/node transitions as toasts while it's open, so you
+don't need Slack for at-the-terminal awareness.
 
 ---
 
@@ -347,8 +404,10 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstra
 | `SLURM_GPU_TUI_AUTO_COLLAPSE_NODES` | `12` | Start with nodes collapsed when the cluster has at least this many GPU nodes |
 | `SLURM_GPU_TUI_USAGE_KEEP_DAYS` | `30` | GPU-hour history retention |
 | `SLURM_GPU_TUI_SACCT_SEC` | `3600` | slurmdbd (sacct) alloc backfill interval; `0` disables. Optional — without accounting it auto-disables after 3 failed tries and alloc stays sampling-based |
-| `SLURM_GPU_TUI_WEBHOOK_URL` | (unset) | Slack-compatible webhook for collector alerts (node down/recovered). The installer asks for a URL and writes `~/.sgpu/webhook.json` (hot-reloaded; `SGPU_WEBHOOK_URL` skips the question). Optional `bot_token`+`channel` group each day's alerts under one Slack thread (needs a bot with `chat:write`; incoming webhooks can't thread). `lang` (`en`/`ko`) sets the alert language. `temp_alert_c` (GPU temp threshold, 0=off) and `ecc_alert` catch failing hardware. `collect_alert` warns when a GPU node reporting fine goes blind (agent died / node hung while SLURM still shows it up). Full config with `sender_name` / `job_done_users` / `free_gpus_min`: see `src/sgpu/notify.py` docstring |
-| `SLURM_GPU_TUI_WEBHOOK_DEBOUNCE_SEC` | `1800` | Min interval between repeated webhook alerts for the same key |
+| `SLURM_GPU_TUI_WEBHOOK_URL` | (unset) | Slack webhook URL (URL-only shortcut). Full alert config lives in `~/.sgpu/webhook.json` — see the [Slack Alerts](#slack-alerts) section |
+| `SLURM_GPU_TUI_SLACK_BOT_TOKEN` | (unset) | Slack bot token for daily-thread mode (alternative to putting it in `webhook.json`) |
+| `SLURM_GPU_TUI_WEBHOOK_DEBOUNCE_SEC` | `1800` | Min interval between repeated alerts for the same event key |
+| `SLURM_GPU_TUI_WEBHOOK_NAG_SEC` | `21600` | Re-alert interval for standing conditions (waste / rogue / temp / ECC) |
 | `SLURM_GPU_TUI_ROGUE_IGNORE` | `root,gdm,xdm` | Users never flagged as rogue |
 | `SLURM_GPU_TUI_SHARE_SCRIPTS` | (unset) | Collector publishes every job's batch script so all users see them in the Enter popup. **Shares script contents (and any secrets in them) with everyone** — the installer asks about this (`[Y/n]`); `SGPU_SHARE_SCRIPTS=0/1` skips the question |
 
