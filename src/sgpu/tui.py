@@ -594,15 +594,18 @@ def render_usage(days: int = 7) -> Text:
         body.append(f"\n {'day':<7}{'alloc':>7}{'busy':>7}  cluster GPU-hours/day\n",
                     style="bold underline")
         width = 30
-        peak = max(a for _, a, _ in daily) or 1.0
-        for day, alloc, busy in daily:
+        peak = max(a for _, a, _, _ in daily) or 1.0
+        for day, alloc, busy, covered in daily:
             cells = round(alloc / peak * width)
             busy_cells = min(cells, round(busy / peak * width))
+            busy_txt = f"{busy / 3600:>6.0f}h" if covered >= 60 or busy > 0 else f"{'-':>7}"
             body.append(f" {day[5:]:<7}", style="cyan")
-            body.append(f"{alloc / 3600:>6.0f}h{busy / 3600:>6.0f}h  ", style="bold")
+            body.append(f"{alloc / 3600:>6.0f}h{busy_txt}  ", style="bold")
             body.append("█" * busy_cells, style="green")
             body.append("█" * (cells - busy_cells), style="bright_black")
             body.append("\n")
+        if any(c < 60 and b <= 0 for _, _, b, c in daily):
+            body.append("   - = collector wasn't sampling that day (busy unknown)\n", style="dim")
     body.append("\nalloc = GPU held by your jobs · busy = GPU actually computing"
                 f" · waste = idle/parked ≥{_waste_thr()}", style="dim")
     if sacct_ts:
@@ -623,16 +626,19 @@ def _read_usage_raw() -> Optional[dict]:
     return None
 
 
-def load_usage_daily(days: int) -> List[Tuple[str, float, float]]:
-    """Cluster-wide per-day totals [(day, alloc_sec, busy_sec)], oldest first.
-    Same max(sampled, sacct) alloc merge as load_usage_totals."""
+def load_usage_daily(days: int) -> List[Tuple[str, float, float, float]]:
+    """Cluster-wide per-day totals [(day, alloc_sec, busy_sec, covered_sec)],
+    oldest first. Same max(sampled, sacct) alloc merge as load_usage_totals.
+    covered_sec ~ 0 means the collector never sampled that day: busy is
+    unknown there, not zero."""
     raw = _read_usage_raw()
     if raw is None:
         return []
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     sampled = raw.get("days", {})
     sacct = raw.get("sacct_days", {}) if isinstance(raw.get("sacct_days"), dict) else {}
-    out: List[Tuple[str, float, float]] = []
+    meta = raw.get("meta", {})
+    out: List[Tuple[str, float, float, float]] = []
     for day in sorted(set(sampled) | set(sacct)):
         if day < cutoff:
             continue
@@ -643,7 +649,7 @@ def load_usage_daily(days: int) -> List[Tuple[str, float, float]]:
             su = s_users.get(user, {})
             alloc += max(su.get("alloc", 0), a_users.get(user, 0.0))
             busy += su.get("busy", 0)
-        out.append((day, alloc, busy))
+        out.append((day, alloc, busy, float(meta.get(day, 0))))
     return out
 
 
@@ -1833,13 +1839,16 @@ def _cli_usage(days: int, daily: bool = False) -> int:
         rows = load_usage_daily(days)
         if rows:
             width = 30
-            peak = max(a for _, a, _ in rows) or 1.0
+            peak = max(a for _, a, _, _ in rows) or 1.0
             print(f"\n{'day':<12}{'alloc':>7}{'busy':>7}  cluster GPU-hours/day")
-            for day, alloc, busy in rows:
+            for day, alloc, busy, covered in rows:
                 cells = round(alloc / peak * width)
                 busy_cells = min(cells, round(busy / peak * width))
                 bar = "█" * busy_cells + "░" * (cells - busy_cells)
-                print(f"{day:<12}{alloc / 3600:>6.0f}h{busy / 3600:>6.0f}h  {bar}")
+                busy_txt = f"{busy / 3600:>6.0f}h" if covered >= 60 or busy > 0 else f"{'-':>7}"
+                print(f"{day:<12}{alloc / 3600:>6.0f}h{busy_txt}  {bar}")
+            if any(c < 60 and b <= 0 for _, _, b, c in rows):
+                print("- = collector wasn't sampling that day (busy unknown)")
     return 0
 
 
@@ -1963,10 +1972,12 @@ def _cli_report(month: str) -> int:
     print("## Daily cluster GPU-hours\n")
     print("| day | alloc | busy |")
     print("|-----|------:|-----:|")
+    meta = raw.get("meta", {})
     for day in sorted(daily):
         a, b = daily[day]
-        print(f"| {day} | {a / 3600:.0f}h | {b / 3600:.0f}h |")
-    print()
+        busy_txt = f"{b / 3600:.0f}h" if float(meta.get(day, 0)) >= 60 or b > 0 else "-"
+        print(f"| {day} | {a / 3600:.0f}h | {busy_txt} |")
+    print("\n(busy `-` = collector wasn't sampling that day)\n")
 
     rows = _sacct_jobs(f"{start_day}T00:00:00", f"{end_day}T23:59:59")
     if rows:

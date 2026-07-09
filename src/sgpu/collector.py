@@ -246,6 +246,8 @@ def _load_usage() -> None:
         return
     if isinstance(raw.get("days"), dict):
         _usage["days"] = raw["days"]
+    if isinstance(raw.get("meta"), dict):
+        _usage["meta"] = raw["meta"]
     if isinstance(raw.get("sacct_days"), dict):
         _usage["sacct_days"] = raw["sacct_days"]
         _usage["sacct_ts"] = raw.get("sacct_ts")
