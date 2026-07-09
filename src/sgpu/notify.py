@@ -3,7 +3,10 @@
 Config: ~/.sgpu/webhook.json (or SLURM_GPU_TUI_WEBHOOK_URL for URL only)
 {
   "url": "https://hooks.slack.com/services/...",   # Slack-compatible {"text": ...}
+  "sender_name": "AI-master",     # identity in the alert footer/username
   "node_health": true,            # node down/recovered alerts
+  "waste_alert_hours": 2,         # GPU idle/parked >= N hours (0 = off)
+  "rogue_alert": true,            # GPU used outside SLURM
   "job_done_users": ["alice"],    # notify when these users' jobs finish
   "free_gpus_min": 0              # alert when free-GPU count reaches N (0 = off)
 }
@@ -25,6 +28,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 DEBOUNCE_SEC = int(os.getenv("SLURM_GPU_TUI_WEBHOOK_DEBOUNCE_SEC", "1800"))
+# waste/rogue conditions persist for hours — re-nag much less often
+NAG_REALERT_SEC = int(os.getenv("SLURM_GPU_TUI_WEBHOOK_NAG_SEC", "21600"))
 
 
 def _gpu_is_free(g: dict) -> bool:
@@ -79,6 +84,8 @@ class Notifier:
         self.node_health: bool = bool(cfg.get("node_health", True))
         self.job_done_users: List[str] = list(cfg.get("job_done_users", []))
         self.free_gpus_min: int = int(cfg.get("free_gpus_min", 0))
+        self.waste_alert_hours: float = float(cfg.get("waste_alert_hours", 0))
+        self.rogue_alert: bool = bool(cfg.get("rogue_alert", False))
         # sender is the single identity in alerts — the real hostname is NOT
         # included ("master" here is also a compute node name; confusing)
         self.sender: str = cfg.get("sender_name", "AI-master")
@@ -144,6 +151,26 @@ class Notifier:
             self._jobs = {jid: {"jobname": j.get("jobname", ""), "user": j.get("user", ""),
                                 "elapsed": j.get("elapsed", "")} for jid, j in current.items()}
 
+        if self.waste_alert_hours > 0 or self.rogue_alert:
+            for n in nodes:
+                for g in n.get("gpus", []):
+                    loc = f"{n['name']} GPU{g.get('index', '?')}"
+                    wasted = max(g.get("idle_sec", 0), g.get("parked_sec", 0))
+                    if self.waste_alert_hours > 0 and wasted >= self.waste_alert_hours * 3600:
+                        kind = "idle" if g.get("idle_sec", 0) >= g.get("parked_sec", 0) else "parked"
+                        jid = g.get("alloc_jobid", "")
+                        key = f"waste:{n['name']}:{g.get('index')}:{jid}"
+                        if self._ok_to_send(key, now, NAG_REALERT_SEC):
+                            self._post(f":hourglass: *{loc} {kind} {_fmt_dur(wasted)}* — "
+                                       f"held by {g.get('alloc_user', '?')}"
+                                       f" (job {jid or '?'}), no compute")
+                    if self.rogue_alert and not g.get("alloc_jobid") and not g.get("alloc_user"):
+                        rogues = [u for u in (g.get("users") or []) if u]
+                        for u in rogues:
+                            if self._ok_to_send(f"rogue:{n['name']}:{g.get('index')}:{u}",
+                                                now, NAG_REALERT_SEC):
+                                self._post(f":no_entry: *{loc} used outside SLURM* by {u}")
+
         if self.free_gpus_min > 0:
             free = sum(1 for n in nodes for g in n.get("gpus", []) if _gpu_is_free(g))
             if free >= self.free_gpus_min:
@@ -155,8 +182,8 @@ class Notifier:
 
         self._save()
 
-    def _ok_to_send(self, key: str, now: float) -> bool:
-        if now - self._last_sent.get(key, 0) < DEBOUNCE_SEC:
+    def _ok_to_send(self, key: str, now: float, min_gap: float = DEBOUNCE_SEC) -> bool:
+        if now - self._last_sent.get(key, 0) < min_gap:
             return False
         self._last_sent[key] = now
         return True

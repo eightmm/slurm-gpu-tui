@@ -116,12 +116,24 @@ if [ "$WEBHOOK_URL" = "__ask__" ]; then
     fi
 fi
 if [ -n "$WEBHOOK_URL" ]; then
+    # SGPU_WEBHOOK_SENDER skips the name question (default AI-master)
+    SENDER="${SGPU_WEBHOOK_SENDER-__ask__}"
+    if [ "$SENDER" = "__ask__" ]; then
+        SENDER=""
+        if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+            printf "Sender name shown in alerts [AI-master]: " > /dev/tty
+            read -r SENDER < /dev/tty || SENDER=""
+        fi
+    fi
+    [ -z "$SENDER" ] && SENDER="AI-master"
     mkdir -p "$HOME/.sgpu"
     cat > "$WEBHOOK_CFG" << WEOF
 {
   "url": "$WEBHOOK_URL",
-  "sender_name": "AI-master",
+  "sender_name": "$SENDER",
   "node_health": true,
+  "waste_alert_hours": 2,
+  "rogue_alert": true,
   "job_done_users": [],
   "free_gpus_min": 0
 }
