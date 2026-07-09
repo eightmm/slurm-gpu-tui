@@ -142,6 +142,16 @@ if [ -n "$WEBHOOK_URL" ]; then
         printf "Channel for threaded alerts (e.g. #gpu-cluster): " > /dev/tty
         read -r CHANNEL < /dev/tty || CHANNEL=""
     fi
+    # Alert language (SGPU_WEBHOOK_LANG skips; default en)
+    LANG_SEL="${SGPU_WEBHOOK_LANG-__ask__}"
+    if [ "$LANG_SEL" = "__ask__" ]; then
+        LANG_SEL=""
+        if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+            printf "Alert language en/ko [en]: " > /dev/tty
+            read -r LANG_SEL < /dev/tty || LANG_SEL=""
+        fi
+    fi
+    [ "$LANG_SEL" = "ko" ] || LANG_SEL="en"
     mkdir -p "$HOME/.sgpu"
     cat > "$WEBHOOK_CFG" << WEOF
 {
@@ -149,6 +159,7 @@ if [ -n "$WEBHOOK_URL" ]; then
   "bot_token": "$BOT_TOKEN",
   "channel": "$CHANNEL",
   "sender_name": "$SENDER",
+  "lang": "$LANG_SEL",
   "node_health": true,
   "down_grace_sec": 180,
   "waste_alert_hours": 2,

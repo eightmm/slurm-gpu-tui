@@ -8,6 +8,7 @@ Config: ~/.sgpu/webhook.json (or SLURM_GPU_TUI_WEBHOOK_URL for URL only)
                                   #   (incoming webhooks can't thread; needs a
                                   #   bot with chat:write invited to the channel)
   "sender_name": "AI-master",     # identity in the alert footer/username
+  "lang": "en",                   # alert language: "en" or "ko"
   "node_health": true,            # node down/recovered alerts
   "down_grace_sec": 180,          # down must persist this long before alerting
   "waste_alert_hours": 2,         # GPU idle/parked >= N hours (0 = off)
@@ -38,6 +39,33 @@ NAG_REALERT_SEC = int(os.getenv("SLURM_GPU_TUI_WEBHOOK_NAG_SEC", "21600"))
 # override for tests; real Slack Web API otherwise
 SLACK_API_BASE = os.getenv("SLURM_GPU_TUI_SLACK_API_BASE", "https://slack.com/api")
 
+# Alert message templates per language. These are user-facing Slack strings
+# (intentionally localizable); all code/logs stay English.
+MSG = {
+    "en": {
+        "parent": ":calendar: *GPU cluster alerts — {date}* · {sender}",
+        "down": ":rotating_light: *node {name} down* — {why}\n{detail}",
+        "down_detail": "partition {part} · {ngpu} GPUs · {njobs} running job(s)",
+        "recovered": ":white_check_mark: *node {name} recovered* after {dur}",
+        "job_done": ":checkered_flag: job {jid} ({name}) by {user} finished after {elapsed}",
+        "waste": ":hourglass: *{loc} {kind} {dur}* — held by {user} (job {jid}), no compute",
+        "rogue": ":no_entry: *{loc} used outside SLURM* by {user}",
+        "free": ":sparkles: {free} free GPU(s) available",
+        "idle": "idle", "parked": "parked",
+    },
+    "ko": {
+        "parent": ":calendar: *GPU 클러스터 알림 — {date}* · {sender}",
+        "down": ":rotating_light: *{name} 노드 다운* — {why}\n{detail}",
+        "down_detail": "파티션 {part} · GPU {ngpu}개 · 실행 작업 {njobs}개",
+        "recovered": ":white_check_mark: *{name} 노드 복구* — {dur} 만에",
+        "job_done": ":checkered_flag: 작업 {jid} ({name}, {user}) 종료 — {elapsed} 경과",
+        "waste": ":hourglass: *{loc} {kind} {dur}* — {user} 점유(작업 {jid}), 연산 없음",
+        "rogue": ":no_entry: *{loc} SLURM 외부 사용* — {user}",
+        "free": ":sparkles: 여유 GPU {free}장 사용 가능",
+        "idle": "유휴", "parked": "점유",
+    },
+}
+
 
 def _gpu_is_free(g: dict) -> bool:
     return not g.get("alloc_jobid") and not g.get("alloc_user") and not g.get("users")
@@ -55,12 +83,13 @@ def _host_ip() -> str:
         return ""
 
 
-def _fmt_dur(sec: float) -> str:
+def _fmt_dur(sec: float, lang: str = "en") -> str:
+    m, h, d = ("분", "시간", "일") if lang == "ko" else ("m", "h", "d")
     if sec < 3600:
-        return f"{sec / 60:.0f}m"
+        return f"{sec / 60:.0f}{m}"
     if sec < 86400:
-        return f"{sec / 3600:.1f}h"
-    return f"{sec / 86400:.1f}d"
+        return f"{sec / 3600:.1f}{h}"
+    return f"{sec / 86400:.1f}{d}"
 
 
 class Notifier:
@@ -108,6 +137,7 @@ class Notifier:
         # sender is the single identity in alerts — the real hostname is NOT
         # included ("master" here is also a compute node name; confusing)
         self.sender: str = cfg.get("sender_name", "AI-master")
+        self.lang: str = cfg.get("lang", "en") if cfg.get("lang") in MSG else "en"
         ip = _host_ip()
         self._origin = self.sender + (f" ({ip})" if ip else "")
 
@@ -120,6 +150,9 @@ class Notifier:
         if mtime != self._cfg_mtime:
             self._load_config()
             print(f"[notify] webhook config reloaded (enabled={self.enabled})", flush=True)
+
+    def _m(self, key: str, **kw) -> str:
+        return MSG.get(self.lang, MSG["en"])[key].format(**kw)
 
     @property
     def _bot_mode(self) -> bool:
@@ -157,18 +190,17 @@ class Notifier:
                         users: Dict[str, int] = {}
                         for j in njobs:
                             users[j.get("user", "?")] = users.get(j.get("user", "?"), 0) + 1
-                        detail = (f"partition {n.get('partition', '?')} · "
-                                  f"{len(n.get('gpus', []))} GPUs · "
-                                  f"{len(njobs)} running job(s)")
+                        detail = self._m("down_detail", part=n.get("partition", "?"),
+                                         ngpu=len(n.get("gpus", [])), njobs=len(njobs))
                         if users:
                             detail += " — " + ", ".join(f"{u}×{c}" for u, c in sorted(users.items()))
-                        self._post(f":rotating_light: *node {name} down* — {why[:120]}\n{detail}")
+                        self._post(self._m("down", name=name, why=why[:120], detail=detail))
                         self._down[name] = first
                 else:
                     self._pending_down.pop(name, None)
                     if confirmed:
-                        self._post(f":white_check_mark: *node {name} recovered* "
-                                   f"after {_fmt_dur(now - confirmed)}")
+                        self._post(self._m("recovered", name=name,
+                                           dur=_fmt_dur(now - confirmed, self.lang)))
                     self._down[name] = 0
 
         if self.job_done_users:
@@ -176,9 +208,8 @@ class Notifier:
                        if j.get("user") in self.job_done_users}
             for jid, j in self._jobs.items():
                 if jid not in current:
-                    self._post(f":checkered_flag: sgpu: job {jid} "
-                               f"({j.get('jobname', '?')}) by {j.get('user', '?')} "
-                               f"left the queue (done/cancelled) after {j.get('elapsed', '?')}")
+                    self._post(self._m("job_done", jid=jid, name=j.get("jobname", "?"),
+                                       user=j.get("user", "?"), elapsed=j.get("elapsed", "?")))
             self._jobs = {jid: {"jobname": j.get("jobname", ""), "user": j.get("user", ""),
                                 "elapsed": j.get("elapsed", "")} for jid, j in current.items()}
 
@@ -188,25 +219,26 @@ class Notifier:
                     loc = f"{n['name']} GPU{g.get('index', '?')}"
                     wasted = max(g.get("idle_sec", 0), g.get("parked_sec", 0))
                     if self.waste_alert_hours > 0 and wasted >= self.waste_alert_hours * 3600:
-                        kind = "idle" if g.get("idle_sec", 0) >= g.get("parked_sec", 0) else "parked"
+                        kind = self._m("idle" if g.get("idle_sec", 0) >= g.get("parked_sec", 0)
+                                       else "parked")
                         jid = g.get("alloc_jobid", "")
                         key = f"waste:{n['name']}:{g.get('index')}:{jid}"
                         if self._ok_to_send(key, now, NAG_REALERT_SEC):
-                            self._post(f":hourglass: *{loc} {kind} {_fmt_dur(wasted)}* — "
-                                       f"held by {g.get('alloc_user', '?')}"
-                                       f" (job {jid or '?'}), no compute")
+                            self._post(self._m("waste", loc=loc, kind=kind,
+                                               dur=_fmt_dur(wasted, self.lang),
+                                               user=g.get("alloc_user", "?"), jid=jid or "?"))
                     if self.rogue_alert and not g.get("alloc_jobid") and not g.get("alloc_user"):
                         rogues = [u for u in (g.get("users") or []) if u]
                         for u in rogues:
                             if self._ok_to_send(f"rogue:{n['name']}:{g.get('index')}:{u}",
                                                 now, NAG_REALERT_SEC):
-                                self._post(f":no_entry: *{loc} used outside SLURM* by {u}")
+                                self._post(self._m("rogue", loc=loc, user=u))
 
         if self.free_gpus_min > 0:
             free = sum(1 for n in nodes for g in n.get("gpus", []) if _gpu_is_free(g))
             if free >= self.free_gpus_min:
                 if self._free_was_below and self._ok_to_send("free_gpus", now):
-                    self._post(f":sparkles: sgpu: {free} free GPU(s) available")
+                    self._post(self._m("free", free=free))
                 self._free_was_below = False
             else:
                 self._free_was_below = True
@@ -261,7 +293,7 @@ class Notifier:
                 return self._thread_ts
             resp = self._slack_api("chat.postMessage", {
                 "channel": self.channel,
-                "text": f":calendar: *GPU cluster alerts — {today}* · {self.sender}",
+                "text": self._m("parent", date=today, sender=self.sender),
             })
             ts = (resp or {}).get("ts", "")
             if ts:
