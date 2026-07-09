@@ -13,6 +13,8 @@ Config: ~/.sgpu/webhook.json (or SLURM_GPU_TUI_WEBHOOK_URL for URL only)
   "down_grace_sec": 180,          # down must persist this long before alerting
   "waste_alert_hours": 2,         # GPU idle/parked >= N hours (0 = off)
   "rogue_alert": true,            # GPU used outside SLURM
+  "temp_alert_c": 0,              # GPU temperature >= N°C (0 = off; ~90 typical)
+  "ecc_alert": true,             # uncorrectable ECC errors (silent HW failure)
   "job_done_users": ["alice"],    # notify when these users' jobs finish
   "free_gpus_min": 0              # alert when free-GPU count reaches N (0 = off)
 }
@@ -51,6 +53,8 @@ MSG = {
         "waste": ":hourglass: *{loc} {kind} {dur}* — held by {user} (job {jid}), no compute",
         "rogue": ":no_entry: *{loc} used outside SLURM* by {user}",
         "free": ":sparkles: {free} free GPU(s) available",
+        "temp": ":thermometer: *{loc} {temp}°C* — over {thr}°C",
+        "ecc": ":warning: *{loc} uncorrectable ECC errors: {n}* — GPU may be failing",
         "idle": "idle", "parked": "parked",
     },
     "ko": {
@@ -62,6 +66,8 @@ MSG = {
         "waste": ":hourglass: *{loc} {kind} {dur}* — {user} 점유(작업 {jid}), 연산 없음",
         "rogue": ":no_entry: *{loc} SLURM 외부 사용* — {user}",
         "free": ":sparkles: 여유 GPU {free}장 사용 가능",
+        "temp": ":thermometer: *{loc} {temp}°C* — {thr}°C 초과",
+        "ecc": ":warning: *{loc} uncorrectable ECC 에러 {n}건* — GPU 이상 가능",
         "idle": "유휴", "parked": "점유",
     },
 }
@@ -69,6 +75,14 @@ MSG = {
 
 def _gpu_is_free(g: dict) -> bool:
     return not g.get("alloc_jobid") and not g.get("alloc_user") and not g.get("users")
+
+
+def _to_int(v) -> Optional[int]:
+    """nvidia-smi numeric field -> int, or None for N/A / non-numeric."""
+    try:
+        return int(str(v).strip())
+    except (ValueError, TypeError, AttributeError):
+        return None
 
 
 def _host_ip() -> str:
@@ -133,6 +147,8 @@ class Notifier:
         self.free_gpus_min: int = int(cfg.get("free_gpus_min", 0))
         self.waste_alert_hours: float = float(cfg.get("waste_alert_hours", 0))
         self.rogue_alert: bool = bool(cfg.get("rogue_alert", False))
+        self.temp_alert_c: float = float(cfg.get("temp_alert_c", 0))
+        self.ecc_alert: bool = bool(cfg.get("ecc_alert", True))
         self.down_grace_sec: float = float(cfg.get("down_grace_sec", 180))
         # sender is the single identity in alerts — the real hostname is NOT
         # included ("master" here is also a compute node name; confusing)
@@ -233,6 +249,24 @@ class Notifier:
                             if self._ok_to_send(f"rogue:{n['name']}:{g.get('index')}:{u}",
                                                 now, NAG_REALERT_SEC):
                                 self._post(self._m("rogue", loc=loc, user=u))
+
+        if self.temp_alert_c > 0 or self.ecc_alert:
+            for n in nodes:
+                for g in n.get("gpus", []):
+                    loc = f"{n['name']} GPU{g.get('index', '?')}"
+                    if self.temp_alert_c > 0:
+                        temp = _to_int(g.get("temp"))
+                        if temp is not None and temp >= self.temp_alert_c \
+                                and self._ok_to_send(f"temp:{n['name']}:{g.get('index')}",
+                                                     now, NAG_REALERT_SEC):
+                            self._post(self._m("temp", loc=loc, temp=temp,
+                                               thr=int(self.temp_alert_c)))
+                    if self.ecc_alert:
+                        ecc = _to_int(g.get("ecc"))
+                        if ecc and ecc > 0 \
+                                and self._ok_to_send(f"ecc:{n['name']}:{g.get('index')}",
+                                                     now, NAG_REALERT_SEC):
+                            self._post(self._m("ecc", loc=loc, n=ecc))
 
         if self.free_gpus_min > 0:
             free = sum(1 for n in nodes for g in n.get("gpus", []) if _gpu_is_free(g))

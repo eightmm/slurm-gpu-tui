@@ -434,7 +434,7 @@ def _gpu_to_dict(gpu: GpuInfo) -> dict:
         "index": gpu.index, "minor": gpu.minor, "name": gpu.name, "util": gpu.util,
         "mem_used": gpu.mem_used, "mem_total": gpu.mem_total,
         "temp": gpu.temp, "power": gpu.power, "power_cap": gpu.power_cap,
-        "pids": gpu.pids, "users": gpu.users,
+        "ecc": gpu.ecc, "pids": gpu.pids, "users": gpu.users,
     }
 
 
@@ -790,6 +790,7 @@ def run_collector():
         print(f"[collector] webhook notifier on ({mode}, sender={notifier.sender}, "
               f"node_health={notifier.node_health}, grace={notifier.down_grace_sec:.0f}s, "
               f"waste_alert_hours={notifier.waste_alert_hours}, rogue={notifier.rogue_alert}, "
+              f"temp_alert_c={notifier.temp_alert_c}, ecc={notifier.ecc_alert}, "
               f"job_done_users={notifier.job_done_users}, free_gpus_min={notifier.free_gpus_min})",
               flush=True)
 

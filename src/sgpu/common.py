@@ -119,6 +119,7 @@ class GpuInfo:
     temp: str = ""       # C
     power: str = ""      # W
     power_cap: str = ""  # W
+    ecc: str = ""        # uncorrectable ECC error count ("" / N/A on consumer GPUs)
     pids: List[str] = field(default_factory=list)
     users: List[str] = field(default_factory=list)
     alloc_jobid: str = ""  # job holding this GPU per SLURM allocation
@@ -393,8 +394,11 @@ def collect_gpu_alloc() -> Tuple[Dict[str, Dict[str, str]], str]:
 # + meminfo + ps (PID→user). Run remotely via SSH (pull) or locally by the
 # resident agent (push).
 NODE_PAYLOAD_CMD = (
+    # NOTE: ecc column stays LAST so the pci.bus_id index (p[9]) used for the
+    # minor mapping doesn't shift. Consumer GPUs report ecc as [N/A].
     "nvidia-smi --query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total,"
-    "temperature.gpu,power.draw,power.limit,pci.bus_id "
+    "temperature.gpu,power.draw,power.limit,pci.bus_id,"
+    "ecc.errors.uncorrected.aggregate.total "
     "--format=csv,noheader,nounits 2>/dev/null; "
     "echo '---SEP---'; "
     "nvidia-smi pmon -c 1 -s m 2>/dev/null; "
@@ -474,10 +478,11 @@ def parse_node_payload(out: str) -> Tuple[List[GpuInfo], NodeMemInfo]:
         minor = ""
         if len(p) >= 10 and ":" in p[9]:
             minor = bus_to_minor.get(p[9].split(":", 1)[1].lower(), "")
+        ecc = p[10] if len(p) >= 11 else ""
         gpus.append(GpuInfo(
             index=idx, minor=minor, name=shorten_gpu_name(p[2]), util=p[3],
             mem_used=p[4], mem_total=p[5], temp=p[6], power=p[7], power_cap=p[8],
-            pids=pids, users=users,
+            ecc=ecc, pids=pids, users=users,
         ))
     return gpus, mem_info
 

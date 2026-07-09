@@ -98,80 +98,91 @@ if [ -n "$SHARE" ] && [ "$SHARE" != "0" ]; then
     fi
 fi
 
-# Slack-compatible webhook for cluster alerts (node down/recovered).
-# Asked interactively; set SGPU_WEBHOOK_URL to skip the question
-# (SGPU_WEBHOOK_URL="" skips with no webhook). Existing config is kept
-# unless a new URL is entered.
+# Slack alerts config (~/.sgpu/webhook.json). Prompts run on both fresh
+# installs and re-installs; every field defaults to its existing value, so
+# each answer only overrides what you type (empty = keep). This lets an
+# existing install gain a bot token / language without a hand-edit.
+# Skip a question with: SGPU_WEBHOOK_URL / _SENDER / _LANG,
+# SGPU_SLACK_BOT_TOKEN / _CHANNEL. Non-interactive with none set = no change.
 WEBHOOK_CFG="$HOME/.sgpu/webhook.json"
+CFG_EXISTS=false; [ -f "$WEBHOOK_CFG" ] && CFG_EXISTS=true
+_tty() { [ -r /dev/tty ] && [ -w /dev/tty ]; }
+
 WEBHOOK_URL="${SGPU_WEBHOOK_URL-__ask__}"
 if [ "$WEBHOOK_URL" = "__ask__" ]; then
     WEBHOOK_URL=""
-    if [ -r /dev/tty ] && [ -w /dev/tty ]; then
-        if [ -f "$WEBHOOK_CFG" ]; then
-            printf "Slack webhook for cluster alerts: config exists — new URL to replace, Enter to keep: " > /dev/tty
+    if _tty; then
+        if $CFG_EXISTS; then
+            printf "Slack webhook URL — Enter to keep existing: " > /dev/tty
         else
             printf "Slack webhook URL for cluster alerts (node down/up) — Enter to skip: " > /dev/tty
         fi
         read -r WEBHOOK_URL < /dev/tty || WEBHOOK_URL=""
     fi
 fi
-if [ -n "$WEBHOOK_URL" ]; then
-    # SGPU_WEBHOOK_SENDER skips the name question (default AI-master)
+
+if $CFG_EXISTS || [ -n "$WEBHOOK_URL" ]; then
     SENDER="${SGPU_WEBHOOK_SENDER-__ask__}"
     if [ "$SENDER" = "__ask__" ]; then
         SENDER=""
-        if [ -r /dev/tty ] && [ -w /dev/tty ]; then
-            printf "Sender name shown in alerts [AI-master]: " > /dev/tty
-            read -r SENDER < /dev/tty || SENDER=""
-        fi
+        _tty && { printf "Sender name shown in alerts (Enter to keep/default AI-master): " > /dev/tty; read -r SENDER < /dev/tty || SENDER=""; }
     fi
-    [ -z "$SENDER" ] && SENDER="AI-master"
-    # Optional bot token: turns alerts into replies under one daily thread
-    # (incoming webhooks can't thread). Needs a bot with chat:write in the
-    # channel. SGPU_SLACK_BOT_TOKEN / SGPU_SLACK_CHANNEL skip the questions.
+    # Optional bot token -> daily-thread grouping (needs chat:write in channel)
     BOT_TOKEN="${SGPU_SLACK_BOT_TOKEN-__ask__}"
     if [ "$BOT_TOKEN" = "__ask__" ]; then
         BOT_TOKEN=""
-        if [ -r /dev/tty ] && [ -w /dev/tty ]; then
-            printf "Slack bot token for daily-thread grouping (xoxb-…, Enter to skip): " > /dev/tty
-            read -r BOT_TOKEN < /dev/tty || BOT_TOKEN=""
-        fi
+        _tty && { printf "Slack bot token for daily-thread grouping (xoxb-…, Enter to keep/skip): " > /dev/tty; read -r BOT_TOKEN < /dev/tty || BOT_TOKEN=""; }
     fi
-    CHANNEL="${SGPU_SLACK_CHANNEL:-}"
-    if [ -n "$BOT_TOKEN" ] && [ -z "$CHANNEL" ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
-        printf "Channel for threaded alerts (e.g. #gpu-cluster): " > /dev/tty
-        read -r CHANNEL < /dev/tty || CHANNEL=""
+    CHANNEL="${SGPU_SLACK_CHANNEL-__ask__}"
+    if [ "$CHANNEL" = "__ask__" ]; then
+        CHANNEL=""
+        _tty && { printf "Channel for threaded alerts (e.g. #gpu-cluster, Enter to keep): " > /dev/tty; read -r CHANNEL < /dev/tty || CHANNEL=""; }
     fi
-    # Alert language (SGPU_WEBHOOK_LANG skips; default en)
     LANG_SEL="${SGPU_WEBHOOK_LANG-__ask__}"
     if [ "$LANG_SEL" = "__ask__" ]; then
         LANG_SEL=""
-        if [ -r /dev/tty ] && [ -w /dev/tty ]; then
-            printf "Alert language en/ko [en]: " > /dev/tty
-            read -r LANG_SEL < /dev/tty || LANG_SEL=""
-        fi
+        _tty && { printf "Alert language en/ko (Enter to keep/default en): " > /dev/tty; read -r LANG_SEL < /dev/tty || LANG_SEL=""; }
     fi
-    [ "$LANG_SEL" = "ko" ] || LANG_SEL="en"
     mkdir -p "$HOME/.sgpu"
-    cat > "$WEBHOOK_CFG" << WEOF
-{
-  "url": "$WEBHOOK_URL",
-  "bot_token": "$BOT_TOKEN",
-  "channel": "$CHANNEL",
-  "sender_name": "$SENDER",
-  "lang": "$LANG_SEL",
-  "node_health": true,
-  "down_grace_sec": 180,
-  "waste_alert_hours": 2,
-  "rogue_alert": true,
-  "job_done_users": [],
-  "free_gpus_min": 0
-}
-WEOF
-    chmod 600 "$WEBHOOK_CFG"
-    echo "[3b] Webhook alerts configured ($WEBHOOK_CFG) — edit it any time; the collector hot-reloads it"
-elif [ -f "$WEBHOOK_CFG" ]; then
-    echo "[3b] Keeping existing webhook config ($WEBHOOK_CFG)"
+    # Merge into existing config in Python: only non-empty answers override;
+    # unknown/tuned keys (node_health, thresholds, …) are preserved. Seeds
+    # sensible defaults for keys absent on a fresh file.
+    SGPU_CFG="$WEBHOOK_CFG" NEW_URL="$WEBHOOK_URL" NEW_SENDER="$SENDER" \
+    NEW_BOT="$BOT_TOKEN" NEW_CHANNEL="$CHANNEL" NEW_LANG="$LANG_SEL" \
+    "$VENV_DIR/bin/python" - << 'PYEOF'
+import json, os
+p = os.environ["SGPU_CFG"]
+try:
+    cfg = json.load(open(p))
+except Exception:
+    cfg = {}
+def setval(key, val):
+    if val:
+        cfg[key] = val
+setval("url", os.environ.get("NEW_URL"))
+setval("bot_token", os.environ.get("NEW_BOT"))
+setval("channel", os.environ.get("NEW_CHANNEL"))
+setval("sender_name", os.environ.get("NEW_SENDER"))
+lang = os.environ.get("NEW_LANG")
+if lang in ("en", "ko"):
+    cfg["lang"] = lang
+# seed defaults only when absent (don't clobber tuned values)
+defaults = {"sender_name": "AI-master", "lang": "en", "node_health": True,
+            "down_grace_sec": 180, "waste_alert_hours": 2, "rogue_alert": True,
+            "ecc_alert": True, "temp_alert_c": 0,
+            "job_done_users": [], "free_gpus_min": 0}
+for k, v in defaults.items():
+    cfg.setdefault(k, v)
+if not cfg.get("url") and not (cfg.get("bot_token") and cfg.get("channel")):
+    print("SKIP")  # no delivery configured -> leave file as-is/absent
+else:
+    json.dump(cfg, open(p, "w"), indent=2)
+    print("OK")
+PYEOF
+    if [ -f "$WEBHOOK_CFG" ]; then
+        chmod 600 "$WEBHOOK_CFG"
+        echo "[3b] Webhook alerts configured ($WEBHOOK_CFG) — edit it any time; the collector hot-reloads it"
+    fi
 fi
 
 SERVICE_FILE="$INSTALL_DIR/sgpu-collector.service"
