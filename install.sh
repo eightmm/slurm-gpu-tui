@@ -168,7 +168,8 @@ if lang in ("en", "ko"):
     cfg["lang"] = lang
 # seed defaults only when absent (don't clobber tuned values)
 defaults = {"sender_name": "AI-master", "lang": "en", "node_health": True,
-            "down_grace_sec": 180, "waste_alert_hours": 2, "rogue_alert": True,
+            "down_grace_sec": 180, "collect_alert": True, "collect_grace_sec": 600,
+            "waste_alert_hours": 2, "rogue_alert": True,
             "ecc_alert": True, "temp_alert_c": 0,
             "job_done_users": [], "free_gpus_min": 0}
 for k, v in defaults.items():

@@ -9,8 +9,10 @@ Config: ~/.sgpu/webhook.json (or SLURM_GPU_TUI_WEBHOOK_URL for URL only)
                                   #   bot with chat:write invited to the channel)
   "sender_name": "AI-master",     # identity in the alert footer/username
   "lang": "en",                   # alert language: "en" or "ko"
-  "node_health": true,            # node down/recovered alerts
+  "node_health": true,            # node down/recovered alerts (SLURM state)
   "down_grace_sec": 180,          # down must persist this long before alerting
+  "collect_alert": true,          # GPU node reporting fine then goes blind
+  "collect_grace_sec": 600,       #   (agent died / node hung) — SLURM still up
   "waste_alert_hours": 2,         # GPU idle/parked >= N hours (0 = off)
   "rogue_alert": true,            # GPU used outside SLURM
   "temp_alert_c": 0,              # GPU temperature >= N°C (0 = off; ~90 typical)
@@ -55,6 +57,8 @@ MSG = {
         "free": ":sparkles: {free} free GPU(s) available",
         "temp": ":thermometer: *{loc} {temp}°C* — over {thr}°C\n{hw}",
         "ecc": ":warning: *{loc} uncorrectable ECC errors: {n}* — GPU may be failing\n{hw}",
+        "collect_lost": ":electric_plug: *{name}: sgpu can't collect GPU data* — agent/SSH down, node still {state} in SLURM",
+        "collect_ok": ":arrows_counterclockwise: *{name}: sgpu collection restored* after {dur}",
         "idle": "idle", "parked": "parked",
     },
     "ko": {
@@ -68,6 +72,8 @@ MSG = {
         "free": ":sparkles: 여유 GPU {free}장 사용 가능",
         "temp": ":thermometer: *{loc} {temp}°C* — {thr}°C 초과\n{hw}",
         "ecc": ":warning: *{loc} uncorrectable ECC 에러 {n}건* — GPU 이상 가능\n{hw}",
+        "collect_lost": ":electric_plug: *{name}: sgpu GPU 데이터 수집 불가* — 에이전트/SSH 끊김, SLURM상 {state}",
+        "collect_ok": ":arrows_counterclockwise: *{name}: sgpu 수집 복구* — {dur} 만에",
         "idle": "유휴", "parked": "점유",
     },
 }
@@ -141,10 +147,12 @@ class Notifier:
         self._thread_day: str = st.get("thread_day", "")
         self._thread_ts: str = st.get("thread_ts", "")
         self._post_lock = threading.Lock()
-        # first-seen ts of an unconfirmed down; deliberately NOT persisted so
-        # a collector restart re-starts the grace clock (cold start looks
+        self._blind: Dict[str, float] = st.get("blind", {})
+        # first-seen ts of an unconfirmed down/blind; deliberately NOT persisted
+        # so a collector restart re-starts the grace clock (cold start looks
         # exactly like an outage for the first cycles)
         self._pending_down: Dict[str, float] = {}
+        self._pending_blind: Dict[str, float] = {}
 
     def _load_config(self) -> None:
         cfg: dict = {}
@@ -158,6 +166,8 @@ class Notifier:
         self.bot_token: str = cfg.get("bot_token", "") or os.getenv("SLURM_GPU_TUI_SLACK_BOT_TOKEN", "")
         self.channel: str = cfg.get("channel", "")
         self.node_health: bool = bool(cfg.get("node_health", True))
+        self.collect_alert: bool = bool(cfg.get("collect_alert", True))
+        self.collect_grace_sec: float = float(cfg.get("collect_grace_sec", 600))
         self.job_done_users: List[str] = list(cfg.get("job_done_users", []))
         self.free_gpus_min: int = int(cfg.get("free_gpus_min", 0))
         self.waste_alert_hours: float = float(cfg.get("waste_alert_hours", 0))
@@ -238,6 +248,33 @@ class Notifier:
                         self._post(self._m("recovered", name=name,
                                            dur=_fmt_dur(now - confirmed, self.lang)))
                     self._down[name] = 0
+
+        if self.collect_alert:
+            for n in nodes:
+                name = n["name"]
+                state = n.get("state", "").lower()
+                slurm_down = any(s in state for s in ("down", "drain", "fail", "err", "boot"))
+                # only GPU nodes (CPU/GPU-less nodes are commonly unreachable
+                # by design in SSH-pull mode), and only when SLURM says the
+                # node is UP — a real outage is node_health's job, not this
+                blind = (n.get("has_gpu", True)
+                         and (bool(n.get("stale")) or bool(n.get("error")))
+                         and not slurm_down)
+                was = self._blind.get(name, 0)
+                confirmed = float(was) if not isinstance(was, bool) else (now if was else 0)
+                if blind:
+                    first = self._pending_blind.setdefault(name, now)
+                    if not confirmed and now - first >= self.collect_grace_sec \
+                            and self._ok_to_send(f"blind:{name}", now, NAG_REALERT_SEC):
+                        self._post(self._m("collect_lost", name=name,
+                                           state=n.get("state", "?")))
+                        self._blind[name] = first
+                else:
+                    self._pending_blind.pop(name, None)
+                    if confirmed:
+                        self._post(self._m("collect_ok", name=name,
+                                           dur=_fmt_dur(now - confirmed, self.lang)))
+                    self._blind[name] = 0
 
         if self.job_done_users:
             current = {j["jobid"]: j for j in data.get("jobs", [])
@@ -375,7 +412,7 @@ class Notifier:
         try:
             tmp = self._state_file.with_suffix(".tmp")
             tmp.write_text(json.dumps({
-                "down": self._down, "jobs": self._jobs,
+                "down": self._down, "blind": self._blind, "jobs": self._jobs,
                 "last_sent": self._last_sent,
                 "free_was_below": self._free_was_below,
                 "thread_day": self._thread_day, "thread_ts": self._thread_ts,
