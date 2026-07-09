@@ -3,6 +3,10 @@
 Config: ~/.sgpu/webhook.json (or SLURM_GPU_TUI_WEBHOOK_URL for URL only)
 {
   "url": "https://hooks.slack.com/services/...",   # Slack-compatible {"text": ...}
+  "bot_token": "xoxb-...",        # optional: Slack bot token -> alerts become
+  "channel": "#gpu-cluster",      #   replies under one parent message per day
+                                  #   (incoming webhooks can't thread; needs a
+                                  #   bot with chat:write invited to the channel)
   "sender_name": "AI-master",     # identity in the alert footer/username
   "node_health": true,            # node down/recovered alerts
   "down_grace_sec": 180,          # down must persist this long before alerting
@@ -31,6 +35,8 @@ from typing import Dict, List, Optional
 DEBOUNCE_SEC = int(os.getenv("SLURM_GPU_TUI_WEBHOOK_DEBOUNCE_SEC", "1800"))
 # waste/rogue conditions persist for hours — re-nag much less often
 NAG_REALERT_SEC = int(os.getenv("SLURM_GPU_TUI_WEBHOOK_NAG_SEC", "21600"))
+# override for tests; real Slack Web API otherwise
+SLACK_API_BASE = os.getenv("SLURM_GPU_TUI_SLACK_API_BASE", "https://slack.com/api")
 
 
 def _gpu_is_free(g: dict) -> bool:
@@ -73,6 +79,10 @@ class Notifier:
         self._jobs: Dict[str, dict] = st.get("jobs", {})
         self._last_sent: Dict[str, float] = st.get("last_sent", {})
         self._free_was_below = bool(st.get("free_was_below", True))
+        # daily thread parent (bot mode): reuse across restarts within a day
+        self._thread_day: str = st.get("thread_day", "")
+        self._thread_ts: str = st.get("thread_ts", "")
+        self._post_lock = threading.Lock()
         # first-seen ts of an unconfirmed down; deliberately NOT persisted so
         # a collector restart re-starts the grace clock (cold start looks
         # exactly like an outage for the first cycles)
@@ -86,6 +96,9 @@ class Notifier:
         except (OSError, ValueError):
             self._cfg_mtime = None
         self.url: str = cfg.get("url") or os.getenv("SLURM_GPU_TUI_WEBHOOK_URL", "")
+        # bot mode: threads alerts under one parent per day (needs chat:write)
+        self.bot_token: str = cfg.get("bot_token", "") or os.getenv("SLURM_GPU_TUI_SLACK_BOT_TOKEN", "")
+        self.channel: str = cfg.get("channel", "")
         self.node_health: bool = bool(cfg.get("node_health", True))
         self.job_done_users: List[str] = list(cfg.get("job_done_users", []))
         self.free_gpus_min: int = int(cfg.get("free_gpus_min", 0))
@@ -109,8 +122,12 @@ class Notifier:
             print(f"[notify] webhook config reloaded (enabled={self.enabled})", flush=True)
 
     @property
+    def _bot_mode(self) -> bool:
+        return bool(self.bot_token and self.channel)
+
+    @property
     def enabled(self) -> bool:
-        return bool(self.url)
+        return bool(self.url) or self._bot_mode
 
     def process(self, data: dict) -> None:
         """Diff one collector snapshot against remembered state; fire alerts."""
@@ -204,24 +221,68 @@ class Notifier:
 
     def _post(self, text: str) -> None:
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        payload = {
-            "text": f"{text}\n_{self._origin} · {stamp}_",
-            # honored by legacy incoming webhooks, silently ignored by
-            # app-scoped ones (those show the Slack app's own name)
-            "username": self.sender,
-            "icon_emoji": ":robot_face:",
-        }
+        body = f"{text}\n_{self._origin} · {stamp}_"
 
         def worker() -> None:
             try:
-                req = urllib.request.Request(
-                    self.url, data=json.dumps(payload).encode(),
-                    headers={"Content-Type": "application/json"})
-                urllib.request.urlopen(req, timeout=10).read()
+                if self._bot_mode:
+                    self._post_bot(body)
+                else:
+                    req = urllib.request.Request(
+                        self.url,
+                        data=json.dumps({
+                            "text": body,
+                            # honored by legacy incoming webhooks, ignored by
+                            # app-scoped ones (those show the app's own name)
+                            "username": self.sender,
+                            "icon_emoji": ":robot_face:",
+                        }).encode(),
+                        headers={"Content-Type": "application/json"})
+                    urllib.request.urlopen(req, timeout=10).read()
             except Exception as e:
-                print(f"[notify] webhook failed: {e}", flush=True)
+                print(f"[notify] post failed: {e}", flush=True)
 
         threading.Thread(target=worker, daemon=True, name="webhook").start()
+
+    def _post_bot(self, body: str) -> None:
+        """chat.postMessage as a reply under today's parent message."""
+        thread_ts = self._ensure_daily_parent()
+        payload = {"channel": self.channel, "text": body}
+        if thread_ts:
+            payload["thread_ts"] = thread_ts
+        self._slack_api("chat.postMessage", payload)
+
+    def _ensure_daily_parent(self) -> str:
+        """Return today's thread parent ts, creating the parent if needed.
+        Serialized so a burst of alerts doesn't spawn duplicate parents."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        with self._post_lock:
+            if self._thread_day == today and self._thread_ts:
+                return self._thread_ts
+            resp = self._slack_api("chat.postMessage", {
+                "channel": self.channel,
+                "text": f":calendar: *GPU cluster alerts — {today}* · {self.sender}",
+            })
+            ts = (resp or {}).get("ts", "")
+            if ts:
+                self._thread_day, self._thread_ts = today, ts
+                self._save()
+            return ts
+
+    def _slack_api(self, method: str, payload: dict) -> Optional[dict]:
+        try:
+            req = urllib.request.Request(
+                f"{SLACK_API_BASE}/{method}",
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json; charset=utf-8",
+                         "Authorization": f"Bearer {self.bot_token}"})
+            resp = json.loads(urllib.request.urlopen(req, timeout=10).read())
+            if not resp.get("ok"):
+                print(f"[notify] slack {method} error: {resp.get('error')}", flush=True)
+            return resp
+        except Exception as e:
+            print(f"[notify] slack {method} failed: {e}", flush=True)
+            return None
 
     def _save(self) -> None:
         try:
@@ -230,6 +291,7 @@ class Notifier:
                 "down": self._down, "jobs": self._jobs,
                 "last_sent": self._last_sent,
                 "free_was_below": self._free_was_below,
+                "thread_day": self._thread_day, "thread_ts": self._thread_ts,
             }))
             tmp.rename(self._state_file)
         except OSError:

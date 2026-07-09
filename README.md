@@ -347,7 +347,7 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstra
 | `SLURM_GPU_TUI_AUTO_COLLAPSE_NODES` | `12` | Start with nodes collapsed when the cluster has at least this many GPU nodes |
 | `SLURM_GPU_TUI_USAGE_KEEP_DAYS` | `30` | GPU-hour history retention |
 | `SLURM_GPU_TUI_SACCT_SEC` | `3600` | slurmdbd (sacct) alloc backfill interval; `0` disables. Optional — without accounting it auto-disables after 3 failed tries and alloc stays sampling-based |
-| `SLURM_GPU_TUI_WEBHOOK_URL` | (unset) | Slack-compatible webhook for collector alerts (node down/recovered). The installer asks for a URL and writes `~/.sgpu/webhook.json` (hot-reloaded; `SGPU_WEBHOOK_URL` skips the question). Full config with `sender_name` / `job_done_users` / `free_gpus_min`: see `src/sgpu/notify.py` docstring |
+| `SLURM_GPU_TUI_WEBHOOK_URL` | (unset) | Slack-compatible webhook for collector alerts (node down/recovered). The installer asks for a URL and writes `~/.sgpu/webhook.json` (hot-reloaded; `SGPU_WEBHOOK_URL` skips the question). Optional `bot_token`+`channel` group each day's alerts under one Slack thread (needs a bot with `chat:write`; incoming webhooks can't thread). Full config with `sender_name` / `job_done_users` / `free_gpus_min`: see `src/sgpu/notify.py` docstring |
 | `SLURM_GPU_TUI_WEBHOOK_DEBOUNCE_SEC` | `1800` | Min interval between repeated webhook alerts for the same key |
 | `SLURM_GPU_TUI_ROGUE_IGNORE` | `root,gdm,xdm` | Users never flagged as rogue |
 | `SLURM_GPU_TUI_SHARE_SCRIPTS` | (unset) | Collector publishes every job's batch script so all users see them in the Enter popup. **Shares script contents (and any secrets in them) with everyone** — the installer asks about this (`[Y/n]`); `SGPU_SHARE_SCRIPTS=0/1` skips the question |

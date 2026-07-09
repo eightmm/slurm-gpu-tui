@@ -126,10 +126,28 @@ if [ -n "$WEBHOOK_URL" ]; then
         fi
     fi
     [ -z "$SENDER" ] && SENDER="AI-master"
+    # Optional bot token: turns alerts into replies under one daily thread
+    # (incoming webhooks can't thread). Needs a bot with chat:write in the
+    # channel. SGPU_SLACK_BOT_TOKEN / SGPU_SLACK_CHANNEL skip the questions.
+    BOT_TOKEN="${SGPU_SLACK_BOT_TOKEN-__ask__}"
+    if [ "$BOT_TOKEN" = "__ask__" ]; then
+        BOT_TOKEN=""
+        if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+            printf "Slack bot token for daily-thread grouping (xoxb-…, Enter to skip): " > /dev/tty
+            read -r BOT_TOKEN < /dev/tty || BOT_TOKEN=""
+        fi
+    fi
+    CHANNEL="${SGPU_SLACK_CHANNEL:-}"
+    if [ -n "$BOT_TOKEN" ] && [ -z "$CHANNEL" ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
+        printf "Channel for threaded alerts (e.g. #gpu-cluster): " > /dev/tty
+        read -r CHANNEL < /dev/tty || CHANNEL=""
+    fi
     mkdir -p "$HOME/.sgpu"
     cat > "$WEBHOOK_CFG" << WEOF
 {
   "url": "$WEBHOOK_URL",
+  "bot_token": "$BOT_TOKEN",
+  "channel": "$CHANNEL",
   "sender_name": "$SENDER",
   "node_health": true,
   "down_grace_sec": 180,
