@@ -79,9 +79,11 @@ class Notifier:
         self.node_health: bool = bool(cfg.get("node_health", True))
         self.job_done_users: List[str] = list(cfg.get("job_done_users", []))
         self.free_gpus_min: int = int(cfg.get("free_gpus_min", 0))
+        # sender is the single identity in alerts — the real hostname is NOT
+        # included ("master" here is also a compute node name; confusing)
         self.sender: str = cfg.get("sender_name", "AI-master")
         ip = _host_ip()
-        self._origin = f"{self.sender} · {socket.gethostname()}" + (f" ({ip})" if ip else "")
+        self._origin = self.sender + (f" ({ip})" if ip else "")
 
     def _maybe_reload(self) -> None:
         """Pick up webhook.json edits without a collector restart."""

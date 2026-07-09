@@ -98,6 +98,40 @@ if [ -n "$SHARE" ] && [ "$SHARE" != "0" ]; then
     fi
 fi
 
+# Slack-compatible webhook for cluster alerts (node down/recovered).
+# Asked interactively; set SGPU_WEBHOOK_URL to skip the question
+# (SGPU_WEBHOOK_URL="" skips with no webhook). Existing config is kept
+# unless a new URL is entered.
+WEBHOOK_CFG="$HOME/.sgpu/webhook.json"
+WEBHOOK_URL="${SGPU_WEBHOOK_URL-__ask__}"
+if [ "$WEBHOOK_URL" = "__ask__" ]; then
+    WEBHOOK_URL=""
+    if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+        if [ -f "$WEBHOOK_CFG" ]; then
+            printf "Slack webhook for cluster alerts: config exists — new URL to replace, Enter to keep: " > /dev/tty
+        else
+            printf "Slack webhook URL for cluster alerts (node down/up) — Enter to skip: " > /dev/tty
+        fi
+        read -r WEBHOOK_URL < /dev/tty || WEBHOOK_URL=""
+    fi
+fi
+if [ -n "$WEBHOOK_URL" ]; then
+    mkdir -p "$HOME/.sgpu"
+    cat > "$WEBHOOK_CFG" << WEOF
+{
+  "url": "$WEBHOOK_URL",
+  "sender_name": "AI-master",
+  "node_health": true,
+  "job_done_users": [],
+  "free_gpus_min": 0
+}
+WEOF
+    chmod 600 "$WEBHOOK_CFG"
+    echo "[3b] Webhook alerts configured ($WEBHOOK_CFG) — edit it any time; the collector hot-reloads it"
+elif [ -f "$WEBHOOK_CFG" ]; then
+    echo "[3b] Keeping existing webhook config ($WEBHOOK_CFG)"
+fi
+
 SERVICE_FILE="$INSTALL_DIR/sgpu-collector.service"
 GENERATED_SERVICE="$(mktemp)"
 sed -e "s|ExecStart=.*|ExecStart=$VENV_DIR/bin/sgpu-collector|" \
