@@ -32,16 +32,9 @@ def _gpu_is_free(g: dict) -> bool:
 class Notifier:
     def __init__(self, state_dir: Path) -> None:
         self._state_file = state_dir / "notify_state.json"
-        cfg: dict = {}
-        cfg_path = Path.home() / ".sgpu" / "webhook.json"
-        try:
-            cfg = json.loads(cfg_path.read_text())
-        except (OSError, ValueError):
-            pass
-        self.url: str = cfg.get("url") or os.getenv("SLURM_GPU_TUI_WEBHOOK_URL", "")
-        self.node_health: bool = bool(cfg.get("node_health", True))
-        self.job_done_users: List[str] = list(cfg.get("job_done_users", []))
-        self.free_gpus_min: int = int(cfg.get("free_gpus_min", 0))
+        self._cfg_path = Path.home() / ".sgpu" / "webhook.json"
+        self._cfg_mtime: Optional[float] = None
+        self._load_config()
         # persisted: node down-state, last-seen jobs, last alert ts per key
         st: dict = {}
         try:
@@ -53,12 +46,35 @@ class Notifier:
         self._last_sent: Dict[str, float] = st.get("last_sent", {})
         self._free_was_below = bool(st.get("free_was_below", True))
 
+    def _load_config(self) -> None:
+        cfg: dict = {}
+        try:
+            self._cfg_mtime = self._cfg_path.stat().st_mtime
+            cfg = json.loads(self._cfg_path.read_text())
+        except (OSError, ValueError):
+            self._cfg_mtime = None
+        self.url: str = cfg.get("url") or os.getenv("SLURM_GPU_TUI_WEBHOOK_URL", "")
+        self.node_health: bool = bool(cfg.get("node_health", True))
+        self.job_done_users: List[str] = list(cfg.get("job_done_users", []))
+        self.free_gpus_min: int = int(cfg.get("free_gpus_min", 0))
+
+    def _maybe_reload(self) -> None:
+        """Pick up webhook.json edits without a collector restart."""
+        try:
+            mtime = self._cfg_path.stat().st_mtime
+        except OSError:
+            mtime = None
+        if mtime != self._cfg_mtime:
+            self._load_config()
+            print(f"[notify] webhook config reloaded (enabled={self.enabled})", flush=True)
+
     @property
     def enabled(self) -> bool:
         return bool(self.url)
 
     def process(self, data: dict) -> None:
         """Diff one collector snapshot against remembered state; fire alerts."""
+        self._maybe_reload()
         if not self.enabled:
             return
         now = time.time()
