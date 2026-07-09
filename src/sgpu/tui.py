@@ -2046,21 +2046,23 @@ def _cli_doctor() -> int:
     except (OSError, ValueError):
         report(False, "collector data", f"{_DAEMON_DATA_FILE} missing — collector not running (TUI falls back to slow SSH)")
 
-    # node delivery: push agents (shared-FS) or SSH-pull — both are valid
-    agent_dir = Path(os.getenv("SLURM_GPU_TUI_AGENT_DIR", str(Path.home() / ".sgpu" / "nodes")))
-    files = sorted(agent_dir.glob("*.json")) if agent_dir.is_dir() else []
-    if files:
-        ages = {f.stem: time.time() - f.stat().st_mtime for f in files}
-        old = [f"{k}({v:.0f}s)" for k, v in ages.items() if v > 60]
-        report(not old, "node delivery",
-               f"push agents: {len(files)} payloads" + (f", stale: {', '.join(old)}" if old else ", all fresh"))
+    # node delivery: trust data.json's per-node source counts (authoritative —
+    # what the collector actually produced). A disk glob of AGENT_DIR is
+    # unreliable here: an interactive `sgpu doctor` doesn't see the collector's
+    # SLURM_GPU_TUI_AGENT_DIR (that's baked into the service unit), so it would
+    # look in the wrong dir and cry "no push agents" while push is working.
+    if srcs.get("agent", 0) > 0 and srcs.get("ssh", 0) > 0:
+        report(True, "node delivery",
+               f"mixed: {srcs['agent']} push + {srcs['ssh']} SSH-pull")
+    elif srcs.get("agent", 0) > 0:
+        report(True, "node delivery", f"push mode ({srcs['agent']} nodes via agent)")
     elif srcs.get("ssh", 0) > 0:
-        # SSH-pull is a fully supported mode, not a problem — only OK when
-        # it's actually delivering (ssh sources present in the snapshot)
+        # SSH-pull is a fully supported mode, not a problem
         report(True, "node delivery", f"SSH-pull mode ({srcs['ssh']} nodes) — "
                "push agents not in use (shared-FS install enables them)")
     else:
-        report(None, "node delivery", f"no push agents in {agent_dir}, no SSH data yet")
+        agent_dir = Path(os.getenv("SLURM_GPU_TUI_AGENT_DIR", str(Path.home() / ".sgpu" / "nodes")))
+        report(None, "node delivery", f"no node data yet (checked {agent_dir})")
 
     # persistent state
     state_dir = Path(os.getenv("SLURM_GPU_TUI_STATE_DIR", str(Path.home() / ".sgpu" / "state")))
