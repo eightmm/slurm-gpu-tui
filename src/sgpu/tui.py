@@ -75,7 +75,9 @@ def read_daemon_data(max_age: float = _DAEMON_MAX_AGE) -> Optional[Tuple[List[No
     for n in raw.get("nodes", []):
         gpus = [
             GpuInfo(
-                index=g.get("index", ""), minor=g.get("minor", ""), name=g.get("name", ""),
+                index=g.get("index", ""), minor=g.get("minor", ""),
+                uuid=g.get("uuid", ""), pci_bus=g.get("pci_bus", ""),
+                serial=g.get("serial", ""), name=g.get("name", ""),
                 util=g.get("util", ""), mem_used=g.get("mem_used", ""),
                 mem_total=g.get("mem_total", ""), temp=g.get("temp", ""),
                 power=g.get("power", ""), power_cap=g.get("power_cap", ""),
@@ -1788,7 +1790,8 @@ def _snapshot_nodes() -> List[NodeInfo]:
     for n in data.get("nodes", []):
         gpus = [
             GpuInfo(**{k: g.get(k, d) for k, d in (
-                ("index", ""), ("minor", ""), ("name", ""), ("util", ""), ("mem_used", ""),
+                ("index", ""), ("minor", ""), ("uuid", ""), ("pci_bus", ""), ("serial", ""),
+                ("name", ""), ("util", ""), ("mem_used", ""),
                 ("mem_total", ""), ("temp", ""), ("power", ""), ("power_cap", ""), ("ecc", ""),
                 ("pids", []), ("users", []), ("alloc_jobid", ""),
                 ("alloc_user", ""), ("idle_sec", 0), ("parked_sec", 0),

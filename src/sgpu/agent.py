@@ -29,7 +29,7 @@ LOCK_FILE = Path("/tmp/sgpu-agent.lock")
 LOG_FILE = Path("/tmp/sgpu-agent.log")
 LOG_MAX_BYTES = 2 * 1024 * 1024
 
-AGENT_PAYLOAD_VERSION = 3  # v3: gpus carry "ecc" (uncorrectable error count)
+AGENT_PAYLOAD_VERSION = 4  # v4: gpus carry uuid/pci_bus/serial (HW identity)
 
 # Fingerprint of the agent source (shared FS ⇒ same value on all hosts).
 # The collector compares this against agent.py's current mtime and restarts

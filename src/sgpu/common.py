@@ -112,6 +112,9 @@ class GpuInfo:
     index: str = ""      # nvidia-smi enumeration order (PCI bus order)
     minor: str = ""      # /dev/nvidiaN number — what SLURM GRES IDX refers to.
                          # Can differ from index (probe order != PCI order)!
+    uuid: str = ""       # durable hardware id (RMA / physical identification)
+    pci_bus: str = ""    # PCI bus address
+    serial: str = ""     # board serial ("" / N/A on consumer GPUs)
     name: str = ""
     util: str = ""       # %
     mem_used: str = ""   # MiB
@@ -394,11 +397,11 @@ def collect_gpu_alloc() -> Tuple[Dict[str, Dict[str, str]], str]:
 # + meminfo + ps (PID→user). Run remotely via SSH (pull) or locally by the
 # resident agent (push).
 NODE_PAYLOAD_CMD = (
-    # NOTE: ecc column stays LAST so the pci.bus_id index (p[9]) used for the
-    # minor mapping doesn't shift. Consumer GPUs report ecc as [N/A].
+    # NOTE: pci.bus_id must stay at index 9 (minor mapping reads p[9]); new
+    # columns append after. Consumer GPUs report ecc/serial as [N/A].
     "nvidia-smi --query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total,"
     "temperature.gpu,power.draw,power.limit,pci.bus_id,"
-    "ecc.errors.uncorrected.aggregate.total "
+    "ecc.errors.uncorrected.aggregate.total,serial "
     "--format=csv,noheader,nounits 2>/dev/null; "
     "echo '---SEP---'; "
     "nvidia-smi pmon -c 1 -s m 2>/dev/null; "
@@ -475,12 +478,15 @@ def parse_node_payload(out: str) -> Tuple[List[GpuInfo], NodeMemInfo]:
         users = list(dict.fromkeys(
             pid_to_user[pid] for pid in pids if pid in pid_to_user
         ))
+        pci_bus = p[9] if len(p) >= 10 else ""
         minor = ""
-        if len(p) >= 10 and ":" in p[9]:
-            minor = bus_to_minor.get(p[9].split(":", 1)[1].lower(), "")
+        if pci_bus and ":" in pci_bus:
+            minor = bus_to_minor.get(pci_bus.split(":", 1)[1].lower(), "")
         ecc = p[10] if len(p) >= 11 else ""
+        serial = p[11] if len(p) >= 12 else ""
         gpus.append(GpuInfo(
-            index=idx, minor=minor, name=shorten_gpu_name(p[2]), util=p[3],
+            index=idx, minor=minor, uuid=p[1], pci_bus=pci_bus, serial=serial,
+            name=shorten_gpu_name(p[2]), util=p[3],
             mem_used=p[4], mem_total=p[5], temp=p[6], power=p[7], power_cap=p[8],
             ecc=ecc, pids=pids, users=users,
         ))

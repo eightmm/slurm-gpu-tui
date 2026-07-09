@@ -53,8 +53,8 @@ MSG = {
         "waste": ":hourglass: *{loc} {kind} {dur}* — held by {user} (job {jid}), no compute",
         "rogue": ":no_entry: *{loc} used outside SLURM* by {user}",
         "free": ":sparkles: {free} free GPU(s) available",
-        "temp": ":thermometer: *{loc} {temp}°C* — over {thr}°C",
-        "ecc": ":warning: *{loc} uncorrectable ECC errors: {n}* — GPU may be failing",
+        "temp": ":thermometer: *{loc} {temp}°C* — over {thr}°C\n{hw}",
+        "ecc": ":warning: *{loc} uncorrectable ECC errors: {n}* — GPU may be failing\n{hw}",
         "idle": "idle", "parked": "parked",
     },
     "ko": {
@@ -66,8 +66,8 @@ MSG = {
         "waste": ":hourglass: *{loc} {kind} {dur}* — {user} 점유(작업 {jid}), 연산 없음",
         "rogue": ":no_entry: *{loc} SLURM 외부 사용* — {user}",
         "free": ":sparkles: 여유 GPU {free}장 사용 가능",
-        "temp": ":thermometer: *{loc} {temp}°C* — {thr}°C 초과",
-        "ecc": ":warning: *{loc} uncorrectable ECC 에러 {n}건* — GPU 이상 가능",
+        "temp": ":thermometer: *{loc} {temp}°C* — {thr}°C 초과\n{hw}",
+        "ecc": ":warning: *{loc} uncorrectable ECC 에러 {n}건* — GPU 이상 가능\n{hw}",
         "idle": "유휴", "parked": "점유",
     },
 }
@@ -83,6 +83,21 @@ def _to_int(v) -> Optional[int]:
         return int(str(v).strip())
     except (ValueError, TypeError, AttributeError):
         return None
+
+
+def _hw_id(g: dict) -> str:
+    """Physical-identity line for a GPU (UUID / PCI bus / serial), skipping
+    fields the driver reports as N/A."""
+    def ok(v: str) -> bool:
+        return bool(v) and "N/A" not in v and "Not Supported" not in v
+    parts = []
+    if ok(g.get("uuid", "")):
+        parts.append(f"UUID {g['uuid']}")
+    if ok(g.get("pci_bus", "")):
+        parts.append(f"bus {g['pci_bus']}")
+    if ok(g.get("serial", "")):
+        parts.append(f"S/N {g['serial']}")
+    return "_" + " · ".join(parts) + "_" if parts else ""
 
 
 def _host_ip() -> str:
@@ -253,20 +268,21 @@ class Notifier:
         if self.temp_alert_c > 0 or self.ecc_alert:
             for n in nodes:
                 for g in n.get("gpus", []):
-                    loc = f"{n['name']} GPU{g.get('index', '?')}"
+                    loc = f"{n['name']} GPU{g.get('index', '?')} ({g.get('name', '?')})"
+                    hw = _hw_id(g)
                     if self.temp_alert_c > 0:
                         temp = _to_int(g.get("temp"))
                         if temp is not None and temp >= self.temp_alert_c \
                                 and self._ok_to_send(f"temp:{n['name']}:{g.get('index')}",
                                                      now, NAG_REALERT_SEC):
                             self._post(self._m("temp", loc=loc, temp=temp,
-                                               thr=int(self.temp_alert_c)))
+                                               thr=int(self.temp_alert_c), hw=hw))
                     if self.ecc_alert:
                         ecc = _to_int(g.get("ecc"))
                         if ecc and ecc > 0 \
                                 and self._ok_to_send(f"ecc:{n['name']}:{g.get('index')}",
                                                      now, NAG_REALERT_SEC):
-                            self._post(self._m("ecc", loc=loc, n=ecc))
+                            self._post(self._m("ecc", loc=loc, n=ecc, hw=hw))
 
         if self.free_gpus_min > 0:
             free = sum(1 for n in nodes for g in n.get("gpus", []) if _gpu_is_free(g))
