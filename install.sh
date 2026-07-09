@@ -193,6 +193,14 @@ sed -e "s|ExecStart=.*|ExecStart=$VENV_DIR/bin/sgpu-collector|" \
 if [ -n "$SHARE" ] && [ "$SHARE" != "0" ]; then
     sed -i "/^User=/a Environment=SLURM_GPU_TUI_SHARE_SCRIPTS=1" "$GENERATED_SERVICE"
 fi
+# Propagate path overrides into the unit: a systemd service does NOT inherit
+# the installing shell's env, so push mode (agents on a shared FS) needs
+# SLURM_GPU_TUI_AGENT_DIR baked into the unit, else the collector falls back
+# to the local default (~/.sgpu/nodes) and agents can't be reached.
+for var in SLURM_GPU_TUI_AGENT_DIR SLURM_GPU_TUI_STATE_DIR SLURM_GPU_TUI_DATA_DIR; do
+    val="$(eval "printf '%s' \"\${$var:-}\"")"
+    [ -n "$val" ] && sed -i "/^User=/a Environment=$var=$val" "$GENERATED_SERVICE"
+done
 
 SYSTEMD_MODE="none"
 
