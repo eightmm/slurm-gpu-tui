@@ -100,7 +100,8 @@ def _load_inventory() -> None:
 def _update_inventory(name: str, gpu_dicts: List[dict]) -> None:
     """Refresh a node's static GPU info; persist when changed or file missing."""
     static = [
-        {"index": g["index"], "name": g["name"], "mem_total": g["mem_total"]}
+        {"index": g["index"], "minor": g.get("minor", ""),
+         "name": g["name"], "mem_total": g["mem_total"]}
         for g in gpu_dicts
     ]
     if not static:
@@ -430,7 +431,7 @@ def _update_poll_state(name: str, success: bool, node_is_cold: bool, slurm_state
 
 def _gpu_to_dict(gpu: GpuInfo) -> dict:
     return {
-        "index": gpu.index, "name": gpu.name, "util": gpu.util,
+        "index": gpu.index, "minor": gpu.minor, "name": gpu.name, "util": gpu.util,
         "mem_used": gpu.mem_used, "mem_total": gpu.mem_total,
         "temp": gpu.temp, "power": gpu.power, "power_cap": gpu.power_cap,
         "pids": gpu.pids, "users": gpu.users,
@@ -626,7 +627,8 @@ def collect_all() -> dict:
         gpus = []
         for g in r["gpus"]:
             g = dict(g)
-            jid = node_alloc.get(g.get("index", ""), "")
+            # SLURM GRES IDX = device minor, not nvidia-smi order
+            jid = node_alloc.get(g.get("minor") or g.get("index", ""), "")
             g["alloc_jobid"] = jid
             g["alloc_user"] = jobid_user.get(jid, "")
             if skeleton_mode:

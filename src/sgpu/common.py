@@ -109,7 +109,9 @@ def ssh_cmd(node: str, inner_cmd: str, timeout: int = 10) -> Tuple[bool, str]:
 
 @dataclass
 class GpuInfo:
-    index: str = ""
+    index: str = ""      # nvidia-smi enumeration order (PCI bus order)
+    minor: str = ""      # /dev/nvidiaN number — what SLURM GRES IDX refers to.
+                         # Can differ from index (probe order != PCI order)!
     name: str = ""
     util: str = ""       # %
     mem_used: str = ""   # MiB
@@ -392,7 +394,8 @@ def collect_gpu_alloc() -> Tuple[Dict[str, Dict[str, str]], str]:
 # resident agent (push).
 NODE_PAYLOAD_CMD = (
     "nvidia-smi --query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total,"
-    "temperature.gpu,power.draw,power.limit --format=csv,noheader,nounits 2>/dev/null; "
+    "temperature.gpu,power.draw,power.limit,pci.bus_id "
+    "--format=csv,noheader,nounits 2>/dev/null; "
     "echo '---SEP---'; "
     "nvidia-smi pmon -c 1 -s m 2>/dev/null; "
     "echo '---SEP---'; "
@@ -400,7 +403,13 @@ NODE_PAYLOAD_CMD = (
     "END{ printf \"%d %d %d\", t/1024, (t-a)/1024, a/1024 }' /proc/meminfo; "
     "echo '---SEP---'; "
     "PIDS=$(nvidia-smi pmon -c 1 -s u 2>/dev/null | awk 'NR>2 && $2!= \"-\" {print $2}' | tr '\\n' ','); "
-    "if [ -n \"$PIDS\" ]; then ps -p ${PIDS%,} -o pid=,user= 2>/dev/null; fi"
+    "if [ -n \"$PIDS\" ]; then ps -p ${PIDS%,} -o pid=,user= 2>/dev/null; fi; "
+    "echo '---SEP---'; "
+    # PCI bus -> /dev/nvidiaN minor. SLURM's GRES IDX means the minor, and
+    # minor order can differ from nvidia-smi (PCI) order on some boards.
+    "for d in /proc/driver/nvidia/gpus/*/information; do "
+    "awk '/Bus Location/{b=$NF} /Device Minor/{m=$NF} END{print b, m}' \"$d\" 2>/dev/null; "
+    "done"
 )
 
 
@@ -420,6 +429,15 @@ def parse_node_payload(out: str) -> Tuple[List[GpuInfo], NodeMemInfo]:
     pmon_raw = sections[1].strip() if len(sections) > 1 else ""
     mem_raw = sections[2].strip() if len(sections) > 2 else ""
     ps_raw = sections[3].strip() if len(sections) > 3 else ""
+    minor_raw = sections[4].strip() if len(sections) > 4 else ""
+
+    # "0000:06:00.0 2" -> {"06:00.0": "2"}; nvidia-smi prints the bus id with
+    # a longer domain ("00000000:06:00.0"), so compare on the bus:dev.fn tail
+    bus_to_minor: Dict[str, str] = {}
+    for line in minor_raw.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and ":" in parts[0]:
+            bus_to_minor[parts[0].split(":", 1)[1].lower()] = parts[1]
 
     mem_info = NodeMemInfo()
     mem_parts = mem_raw.split()
@@ -453,8 +471,11 @@ def parse_node_payload(out: str) -> Tuple[List[GpuInfo], NodeMemInfo]:
         users = list(dict.fromkeys(
             pid_to_user[pid] for pid in pids if pid in pid_to_user
         ))
+        minor = ""
+        if len(p) >= 10 and ":" in p[9]:
+            minor = bus_to_minor.get(p[9].split(":", 1)[1].lower(), "")
         gpus.append(GpuInfo(
-            index=idx, name=shorten_gpu_name(p[2]), util=p[3],
+            index=idx, minor=minor, name=shorten_gpu_name(p[2]), util=p[3],
             mem_used=p[4], mem_total=p[5], temp=p[6], power=p[7], power_cap=p[8],
             pids=pids, users=users,
         ))
@@ -521,7 +542,8 @@ def apply_gpu_alloc(
     for node in nodes:
         node_alloc = gpu_alloc.get(node.name, {})
         for g in node.gpus:
-            jid = node_alloc.get(g.index, "")
+            # SLURM GRES IDX = device minor, not nvidia-smi order
+            jid = node_alloc.get(g.minor or g.index, "")
             g.alloc_jobid = jid
             g.alloc_user = jobid_user.get(jid, "")
 

@@ -193,3 +193,44 @@ def test_fmt_start_time():
     assert fmt_start_time("N/A") == ""
     assert fmt_start_time("") == ""
     assert fmt_start_time("2030-01-02T15:00:00") == "01-02 15:00"
+
+
+def test_payload_minor_mapping_and_alloc():
+    # gpu4-style board: nvidia-smi (PCI) order differs from /dev/nvidiaN
+    # minors, and SLURM GRES IDX means the minor. Captured from gpu4.
+    payload = (
+        "0, GPU-aaa, RTX 6000 Ada, 7, 2603, 49140, 60, 100, 300, 00000000:06:00.0\n"
+        "1, GPU-bbb, RTX 6000 Ada, 96, 46321, 49140, 70, 250, 300, 00000000:07:00.0\n"
+        "2, GPU-ccc, RTX 6000 Ada, 0, 0, 49140, 40, 20, 300, 00000000:46:00.0\n"
+        "---SEP---\n"
+        "# gpu pid mm\n"
+        "0 1718866 2592\n"
+        "---SEP---\n"
+        "128000 64000 64000"
+        "---SEP---\n"
+        "1718866 jwsong\n"
+        "---SEP---\n"
+        "0000:06:00.0 2\n"
+        "0000:07:00.0 3\n"
+        "0000:46:00.0 0\n"
+    )
+    gpus, _ = parse_node_payload(payload)
+    assert [g.minor for g in gpus] == ["2", "3", "0"]
+    # job holds SLURM IDX 2 -> must land on smi GPU0 (where the process is)
+    from sgpu.common import apply_gpu_alloc
+    node = NodeInfo(name="gpu4", gpus=gpus)
+    apply_gpu_alloc([node], {"gpu4": {"2": "37885"}}, [JobInfo(jobid="37885", user="jwsong")])
+    assert gpus[0].alloc_jobid == "37885" and gpus[0].alloc_user == "jwsong"
+    assert gpus[2].alloc_jobid == ""  # smi GPU2 (minor 0) is truly free
+
+
+def test_payload_without_minor_falls_back_to_index():
+    # macOS-style / old-agent payload with no minor section, no pci column
+    payload = ("0, GPU-aaa, A100, 50, 100, 40000, 50, 100, 300\n"
+               "---SEP---\n\n---SEP---\n1 1 0---SEP---\n")
+    gpus, _ = parse_node_payload(payload)
+    assert gpus[0].minor == ""
+    from sgpu.common import apply_gpu_alloc
+    node = NodeInfo(name="n1", gpus=gpus)
+    apply_gpu_alloc([node], {"n1": {"0": "9"}}, [JobInfo(jobid="9", user="u")])
+    assert gpus[0].alloc_jobid == "9"
