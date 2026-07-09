@@ -2031,13 +2031,13 @@ def _cli_doctor() -> int:
         report(ok, cmd.split()[0], "reachable" if ok else out.splitlines()[0][:70])
 
     # collector data
+    srcs: Dict[str, int] = {}
     try:
         age = time.time() - _DAEMON_DATA_FILE.stat().st_mtime
         raw = json.loads(_DAEMON_DATA_FILE.read_text())
         fresh = age <= _DAEMON_MAX_AGE
         report(fresh, "collector data", f"{_DAEMON_DATA_FILE} age {age:.0f}s"
                + ("" if fresh else " — STALE, is sgpu-collector running?"))
-        srcs: Dict[str, int] = {}
         for n in raw.get("nodes", []):
             srcs[n.get("source", "?")] = srcs.get(n.get("source", "?"), 0) + 1
         stale_n = srcs.get("stale", 0)
@@ -2046,16 +2046,21 @@ def _cli_doctor() -> int:
     except (OSError, ValueError):
         report(False, "collector data", f"{_DAEMON_DATA_FILE} missing — collector not running (TUI falls back to slow SSH)")
 
-    # push agents
+    # node delivery: push agents (shared-FS) or SSH-pull — both are valid
     agent_dir = Path(os.getenv("SLURM_GPU_TUI_AGENT_DIR", str(Path.home() / ".sgpu" / "nodes")))
     files = sorted(agent_dir.glob("*.json")) if agent_dir.is_dir() else []
     if files:
         ages = {f.stem: time.time() - f.stat().st_mtime for f in files}
         old = [f"{k}({v:.0f}s)" for k, v in ages.items() if v > 60]
-        report(not old, "push agents",
-               f"{len(files)} payloads in {agent_dir}" + (f", stale: {', '.join(old)}" if old else ", all fresh"))
+        report(not old, "node delivery",
+               f"push agents: {len(files)} payloads" + (f", stale: {', '.join(old)}" if old else ", all fresh"))
+    elif srcs.get("ssh", 0) > 0:
+        # SSH-pull is a fully supported mode, not a problem — only OK when
+        # it's actually delivering (ssh sources present in the snapshot)
+        report(True, "node delivery", f"SSH-pull mode ({srcs['ssh']} nodes) — "
+               "push agents not in use (shared-FS install enables them)")
     else:
-        report(None, "push agents", f"none in {agent_dir} (SSH pull mode)")
+        report(None, "node delivery", f"no push agents in {agent_dir}, no SSH data yet")
 
     # persistent state
     state_dir = Path(os.getenv("SLURM_GPU_TUI_STATE_DIR", str(Path.home() / ".sgpu" / "state")))
