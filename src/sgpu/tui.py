@@ -573,25 +573,36 @@ def render_usage(days: int = 7) -> Text:
     if loaded is None:
         body.append("No usage data (collector not running or too new).", style="dim")
         return body
-    totals, covered = loaded
+    totals, covered, sacct_ts = loaded
     if not totals:
         body.append("No GPU usage recorded in this window.", style="dim")
         return body
     body.append(f" {'user':<14}{'alloc':>9}{'busy':>9}{'eff':>6}\n", style="bold underline")
-    for user, alloc, busy in totals:
-        eff = busy / alloc if alloc > 0 else 0
+    for user, alloc, busy, sampled_alloc in totals:
+        eff = busy / sampled_alloc if sampled_alloc > 0 else 0
         eff_style = "green" if eff >= 0.7 else "yellow" if eff >= 0.4 else "red"
         body.append(f" {user:<14}", style="magenta")
         body.append(f"{alloc / 3600:>8.1f}h{busy / 3600:>8.1f}h", style="bold")
         body.append(f"{eff:>6.0%}\n", style=eff_style)
     body.append("\nalloc = GPU held by your jobs · busy = GPU actually computing", style="dim")
-    body.append(f"\nsampling-based (collector observed {covered / 3600:.1f}h of this window)", style="dim")
+    if sacct_ts:
+        body.append(f"\nalloc from slurmdbd (sacct, {(time.time() - sacct_ts) / 60:.0f}m ago)"
+                    f" · busy/eff sampled ({covered / 3600:.1f}h observed)", style="dim")
+    else:
+        body.append(f"\nsampling-based (collector observed {covered / 3600:.1f}h of this window)", style="dim")
     return body
 
 
-def load_usage_totals(days: int) -> Optional[Tuple[List[Tuple[str, float, float]], float]]:
+def load_usage_totals(days: int) -> Optional[Tuple[List[Tuple[str, float, float, float]], float, Optional[float]]]:
     """Sum usage.json daily buckets over the window.
-    Returns ([(user, alloc_sec, busy_sec)] alloc desc, covered_seconds)."""
+
+    alloc per user-day = max(sampled, slurmdbd/sacct) — sacct survives
+    collector downtime, sampling covers jobs slurmdbd hasn't flushed yet.
+    busy exists only in sampling. eff should be computed against
+    sampled_alloc (same observation window as busy), not merged alloc.
+
+    Returns ([(user, alloc, busy, sampled_alloc)] alloc desc,
+             covered_seconds, sacct_ts or None)."""
     state_dir = Path(os.getenv("SLURM_GPU_TUI_STATE_DIR", str(Path.home() / ".sgpu" / "state")))
     raw = None
     for p in (state_dir / "usage.json", _DAEMON_DATA_FILE.parent / "usage.json"):
@@ -603,16 +614,24 @@ def load_usage_totals(days: int) -> Optional[Tuple[List[Tuple[str, float, float]
     if raw is None:
         return None
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    sampled = raw.get("days", {})
+    sacct = raw.get("sacct_days", {}) if isinstance(raw.get("sacct_days"), dict) else {}
     totals: Dict[str, List[float]] = {}
-    for day, users in raw.get("days", {}).items():
+    for day in set(sampled) | set(sacct):
         if day < cutoff:
             continue
-        for user, u in users.items():
-            t = totals.setdefault(user, [0.0, 0.0])
-            t[0] += u.get("alloc", 0)
-            t[1] += u.get("busy", 0)
+        s_users = sampled.get(day, {})
+        a_users = sacct.get(day, {})
+        for user in set(s_users) | set(a_users):
+            su = s_users.get(user, {})
+            t = totals.setdefault(user, [0.0, 0.0, 0.0])
+            t[0] += max(su.get("alloc", 0), a_users.get(user, 0.0))
+            t[1] += su.get("busy", 0)
+            t[2] += su.get("alloc", 0)
     covered = sum(v for d, v in raw.get("meta", {}).items() if d >= cutoff)
-    return sorted(((u, a, b) for u, (a, b) in totals.items()), key=lambda x: -x[1]), covered
+    sacct_ts = raw.get("sacct_ts") if sacct else None
+    return (sorted(((u, a, b, sa) for u, (a, b, sa) in totals.items()), key=lambda x: -x[1]),
+            covered, sacct_ts)
 
 
 class UserSelectScreen(ModalScreen):
@@ -1640,10 +1659,11 @@ def _cli_usage(days: int) -> int:
     if loaded is None:
         print("no usage data (collector not running or too new)")
         return 1
-    totals, covered = loaded
-    print(f"{'user':<14}{'alloc':>9}{'busy':>9}{'eff':>6}   (last {days}d, sampled {covered / 3600:.1f}h)")
-    for user, alloc, busy in totals:
-        eff = busy / alloc if alloc > 0 else 0
+    totals, covered, sacct_ts = loaded
+    src = "alloc:sacct busy:sampled" if sacct_ts else f"sampled {covered / 3600:.1f}h"
+    print(f"{'user':<14}{'alloc':>9}{'busy':>9}{'eff':>6}   (last {days}d, {src})")
+    for user, alloc, busy, sampled_alloc in totals:
+        eff = busy / sampled_alloc if sampled_alloc > 0 else 0
         print(f"{user:<14}{alloc / 3600:>8.1f}h{busy / 3600:>8.1f}h{eff:>6.0%}")
     return 0
 
@@ -1711,6 +1731,25 @@ def _cli_doctor() -> int:
         report(True, "usage history", f"{usage} age {(time.time() - usage.stat().st_mtime):.0f}s")
     else:
         report(None, "usage history", "not started yet (collector writes it)")
+
+    # slurmdbd backfill (alloc GPU-hours survive collector downtime)
+    ok, out = run_cmd("sacct -a -X --noheader -S now-1hour --format=JobID", timeout=10)
+    if not ok:
+        report(None, "sacct backfill", "sacct unavailable — alloc is sampling-only "
+               + (out.splitlines()[0][:50] if out else ""))
+    else:
+        sacct_ts = None
+        try:
+            sacct_ts = json.loads(usage.read_text()).get("sacct_ts")
+        except (OSError, ValueError):
+            pass
+        if sacct_ts:
+            age = time.time() - sacct_ts
+            fresh = age <= 2 * 3600
+            report(True if fresh else None, "sacct backfill",
+                   f"last refresh {age / 60:.0f}m ago" + ("" if fresh else " — stale, collector running?"))
+        else:
+            report(None, "sacct backfill", "sacct works but no backfill yet (collector runs it hourly)")
 
     # script sharing (sudoers)
     ok, out = run_cmd("sudo -n scontrol write batch_script 999999999 -", timeout=10)

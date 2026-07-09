@@ -4,6 +4,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import signal
 import sys
 import threading
@@ -216,18 +217,36 @@ def _fetch_scripts(jobs: List[JobInfo]) -> Dict[str, str]:
 # ── Per-user GPU-hour accounting ──────────────────────────────────────────
 # Daily buckets: {"days": {"YYYY-MM-DD": {user: {"alloc": sec, "busy": sec}}}}
 # alloc = GPU allocated to the user's job; busy = that GPU actually computing.
-# Rolling window, persisted each cycle. No slurmdbd needed.
+# Rolling window, persisted each cycle.
+#
+# Two alloc sources:
+#   days       — 3s sampling (loses time whenever the collector is down)
+#   sacct_days — {"YYYY-MM-DD": {user: alloc_sec}} rebuilt from slurmdbd,
+#                which records jobs even while the collector is dead.
+# Readers take max(sampled, sacct) per user-day. busy has no slurmdbd
+# equivalent here (needs an acct_gather GPU plugin), so it stays sampled.
 
 USAGE_FILE = STATE_DIR / "usage.json"
 USAGE_KEEP_DAYS = int(os.getenv("SLURM_GPU_TUI_USAGE_KEEP_DAYS", "30"))
+# 0 disables slurmdbd backfill
+SACCT_BACKFILL_SEC = int(os.getenv("SLURM_GPU_TUI_SACCT_SEC", "3600"))
 _usage: Dict[str, dict] = {"days": {}}
 _last_usage_ts: float | None = None
+_sacct_inflight = False
+_sacct_last_attempt = 0.0
+_sacct_failures = 0  # consecutive; disables backfill on clusters without slurmdbd
+_SACCT_MAX_FAILURES = 3
 
 
 def _load_usage() -> None:
     raw = _read_state_json(USAGE_FILE)
-    if isinstance(raw, dict) and isinstance(raw.get("days"), dict):
+    if not isinstance(raw, dict):
+        return
+    if isinstance(raw.get("days"), dict):
         _usage["days"] = raw["days"]
+    if isinstance(raw.get("sacct_days"), dict):
+        _usage["sacct_days"] = raw["sacct_days"]
+        _usage["sacct_ts"] = raw.get("sacct_ts")
 
 
 def _save_usage() -> None:
@@ -269,6 +288,98 @@ def _accumulate_usage(result_nodes: List[dict], now: float) -> None:
         del _usage["days"][d]
     for d in [d for d in _usage.get("meta", {}) if d < cutoff]:
         del _usage["meta"][d]
+
+
+def _parse_sacct_time(s: str) -> float | None:
+    if not s or s in ("Unknown", "None", "N/A"):
+        return None
+    try:
+        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%S").timestamp()
+    except ValueError:
+        return None
+
+
+def _gpu_count_from_tres(tres: str) -> int:
+    m = re.search(r"(?:^|,)gres/gpu=(\d+)", tres)
+    if m:
+        return int(m.group(1))
+    # some setups only record typed GRES (gres/gpu:a6000=2)
+    return sum(int(n) for n in re.findall(r"(?:^|,)gres/gpu:[^=,]+=(\d+)", tres))
+
+
+def _sacct_backfill(now: float) -> None:
+    """Rebuild per-day alloc GPU-seconds from slurmdbd (authoritative)."""
+    global _sacct_failures
+    start_dt = datetime.now() - timedelta(days=USAGE_KEEP_DAYS)
+    cutoff = start_dt.strftime("%Y-%m-%d")
+    ok, out = run_cmd(
+        "sacct -a -X --noheader --parsable2 --format=User,AllocTRES,Start,End "
+        f"-S {start_dt.strftime('%Y-%m-%dT00:00:00')}", timeout=60)
+    if not ok:
+        _sacct_failures += 1
+        print(f"[collector] sacct backfill failed ({_sacct_failures}/{_SACCT_MAX_FAILURES}): "
+              f"{out.splitlines()[0][:100] if out else 'no output'}", flush=True)
+        if _sacct_failures >= _SACCT_MAX_FAILURES:
+            print("[collector] disabling sacct backfill (no slurmdbd/accounting?) — "
+                  "alloc stays sampling-based", flush=True)
+        return
+    _sacct_failures = 0
+    days: Dict[str, Dict[str, float]] = {}
+    for line in out.splitlines():
+        parts = line.split("|")
+        if len(parts) != 4:
+            continue
+        user, tres, s_start, s_end = parts
+        ngpu = _gpu_count_from_tres(tres)
+        if not user or ngpu <= 0:
+            continue
+        t0 = _parse_sacct_time(s_start)
+        t1 = _parse_sacct_time(s_end) or now  # still running
+        t1 = min(t1, now)
+        if t0 is None or t1 <= t0:
+            continue
+        # split the job's [t0, t1) across day boundaries
+        cur = t0
+        while cur < t1:
+            d = datetime.fromtimestamp(cur)
+            day_end = datetime(d.year, d.month, d.day).timestamp() + 86400
+            day_key = d.strftime("%Y-%m-%d")
+            seg = min(t1, day_end) - cur
+            if day_key >= cutoff:
+                bucket = days.setdefault(day_key, {})
+                bucket[user] = bucket.get(user, 0.0) + ngpu * seg
+            cur = day_end
+    _usage["sacct_days"] = days
+    _usage["sacct_ts"] = now
+    print(f"[collector] sacct backfill: {len(days)} day(s), "
+          f"{sum(len(u) for u in days.values())} user-day rows", flush=True)
+
+
+def _maybe_backfill_sacct(now: float) -> None:
+    """Spawn a background sacct refresh when the last one is old enough."""
+    global _sacct_inflight, _sacct_last_attempt
+    if SACCT_BACKFILL_SEC <= 0 or _sacct_inflight:
+        return
+    if _sacct_failures >= _SACCT_MAX_FAILURES:
+        return
+    if now - float(_usage.get("sacct_ts") or 0) < SACCT_BACKFILL_SEC:
+        return
+    # failed attempts don't advance sacct_ts; don't hammer a broken sacct
+    if now - _sacct_last_attempt < min(SACCT_BACKFILL_SEC, 900):
+        return
+    _sacct_last_attempt = now
+    _sacct_inflight = True
+
+    def worker() -> None:
+        global _sacct_inflight
+        try:
+            _sacct_backfill(time.time())
+        except Exception as e:
+            print(f"[collector] sacct backfill error: {e}", flush=True)
+        finally:
+            _sacct_inflight = False
+
+    threading.Thread(target=worker, daemon=True, name="sacct-backfill").start()
 
 
 # ── Adaptive polling state ────────────────────────────────────────────────
@@ -680,6 +791,7 @@ def run_collector():
             tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
             tmp.rename(DATA_FILE)
             _save_idle_state()
+            _maybe_backfill_sacct(time.time())
             _save_usage()
             _write_metrics(data)
 
