@@ -21,6 +21,7 @@ from .common import (
 )
 from .agent import AGENT_PAYLOAD_VERSION
 from . import agent as _agent_module
+from .notify import Notifier
 
 # ── Config ────────────────────────────────────────────────────────────────
 
@@ -228,6 +229,7 @@ def _fetch_scripts(jobs: List[JobInfo]) -> Dict[str, str]:
 
 USAGE_FILE = STATE_DIR / "usage.json"
 USAGE_KEEP_DAYS = int(os.getenv("SLURM_GPU_TUI_USAGE_KEEP_DAYS", "30"))
+WASTE_MIN_SEC = int(os.getenv("SLURM_GPU_TUI_WASTE_MIN_SEC", "600"))
 # 0 disables slurmdbd backfill
 SACCT_BACKFILL_SEC = int(os.getenv("SLURM_GPU_TUI_SACCT_SEC", "3600"))
 _usage: Dict[str, dict] = {"days": {}}
@@ -283,6 +285,11 @@ def _accumulate_usage(result_nodes: List[dict], now: float) -> None:
                     u["busy"] += dt
             except (ValueError, TypeError):
                 pass
+            # waste = allocated but idle (no process) or parked (VRAM held,
+            # no compute). Same threshold as the TUI waste view, so short
+            # startup/data-loading lulls don't count.
+            if max(g.get("idle_sec", 0), g.get("parked_sec", 0)) >= WASTE_MIN_SEC:
+                u["waste"] = u.get("waste", 0) + dt
     cutoff = (datetime.now() - timedelta(days=USAGE_KEEP_DAYS)).strftime("%Y-%m-%d")
     for d in [d for d in _usage["days"] if d < cutoff]:
         del _usage["days"][d]
@@ -773,6 +780,11 @@ def run_collector():
     _load_idle_state()
     _load_inventory()
     _load_usage()
+    notifier = Notifier(STATE_DIR)
+    if notifier.enabled:
+        print(f"[collector] webhook notifier on (node_health={notifier.node_health}, "
+              f"job_done_users={notifier.job_done_users}, free_gpus_min={notifier.free_gpus_min})",
+              flush=True)
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
@@ -794,6 +806,10 @@ def run_collector():
             _maybe_backfill_sacct(time.time())
             _save_usage()
             _write_metrics(data)
+            try:
+                notifier.process(data)
+            except Exception as e:
+                print(f"[collector] notify error: {e}", flush=True)
 
             n_gpus = sum(len(n.get("gpus", [])) for n in data["nodes"])
             print(f"[collector] {data['ts']} nodes={len(data['nodes'])} "
