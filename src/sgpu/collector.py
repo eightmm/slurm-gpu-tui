@@ -5,6 +5,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import signal
 import sys
 import threading
@@ -509,7 +510,13 @@ def _maybe_repair_agent(name: str) -> None:
         # the kill command itself from self-matching.
         ssh_cmd(name, 'pkill -f "bin/[s]gpu-agent" 2>/dev/null || true', timeout=15)
         time.sleep(1)
-        ok, out = ssh_cmd(name, f"{_AGENT_BIN} --daemon", timeout=25)
+        # Pass our AGENT_DIR to the remote agent: an SSH launch does NOT inherit
+        # the collector's env, and the agent's own default (~/.sgpu/nodes) is
+        # relative to the SSH user's home — which differs from the collector's
+        # when it runs as a system service. Both sides must use the same shared
+        # dir or the collector never sees the payloads (silent SSH-pull).
+        launch = f"SLURM_GPU_TUI_AGENT_DIR={shlex.quote(str(AGENT_DIR))} {_AGENT_BIN} --daemon"
+        ok, out = ssh_cmd(name, launch, timeout=25)
         if not ok and "No such file" in out:
             # Install dir isn't visible from this node (not a shared FS):
             # push mode can't work there — stop retrying, SSH pull covers it
