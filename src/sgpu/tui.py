@@ -507,6 +507,9 @@ HELP_TEXT = """\
  ?        This help
  q        Quit
 
+ Toasts appear when your jobs start/finish and when a
+ node goes down or recovers (while the TUI is open).
+
  Node header GPU strip (one glyph per GPU):
    █ busy   ▅ parked (VRAM held, no compute)
    ▂ idle (reserved, no process)   ▁ free
@@ -905,6 +908,10 @@ class SlurmGpuTui(App):
         self._force_render = False
         self._row_job: Dict[str, str] = {}  # table row key -> jobid for detail popup
         self._pending_user: Dict[str, str] = {}  # pending jobid -> user (for cancel)
+        # toast baselines (None = no refresh seen yet)
+        self._toast_jobs: Optional[Dict[str, JobInfo]] = None
+        self._toast_pending: set = set()
+        self._toast_down: Dict[str, bool] = {}
         self._nodes_cache: List[NodeInfo] = []  # last applied nodes (waste view)
         self._jobs_by_id: Dict[str, JobInfo] = {}  # for detail popup scripts
         self._auto_collapsed = False  # big clusters start collapsed, once
@@ -1215,7 +1222,40 @@ class SlurmGpuTui(App):
             apply_gpu_alloc(phase2_nodes, gpu_alloc, jobs)
             self.call_from_thread(self._apply, phase2_nodes, jobs, pending, " | ".join(all_errors) if all_errors else "")
 
+    def _toast_check(self, nodes: List[NodeInfo], jobs: List[JobInfo],
+                     pending: List[PendingJob]) -> None:
+        """In-TUI toasts: my job started/finished, node down/recovered.
+        First refresh only records the baseline."""
+        mine_run = {j.jobid: j for j in jobs if j.user == self.current_user}
+        mine_pend = {pj.jobid for pj in pending if pj.user == self.current_user}
+        # state-string only (not staleness): SSH-fallback renders would
+        # otherwise false-alarm "down" while a node is merely slow to poll
+        down_now = {n.name: any(s in n.state for s in ("down", "drain", "fail"))
+                    for n in nodes}
+        if self._toast_jobs is not None:
+            for jid, j in self._toast_jobs.items():
+                if jid not in mine_run and jid not in mine_pend:
+                    self.notify(f"{jid} ({j.jobname}) finished after {j.elapsed}",
+                                title="job done", severity="information", timeout=10)
+            for jid in self._toast_pending:
+                if jid in mine_run:
+                    self.notify(f"{jid} ({mine_run[jid].jobname}) started",
+                                title="job started", severity="information", timeout=8)
+            for name, down in down_now.items():
+                was = self._toast_down.get(name)
+                if was is not None and down != was:
+                    if down:
+                        self.notify(f"{name}: {next(n.state for n in nodes if n.name == name)}",
+                                    title="node down", severity="error", timeout=15)
+                    else:
+                        self.notify(f"{name} back in service",
+                                    title="node recovered", severity="information", timeout=8)
+        self._toast_jobs = mine_run
+        self._toast_pending = mine_pend
+        self._toast_down = down_now
+
     def _apply(self, nodes: List[NodeInfo], jobs: List[JobInfo], pending: List[PendingJob], err: str) -> None:
+        self._toast_check(nodes, jobs, pending)
         saved_row = self.tbl.cursor_row
         saved_col = self.tbl.cursor_column
         saved_scroll_x = self.tbl.scroll_x

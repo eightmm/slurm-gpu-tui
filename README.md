@@ -111,6 +111,8 @@ sgpu        # Launch the GPU monitor
 | `?` | Help overlay |
 | `q` | Quit |
 
+While the TUI is open it also pops toast notifications: your jobs starting/finishing, and nodes going down or recovering. (For alerts without a TUI open, see the webhook config in Environment Variables.)
+
 ### One-shot CLI mode
 
 ```bash
