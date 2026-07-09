@@ -204,8 +204,13 @@ class Notifier:
         if self.node_health:
             for n in nodes:
                 name = n["name"]
-                down = bool(n.get("stale")) or bool(n.get("error")) \
-                    or any(s in n.get("state", "") for s in ("down", "drain", "fail"))
+                # Node health = SLURM state only (from local sinfo, always
+                # available and authoritative). sgpu's own SSH/agent collection
+                # errors or staleness are NOT node-down — SSH-pull clusters
+                # routinely fail to reach CPU/GPU-less nodes, which used to
+                # spam false "down" alerts.
+                state = n.get("state", "").lower()
+                down = any(s in state for s in ("down", "drain", "fail", "err", "boot"))
                 # _down: 0/absent = up, else ts of the CONFIRMED (alerted)
                 # outage start (older state files stored bools; coerce)
                 was = self._down.get(name, 0)
@@ -216,7 +221,7 @@ class Notifier:
                     # look identical to an outage for a few cycles
                     if not confirmed and now - first >= self.down_grace_sec \
                             and self._ok_to_send(f"down:{name}", now):
-                        why = n.get("error") or n.get("state", "unreachable")
+                        why = n.get("state", "") or "unreachable"
                         njobs = n.get("jobs", [])
                         users: Dict[str, int] = {}
                         for j in njobs:
