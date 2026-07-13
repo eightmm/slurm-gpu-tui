@@ -1,6 +1,8 @@
-# sgpu - SLURM GPU Monitor
+# sgpu - SLURM GPU Operations Monitor
 
-A real-time TUI tool for monitoring GPU usage across your SLURM cluster, right from the terminal.
+Real-time SLURM cluster monitoring for GPU operations: a terminal TUI, a
+collector daemon, push agents for compute nodes, usage/waste accounting, and
+Slack alerts for the conditions operators need to act on.
 
 ![CI](https://github.com/eightmm/slurm-gpu-tui/actions/workflows/test.yml/badge.svg)
 ![Python](https://img.shields.io/badge/python-3.10+-blue)
@@ -39,6 +41,22 @@ A real-time TUI tool for monitoring GPU usage across your SLURM cluster, right f
 - Collector daemon for instant startup — no SSH wait on launch
 - Slack alerts: node down/recovered, GPU health (temp/ECC), wasted/rogue GPUs,
   and lost collection — grouped into a daily thread, in English or Korean
+
+## Operations Model
+
+`sgpu` is built for a Slurm login/master node that already has `sinfo`,
+`squeue`, `sacct` (optional), and passwordless SSH to GPU nodes.
+
+- `sgpu-collector` runs continuously on the master and writes the latest merged
+  cluster state to `/tmp/slurm-gpu-tui/data.json`.
+- `sgpu-agent` can run on each GPU node and push local `nvidia-smi` data into a
+  shared filesystem. If push mode is not available, the collector falls back to
+  SSH-pull automatically.
+- The TUI reads the collector output first, so opening `sgpu` is instant even on
+  a large cluster.
+- Slack alerting is driven by the collector snapshot and persistent state under
+  `~/.sgpu/state`, so restarts do not re-fire old standing alerts.
+- `sgpu doctor` is the first check after install or when alerts/data look wrong.
 
 ---
 
@@ -191,7 +209,12 @@ need Slack for at-the-terminal awareness.
 
 The TUI reads the merged JSON on each refresh — startup is instant regardless of cluster size. Without the collector, the TUI falls back to direct SSH collection (slower first load).
 
-The collector also writes `/tmp/slurm-gpu-tui/metrics.prom` (Prometheus textfile format: GPU util/memory/temp/power, allocation, idle seconds, node health) — point node_exporter's textfile collector or any scraper at it for Grafana dashboards.
+The collector also writes `/tmp/slurm-gpu-tui/metrics.prom` (Prometheus
+textfile format: GPU util/memory/temp/power, allocation, free/rogue/waste
+counts, idle seconds, node health). Point node_exporter's textfile collector at
+it and import the bundled Grafana dashboard.
+
+**-> Grafana setup and dashboard import: [docs/GRAFANA.md](docs/GRAFANA.md)**
 
 ---
 

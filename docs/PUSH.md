@@ -50,6 +50,25 @@ sgpu doctor        # node delivery → "push mode (N nodes via agent)"
 - CPU-only / GPU-less nodes are never agent targets; SSH-pull-only, and they
   never raise alerts for it.
 
+## Operational checks
+
+```bash
+sgpu doctor
+systemctl status sgpu-collector          # system service
+systemctl --user status sgpu-collector   # user service
+```
+
+Healthy push mode usually shows:
+
+- fresh collector data
+- `node delivery -> push mode (N nodes via agent)` or a mixed push/SSH state
+- writable `SLURM_GPU_TUI_AGENT_DIR`
+- no stale agent payloads older than `SLURM_GPU_TUI_AGENT_MAX_AGE_SEC`
+
+If a node is stale, wait one repair interval
+(`SLURM_GPU_TUI_AGENT_REPAIR_SEC`, default 180s) before assuming manual repair
+is needed. The collector rate-limits per-node relaunches.
+
 ## Wiping and reinstalling (shared FS)
 
 Files on a shared FS are held open by the collector **and by every node's
