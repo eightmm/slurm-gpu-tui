@@ -1,34 +1,43 @@
 """SLURM GPU Monitor TUI application."""
 from __future__ import annotations
 
+import getpass
 import json
 import os
 import re
-import sys
+import threading
 import time
 from dataclasses import asdict
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from rich.syntax import Syntax
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Vertical, VerticalScroll
 from textual.coordinate import Coordinate
-from textual.screen import ModalScreen
 from textual.timer import Timer
 from textual.widgets import (
-    DataTable, Footer, Header, Input, OptionList, Static, TabbedContent, TabPane,
+    DataTable, Footer, Header, Input, Static, TabbedContent, TabPane,
 )
-from textual.widgets.option_list import Option
 
+from .cells import (
+    WASTE_MIN_SEC, classify_gpu, collect_waste, ellipsize, fmt_idle_age,
+    fmt_span, fmt_start_time, gpu_strip, highlight_row, make_bar, mem_cell,
+    pct_color, power_cell, remaining_cell, state_cell, temp_cell, util_cell,
+    vram_cell,
+)
 from .common import (
-    GpuInfo, JobInfo, NodeInfo, NodeSSHResult, PendingJob, ROGUE_IGNORE,
+    GpuInfo, JobInfo, NodeInfo, NodeSSHResult, PendingJob,
     apply_gpu_alloc, build_nodes, cleanup_ssh_pool, collect_basic,
     collect_node_data_parallel, run_cmd,
 )
+from .screens import (
+    _JAMO_ACTIONS, ConfirmScreen, DetailScreen, HelpScreen, UserSelectScreen,
+    WasteScreen,
+)
+from .usage import render_usage
 
 
 # ── Daemon data reader ────────────────────────────────────────────────────
@@ -46,9 +55,14 @@ def read_daemon_data(max_age: float = _DAEMON_MAX_AGE) -> Optional[Tuple[List[No
         if age > max_age:
             return None
         raw = json.loads(_DAEMON_DATA_FILE.read_text(encoding="utf-8"))
+        return _parse_daemon_data(raw)
     except Exception:
+        # any malformed entry (wrong type, non-dict item) falls back to
+        # direct collection instead of killing the refresh worker
         return None
 
+
+def _parse_daemon_data(raw: dict) -> Tuple[List[NodeInfo], List[JobInfo], List[PendingJob], str]:
     jobs: List[JobInfo] = []
     for j in raw.get("jobs", []):
         jobs.append(JobInfo(
@@ -117,684 +131,6 @@ def read_daemon_data(max_age: float = _DAEMON_MAX_AGE) -> Optional[Tuple[List[No
     return nodes, jobs, pending, daemon_errors
 
 
-# ── Rich visual helpers ───────────────────────────────────────────────────
-
-def mb_to_gb(val: str) -> str:
-    try:
-        return f"{float(val) / 1024:.1f}"
-    except (ValueError, TypeError):
-        return val
-
-
-def pct_color(pct: float) -> str:
-    if pct >= 0.90:
-        return "red"
-    if pct >= 0.60:
-        return "yellow"
-    return "green"
-
-
-def make_bar(pct: float, width: int = 20) -> Text:
-    filled = int(pct * width)
-    empty = width - filled
-    color = pct_color(pct)
-    bar = Text()
-    bar.append("█" * filled, style=f"bold {color}")
-    bar.append("░" * empty, style="bright_black")
-    return bar
-
-
-def util_cell(util_str: str) -> Text:
-    if not util_str:
-        return Text("-", style="bright_black")
-    try:
-        val = float(util_str)
-        pct = val / 100.0
-    except (ValueError, TypeError):
-        return Text(f"{util_str}%", style="bright_black")
-    bar = make_bar(pct, width=10)
-    label = Text(f" {val:3.0f}%", style=f"bold {pct_color(pct)}")
-    return bar + label
-
-
-def vram_cell(used_str: str, total_str: str) -> Text:
-    try:
-        t_gb = float(total_str) / 1024
-    except (ValueError, TypeError):
-        t_gb = 0.0
-    try:
-        u_gb = float(used_str) / 1024
-        if t_gb <= 0:
-            return Text("?")
-        pct = u_gb / t_gb
-    except (ValueError, TypeError):
-        # no live reading — still show the capacity when inventory knows it
-        return Text(f"-/{t_gb:.0f}G" if t_gb > 0 else "-", style="bright_black")
-    bar = make_bar(pct, width=12)
-    label = Text(f" {u_gb:.1f}/{t_gb:.0f}G {pct:.0%}", style=f"bold {pct_color(pct)}")
-    return bar + label
-
-
-def temp_cell(temp_str: str) -> Text:
-    if not temp_str:
-        return Text("-", style="bright_black")
-    try:
-        t = float(temp_str)
-    except (ValueError, TypeError):
-        return Text(f"{temp_str}C", style="bright_black")
-    if t >= 85:
-        return Text(f"{t:.0f}C HOT", style="bold red")
-    if t >= 70:
-        return Text(f"{t:.0f}C", style="bold yellow")
-    return Text(f"{t:.0f}C", style="green")
-
-
-def power_cell(power_str: str, cap_str: str) -> Text:
-    if not power_str:
-        return Text("-", style="bright_black")
-    try:
-        pw = float(power_str)
-        cap = float(cap_str)
-        pct = pw / cap if cap > 0 else 0
-    except (ValueError, TypeError):
-        return Text(f"{power_str}W", style="bright_black")
-    bar = make_bar(pct, width=6)
-    label = Text(f" {pw:.0f}/{cap:.0f}W", style=f"{pct_color(pct)}")
-    return bar + label
-
-
-# Long slurm state names get cut by the column — shorten, keep meaning
-_STATE_SHORT = {"allocated": "alloc", "draining": "drain↓", "drained": "drain",
-                "completing": "compl", "reserved": "resvd"}
-
-
-def state_cell(state: str) -> Text:
-    s = state.lower()
-    disp = state
-    for long, short in _STATE_SHORT.items():
-        disp = disp.replace(long, short)
-    if "idle" in s:
-        return Text(f"● {disp}", style="bold green")
-    if "mix" in s:
-        return Text(f"◐ {disp}", style="bold yellow")
-    if "alloc" in s:
-        return Text(f"○ {disp}", style="bold blue")
-    if "down" in s or "drain" in s:
-        return Text(f"✖ {disp}", style="bold bright_black")
-    return Text(disp)
-
-
-def ellipsize(s: str, n: int = 20) -> str:
-    return s if len(s) <= n else s[: n - 1] + "…"
-
-
-def highlight_row(cells: list) -> list:
-    """Apply 'My Jobs' background highlight to all cells in a row."""
-    for cell in cells:
-        if isinstance(cell, Text):
-            cell.stylize("on #1a1a3a")
-    return cells
-
-
-def node_cell(name: str) -> Text:
-    return Text(name, style="bold cyan")
-
-
-def mem_cell(node: NodeInfo) -> Text:
-    """Memory bar. Sources, best first: OS meminfo from the node's agent/SSH
-    payload, sinfo FreeMem, then slurm AllocMem ('~' prefix — allocation, not
-    live usage — but always available, e.g. Ubuntu slurm without FreeMem)."""
-    try:
-        total_mb = float(node.mem_total)
-    except (ValueError, TypeError):
-        return Text("?")
-    used_mb = None
-    approx = False
-    for src in (node.mem_avail, node.mem_free):
-        try:
-            used_mb = total_mb - float(src)
-            break
-        except (ValueError, TypeError):
-            continue
-    if used_mb is None:
-        try:
-            used_mb = float(node.mem_alloc)
-            approx = True
-        except (ValueError, TypeError):
-            return Text(f"-/{total_mb / 1024:.0f}G", style="bright_black")
-    # sinfo free_mem can exceed configured total; clamp to sane range
-    used_mb = min(max(used_mb, 0.0), total_mb)
-    pct = used_mb / total_mb if total_mb > 0 else 0
-    cell = make_bar(pct, width=6)
-    prefix = "~" if approx else ""
-    cell.append(f" {prefix}{used_mb / 1024:.0f}/{total_mb / 1024:.0f}G {pct:.0%}",
-                style=f"{pct_color(pct)}")
-    return cell
-
-
-def parse_slurm_duration(s: str) -> int:
-    """Parse SLURM duration string to total seconds. Returns -1 on failure."""
-    if not s or s in ("N/A", "UNLIMITED", "Partition_Limit"):
-        return -1
-    try:
-        days = 0
-        if "-" in s:
-            d, s = s.split("-", 1)
-            days = int(d)
-        parts = s.split(":")
-        if len(parts) == 3:
-            h, m, sec = int(parts[0]), int(parts[1]), int(parts[2])
-        elif len(parts) == 2:
-            h, m, sec = 0, int(parts[0]), int(parts[1])
-        else:
-            return -1
-        return days * 86400 + h * 3600 + m * 60 + sec
-    except (ValueError, IndexError):
-        return -1
-
-
-def classify_gpu(g: GpuInfo) -> str:
-    """One of: rogue (GPU process outside any SLURM allocation) / busy /
-    parked (VRAM held, no compute) / idle (reserved, no process) / free /
-    unknown (no data yet)."""
-    real_users = [u for u in g.users if u not in ROGUE_IGNORE]
-    if real_users and not g.alloc_jobid:
-        return "rogue"
-    try:
-        util = float(g.util)
-    except (ValueError, TypeError):
-        return "unknown"
-    if util > 5:
-        return "busy"
-    try:
-        total = float(g.mem_total)
-        vram_pct = float(g.mem_used) / total if total > 0 else 0.0
-    except (ValueError, TypeError):
-        vram_pct = 0.0
-    if vram_pct >= 0.3:
-        return "parked"
-    if g.alloc_jobid or real_users:
-        return "idle"
-    return "free"
-
-
-_CLASS_GLYPH = {
-    "busy": ("█", "green"),
-    "parked": ("▅", "blue"),
-    "idle": ("▂", "yellow"),
-    "free": ("▁", "bold cyan"),
-    "rogue": ("!", "bold red"),
-    "unknown": ("?", "bright_black"),
-}
-
-
-def gpu_strip(classes: List[str]) -> Text:
-    """One glyph per GPU: at-a-glance node state, useful when collapsed."""
-    strip = Text()
-    for c in classes:
-        ch, style = _CLASS_GLYPH.get(c, ("?", "bright_black"))
-        strip.append(ch, style=style)
-    return strip
-
-
-def fmt_span(sec: int) -> str:
-    """'3.2h' / '12m' / '' for sub-minute durations."""
-    if sec >= 3600:
-        return f"{sec / 3600:.1f}h"
-    if sec >= 60:
-        return f"{sec // 60}m"
-    return ""
-
-
-def fmt_idle_age(sec: int) -> str:
-    """'idle 3.2h' / 'idle 12m' / 'idle' for short/unknown durations."""
-    span = fmt_span(sec)
-    return f"idle {span}" if span else "idle"
-
-
-def collect_waste(nodes: List[NodeInfo], min_sec: int) -> List[dict]:
-    """Idle/parked offenders over the threshold, worst first."""
-    rows: List[dict] = []
-    for n in nodes:
-        for g in n.gpus:
-            real_users = [u for u in g.users if u not in ROGUE_IGNORE]
-            if real_users and not g.alloc_jobid:
-                # Link to the culprit job when it's a gres-less SLURM job
-                jid = next((j.jobid for j in n.jobs
-                            if j.user in real_users and j.gpu_count == 0), "")
-                rows.append({
-                    "node": n.name, "gpu": g.index,
-                    "kind": "no-gres" if jid else "rogue",
-                    "sec": 0, "user": ",".join(real_users), "jobid": jid,
-                })
-            elif g.idle_sec >= min_sec:
-                rows.append({
-                    "node": n.name, "gpu": g.index, "kind": "idle",
-                    "sec": g.idle_sec, "user": g.alloc_user,
-                    "jobid": g.alloc_jobid,
-                })
-            elif g.parked_sec >= min_sec:
-                rows.append({
-                    "node": n.name, "gpu": g.index, "kind": "parked",
-                    "sec": g.parked_sec,
-                    "user": g.alloc_user or ",".join(g.users),
-                    "jobid": g.alloc_jobid,
-                })
-    # unauthorized GPU use first (rogue / gres-less job), then worst waste
-    rows.sort(key=lambda r: (r["kind"] not in ("rogue", "no-gres"), -r["sec"]))
-    return rows
-
-
-WASTE_MIN_SEC = int(os.getenv("SLURM_GPU_TUI_WASTE_MIN_SEC", "600"))
-
-
-def _waste_thr() -> str:
-    return fmt_span(WASTE_MIN_SEC) or f"{WASTE_MIN_SEC}s"
-
-
-def fmt_start_time(s: str) -> str:
-    """Compact squeue %S estimate: '15:00' today, '07-08 15:00' otherwise."""
-    if not s or s in ("N/A", "(null)"):
-        return ""
-    try:
-        dt = datetime.fromisoformat(s)
-    except ValueError:
-        return s
-    if dt.date() == datetime.now().date():
-        return dt.strftime("%H:%M")
-    return dt.strftime("%m-%d %H:%M")
-
-
-def remaining_cell(elapsed: str, time_limit: str) -> Text:
-    """Show time remaining in job. Red <1h, yellow <12h, green otherwise."""
-    elapsed_s = parse_slurm_duration(elapsed)
-    limit_s = parse_slurm_duration(time_limit)
-    if elapsed_s < 0 or limit_s < 0:
-        return Text(elapsed or "", style="dim")
-    remaining_s = limit_s - elapsed_s
-    if remaining_s < 0:
-        remaining_s = 0
-    h = remaining_s // 3600
-    m = (remaining_s % 3600) // 60
-    label = f"{h}:{m:02d}h" if h > 0 else f"{m}m"
-    if remaining_s < 3600:
-        return Text(label, style="bold red")
-    elif remaining_s < 43200:
-        return Text(label, style="yellow")
-    else:
-        return Text(label, style="dim green")
-
-
-# ── Modal screens ─────────────────────────────────────────────────────────
-
-class DetailScreen(ModalScreen):
-    """Modal for a job or node: scontrol info, plus a Script tab for jobs."""
-
-    BINDINGS = [
-        ("escape", "close", "Close"),
-        ("q", "close", "Close"),
-        ("enter", "close", "Close"),
-        ("tab", "switch_tab", "Info/Script"),
-    ]
-    CSS = """
-    DetailScreen { align: center middle; }
-    #detail-box {
-        width: 90%; height: 85%;
-        border: round $primary; background: $surface; padding: 1 2;
-    }
-    #detail-title { text-style: bold; color: $accent; height: 1; }
-    DetailScreen TabbedContent { height: 1fr; }
-    DetailScreen VerticalScroll { height: 1fr; }
-    """
-
-    def on_key(self, event) -> None:
-        if getattr(event, "character", None) == "ㅂ":
-            event.stop()
-            self.action_close()
-
-    def __init__(self, title: str, body: str, script: str = "", script_src: str = "") -> None:
-        super().__init__()
-        self._title = title
-        self._body = body
-        self._script = script
-        self._script_src = script_src
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="detail-box"):
-            yield Static(self._title, id="detail-title")
-            # Text() so shell scripts with [brackets] aren't parsed as markup
-            if self._script:
-                with TabbedContent(initial="tab-info"):
-                    with TabPane("Job Info", id="tab-info"):
-                        with VerticalScroll():
-                            yield Static(Text(self._body))
-                    with TabPane(f"Script ({self._script_src})", id="tab-script"):
-                        with VerticalScroll():
-                            yield Static(Syntax(self._script, "bash",
-                                                line_numbers=True, word_wrap=True))
-            else:
-                with VerticalScroll():
-                    yield Static(Text(self._body))
-
-    def action_switch_tab(self) -> None:
-        try:
-            tc = self.query_one(TabbedContent)
-        except Exception:
-            return
-        tc.active = "tab-script" if tc.active == "tab-info" else "tab-info"
-
-    def action_close(self) -> None:
-        self.app.pop_screen()
-
-
-HELP_TEXT = """\
- 1/2/3    Tabs: GPU / CPU / Usage  (g also opens Usage)
- r        Refresh now
- s        Cycle sort: Node → Utilization → User → Free
- u        Filter by user (pick from list; u again clears)
- i        Idle filter (truly free GPUs only)
- d        Detail columns (Temp / Power / JobID / JobName)
- Space    Collapse / expand node (on header row)
- Enter    Job / node details — Tab switches Info/Script
- /        Search node or user (Esc clears)
- w        Wasted GPUs (idle / parked, worst first)
- x        Cancel job under cursor (your own only, asks first)
- j / k    Cursor down / up
- e        Export snapshot JSON
- ?        This help
- q        Quit
-
- Toasts appear when your jobs start/finish and when a
- node goes down or recovers (while the TUI is open).
-
- Node header GPU strip (one glyph per GPU):
-   █ busy   ▅ parked (VRAM held, no compute)
-   ▂ idle (reserved, no process)   ▁ free
-   ! rogue (GPU use outside SLURM)   ? no data
-
- User column markers:
-   bold user        process running on GPU
-   user idle 3.2h   allocated but no process (wasted)
-   parked           VRAM held at ~0% util
-   user !slurm      GPU process with no SLURM allocation
-
- Korean IME: same physical keys work without switching
- (ㅂ=q, ㄱ=r, ㄴ=s, ㅇ=d, ㅑ=i, ㅕ=u, ㄷ=e, ㅈ=w, ㅎ=g, ㅓ=j, ㅏ=k)
-"""
-
-
-class WasteScreen(ModalScreen):
-    """GPUs wasting away: idle (allocated, no process) and parked (VRAM held)."""
-
-    BINDINGS = [("escape", "close", "Close"), ("q", "close", "Close"), ("w", "close", "Close")]
-    CSS = """
-    WasteScreen { align: center middle; }
-    #waste-box {
-        width: 76; max-height: 85%;
-        border: round $warning; background: $surface; padding: 1 2;
-    }
-    """
-
-    def __init__(self, rows: List[dict]) -> None:
-        super().__init__()
-        self._rows = rows
-
-    def compose(self) -> ComposeResult:
-        body = Text()
-        if not self._rows:
-            body.append("No wasted GPUs over threshold. Nice cluster.", style="green")
-        for r in self._rows:
-            body.append(f" {r['node']}/{r['gpu']:<3}", style="bold cyan")
-            style = {"idle": "yellow", "parked": "blue", "rogue": "red", "no-gres": "red"}.get(r["kind"], "white")
-            body.append(f" {r['kind']:<7}", style=f"bold {style}")
-            span = "-" if r["kind"] in ("rogue", "no-gres") else (fmt_span(r["sec"]) or "<1m")
-            body.append(f" {span:>7} ", style="bold")
-            body.append(f" {r['user']:<12}", style="magenta")
-            if r["jobid"]:
-                body.append(f" job {r['jobid']}", style="dim")
-            body.append("\n")
-        with VerticalScroll(id="waste-box"):
-            yield Static(Text(f"Wasted GPUs (≥{_waste_thr()}) — idle: reserved w/o process · parked: VRAM held at 0% util", style="bold"))
-            yield Static(body)
-
-    def on_key(self, event) -> None:
-        if getattr(event, "character", None) == "ㅂ":
-            event.stop()
-            self.action_close()
-
-    def action_close(self) -> None:
-        self.app.pop_screen()
-
-
-def render_usage(days: int = 7) -> Text:
-    """Per-user GPU-hours table (Usage tab / former modal)."""
-    body = Text()
-    body.append(f"GPU-hours by user — last {days} days\n\n", style="bold")
-    loaded = load_usage_totals(days)
-    if loaded is None:
-        body.append("No usage data (collector not running or too new).", style="dim")
-        return body
-    totals, covered, sacct_ts = loaded
-    if not totals:
-        body.append("No GPU usage recorded in this window.", style="dim")
-        return body
-    body.append(f" {'user':<14}{'alloc':>9}{'busy':>9}{'eff':>6}{'waste':>9}\n", style="bold underline")
-    for user, alloc, busy, sampled_alloc, waste in totals:
-        eff = busy / sampled_alloc if sampled_alloc > 0 else 0
-        eff_style = "green" if eff >= 0.7 else "yellow" if eff >= 0.4 else "red"
-        body.append(f" {user:<14}", style="magenta")
-        body.append(f"{alloc / 3600:>8.1f}h{busy / 3600:>8.1f}h", style="bold")
-        body.append(f"{eff:>6.0%}", style=eff_style)
-        body.append(f"{waste / 3600:>8.1f}h\n", style="red" if waste >= 3600 else "dim")
-    daily = load_usage_daily(days)
-    if len(daily) > 1:
-        body.append(f"\n {'day':<7}{'alloc':>7}{'busy':>7}  cluster GPU-hours/day\n",
-                    style="bold underline")
-        width = 30
-        peak = max(a for _, a, _, _ in daily) or 1.0
-        for day, alloc, busy, covered in daily:
-            cells = round(alloc / peak * width)
-            busy_cells = min(cells, round(busy / peak * width))
-            busy_txt = f"{busy / 3600:>6.0f}h" if covered >= 60 or busy > 0 else f"{'-':>7}"
-            body.append(f" {day[5:]:<7}", style="cyan")
-            body.append(f"{alloc / 3600:>6.0f}h{busy_txt}  ", style="bold")
-            body.append("█" * busy_cells, style="green")
-            body.append("█" * (cells - busy_cells), style="bright_black")
-            body.append("\n")
-        if any(c < 60 and b <= 0 for _, _, b, c in daily):
-            body.append("   - = collector wasn't sampling that day (busy unknown)\n", style="dim")
-    body.append("\nalloc = GPU held by your jobs · busy = GPU actually computing"
-                f" · waste = idle/parked ≥{_waste_thr()}", style="dim")
-    if sacct_ts:
-        body.append(f"\nalloc from slurmdbd (sacct, {(time.time() - sacct_ts) / 60:.0f}m ago)"
-                    f" · busy/eff sampled ({covered / 3600:.1f}h observed)", style="dim")
-    else:
-        body.append(f"\nsampling-based (collector observed {covered / 3600:.1f}h of this window)", style="dim")
-    return body
-
-
-def _read_usage_raw() -> Optional[dict]:
-    state_dir = Path(os.getenv("SLURM_GPU_TUI_STATE_DIR", str(Path.home() / ".sgpu" / "state")))
-    for p in (state_dir / "usage.json", _DAEMON_DATA_FILE.parent / "usage.json"):
-        try:
-            return json.loads(p.read_text())
-        except (OSError, ValueError):
-            continue
-    return None
-
-
-def load_usage_daily(days: int) -> List[Tuple[str, float, float, float]]:
-    """Cluster-wide per-day totals [(day, alloc_sec, busy_sec, covered_sec)],
-    oldest first. Same max(sampled, sacct) alloc merge as load_usage_totals.
-    covered_sec ~ 0 means the collector never sampled that day: busy is
-    unknown there, not zero."""
-    raw = _read_usage_raw()
-    if raw is None:
-        return []
-    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    sampled = raw.get("days", {})
-    sacct = raw.get("sacct_days", {}) if isinstance(raw.get("sacct_days"), dict) else {}
-    meta = raw.get("meta", {})
-    out: List[Tuple[str, float, float, float]] = []
-    for day in sorted(set(sampled) | set(sacct)):
-        if day < cutoff:
-            continue
-        s_users = sampled.get(day, {})
-        a_users = sacct.get(day, {})
-        alloc = busy = 0.0
-        for user in set(s_users) | set(a_users):
-            su = s_users.get(user, {})
-            alloc += max(su.get("alloc", 0), a_users.get(user, 0.0))
-            busy += su.get("busy", 0)
-        out.append((day, alloc, busy, float(meta.get(day, 0))))
-    return out
-
-
-def load_usage_totals(days: int) -> Optional[Tuple[List[Tuple[str, float, float, float]], float, Optional[float]]]:
-    """Sum usage.json daily buckets over the window.
-
-    alloc per user-day = max(sampled, slurmdbd/sacct) — sacct survives
-    collector downtime, sampling covers jobs slurmdbd hasn't flushed yet.
-    busy exists only in sampling. eff should be computed against
-    sampled_alloc (same observation window as busy), not merged alloc.
-
-    Returns ([(user, alloc, busy, sampled_alloc, waste)] alloc desc,
-             covered_seconds, sacct_ts or None)."""
-    raw = _read_usage_raw()
-    if raw is None:
-        return None
-    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    sampled = raw.get("days", {})
-    sacct = raw.get("sacct_days", {}) if isinstance(raw.get("sacct_days"), dict) else {}
-    totals: Dict[str, List[float]] = {}
-    for day in set(sampled) | set(sacct):
-        if day < cutoff:
-            continue
-        s_users = sampled.get(day, {})
-        a_users = sacct.get(day, {})
-        for user in set(s_users) | set(a_users):
-            su = s_users.get(user, {})
-            t = totals.setdefault(user, [0.0, 0.0, 0.0, 0.0])
-            t[0] += max(su.get("alloc", 0), a_users.get(user, 0.0))
-            t[1] += su.get("busy", 0)
-            t[2] += su.get("alloc", 0)
-            t[3] += su.get("waste", 0)
-    covered = sum(v for d, v in raw.get("meta", {}).items() if d >= cutoff)
-    sacct_ts = raw.get("sacct_ts") if sacct else None
-    return (sorted(((u, a, b, sa, w) for u, (a, b, sa, w) in totals.items()), key=lambda x: -x[1]),
-            covered, sacct_ts)
-
-
-class UserSelectScreen(ModalScreen):
-    """Pick a user to filter the view by (Enter selects, Esc cancels)."""
-
-    BINDINGS = [("escape", "cancel", "Cancel"), ("q", "cancel", "Cancel")]
-    CSS = """
-    UserSelectScreen { align: center middle; }
-    #user-box {
-        width: 44; max-height: 80%;
-        border: round $primary; background: $surface; padding: 1 2;
-    }
-    """
-
-    def __init__(self, users: List[Tuple[str, int]]) -> None:
-        super().__init__()
-        self._users = users
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="user-box"):
-            yield Static(Text("Filter by user", style="bold"))
-            yield OptionList(*[
-                Option(f"{u:<16} {c} GPU", id=u) for u, c in self._users
-            ])
-
-    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        self.dismiss(str(event.option.id))
-
-    def on_key(self, event) -> None:
-        if getattr(event, "character", None) == "ㅂ":
-            event.stop()
-            self.action_cancel()
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)
-
-
-class ConfirmScreen(ModalScreen):
-    """Yes/no confirmation; dismisses with a bool."""
-
-    BINDINGS = [
-        ("escape", "no", "No"), ("n", "no", "No"),
-        ("y", "yes", "Yes"), ("enter", "yes", "Yes"),
-    ]
-    CSS = """
-    ConfirmScreen { align: center middle; }
-    #confirm-box {
-        width: 60; height: auto;
-        border: round $error; background: $surface; padding: 1 2;
-    }
-    """
-
-    def __init__(self, message: str) -> None:
-        super().__init__()
-        self._message = message
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="confirm-box"):
-            yield Static(Text(self._message, style="bold"))
-            yield Static(Text("y/Enter = yes · n/Esc = no", style="dim"))
-
-    def action_yes(self) -> None:
-        self.dismiss(True)
-
-    def action_no(self) -> None:
-        self.dismiss(False)
-
-
-class HelpScreen(ModalScreen):
-    BINDINGS = [
-        ("escape", "close", "Close"),
-        ("q", "close", "Close"),
-        ("question_mark", "close", "Close"),
-    ]
-    CSS = """
-    HelpScreen { align: center middle; }
-    #help-box {
-        width: 60; max-height: 90%;
-        border: round $primary; background: $surface; padding: 1 2;
-    }
-    """
-
-    def compose(self) -> ComposeResult:
-        with VerticalScroll(id="help-box"):
-            yield Static(Text("Keyboard Shortcuts", style="bold"))
-            yield Static(HELP_TEXT)
-
-    def on_key(self, event) -> None:
-        if getattr(event, "character", None) == "ㅂ":
-            event.stop()
-            self.action_close()
-
-    def action_close(self) -> None:
-        self.app.pop_screen()
-
-
-# Korean 2-set layout: jamo typed where the latin binding key sits.
-# Lets every shortcut work without switching IME back to English.
-_JAMO_ACTIONS = {
-    "ㅂ": "quit",          # q
-    "ㄱ": "refresh",       # r
-    "ㄴ": "toggle_sort",   # s
-    "ㅕ": "toggle_user_filter",  # u
-    "ㅑ": "toggle_idle_filter",  # i
-    "ㅇ": "toggle_details",      # d
-    "ㄷ": "export_json",         # e
-    "ㅈ": "show_waste",          # w
-    "ㅎ": "show_usage",          # g
-    "ㅓ": "cursor_down",         # j
-    "ㅏ": "cursor_up",           # k
-}
-
 
 # ── TUI App ───────────────────────────────────────────────────────────────
 
@@ -819,6 +155,8 @@ class SlurmGpuTui(App):
     BINDINGS = [
         ("r", "refresh", "Refresh"),
         ("s", "toggle_sort", "Sort"),
+        ("S", "reverse_sort", "Rev-sort"),
+        ("z", "collapse_all", "Fold all"),
         ("u", "toggle_user_filter", "User"),
         ("i", "toggle_idle_filter", "Free GPUs"),
         ("space", "toggle_collapse", "Collapse"),
@@ -876,7 +214,12 @@ class SlurmGpuTui(App):
         self.cpu_tbl.add_column("CPU users (cores)", key="c_users")
         self.cpu_tbl.cursor_type = "row"
         self.cpu_tbl.zebra_stripes = True
-        self.current_user = os.environ.get("USER", os.getlogin() if hasattr(os, "getlogin") else "user")
+        # NOT os.getlogin(): it raises OSError without a controlling TTY
+        # (tmux detach, systemd, nohup)
+        try:
+            self.current_user = os.environ.get("USER") or getpass.getuser()
+        except Exception:
+            self.current_user = "user"
         self._node_cache: dict = {}
 
         self.show_details = False
@@ -901,9 +244,9 @@ class SlurmGpuTui(App):
         self.refresh_sec = int(os.getenv("SLURM_GPU_TUI_REFRESH_SEC", "3"))
         self.node_timeout = int(os.getenv("SLURM_GPU_TUI_NODE_TIMEOUT_SEC", "30"))
         self.max_workers = int(os.getenv("SLURM_GPU_TUI_MAX_WORKERS", "8"))
-        self.snapshot: dict = {}
 
         self.sort_by = "node"  # "node", "util", "user", "free"
+        self.sort_reverse = False
         self.filter_user = ""  # show only this user's jobs ("" = everyone)
         self._user_gpu_count: Dict[str, int] = {}
         self._collapsed: set = set()  # node names that are collapsed
@@ -918,6 +261,10 @@ class SlurmGpuTui(App):
         self._nodes_cache: List[NodeInfo] = []  # last applied nodes (waste view)
         self._jobs_by_id: Dict[str, JobInfo] = {}  # for detail popup scripts
         self._auto_collapsed = False  # big clusters start collapsed, once
+        self._last_applied: Optional[Tuple[List[NodeInfo], List[JobInfo], List[PendingJob], str]] = None
+        # one collection at a time: exclusive=True only cancels cooperatively,
+        # so without this a slow SSH-fallback sweep piles up parallel sweeps
+        self._refresh_lock = threading.Lock()
 
         self._timer: Timer | None = None
         self._reset_timer(self.refresh_sec)
@@ -929,7 +276,6 @@ class SlurmGpuTui(App):
         self._timer = self.set_interval(sec, self.refresh_all)
 
     def action_quit(self) -> None:
-        from .common import cleanup_ssh_pool
         cleanup_ssh_pool()
         self.exit()
 
@@ -942,9 +288,18 @@ class SlurmGpuTui(App):
         self._rerender()
 
     def action_export_json(self) -> None:
-        import json as _json
+        if self._last_applied is None:
+            self.status_w.update(Text(" No data to export yet ", style="dim"))
+            return
+        nodes, jobs, pending, _ = self._last_applied
+        snapshot = {
+            "ts": datetime.now().isoformat(),
+            "nodes": [asdict(n) for n in nodes],
+            "jobs": [asdict(j) for j in jobs],
+            "pending": [asdict(p) for p in pending],
+        }
         out = Path(f"sgpu-export-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json")
-        out.write_text(_json.dumps(self.snapshot, indent=2, ensure_ascii=False))
+        out.write_text(json.dumps(snapshot, indent=2, ensure_ascii=False))
         self.status_w.update(Text(f" Exported → {out} ", style="bold green"))
 
     def action_toggle_sort(self) -> None:
@@ -952,6 +307,20 @@ class SlurmGpuTui(App):
         idx = choices.index(self.sort_by)
         self.sort_by = choices[(idx + 1) % len(choices)]
         self.status_w.update(f"Sort by: {self.sort_by}")
+        self._rerender()
+
+    def action_reverse_sort(self) -> None:
+        self.sort_reverse = not self.sort_reverse
+        self.status_w.update(f"Sort by: {self.sort_by}"
+                             + (" (reversed)" if self.sort_reverse else ""))
+        self._rerender()
+
+    def action_collapse_all(self) -> None:
+        gpu_nodes = {n.name for n in self._nodes_cache if n.has_gpu}
+        if self._collapsed >= gpu_nodes:
+            self._collapsed.clear()
+        else:
+            self._collapsed = set(gpu_nodes)
         self._rerender()
 
     def action_toggle_user_filter(self) -> None:
@@ -1008,17 +377,23 @@ class SlurmGpuTui(App):
             return
 
         def _do(confirmed: Optional[bool]) -> None:
-            if not confirmed:
-                return
-            ok, out = run_cmd(f"scancel {jid}")
-            if ok:
-                self.status_w.update(Text(f" job {jid} cancelled ", style="bold green"))
-                self.action_refresh()
-            else:
-                self.status_w.update(Text(f" scancel failed: {out.strip()[:60]} ", style="bold red"))
+            if confirmed:
+                self._do_scancel(jid)
 
         label = f"{jid} ({name})" if name else jid
         self.push_screen(ConfirmScreen(f"Cancel your job {label}?"), _do)
+
+    @work(thread=True)
+    def _do_scancel(self, jid: str) -> None:
+        # off the UI thread — a slow slurmctld would otherwise freeze the app
+        ok, out = run_cmd(f"scancel {jid}")
+        if ok:
+            self.call_from_thread(self.status_w.update,
+                                  Text(f" job {jid} cancelled ", style="bold green"))
+            self.call_from_thread(self.action_refresh)
+        else:
+            self.call_from_thread(self.status_w.update,
+                                  Text(f" scancel failed: {out.strip()[:60]} ", style="bold red"))
 
     def action_toggle_collapse(self) -> None:
         if self.tbl.row_count == 0:
@@ -1142,11 +517,30 @@ class SlurmGpuTui(App):
             return
         self.call_from_thread(self.push_screen, DetailScreen(f"{kind} {name}", out))
 
+    def _active_scrollable(self):
+        """Widget j/k should drive: the focused table, else the active tab's."""
+        if self.pending_tbl.has_focus:
+            return self.pending_tbl
+        active = self.query_one("#main-tabs", TabbedContent).active
+        if active == "pane-cpu":
+            return self.cpu_tbl
+        if active == "pane-usage":
+            return self.query_one("#usage-scroll", VerticalScroll)
+        return self.tbl
+
     def action_cursor_down(self) -> None:
-        self.tbl.action_scroll_down()
+        w = self._active_scrollable()
+        if isinstance(w, DataTable):
+            w.action_scroll_down()
+        else:
+            w.scroll_down()
 
     def action_cursor_up(self) -> None:
-        self.tbl.action_scroll_up()
+        w = self._active_scrollable()
+        if isinstance(w, DataTable):
+            w.action_scroll_up()
+        else:
+            w.scroll_up()
 
     def action_start_search(self) -> None:
         w = self.query_one("#search-input", Input)
@@ -1179,6 +573,14 @@ class SlurmGpuTui(App):
 
     @work(exclusive=True, thread=True)
     def refresh_all(self) -> None:
+        if not self._refresh_lock.acquire(blocking=False):
+            return  # a collection is still running; this tick just skips
+        try:
+            self._refresh_all_locked()
+        finally:
+            self._refresh_lock.release()
+
+    def _refresh_all_locked(self) -> None:
         force = self._force_render
         self._force_render = False
 
@@ -1226,7 +628,7 @@ class SlurmGpuTui(App):
             self.call_from_thread(self._apply, phase2_nodes, jobs, pending, " | ".join(all_errors) if all_errors else "")
 
     def _toast_check(self, nodes: List[NodeInfo], jobs: List[JobInfo],
-                     pending: List[PendingJob]) -> None:
+                     pending: List[PendingJob], err: str) -> None:
         """In-TUI toasts: my job started/finished, node down/recovered.
         First refresh only records the baseline."""
         mine_run = {j.jobid: j for j in jobs if j.user == self.current_user}
@@ -1235,15 +637,19 @@ class SlurmGpuTui(App):
         # otherwise false-alarm "down" while a node is merely slow to poll
         down_now = {n.name: any(s in n.state for s in ("down", "drain", "fail"))
                     for n in nodes}
+        # a failed/partial collection yields an empty job list — diffing
+        # against it would toast "finished" for every running job
+        jobs_ok = not err
         if self._toast_jobs is not None:
-            for jid, j in self._toast_jobs.items():
-                if jid not in mine_run and jid not in mine_pend:
-                    self.notify(f"{jid} ({j.jobname}) finished after {j.elapsed}",
-                                title="job done", severity="information", timeout=10)
-            for jid in self._toast_pending:
-                if jid in mine_run:
-                    self.notify(f"{jid} ({mine_run[jid].jobname}) started",
-                                title="job started", severity="information", timeout=8)
+            if jobs_ok:
+                for jid, j in self._toast_jobs.items():
+                    if jid not in mine_run and jid not in mine_pend:
+                        self.notify(f"{jid} ({j.jobname}) finished after {j.elapsed}",
+                                    title="job done", severity="information", timeout=10)
+                for jid in self._toast_pending:
+                    if jid in mine_run:
+                        self.notify(f"{jid} ({mine_run[jid].jobname}) started",
+                                    title="job started", severity="information", timeout=8)
             for name, down in down_now.items():
                 was = self._toast_down.get(name)
                 if was is not None and down != was:
@@ -1253,29 +659,45 @@ class SlurmGpuTui(App):
                     else:
                         self.notify(f"{name} back in service",
                                     title="node recovered", severity="information", timeout=8)
-        self._toast_jobs = mine_run
-        self._toast_pending = mine_pend
+        if jobs_ok:
+            self._toast_jobs = mine_run
+            self._toast_pending = mine_pend
         self._toast_down = down_now
 
-    def _apply(self, nodes: List[NodeInfo], jobs: List[JobInfo], pending: List[PendingJob], err: str) -> None:
-        self._toast_check(nodes, jobs, pending)
-        saved_row = self.tbl.cursor_row
-        saved_col = self.tbl.cursor_column
-        saved_scroll_x = self.tbl.scroll_x
-        saved_scroll_y = self.tbl.scroll_y
-        saved_key = None
-        try:
-            cell_key = self.tbl.coordinate_to_cell_key(Coordinate(saved_row, 0))
-            saved_key = cell_key.row_key.value
-        except Exception:
-            pass
+    def _node_visible(self, node: NodeInfo, node_classes: Dict[str, List[str]]) -> bool:
+        """GPU-tab filters: user filter, free-GPU filter, live search."""
+        if self.filter_user:
+            fu = self.filter_user
+            has_user = any(fu in g.users or fu == g.alloc_user for g in node.gpus)
+            has_user = has_user or any(j.user == fu for j in node.jobs)
+            if not has_user:
+                return False
+        if self.idle_filter_only and "free" not in node_classes[node.name]:
+            return False
+        if self.search_text:
+            node_users = set()
+            for g in node.gpus:
+                node_users.update(g.users)
+                if g.alloc_user:
+                    node_users.add(g.alloc_user)
+            for j in node.jobs:
+                node_users.add(j.user)
+            if (self.search_text not in node.name.lower() and
+                    not any(self.search_text in u.lower() for u in node_users)):
+                return False
+        return True
 
-        self.tbl.clear()
-        self.pending_tbl.clear()
-        self._row_job.clear()
+    def on_tabbed_content_activated(self, event) -> None:
+        # tabs render lazily — repaint the newly shown pane with current data
+        if getattr(self, "_timer", None) is not None:  # fires during compose too
+            self._rerender()
+
+    def _apply(self, nodes: List[NodeInfo], jobs: List[JobInfo], pending: List[PendingJob], err: str) -> None:
+        self._toast_check(nodes, jobs, pending, err)
 
         self._nodes_cache = nodes
         self._jobs_by_id = {j.jobid: j for j in jobs}
+        self._last_applied = (nodes, jobs, pending, err)
 
         # Big clusters: start with every node collapsed (one line per node),
         # Space expands. Only on first data, never after user interaction.
@@ -1302,49 +724,71 @@ class SlurmGpuTui(App):
             nodes.sort(key=lambda n: node_classes[n.name].count("free"), reverse=True)
         else:
             nodes.sort(key=lambda n: n.name)
+        if self.sort_reverse:
+            nodes.reverse()
+
+        visible = [n for n in nodes if n.has_gpu and self._node_visible(n, node_classes)]
+
+        # Summary stats over every visible GPU (collapse-independent —
+        # row building below skips collapsed nodes' GPU rows)
+        total_gpus = 0
+        busy_gpus = 0
+        partition_gpu_stats: Dict[str, List[int]] = {}  # partition -> [busy, total]
+        for node in visible:
+            node_partition = node.partition or (node.jobs[0].partition if node.jobs else "")
+            parts_sorted = sorted(
+                (p for p in node_partition.split(",") if p),
+                key=lambda p: ("cpu" in p.lower(), p),
+            )
+            stat_key = node.jobs[0].partition if node.jobs else (parts_sorted[0] if parts_sorted else "")
+            for gpu in node.gpus:
+                total_gpus += 1
+                stats = partition_gpu_stats.setdefault(stat_key, [0, 0])
+                stats[1] += 1
+                try:
+                    if float(gpu.util) > 5:
+                        busy_gpus += 1
+                        stats[0] += 1
+                except (ValueError, TypeError):
+                    pass
+
+        active_pane = self.query_one("#main-tabs", TabbedContent).active
+        if active_pane == "pane-gpu":
+            self._apply_gpu_tab(visible, node_classes, pending)
+        elif active_pane == "pane-cpu":
+            self._apply_cpu_tab(nodes)
+        elif active_pane == "pane-usage":
+            self.usage_view.update(render_usage())
+
+        self._apply_summary(nodes, jobs, pending, err, node_classes,
+                            total_gpus, busy_gpus, partition_gpu_stats)
+
+    def _apply_gpu_tab(self, visible: List[NodeInfo], node_classes: Dict[str, List[str]],
+                       pending: List[PendingJob]) -> None:
+        saved_row = self.tbl.cursor_row
+        saved_col = self.tbl.cursor_column
+        saved_scroll_x = self.tbl.scroll_x
+        saved_scroll_y = self.tbl.scroll_y
+        saved_key = None
+        try:
+            cell_key = self.tbl.coordinate_to_cell_key(Coordinate(saved_row, 0))
+            saved_key = cell_key.row_key.value
+        except Exception:
+            pass
+
+        self.tbl.clear()
+        self.pending_tbl.clear()
+        self._row_job.clear()
 
         _HDR_BG = "on #0d1f0d"  # dark green tint for node header rows
 
-        total_gpus = 0
-        busy_gpus = 0
-        user_gpu_count: Dict[str, int] = {}
-        partition_gpu_stats: Dict[str, List[int]] = {}  # partition -> [busy, total]
-
-        for node in nodes:
-            if not node.has_gpu:
-                continue  # CPU-only nodes live on the CPU tab
-            # Filter logic
-            if self.filter_user:
-                fu = self.filter_user
-                has_user = any(fu in g.users or fu == g.alloc_user for g in node.gpus)
-                has_user = has_user or any(j.user == fu for j in node.jobs)
-                if not has_user:
-                    continue
-
-            if self.idle_filter_only:
-                if "free" not in node_classes[node.name]:
-                    continue
-
-            if self.search_text:
-                node_users = set()
-                for g in node.gpus:
-                    node_users.update(g.users)
-                    if g.alloc_user:
-                        node_users.add(g.alloc_user)
-                for j in node.jobs:
-                    node_users.add(j.user)
-                if (self.search_text not in node.name.lower() and
-                        not any(self.search_text in u.lower() for u in node_users)):
-                    continue
-
+        for node in visible:
             node_partition = node.partition or (node.jobs[0].partition if node.jobs else "")
             # GPU-ish partitions first so "cpu_only" doesn't hog the display
             parts_sorted = sorted(
                 (p for p in node_partition.split(",") if p),
                 key=lambda p: ("cpu" in p.lower(), p),
             )
-            # Stats: prefer the partition jobs actually run in over sinfo's first listing
-            partition_stat_key = node.jobs[0].partition if node.jobs else (parts_sorted[0] if parts_sorted else "")
 
             alloc = node.cpu_alloc or "0"
             cpu_text = Text()
@@ -1417,21 +861,6 @@ class SlurmGpuTui(App):
                 pass
             elif node.gpus:
                 for gpu_i, gpu in enumerate(node.gpus):
-                    total_gpus += 1
-                    gpu_busy = False
-                    try:
-                        if float(gpu.util) > 5:
-                            busy_gpus += 1
-                            gpu_busy = True
-                    except (ValueError, TypeError):
-                        pass
-
-                    if partition_stat_key not in partition_gpu_stats:
-                        partition_gpu_stats[partition_stat_key] = [0, 0]
-                    partition_gpu_stats[partition_stat_key][1] += 1
-                    if gpu_busy:
-                        partition_gpu_stats[partition_stat_key][0] += 1
-
                     user = ""
                     jobid = ""
                     jobname = ""
@@ -1534,6 +963,42 @@ class SlurmGpuTui(App):
                     self._row_job[job_key] = j.jobid
                     self.tbl.add_row(*row_cells, key=job_key)
 
+        # ── Pending Jobs Table (lives in the GPU pane) ──
+        self.query_one("#pending-container").display = bool(pending)
+        self._pending_user = {pj.jobid: pj.user for pj in pending}
+        for pj in pending:
+            is_me = (pj.user == self.current_user)
+            if self.filter_user and pj.user != self.filter_user:
+                continue
+            reason_style = "bold red" if pj.reason == "Resources" else "yellow" if pj.reason == "Priority" else "dim"
+            gpu_txt = f"x{pj.gpu_count}" if pj.gpu_count else "-"
+            row_cells = [
+                Text(pj.jobid, style="dim"),
+                Text(pj.user, style="bold magenta"),
+                Text(gpu_txt, style="bold"),
+                Text(pj.partition, style="dim"),
+                Text(ellipsize(pj.jobname, 24)),
+                Text(pj.reason, style=reason_style),
+                Text(pj.priority, style="dim"),
+                Text(fmt_start_time(pj.start_time), style="cyan"),
+            ]
+            if is_me:
+                highlight_row(row_cells)
+            self.pending_tbl.add_row(*row_cells, key=f"pend_{pj.jobid}")
+
+        if self.tbl.row_count > 0:
+            row = None
+            if saved_key is not None:
+                try:
+                    row = self.tbl.get_row_index(saved_key)
+                except Exception:
+                    row = None
+            if row is None:
+                row = min(saved_row, self.tbl.row_count - 1)
+            self.tbl.move_cursor(row=row, column=saved_col, animate=False)
+        self.tbl.scroll_to(x=saved_scroll_x, y=saved_scroll_y, animate=False)
+
+    def _apply_cpu_tab(self, nodes: List[NodeInfo]) -> None:
         # ── CPU tab (all nodes, CPU-only included) ──
         self.cpu_tbl.clear()
         cpu_rows = []
@@ -1593,40 +1058,20 @@ class SlurmGpuTui(App):
             cpu_sum.append(f":{c}", style="bold")
         self.cpu_summary.update(cpu_sum)
 
-        # ── Usage tab ──
-        self.usage_view.update(render_usage())
-
-        # ── Pending Jobs Table ──
-        self.query_one("#pending-container").display = bool(pending)
-        self._pending_user = {pj.jobid: pj.user for pj in pending}
-        for pj in pending:
-            is_me = (pj.user == self.current_user)
-            if self.filter_user and pj.user != self.filter_user:
-                continue
-            reason_style = "bold red" if pj.reason == "Resources" else "yellow" if pj.reason == "Priority" else "dim"
-            gpu_txt = f"x{pj.gpu_count}" if pj.gpu_count else "-"
-            row_cells = [
-                Text(pj.jobid, style="dim"),
-                Text(pj.user, style="bold magenta"),
-                Text(gpu_txt, style="bold"),
-                Text(pj.partition, style="dim"),
-                Text(ellipsize(pj.jobname, 24)),
-                Text(pj.reason, style=reason_style),
-                Text(pj.priority, style="dim"),
-                Text(fmt_start_time(pj.start_time), style="cyan"),
-            ]
-            if is_me:
-                highlight_row(row_cells)
-            self.pending_tbl.add_row(*row_cells, key=f"pend_{pj.jobid}")
-
-        # Update Summary
+    def _apply_summary(self, nodes: List[NodeInfo], jobs: List[JobInfo],
+                       pending: List[PendingJob], err: str,
+                       node_classes: Dict[str, List[str]],
+                       total_gpus: int, busy_gpus: int,
+                       partition_gpu_stats: Dict[str, List[int]]) -> None:
+        user_gpu_count: Dict[str, int] = {}
         for j in jobs:
             if j.gpu_count > 0:
                 user_gpu_count[j.user] = user_gpu_count.get(j.user, 0) + j.gpu_count
         self._user_gpu_count = user_gpu_count
 
         ts = datetime.now().strftime("%H:%M:%S")
-        sort_label = Text(f" SORT:{self.sort_by.upper()} ", style="bold white on #444444")
+        sort_label = Text(f" SORT:{self.sort_by.upper()}{'↑' if self.sort_reverse else ''} ",
+                          style="bold white on #444444")
 
         summary = Text()
         summary.append(" GPU ", style="bold white on dark_green")
@@ -1703,518 +1148,11 @@ class SlurmGpuTui(App):
         else:
             self.status_w.update(Text(f" OK [{ts}] ", style="dim"))
 
-        if self.tbl.row_count > 0:
-            row = None
-            if saved_key is not None:
-                try:
-                    row = self.tbl.get_row_index(saved_key)
-                except Exception:
-                    row = None
-            if row is None:
-                row = min(saved_row, self.tbl.row_count - 1)
-            self.tbl.move_cursor(row=row, column=saved_col, animate=False)
-        self.tbl.scroll_to(x=saved_scroll_x, y=saved_scroll_y, animate=False)
 
-        self.snapshot = {
-            "ts": datetime.now().isoformat(),
-            "nodes": [asdict(n) for n in nodes],
-            "jobs": [asdict(j) for j in jobs],
-            "pending": [asdict(p) for p in pending],
-        }
-
-
-# ── One-shot CLI mode ─────────────────────────────────────────────────────
-
-def _oneshot_snapshot() -> dict:
-    """Fresh snapshot dict: daemon file if recent, else direct collection."""
-    try:
-        age = time.time() - _DAEMON_DATA_FILE.stat().st_mtime
-        if age <= _DAEMON_MAX_AGE:
-            return json.loads(_DAEMON_DATA_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        pass
-    nodes_raw, jobs, pending, node_jobs, gpu_alloc, alloc_user_map, err = collect_basic()
-    node_names = [n["name"] for n in nodes_raw]
-    ssh_results, stale_nodes, ssh_errors = collect_node_data_parallel(node_names)
-    nodes = build_nodes(nodes_raw, node_jobs, ssh_results, stale_nodes)
-    apply_gpu_alloc(nodes, gpu_alloc, jobs, alloc_user_map)
-    return {
-        "version": 1,
-        "ts": datetime.now().isoformat(),
-        "nodes": [asdict(n) for n in nodes],
-        "jobs": [asdict(j) for j in jobs],
-        "pending": [asdict(p) for p in pending],
-        "stale_nodes": stale_nodes,
-        "errors": " | ".join(x for x in [err] + ssh_errors if x),
-    }
-
-
-def _print_once(data: dict) -> None:
-    print(f"sgpu {data.get('ts', '')}")
-    for n in data.get("nodes", []):
-        stale = " ~stale" if n.get("stale") else ""
-        err = f" ERROR: {n['error']}" if n.get("error") else ""
-        print(f"\n{n['name']}  {n['state']}  [{n.get('partition', '')}]  "
-              f"CPU {n.get('cpu_alloc') or '0'}/{n.get('cpus', '?')}{stale}{err}")
-        for g in n.get("gpus", []):
-            user = ",".join(g.get("users", []))
-            note = ""
-            if not user and g.get("alloc_user"):
-                user = g["alloc_user"]
-                note = f"  [{fmt_idle_age(g.get('idle_sec', 0)).upper()}]"
-            job = f"  job {g['alloc_jobid']}" if g.get("alloc_jobid") else ""
-            print(f"  GPU{g.get('index', '?')}  {g.get('name', ''):<14} "
-                  f"util {g.get('util', '?'):>3}%  "
-                  f"{mb_to_gb(g.get('mem_used', '')):>6}/{mb_to_gb(g.get('mem_total', ''))}G"
-                  f"  {user}{note}{job}")
-    pending = data.get("pending", [])
-    if pending:
-        print(f"\nPENDING ({len(pending)}):")
-        for p in pending:
-            start = fmt_start_time(p.get("start_time", ""))
-            start = f"  est.start {start}" if start else ""
-            print(f"  {p['jobid']}  {p['user']}  x{p.get('gpu_count', 0)}  "
-                  f"{p.get('partition', '')}  {p.get('reason', '')}{start}")
-
-
-def _snapshot_nodes() -> List[NodeInfo]:
-    """Snapshot as NodeInfo list (daemon file or direct collection)."""
-    data = _oneshot_snapshot()
-    nodes: List[NodeInfo] = []
-    for n in data.get("nodes", []):
-        gpus = [
-            GpuInfo(**{k: g.get(k, d) for k, d in (
-                ("index", ""), ("minor", ""), ("uuid", ""), ("pci_bus", ""), ("serial", ""),
-                ("name", ""), ("util", ""), ("mem_used", ""),
-                ("mem_total", ""), ("temp", ""), ("power", ""), ("power_cap", ""), ("ecc", ""),
-                ("pids", []), ("users", []), ("alloc_jobid", ""),
-                ("alloc_user", ""), ("idle_sec", 0), ("parked_sec", 0),
-            )})
-            for g in n.get("gpus", [])
-        ]
-        node_jobs = [
-            JobInfo(jobid=j.get("jobid", ""), user=j.get("user", ""),
-                    gpu_count=j.get("gpu_count", 0))
-            for j in n.get("jobs", [])
-        ]
-        nodes.append(NodeInfo(
-            name=n.get("name", ""), state=n.get("state", ""),
-            partition=n.get("partition", ""), gpus=gpus, jobs=node_jobs,
-        ))
-    return nodes
-
-
-def _cli_waste(verbose: bool = False) -> int:
-    rows = collect_waste(_snapshot_nodes(), WASTE_MIN_SEC)
-    if not rows:
-        print(f"no wasted GPUs over threshold ({_waste_thr()})")
-        return 0
-    print(f"threshold {_waste_thr()} (SLURM_GPU_TUI_WASTE_MIN_SEC)")
-    for r in rows:
-        job = f"  job {r['jobid']}" if r["jobid"] else ""
-        span = "-" if r["kind"] in ("rogue", "no-gres") else (fmt_span(r["sec"]) or "<1m")
-        print(f"{r['node']}/{r['gpu']}  {r['kind']:<7} {span:>7}  {r['user']}{job}")
-        if verbose and r["jobid"]:
-            ok, out = run_cmd(f"scontrol show job {r['jobid']}", timeout=10)
-            if ok:
-                for m in re.finditer(r"(JobName|Command|WorkDir)=(\S+)", out):
-                    print(f"    {m.group(1)}: {m.group(2)}")
-    return 1  # non-zero so cron/scripts can alert on it
-
-
-def _cli_usage(days: int, daily: bool = False) -> int:
-    loaded = load_usage_totals(days)
-    if loaded is None:
-        print("no usage data (collector not running or too new)")
-        return 1
-    totals, covered, sacct_ts = loaded
-    src = "alloc:sacct busy:sampled" if sacct_ts else f"sampled {covered / 3600:.1f}h"
-    print(f"{'user':<14}{'alloc':>9}{'busy':>9}{'eff':>6}{'waste':>9}   (last {days}d, {src})")
-    for user, alloc, busy, sampled_alloc, waste in totals:
-        eff = busy / sampled_alloc if sampled_alloc > 0 else 0
-        print(f"{user:<14}{alloc / 3600:>8.1f}h{busy / 3600:>8.1f}h{eff:>6.0%}{waste / 3600:>8.1f}h")
-    if daily:
-        rows = load_usage_daily(days)
-        if rows:
-            width = 30
-            peak = max(a for _, a, _, _ in rows) or 1.0
-            print(f"\n{'day':<12}{'alloc':>7}{'busy':>7}  cluster GPU-hours/day")
-            for day, alloc, busy, covered in rows:
-                cells = round(alloc / peak * width)
-                busy_cells = min(cells, round(busy / peak * width))
-                bar = "█" * busy_cells + "░" * (cells - busy_cells)
-                busy_txt = f"{busy / 3600:>6.0f}h" if covered >= 60 or busy > 0 else f"{'-':>7}"
-                print(f"{day:<12}{alloc / 3600:>6.0f}h{busy_txt}  {bar}")
-            if any(c < 60 and b <= 0 for _, _, b, c in rows):
-                print("- = collector wasn't sampling that day (busy unknown)")
-    return 0
-
-
-def _sacct_jobs(start: str, end: str = "", user: str = "") -> Optional[List[dict]]:
-    """Fetch job rows from slurmdbd. None = sacct failed (no accounting?)."""
-    from .collector import _gpu_count_from_tres, _parse_sacct_time
-    who = f"-u {user}" if user else "-a"
-    span = f"-S {start}" + (f" -E {end}" if end else "")
-    ok, out = run_cmd(
-        f"sacct {who} -X --noheader --parsable2 "
-        f"--format=JobID,User,JobName,Partition,AllocTRES,Submit,Start,End,State {span}",
-        timeout=30)
-    if not ok:
-        print(f"sacct failed: {out.splitlines()[0][:80] if out else 'no output'}")
-        return None
-    now = time.time()
-    rows = []
-    for line in out.splitlines():
-        parts = line.split("|")
-        if len(parts) != 9:
-            continue
-        jobid, juser, name, part, tres, submit, s_start, s_end, state = parts
-        state = state.split()[0]  # "CANCELLED by 1234" -> CANCELLED
-        t_sub = _parse_sacct_time(submit)
-        t0 = _parse_sacct_time(s_start)
-        t1 = _parse_sacct_time(s_end) or now
-        wait = (t0 - t_sub) if (t0 and t_sub and t0 > t_sub) else 0.0
-        elapsed = (min(t1, now) - t0) if t0 else 0.0
-        rows.append({"jobid": jobid, "user": juser, "name": name, "part": part,
-                     "gpus": _gpu_count_from_tres(tres), "wait": wait,
-                     "elapsed": elapsed, "state": state, "start": t0 or t_sub or 0})
-    rows.sort(key=lambda r: r["start"])
-    return rows
-
-
-def _job_summaries(rows: List[dict]) -> Tuple[Dict[str, List[float]], Dict[str, List[float]]]:
-    """(gpu-seconds by outcome state, wait-seconds by partition)."""
-    by_state: Dict[str, List[float]] = {}
-    by_part: Dict[str, List[float]] = {}
-    for r in rows:
-        by_state.setdefault(r["state"], []).append(r["gpus"] * r["elapsed"])
-        if r["start"] and r["state"] != "PENDING":
-            by_part.setdefault(r["part"], []).append(r["wait"])
-    return by_state, by_part
-
-
-def _cli_jobs(days: int, user: str = "") -> int:
-    """Job history from slurmdbd: per-job rows + failure/wait summary."""
-    start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00")
-    rows = _sacct_jobs(start, user=user)
-    if rows is None:
-        return 1
-    if not rows:
-        print(f"no jobs in the last {days} day(s)")
-        return 0
-    print(f"{'jobid':<10}{'user':<12}{'state':<12}{'gpus':>4}{'wait':>8}{'elapsed':>9}  "
-          f"{'partition':<10} name   (last {days}d)")
-    for r in rows:
-        print(f"{r['jobid']:<10}{r['user']:<12}{r['state']:<12}{r['gpus'] or '-':>4}"
-              f"{fmt_span(r['wait']) or '-':>8}{fmt_span(r['elapsed']) or '-':>9}  "
-              f"{r['part']:<10} {r['name'][:24]}")
-
-    by_state, by_part = _job_summaries(rows)
-    print(f"\n{'outcome':<14}{'jobs':>6}{'gpu-hours':>11}")
-    for state, hours in sorted(by_state.items(), key=lambda kv: -sum(kv[1])):
-        print(f"{state:<14}{len(hours):>6}{sum(hours) / 3600:>10.1f}h")
-
-    print(f"\n{'partition':<14}{'jobs':>6}{'median wait':>12}{'max wait':>10}")
-    for part, waits in sorted(by_part.items()):
-        waits.sort()
-        med = waits[len(waits) // 2]
-        print(f"{part:<14}{len(waits):>6}{fmt_span(med) or '0m':>12}{fmt_span(waits[-1]) or '0m':>10}")
-    return 0
-
-
-def _cli_report(month: str) -> int:
-    """Markdown usage report for a month (YYYY-MM) — for lab meetings/admin."""
-    try:
-        first = datetime.strptime(month, "%Y-%m")
-    except ValueError:
-        print(f"bad month {month!r} — expected YYYY-MM")
-        return 1
-    nxt = datetime(first.year + (first.month == 12), first.month % 12 + 1, 1)
-    end_day = min(nxt - timedelta(days=1), datetime.now()).strftime("%Y-%m-%d")
-    start_day = first.strftime("%Y-%m-%d")
-
-    print(f"# GPU usage report — {month}\n")
-
-    raw = _read_usage_raw() or {}
-    sampled = raw.get("days", {})
-    sacct_days = raw.get("sacct_days", {}) if isinstance(raw.get("sacct_days"), dict) else {}
-    in_month = lambda d: start_day <= d <= end_day
-    users: Dict[str, List[float]] = {}  # alloc, busy, sampled_alloc, waste
-    daily: Dict[str, List[float]] = {}  # alloc, busy
-    for day in set(sampled) | set(sacct_days):
-        if not in_month(day):
-            continue
-        s_users = sampled.get(day, {})
-        a_users = sacct_days.get(day, {})
-        for user in set(s_users) | set(a_users):
-            su = s_users.get(user, {})
-            alloc = max(su.get("alloc", 0), a_users.get(user, 0.0))
-            t = users.setdefault(user, [0.0, 0.0, 0.0, 0.0])
-            t[0] += alloc
-            t[1] += su.get("busy", 0)
-            t[2] += su.get("alloc", 0)
-            t[3] += su.get("waste", 0)
-            d = daily.setdefault(day, [0.0, 0.0])
-            d[0] += alloc
-            d[1] += su.get("busy", 0)
-
-    print("## Per-user GPU-hours\n")
-    print("| user | alloc | busy | eff* | waste |")
-    print("|------|------:|-----:|-----:|------:|")
-    for user, (a, b, sa, w) in sorted(users.items(), key=lambda kv: -kv[1][0]):
-        eff = f"{b / sa:.0%}" if sa > 0 else "-"
-        print(f"| {user} | {a / 3600:.1f}h | {b / 3600:.1f}h | {eff} | {w / 3600:.1f}h |")
-    print("\n\\* eff/busy/waste are sampling-based (collector uptime only); "
-          "alloc includes slurmdbd backfill\n")
-
-    print("## Daily cluster GPU-hours\n")
-    print("| day | alloc | busy |")
-    print("|-----|------:|-----:|")
-    meta = raw.get("meta", {})
-    for day in sorted(daily):
-        a, b = daily[day]
-        busy_txt = f"{b / 3600:.0f}h" if float(meta.get(day, 0)) >= 60 or b > 0 else "-"
-        print(f"| {day} | {a / 3600:.0f}h | {busy_txt} |")
-    print("\n(busy `-` = collector wasn't sampling that day)\n")
-
-    rows = _sacct_jobs(f"{start_day}T00:00:00", f"{end_day}T23:59:59")
-    if rows:
-        by_state, by_part = _job_summaries(rows)
-        print("## Job outcomes\n")
-        print("| outcome | jobs | gpu-hours |")
-        print("|---------|-----:|----------:|")
-        for state, hours in sorted(by_state.items(), key=lambda kv: -sum(kv[1])):
-            print(f"| {state} | {len(hours)} | {sum(hours) / 3600:.1f}h |")
-        print("\n## Queue wait by partition\n")
-        print("| partition | jobs | median wait | max wait |")
-        print("|-----------|-----:|------------:|---------:|")
-        for part, waits in sorted(by_part.items()):
-            waits.sort()
-            med = waits[len(waits) // 2]
-            print(f"| {part} | {len(waits)} | {fmt_span(med) or '0m'} | {fmt_span(waits[-1]) or '0m'} |")
-    return 0
-
-
-def _cli_wait_free(want: int, partition: str, interval: int) -> int:
-    while True:
-        free = 0
-        for n in _snapshot_nodes():
-            if partition and partition not in n.partition.split(","):
-                continue
-            free += sum(1 for g in n.gpus if classify_gpu(g) == "free")
-        if free >= want:
-            print(f"{free} free GPU(s) available" + (f" in {partition}" if partition else ""))
-            return 0
-        time.sleep(interval)
-
-
-def _cli_doctor() -> int:
-    """Self-diagnosis: is the data trustworthy, and if not, why."""
-    problems = 0
-
-    def report(ok: Optional[bool], name: str, detail: str) -> None:
-        nonlocal problems
-        mark = "OK  " if ok else ("WARN" if ok is None else "FAIL")
-        if ok is False:  # WARN is informational, only FAIL flips the exit code
-            problems += 1
-        print(f"[{mark}] {name:<22} {detail}")
-
-    # slurm commands
-    for cmd in ("sinfo -h -o %N", "squeue -h -o %i", "scontrol show config"):
-        ok, out = run_cmd(cmd, timeout=10)
-        report(ok, cmd.split()[0], "reachable" if ok else out.splitlines()[0][:70])
-
-    # Doctor may run as a different user (e.g. root) than the collector, so
-    # home-relative defaults would point at the wrong account. The data.json
-    # owner IS the collector user — use their identity for state/webhook/
-    # sudoers checks below.
-    collector_user: Optional[str] = None
-    collector_home: Optional[Path] = None
-    try:
-        import pwd
-        pw = pwd.getpwuid(_DAEMON_DATA_FILE.stat().st_uid)
-        collector_user, collector_home = pw.pw_name, Path(pw.pw_dir)
-    except (OSError, KeyError):
-        pass
-
-    # collector data
-    srcs: Dict[str, int] = {}
-    try:
-        age = time.time() - _DAEMON_DATA_FILE.stat().st_mtime
-        raw = json.loads(_DAEMON_DATA_FILE.read_text())
-        fresh = age <= _DAEMON_MAX_AGE
-        report(fresh, "collector data", f"{_DAEMON_DATA_FILE} age {age:.0f}s"
-               + ("" if fresh else " — STALE, is sgpu-collector running?"))
-        for n in raw.get("nodes", []):
-            srcs[n.get("source", "?")] = srcs.get(n.get("source", "?"), 0) + 1
-        stale_n = srcs.get("stale", 0)
-        report(stale_n == 0 if srcs else None, "node sources",
-               " ".join(f"{k}:{v}" for k, v in sorted(srcs.items())) or "no nodes")
-    except (OSError, ValueError):
-        report(False, "collector data", f"{_DAEMON_DATA_FILE} missing — collector not running (TUI falls back to slow SSH)")
-
-    # node delivery: trust data.json's per-node source counts (authoritative —
-    # what the collector actually produced). A disk glob of AGENT_DIR is
-    # unreliable here: an interactive `sgpu doctor` doesn't see the collector's
-    # SLURM_GPU_TUI_AGENT_DIR (that's baked into the service unit), so it would
-    # look in the wrong dir and cry "no push agents" while push is working.
-    if srcs.get("agent", 0) > 0 and srcs.get("ssh", 0) > 0:
-        report(True, "node delivery",
-               f"mixed: {srcs['agent']} push + {srcs['ssh']} SSH-pull")
-    elif srcs.get("agent", 0) > 0:
-        report(True, "node delivery", f"push mode ({srcs['agent']} nodes via agent)")
-    elif srcs.get("ssh", 0) > 0:
-        # SSH-pull is a fully supported mode, not a problem
-        report(True, "node delivery", f"SSH-pull mode ({srcs['ssh']} nodes) — "
-               "push agents not in use (shared-FS install enables them)")
-    else:
-        agent_dir = Path(os.getenv("SLURM_GPU_TUI_AGENT_DIR", str(Path.home() / ".sgpu" / "nodes")))
-        report(None, "node delivery", f"no node data yet (checked {agent_dir})")
-
-    # persistent state — fall back to the collector user's home when ours
-    # has no state (doctor as root, collector as a regular user)
-    state_dir = Path(os.getenv("SLURM_GPU_TUI_STATE_DIR", str(Path.home() / ".sgpu" / "state")))
-    if (not (state_dir / "usage.json").exists()
-            and not os.getenv("SLURM_GPU_TUI_STATE_DIR") and collector_home
-            and (collector_home / ".sgpu" / "state" / "usage.json").exists()):
-        state_dir = collector_home / ".sgpu" / "state"
-    usage = state_dir / "usage.json"
-    if usage.exists():
-        report(True, "usage history", f"{usage} age {(time.time() - usage.stat().st_mtime):.0f}s")
-    else:
-        report(None, "usage history", "not started yet (collector writes it)")
-
-    # slurmdbd backfill (alloc GPU-hours survive collector downtime).
-    # Absolute -S time: Slurm < 20.11 rejects relative forms like "now-1hour".
-    since = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S")
-    ok, out = run_cmd(f"sacct -a -X --noheader -S {since} --format=JobID", timeout=10)
-    if not ok:
-        report(None, "sacct backfill", "sacct unavailable — alloc is sampling-only "
-               + (out.splitlines()[0][:50] if out else ""))
-    else:
-        sacct_ts = None
-        try:
-            sacct_ts = json.loads(usage.read_text()).get("sacct_ts")
-        except (OSError, ValueError):
-            pass
-        if sacct_ts:
-            age = time.time() - sacct_ts
-            fresh = age <= 2 * 3600
-            report(True if fresh else None, "sacct backfill",
-                   f"last refresh {age / 60:.0f}m ago" + ("" if fresh else " — stale, collector running?"))
-        else:
-            report(None, "sacct backfill", "sacct works but no backfill yet (collector runs it hourly)")
-
-    # script sharing (sudoers). What matters is whether the COLLECTOR user
-    # holds the grant — it does the fetching. Probing `sudo -n` as root is
-    # meaningless (root always passes), so read the rule itself instead.
-    if os.geteuid() == 0 and collector_user not in (None, "root"):
-        grantee = None
-        try:
-            for line in Path("/etc/sudoers.d/sgpu").read_text().splitlines():
-                if line.strip() and not line.lstrip().startswith("#"):
-                    grantee = line.split()[0]
-                    break
-        except OSError:
-            pass
-        if grantee == collector_user:
-            report(True, "script sharing", f"sudoers rule active (grants {grantee})")
-        elif grantee:
-            report(None, "script sharing", f"sudoers rule grants '{grantee}' but "
-                   f"collector runs as '{collector_user}' — rerun installer as {collector_user}")
-        else:
-            report(None, "script sharing", "not configured (own jobs only) — rerun installer to enable")
-    else:
-        ok, out = run_cmd("sudo -n scontrol write batch_script 999999999 -", timeout=10)
-        if "Invalid job id" in out or ok:
-            report(True, "script sharing", "sudoers rule active (all-user script view)")
-        else:
-            report(None, "script sharing", "not configured (own jobs only) — rerun installer to enable")
-
-    # webhook notifier (optional) — same collector-home fallback as state
-    from .notify import Notifier
-    try:
-        cfg = Path.home() / ".sgpu" / "webhook.json"
-        if not cfg.exists() and collector_home:
-            alt = collector_home / ".sgpu" / "webhook.json"
-            if alt.exists():
-                cfg = alt
-        nf = Notifier(state_dir, cfg_path=cfg)
-        if nf.enabled:
-            mode = f"bot→{nf.channel} daily-thread" if nf._bot_mode else "incoming-webhook"
-            on = [k for k, v in (("node", nf.node_health), ("collect", nf.collect_alert),
-                                 ("waste", nf.waste_alert_hours > 0), ("rogue", nf.rogue_alert),
-                                 ("ecc", nf.ecc_alert), ("temp", nf.temp_alert_c > 0)) if v]
-            report(True, "webhook", f"{mode}, lang={nf.lang}, alerts: {'+'.join(on) or 'none'}")
-        else:
-            report(None, "webhook", "not configured (optional) — ~/.sgpu/webhook.json")
-    except Exception as e:
-        report(False, "webhook", f"config error: {e}")
-
-    # prometheus (honors SLURM_GPU_TUI_METRICS_FILE override)
-    prom = Path(os.getenv("SLURM_GPU_TUI_METRICS_FILE",
-                          str(_DAEMON_DATA_FILE.parent / "metrics.prom")))
-    report(True if prom.exists() else None, "prometheus",
-           str(prom) if prom.exists() else "no metrics file yet")
-
-    print(f"\n{'all checks passed' if problems == 0 else f'{problems} problem(s) found'}")
-    return 0 if problems == 0 else 1
-
-
-def _arg_value(argv: List[str], flag: str, default: str) -> str:
-    if flag in argv:
-        i = argv.index(flag)
-        if i + 1 < len(argv):
-            return argv[i + 1]
-    return default
 
 
 def main():
-    argv = sys.argv[1:]
-    try:
-        if "--json" in argv or "--once" in argv:
-            data = _oneshot_snapshot()
-            if "--json" in argv:
-                print(json.dumps(data, ensure_ascii=False, indent=2))
-            else:
-                _print_once(data)
-            return
-        if "--doctor" in argv or "doctor" in argv:
-            sys.exit(_cli_doctor())
-        if "--waste" in argv:
-            sys.exit(_cli_waste(verbose="-v" in argv or "--verbose" in argv))
-        if "--usage" in argv:
-            v = _arg_value(argv, "--usage", "7")
-            sys.exit(_cli_usage(int(v) if v.isdigit() else 7, daily="--daily" in argv))
-        if "--report" in argv:
-            sys.exit(_cli_report(_arg_value(argv, "--report", datetime.now().strftime("%Y-%m"))))
-        if "--jobs" in argv:
-            v = _arg_value(argv, "--jobs", "7")
-            sys.exit(_cli_jobs(int(v) if v.isdigit() else 7,
-                               user=_arg_value(argv, "--user", "")))
-        if "--wait-free" in argv:
-            want = int(_arg_value(argv, "--wait-free", "1"))
-            part = _arg_value(argv, "--partition", "")
-            interval = int(_arg_value(argv, "--interval", "10"))
-            sys.exit(_cli_wait_free(want, part, interval))
-        if argv and argv[0] in ("-h", "--help"):
-            print("usage: sgpu [--json | --once | --waste [-v] | --usage [days] [--daily] |\n"
-                  "             --jobs [days] [--user U] | --report [YYYY-MM] | --wait-free N | doctor]\n"
-                  "  (no args)      interactive TUI\n"
-                  "  --json         print snapshot as JSON and exit\n"
-                  "  --once         print snapshot as plain text and exit\n"
-                  "  --waste [-v]   list idle/parked/rogue GPUs; exit 1 if any (cron-friendly)\n"
-                  "                 -v adds JobName/Command/WorkDir per offender\n"
-                  "  --usage [N]    per-user GPU-hours over last N days (default 7)\n"
-                  "                 --daily adds a per-day cluster trend\n"
-                  "  --jobs [N]     job history from slurmdbd: outcomes, queue waits\n"
-                  "                 [--user U] filters to one user\n"
-                  "  --report [M]   markdown monthly report (default: current month)\n"
-                  "  --wait-free N  block until N GPUs are free\n"
-                  "                 [--partition P] [--interval sec]\n"
-                  "  doctor         self-diagnosis: data freshness, agents, slurm, sharing")
-            return
-    finally:
-        if argv:
-            cleanup_ssh_pool()
-    SlurmGpuTui().run()
+    """Entry-point shim: real CLI lives in sgpu.cli (kept for old venvs whose
+    console script still imports sgpu.tui:main)."""
+    from .cli import main as _main
+    _main()

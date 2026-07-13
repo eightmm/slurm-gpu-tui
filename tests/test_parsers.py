@@ -5,7 +5,7 @@ from sgpu.common import (
     shorten_gpu_name,
 )
 from sgpu.common import GpuInfo, JobInfo, NodeInfo
-from sgpu.tui import (
+from sgpu.cells import (
     classify_gpu, collect_waste, fmt_idle_age, fmt_span, fmt_start_time,
     mem_cell, parse_slurm_duration,
 )
@@ -331,7 +331,7 @@ def _mk_notifier(tmp_path):
     }))
     n = Notifier(tmp_path, cfg_path=cfg)
     sent = []
-    n._post = sent.append
+    n._post = lambda text, key="": sent.append(text)
     return n, sent
 
 
