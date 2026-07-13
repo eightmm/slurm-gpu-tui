@@ -60,8 +60,25 @@ pkill -f "bin/[s]gpu-collector" 2>/dev/null
 if $HAS_SUDO; then
     $SUDO rm -f /usr/local/bin/sgpu /usr/local/bin/sgpu-collector /usr/local/bin/chkgpu /etc/sudoers.d/sgpu
 fi
-rm -rf "${SLURM_GPU_TUI_DATA_DIR:-/tmp/slurm-gpu-tui}" "$HOME/.sgpu/nodes" \
-       "${SLURM_GPU_TUI_STATE_DIR:-$HOME/.sgpu/state}"
+# env-supplied dirs are only removed when they look like sgpu's own data
+# (marker file check) — a mistyped/hijacked env var must not rm -rf elsewhere
+_rm_data_dir() {
+    local d="$1" m
+    shift
+    if [ -z "$d" ] || [ "$d" = "/" ] || [ ! -e "$d" ]; then
+        return
+    fi
+    for m in "$@"; do
+        if [ -e "$d/$m" ]; then
+            rm -rf "$d"
+            return
+        fi
+    done
+    echo "[uninstall] skipping $d (no sgpu files inside — not an sgpu dir?)"
+}
+_rm_data_dir "${SLURM_GPU_TUI_DATA_DIR:-/tmp/slurm-gpu-tui}" data.json collector.lock
+_rm_data_dir "${SLURM_GPU_TUI_STATE_DIR:-$HOME/.sgpu/state}" usage.json idle_state.json inventory.json
+rm -rf "$HOME/.sgpu/nodes"
 
 if [ -n "$INSTALL_DIR" ] && [ -e "$INSTALL_DIR/bin/sgpu" ]; then
     # Marker check above keeps a bad INSTALL_DIR from deleting the wrong tree

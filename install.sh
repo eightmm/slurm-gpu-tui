@@ -30,8 +30,25 @@ echo "[1] Creating venv and installing..."
 # (~/.local/share/uv) is unreadable by other users when installing as root,
 # and invisible to compute nodes when the home dir isn't the shared FS.
 export UV_PYTHON_INSTALL_DIR="$INSTALL_DIR/python"
-uv venv --clear --python 3.12 "$VENV_DIR"
+# Keep the old venv restorable: a failed build (network, disk) would otherwise
+# leave the still-enabled collector service pointing at a destroyed venv.
+# The venv must be rebuilt at its real path (console-script shebangs bake it in).
+if [ -d "$VENV_DIR" ]; then
+    rm -rf "$VENV_DIR.bak"
+    mv "$VENV_DIR" "$VENV_DIR.bak"
+fi
+_restore_venv() {
+    if [ -d "$VENV_DIR.bak" ]; then
+        echo "install failed — restoring previous venv" >&2
+        rm -rf "$VENV_DIR"
+        mv "$VENV_DIR.bak" "$VENV_DIR"
+    fi
+}
+trap _restore_venv ERR
+uv venv --python 3.12 "$VENV_DIR"
 uv pip install --python "$VENV_DIR/bin/python" -e "$INSTALL_DIR"
+trap - ERR
+rm -rf "$VENV_DIR.bak"
 chmod -R a+rX "$INSTALL_DIR"
 
 # Every path component must be world-traversable or other users can't run
@@ -88,10 +105,17 @@ if [ -n "$SHARE" ] && [ "$SHARE" != "0" ]; then
         # 'scontrol write batch_script' as root — nothing else. This keeps
         # the collector (and its push agents / state paths) non-root.
         SCONTROL_BIN="$(command -v scontrol || echo /usr/bin/scontrol)"
-        echo "$(id -un) ALL=(root) NOPASSWD: $SCONTROL_BIN write batch_script *" \
-            | $SUDO tee /etc/sudoers.d/sgpu >/dev/null
-        $SUDO chmod 440 /etc/sudoers.d/sgpu
-        echo "[3a] Script sharing enabled (sudoers.d/sgpu)"
+        SUDOERS_TMP="$(mktemp)"
+        echo "$(id -un) ALL=(root) NOPASSWD: $SCONTROL_BIN write batch_script *" > "$SUDOERS_TMP"
+        # validate before installing — a malformed sudoers.d file breaks sudo host-wide
+        if ! command -v visudo >/dev/null || visudo -cf "$SUDOERS_TMP" >/dev/null 2>&1; then
+            $SUDO install -m 440 "$SUDOERS_TMP" /etc/sudoers.d/sgpu
+            echo "[3a] Script sharing enabled (sudoers.d/sgpu)"
+        else
+            echo "WARNING: generated sudoers rule failed visudo check — script sharing skipped"
+            SHARE=""
+        fi
+        rm -f "$SUDOERS_TMP"
     else
         echo "NOTE: script sharing needs sudo to provision — skipping."
         SHARE=""
@@ -131,7 +155,7 @@ if $CFG_EXISTS || [ -n "$WEBHOOK_URL" ]; then
     BOT_TOKEN="${SGPU_SLACK_BOT_TOKEN-__ask__}"
     if [ "$BOT_TOKEN" = "__ask__" ]; then
         BOT_TOKEN=""
-        _tty && { printf "Slack bot token for daily-thread grouping (xoxb-…, Enter to keep/skip): " > /dev/tty; read -r BOT_TOKEN < /dev/tty || BOT_TOKEN=""; }
+        _tty && { printf "Slack bot token for daily-thread grouping (xoxb-…, Enter to keep/skip): " > /dev/tty; read -rs BOT_TOKEN < /dev/tty || BOT_TOKEN=""; echo > /dev/tty; }
     fi
     CHANNEL="${SGPU_SLACK_CHANNEL-__ask__}"
     if [ "$CHANNEL" = "__ask__" ]; then
@@ -221,7 +245,7 @@ else
         SYSTEMD_MODE="user"
     else
         rm -f "$USER_SERVICE_DIR/sgpu-collector.service"
-        pkill -f sgpu-collector 2>/dev/null || true
+        pkill -f "bin/[s]gpu-collector" 2>/dev/null || true
         nohup "$VENV_DIR/bin/sgpu-collector" > /tmp/sgpu-collector.log 2>&1 &
         SYSTEMD_MODE="none"
     fi
@@ -271,7 +295,7 @@ elif [ "$SYSTEMD_MODE" = "user" ]; then
     echo "Collector daemon (user service):"
     systemctl --user status sgpu-collector --no-pager -l || true
 else
-    echo "Collector daemon (background process, PID $(pgrep -f sgpu-collector | head -1)):"
+    echo "Collector daemon (background process, PID $(pgrep -f 'bin/[s]gpu-collector' | head -1)):"
     echo "  Log: /tmp/sgpu-collector.log"
     echo ""
     echo "  NOTE: Add this to $SHELL_RC to auto-start on login:"

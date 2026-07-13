@@ -12,12 +12,14 @@ REPO="$(cd "$(dirname "$0")" && pwd)"
 PROD_VENV="${SGPU_PROD_VENV:-/home/shared/sgpu/.venv}"
 
 # uv may not be on root's PATH (it installs under a user's ~/.local/bin).
-UV="$(command -v uv 2>/dev/null || true)"
-for c in /usr/local/bin/uv /home/jaemin/.local/bin/uv; do
-    [ -n "$UV" ] && break
-    [ -x "$c" ] && UV="$c"
-done
-[ -n "$UV" ] || { echo "uv not found on PATH, /usr/local/bin, or /home/jaemin/.local/bin"; exit 1; }
+# Override with SGPU_UV=/path/to/uv when auto-detection misses.
+UV="${SGPU_UV:-$(command -v uv 2>/dev/null || true)}"
+if [ -z "$UV" ]; then
+    for home in /usr/local/bin $(ls -d /home/*/.local/bin 2>/dev/null); do
+        [ -x "$home/uv" ] && UV="$home/uv" && break
+    done
+fi
+[ -n "$UV" ] || { echo "uv not found — set SGPU_UV=/path/to/uv"; exit 1; }
 
 # systemctl needs root; if not already root, prefix with sudo.
 SUDO=""

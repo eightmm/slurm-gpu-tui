@@ -25,6 +25,14 @@ fi
 
 if [ -d "$DIR/.git" ]; then
     echo "[bootstrap] updating existing install at $DIR"
+    # local edits (site-patched service file, agent tweaks) would be silently
+    # destroyed by reset --hard — refuse unless explicitly forced
+    if [ -n "$(git -C "$DIR" status --porcelain 2>/dev/null)" ] && [ -z "${SGPU_FORCE_UPDATE:-}" ]; then
+        echo "[bootstrap] ERROR: $DIR has local changes:" >&2
+        git -C "$DIR" status --short >&2
+        echo "[bootstrap] commit/stash them, or re-run with SGPU_FORCE_UPDATE=1 to discard" >&2
+        exit 1
+    fi
     git -C "$DIR" fetch --quiet origin
     git -C "$DIR" reset --hard --quiet origin/main
 else
