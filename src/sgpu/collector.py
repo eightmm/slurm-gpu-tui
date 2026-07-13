@@ -17,8 +17,8 @@ from typing import Dict, List
 
 from .common import (
     GpuInfo, JobInfo, NodeErrorKind, NodeMemInfo, PendingJob,
-    collect_basic, collect_node_data, parse_gres_models, run_cmd, ssh_cmd,
-    _classify_error,
+    collect_basic, collect_node_data, parse_gres_models, resolve_user,
+    run_cmd, ssh_cmd, _classify_error,
 )
 from .agent import AGENT_PAYLOAD_VERSION
 from . import agent as _agent_module
@@ -577,12 +577,15 @@ def collect_all() -> dict:
     Node SSH polls run in the background and never block this cycle — a dead
     node only goes stale, it cannot stall data for healthy nodes.
     """
-    nodes_raw, jobs, pending, node_jobs_from_basic, gpu_alloc, basic_err = collect_basic()
+    nodes_raw, jobs, pending, node_jobs_from_basic, gpu_alloc, alloc_user_map, basic_err = collect_basic()
 
     node_jobs: Dict[str, List[dict]] = {
         k: [_job_to_dict(j) for j in v] for k, v in node_jobs_from_basic.items()
     }
+    # scontrol's UserId map wins over squeue: it resolves array-task jobids
+    # (38182_0 in squeue vs the real 38192 in the alloc) and carries the name
     jobid_user = {j.jobid: j.user for j in jobs}
+    jobid_user.update({k: v for k, v in alloc_user_map.items() if v})
 
     # Prefer push-agent payloads (local NFS read, every cycle). Nodes without
     # a live agent fall back to async SSH polls + agent repair.
@@ -640,6 +643,10 @@ def collect_all() -> dict:
             jid = node_alloc.get(g.get("minor") or g.get("index", ""), "")
             g["alloc_jobid"] = jid
             g["alloc_user"] = jobid_user.get(jid, "")
+            # node-side ps reports a bare UID when the node lacks the account;
+            # resolve it here on the master, where the name service knows it
+            if g.get("users"):
+                g["users"] = [resolve_user(u) for u in g["users"]]
             if skeleton_mode:
                 # Placeholder rows carry no process info — show previously
                 # tracked waste ages but never start or reset the timers.
@@ -687,15 +694,20 @@ def collect_all() -> dict:
 
 # ── Prometheus textfile exporter ──────────────────────────────────────────
 
-METRICS_FILE = DATA_DIR / "metrics.prom"
+# Prometheus textfile. Default sits next to data.json in DATA_DIR (/tmp),
+# but node_exporter units often ship PrivateTmp=yes and then never see a
+# /tmp file — point this at a shared path node_exporter can read in that case.
+METRICS_FILE = Path(
+    os.getenv("SLURM_GPU_TUI_METRICS_FILE", str(DATA_DIR / "metrics.prom"))
+)
 
 
 def _prom_escape(s: str) -> str:
-    return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "")
+    return str(s).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "")
 
 
-def _write_metrics(data: dict) -> None:
-    """Write a Prometheus textfile snapshot next to data.json."""
+def _format_metrics(data: dict) -> str:
+    """Return a Prometheus textfile snapshot for the merged cluster state."""
     def num(v):
         try:
             return float(v)
@@ -703,20 +715,106 @@ def _write_metrics(data: dict) -> None:
             return None
 
     lines = [
+        "# HELP sgpu_jobs_running Running Slurm jobs visible to sgpu",
+        "# TYPE sgpu_jobs_running gauge",
+        "# HELP sgpu_jobs_pending Pending Slurm jobs visible to sgpu",
+        "# TYPE sgpu_jobs_pending gauge",
+        "# HELP sgpu_nodes_total Nodes visible to sgpu",
+        "# TYPE sgpu_nodes_total gauge",
+        "# HELP sgpu_nodes_up Nodes without an sgpu collection error",
+        "# TYPE sgpu_nodes_up gauge",
+        "# HELP sgpu_nodes_stale Nodes with stale sgpu data",
+        "# TYPE sgpu_nodes_stale gauge",
+        "# HELP sgpu_node_up Node collection state by node",
+        "# TYPE sgpu_node_up gauge",
+        "# HELP sgpu_node_stale Node stale-data state by node",
+        "# TYPE sgpu_node_stale gauge",
+        "# HELP sgpu_gpus_total GPUs visible to sgpu",
+        "# TYPE sgpu_gpus_total gauge",
+        "# HELP sgpu_gpus_allocated GPUs allocated by Slurm",
+        "# TYPE sgpu_gpus_allocated gauge",
+        "# HELP sgpu_gpus_free GPUs with no Slurm allocation and no process",
+        "# TYPE sgpu_gpus_free gauge",
+        "# HELP sgpu_gpus_idle GPUs allocated by Slurm with no process",
+        "# TYPE sgpu_gpus_idle gauge",
+        "# HELP sgpu_gpus_parked GPUs holding VRAM with near-zero utilization",
+        "# TYPE sgpu_gpus_parked gauge",
+        "# HELP sgpu_gpus_rogue GPUs with a process but no Slurm GPU allocation",
+        "# TYPE sgpu_gpus_rogue gauge",
         "# HELP sgpu_gpu_util GPU utilization percent",
+        "# TYPE sgpu_gpu_util gauge",
+        "# HELP sgpu_gpu_mem_used_mib GPU memory used in MiB",
+        "# TYPE sgpu_gpu_mem_used_mib gauge",
+        "# HELP sgpu_gpu_mem_total_mib GPU memory total in MiB",
+        "# TYPE sgpu_gpu_mem_total_mib gauge",
+        "# HELP sgpu_gpu_mem_used_percent GPU memory used percent",
+        "# TYPE sgpu_gpu_mem_used_percent gauge",
+        "# HELP sgpu_gpu_temp_celsius GPU temperature in Celsius",
+        "# TYPE sgpu_gpu_temp_celsius gauge",
+        "# HELP sgpu_gpu_power_watts GPU power draw in watts",
+        "# TYPE sgpu_gpu_power_watts gauge",
+        "# HELP sgpu_gpu_allocated GPU allocation state by Slurm user",
+        "# TYPE sgpu_gpu_allocated gauge",
         "# HELP sgpu_gpu_idle_seconds Seconds GPU has been allocated with no process",
+        "# TYPE sgpu_gpu_idle_seconds gauge",
+        "# HELP sgpu_gpu_parked_seconds Seconds GPU has held VRAM with near-zero utilization",
+        "# TYPE sgpu_gpu_parked_seconds gauge",
+        "# HELP sgpu_gpu_info Static GPU identity labels",
+        "# TYPE sgpu_gpu_info gauge",
+        "# HELP sgpu_node_info Static node identity labels",
+        "# TYPE sgpu_node_info gauge",
+        "# HELP sgpu_collector_last_success_timestamp_seconds Unix time of this snapshot",
+        "# TYPE sgpu_collector_last_success_timestamp_seconds gauge",
     ]
+    lines.append(f"sgpu_collector_last_success_timestamp_seconds {time.time():.0f}")
     n_run = len(data.get("jobs", []))
     n_pend = len(data.get("pending", []))
+    nodes = data.get("nodes", [])
+    total_nodes = len(nodes)
+    up_nodes = sum(1 for n in nodes if not n.get("error"))
+    stale_nodes = sum(1 for n in nodes if n.get("stale"))
+    total_gpus = allocated_gpus = free_gpus = idle_gpus = parked_gpus = rogue_gpus = 0
+    for n in nodes:
+        for g in n.get("gpus", []):
+            total_gpus += 1
+            allocated = bool(g.get("alloc_jobid") or g.get("alloc_user"))
+            has_process = bool(g.get("users"))
+            if allocated:
+                allocated_gpus += 1
+            if not allocated and not has_process:
+                free_gpus += 1
+            if g.get("idle_sec", 0) > 0:
+                idle_gpus += 1
+            if g.get("parked_sec", 0) > 0:
+                parked_gpus += 1
+            if has_process and not allocated:
+                rogue_gpus += 1
     lines.append(f"sgpu_jobs_running {n_run}")
     lines.append(f"sgpu_jobs_pending {n_pend}")
-    for n in data.get("nodes", []):
+    lines.append(f"sgpu_nodes_total {total_nodes}")
+    lines.append(f"sgpu_nodes_up {up_nodes}")
+    lines.append(f"sgpu_nodes_stale {stale_nodes}")
+    lines.append(f"sgpu_gpus_total {total_gpus}")
+    lines.append(f"sgpu_gpus_allocated {allocated_gpus}")
+    lines.append(f"sgpu_gpus_free {free_gpus}")
+    lines.append(f"sgpu_gpus_idle {idle_gpus}")
+    lines.append(f"sgpu_gpus_parked {parked_gpus}")
+    lines.append(f"sgpu_gpus_rogue {rogue_gpus}")
+    for n in nodes:
         node = _prom_escape(n["name"])
+        partition = _prom_escape(n.get("partition", ""))
+        source = _prom_escape(n.get("source", ""))
         up = 0 if n.get("error") else 1
+        lines.append(
+            f'sgpu_node_info{{node="{node}",partition="{partition}",source="{source}"}} 1'
+        )
         lines.append(f'sgpu_node_up{{node="{node}"}} {up}')
         lines.append(f'sgpu_node_stale{{node="{node}"}} {1 if n.get("stale") else 0}')
         for g in n.get("gpus", []):
             lbl = f'node="{node}",gpu="{_prom_escape(g.get("index", ""))}"'
+            lines.append(
+                f'sgpu_gpu_info{{{lbl},name="{_prom_escape(g.get("name", ""))}"}} 1'
+            )
             for metric, key in (
                 ("sgpu_gpu_util", "util"),
                 ("sgpu_gpu_mem_used_mib", "mem_used"),
@@ -727,16 +825,26 @@ def _write_metrics(data: dict) -> None:
                 v = num(g.get(key))
                 if v is not None:
                     lines.append(f"{metric}{{{lbl}}} {v:g}")
+            mem_used = num(g.get("mem_used"))
+            mem_total = num(g.get("mem_total"))
+            if mem_used is not None and mem_total and mem_total > 0:
+                lines.append(f"sgpu_gpu_mem_used_percent{{{lbl}}} {mem_used / mem_total * 100:g}")
             user = _prom_escape(g.get("alloc_user", ""))
-            lines.append(f'sgpu_gpu_allocated{{{lbl},user="{user}"}} {1 if g.get("alloc_jobid") else 0}')
+            allocated = 1 if (g.get("alloc_jobid") or g.get("alloc_user")) else 0
+            lines.append(f'sgpu_gpu_allocated{{{lbl},user="{user}"}} {allocated}')
             lines.append(f"sgpu_gpu_idle_seconds{{{lbl}}} {g.get('idle_sec', 0)}")
             lines.append(f"sgpu_gpu_parked_seconds{{{lbl}}} {g.get('parked_sec', 0)}")
+    return "\n".join(lines) + "\n"
+
+
+def _write_metrics(data: dict) -> None:
+    """Write a Prometheus textfile snapshot next to data.json."""
     try:
         tmp = METRICS_FILE.with_suffix(".tmp")
-        tmp.write_text("\n".join(lines) + "\n")
+        tmp.write_text(_format_metrics(data))
         tmp.rename(METRICS_FILE)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[collector] metrics write error: {e}", flush=True)
 
 
 # ── Daemon ────────────────────────────────────────────────────────────────

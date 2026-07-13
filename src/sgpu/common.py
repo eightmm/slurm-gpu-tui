@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import pwd
 import re
 import shlex
 import subprocess
@@ -24,6 +25,37 @@ class NodeErrorKind(str, Enum):
     SLURM_DOWN = "slurm_down"
     STALE_CACHED = "stale_cached"
     UNKNOWN = "unknown"
+
+
+# GPU processes by these users never count as rogue (system daemons)
+ROGUE_IGNORE = {
+    u for u in os.getenv("SLURM_GPU_TUI_ROGUE_IGNORE", "root,gdm,xdm").split(",") if u
+}
+
+
+_uid_name_cache: Dict[str, str] = {}
+
+
+def resolve_user(name: str) -> str:
+    """Map a bare numeric UID to a login name via the master's name service.
+
+    Compute nodes often lack a passwd entry for cluster users (home is NFS but
+    the account DB isn't shared), so node-side `ps` reports the UID number.
+    This runs on the master, where the name resolves. Non-numeric names (already
+    resolved) and unknown UIDs pass through unchanged. Call only on the master
+    — a compute node would fail the same lookup.
+    """
+    if not name or not name.isdigit():
+        return name
+    cached = _uid_name_cache.get(name)
+    if cached is not None:
+        return cached
+    try:
+        resolved = pwd.getpwuid(int(name)).pw_name
+    except (KeyError, ValueError, OverflowError):
+        resolved = name
+    _uid_name_cache[name] = resolved
+    return resolved
 
 
 # ── Shell helpers ─────────────────────────────────────────────────────────
@@ -357,19 +389,28 @@ def parse_gres_models(gres: str) -> List[str]:
     return out
 
 
-def parse_gpu_alloc(out: str) -> Dict[str, Dict[str, str]]:
-    """Parse `scontrol -o show job -d` output: node -> gpu index -> jobid.
+def parse_gpu_alloc(out: str) -> Tuple[Dict[str, Dict[str, str]], Dict[str, str]]:
+    """Parse `scontrol -o show job -d`: (node -> gpu index -> jobid, jobid -> user).
 
     Reads per-node detail segments like 'Nodes=gpu4 CPU_IDs=... Mem=... GRES=gpu:1(IDX:0)'.
+    The jobid->user map comes from scontrol's own `UserId=name(uid)` field: it
+    carries the login name even for array tasks (whose real jobid never appears
+    in squeue's `38182_0` notation) and for users with no node-side passwd entry.
     """
     alloc: Dict[str, Dict[str, str]] = {}
+    jobid_user: Dict[str, str] = {}
     for line in out.splitlines():
-        if "JobState=RUNNING" not in line:
+        # COMPLETING keeps its GRES detail while epilog/process teardown runs;
+        # dropping it made every job's final seconds look like rogue GPU use
+        if "JobState=RUNNING" not in line and "JobState=COMPLETING" not in line:
             continue
         m_id = re.search(r"JobId=(\d+)", line)
         if not m_id:
             continue
         jobid = m_id.group(1)
+        m_u = re.search(r"UserId=([^(\s]+)\(", line)
+        if m_u:
+            jobid_user[jobid] = m_u.group(1)
         for m in re.finditer(r"Nodes=(\S+)\s+CPU_IDs=\S+\s+Mem=\S+\s+GRES=(\S+)", line):
             nodes_expr, gres = m.group(1), m.group(2)
             gm = re.search(r"gpu[^(]*\(IDX:([^)]+)\)", gres)
@@ -380,17 +421,18 @@ def parse_gpu_alloc(out: str) -> Dict[str, Dict[str, str]]:
                 d = alloc.setdefault(node, {})
                 for i in idxs:
                     d[i] = jobid
-    return alloc
+    return alloc, jobid_user
 
 
-def collect_gpu_alloc() -> Tuple[Dict[str, Dict[str, str]], str]:
-    """Exact GPU allocation from scontrol: node -> gpu index -> jobid."""
+def collect_gpu_alloc() -> Tuple[Dict[str, Dict[str, str]], Dict[str, str], str]:
+    """Exact GPU allocation from scontrol: (node->idx->jobid, jobid->user, err)."""
     ok, out = run_cmd("scontrol -o show job -d")
     if not ok:
         if "no jobs" in out.lower():
-            return {}, ""
-        return {}, f"scontrol failed: {out}"
-    return parse_gpu_alloc(out), ""
+            return {}, {}, ""
+        return {}, {}, f"scontrol failed: {out}"
+    alloc, jobid_user = parse_gpu_alloc(out)
+    return alloc, jobid_user, ""
 
 
 # Combined node-side payload command: nvidia-smi metrics + pmon (PID→GPU)
@@ -507,7 +549,7 @@ def collect_mem_alloc() -> Tuple[Dict[str, str], str]:
     return res, ""
 
 
-def collect_basic() -> Tuple[List[dict], List[JobInfo], List[PendingJob], Dict[str, List[JobInfo]], Dict[str, Dict[str, str]], str]:
+def collect_basic() -> Tuple[List[dict], List[JobInfo], List[PendingJob], Dict[str, List[JobInfo]], Dict[str, Dict[str, str]], Dict[str, str], str]:
     """Phase 1: fast local commands only (sinfo + squeue + scontrol)."""
     with ThreadPoolExecutor(max_workers=5) as ex:
         f_nodes = ex.submit(collect_nodes_basic)
@@ -518,12 +560,12 @@ def collect_basic() -> Tuple[List[dict], List[JobInfo], List[PendingJob], Dict[s
         nodes_raw, e1 = f_nodes.result()
         jobs, e2 = f_jobs.result()
         pending, e3 = f_pending.result()
-        gpu_alloc, e4 = f_alloc.result()
+        gpu_alloc, alloc_user_map, e4 = f_alloc.result()
         mem_alloc, e5 = f_mem.result()
     for n in nodes_raw:
         n["mem_alloc"] = mem_alloc.get(n["name"], "")
     err = " | ".join(x for x in [e1, e2, e3, e4, e5] if x)
-    return nodes_raw, jobs, pending, assign_node_jobs(jobs), gpu_alloc, err
+    return nodes_raw, jobs, pending, assign_node_jobs(jobs), gpu_alloc, alloc_user_map, err
 
 
 def assign_node_jobs(jobs: List[JobInfo]) -> Dict[str, List[JobInfo]]:
@@ -547,9 +589,14 @@ def assign_node_jobs(jobs: List[JobInfo]) -> Dict[str, List[JobInfo]]:
 
 def apply_gpu_alloc(
     nodes: List[NodeInfo], gpu_alloc: Dict[str, Dict[str, str]], jobs: List[JobInfo],
+    alloc_user_map: Dict[str, str] | None = None,
 ) -> None:
     """Annotate GPUs with the job/user that holds them per SLURM allocation."""
+    # squeue's jobid can't be joined to an array task's real jobid; scontrol's
+    # UserId map (alloc_user_map) can, so it wins where present.
     jobid_user = {j.jobid: j.user for j in jobs}
+    if alloc_user_map:
+        jobid_user.update({k: v for k, v in alloc_user_map.items() if v})
     for node in nodes:
         node_alloc = gpu_alloc.get(node.name, {})
         for g in node.gpus:
@@ -557,6 +604,8 @@ def apply_gpu_alloc(
             jid = node_alloc.get(g.minor or g.index, "")
             g.alloc_jobid = jid
             g.alloc_user = jobid_user.get(jid, "")
+            # node-side ps reports a bare UID when the node lacks the account
+            g.users = [resolve_user(u) for u in g.users]
 
 
 def build_nodes(

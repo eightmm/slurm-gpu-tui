@@ -15,6 +15,7 @@ Config: ~/.sgpu/webhook.json (or SLURM_GPU_TUI_WEBHOOK_URL for URL only)
   "collect_grace_sec": 600,       #   (agent died / node hung) — SLURM still up
   "waste_alert_hours": 2,         # GPU idle/parked >= N hours (0 = off)
   "rogue_alert": true,            # GPU used outside SLURM
+  "rogue_grace_sec": 300,         #   must persist this long before alerting
   "temp_alert_c": 0,              # GPU temperature >= N°C (0 = off; ~90 typical)
   "ecc_alert": true,             # uncorrectable ECC errors (silent HW failure)
   "job_done_users": ["alice"],    # notify when these users' jobs finish
@@ -36,6 +37,8 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
+
+from .common import ROGUE_IGNORE
 
 DEBOUNCE_SEC = int(os.getenv("SLURM_GPU_TUI_WEBHOOK_DEBOUNCE_SEC", "1800"))
 # waste/rogue conditions persist for hours — re-nag much less often
@@ -128,9 +131,9 @@ def _fmt_dur(sec: float, lang: str = "en") -> str:
 
 
 class Notifier:
-    def __init__(self, state_dir: Path) -> None:
+    def __init__(self, state_dir: Path, cfg_path: Optional[Path] = None) -> None:
         self._state_file = state_dir / "notify_state.json"
-        self._cfg_path = Path.home() / ".sgpu" / "webhook.json"
+        self._cfg_path = cfg_path or Path.home() / ".sgpu" / "webhook.json"
         self._cfg_mtime: Optional[float] = None
         self._load_config()
         # persisted: node down-state, last-seen jobs, last alert ts per key
@@ -153,6 +156,7 @@ class Notifier:
         # exactly like an outage for the first cycles)
         self._pending_down: Dict[str, float] = {}
         self._pending_blind: Dict[str, float] = {}
+        self._pending_rogue: Dict[str, float] = {}
 
     def _load_config(self) -> None:
         cfg: dict = {}
@@ -172,6 +176,7 @@ class Notifier:
         self.free_gpus_min: int = int(cfg.get("free_gpus_min", 0))
         self.waste_alert_hours: float = float(cfg.get("waste_alert_hours", 0))
         self.rogue_alert: bool = bool(cfg.get("rogue_alert", False))
+        self.rogue_grace_sec: float = float(cfg.get("rogue_grace_sec", 300))
         self.temp_alert_c: float = float(cfg.get("temp_alert_c", 0))
         self.ecc_alert: bool = bool(cfg.get("ecc_alert", True))
         self.down_grace_sec: float = float(cfg.get("down_grace_sec", 180))
@@ -287,7 +292,13 @@ class Notifier:
                                 "elapsed": j.get("elapsed", "")} for jid, j in current.items()}
 
         if self.waste_alert_hours > 0 or self.rogue_alert:
+            # Rogue needs trustworthy allocation data: a failed controller
+            # query means empty gpu_alloc (every busy GPU would look rogue),
+            # and a stale node payload lists processes from before jobs ended.
+            rogue_ok = self.rogue_alert and not data.get("errors")
+            active_rogue: set = set()
             for n in nodes:
+                node_rogue_ok = rogue_ok and not n.get("stale")
                 for g in n.get("gpus", []):
                     loc = f"{n['name']} GPU{g.get('index', '?')}"
                     wasted = max(g.get("idle_sec", 0), g.get("parked_sec", 0))
@@ -300,12 +311,23 @@ class Notifier:
                             self._post(self._m("waste", loc=loc, kind=kind,
                                                dur=_fmt_dur(wasted, self.lang),
                                                user=g.get("alloc_user", "?"), jid=jid or "?"))
-                    if self.rogue_alert and not g.get("alloc_jobid") and not g.get("alloc_user"):
-                        rogues = [u for u in (g.get("users") or []) if u]
+                    if node_rogue_ok and not g.get("alloc_jobid") and not g.get("alloc_user"):
+                        rogues = [u for u in (g.get("users") or [])
+                                  if u and u not in ROGUE_IGNORE]
                         for u in rogues:
-                            if self._ok_to_send(f"rogue:{n['name']}:{g.get('index')}:{u}",
-                                                now, NAG_REALERT_SEC):
+                            key = f"rogue:{n['name']}:{g.get('index')}:{u}"
+                            active_rogue.add(key)
+                            first = self._pending_rogue.setdefault(key, now)
+                            # grace: job start/end races and transient scontrol
+                            # gaps look identical to real off-SLURM use
+                            if now - first >= self.rogue_grace_sec \
+                                    and self._ok_to_send(key, now, NAG_REALERT_SEC):
                                 self._post(self._m("rogue", loc=loc, user=u))
+            if rogue_ok:
+                # condition cleared (or node data untrusted) → restart clock
+                for key in list(self._pending_rogue):
+                    if key not in active_rogue:
+                        del self._pending_rogue[key]
 
         if self.temp_alert_c > 0 or self.ecc_alert:
             for n in nodes:

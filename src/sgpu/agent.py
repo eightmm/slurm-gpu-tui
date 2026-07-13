@@ -22,7 +22,9 @@ from .common import NODE_PAYLOAD_CMD, parse_node_payload
 
 AGENT_DIR = Path(os.getenv("SLURM_GPU_TUI_AGENT_DIR", str(Path.home() / ".sgpu" / "nodes")))
 INTERVAL = int(os.getenv("SLURM_GPU_TUI_AGENT_SEC", "3"))
-CMD_TIMEOUT = int(os.getenv("SLURM_GPU_TUI_AGENT_CMD_TIMEOUT_SEC", "20"))
+# Generous: without GPU persistence mode each nvidia-smi call can take ~5s
+# (driver re-init), and the payload runs three of them
+CMD_TIMEOUT = int(os.getenv("SLURM_GPU_TUI_AGENT_CMD_TIMEOUT_SEC", "40"))
 
 # Node-local (NOT on NFS): one agent per node, log stays on the node
 LOCK_FILE = Path("/tmp/sgpu-agent.lock")

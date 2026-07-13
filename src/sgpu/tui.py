@@ -25,7 +25,7 @@ from textual.widgets import (
 from textual.widgets.option_list import Option
 
 from .common import (
-    GpuInfo, JobInfo, NodeInfo, NodeSSHResult, PendingJob,
+    GpuInfo, JobInfo, NodeInfo, NodeSSHResult, PendingJob, ROGUE_IGNORE,
     apply_gpu_alloc, build_nodes, cleanup_ssh_pool, collect_basic,
     collect_node_data_parallel, run_cmd,
 )
@@ -293,17 +293,11 @@ def parse_slurm_duration(s: str) -> int:
         return -1
 
 
-# GPU processes by these users never count as rogue (system daemons)
-_ROGUE_IGNORE = {
-    u for u in os.getenv("SLURM_GPU_TUI_ROGUE_IGNORE", "root,gdm,xdm").split(",") if u
-}
-
-
 def classify_gpu(g: GpuInfo) -> str:
     """One of: rogue (GPU process outside any SLURM allocation) / busy /
     parked (VRAM held, no compute) / idle (reserved, no process) / free /
     unknown (no data yet)."""
-    real_users = [u for u in g.users if u not in _ROGUE_IGNORE]
+    real_users = [u for u in g.users if u not in ROGUE_IGNORE]
     if real_users and not g.alloc_jobid:
         return "rogue"
     try:
@@ -363,7 +357,7 @@ def collect_waste(nodes: List[NodeInfo], min_sec: int) -> List[dict]:
     rows: List[dict] = []
     for n in nodes:
         for g in n.gpus:
-            real_users = [u for u in g.users if u not in _ROGUE_IGNORE]
+            real_users = [u for u in g.users if u not in ROGUE_IGNORE]
             if real_users and not g.alloc_jobid:
                 # Link to the culprit job when it's a gres-less SLURM job
                 jid = next((j.jobid for j in n.jobs
@@ -1204,7 +1198,7 @@ class SlurmGpuTui(App):
                 return
 
         # Fallback: direct collection (2-phase)
-        nodes_raw, jobs, pending, node_jobs, gpu_alloc, err1 = collect_basic()
+        nodes_raw, jobs, pending, node_jobs, gpu_alloc, alloc_user_map, err1 = collect_basic()
         node_names = [n["name"] for n in nodes_raw]
 
         # Show basic data immediately (use cache or empty)
@@ -1216,7 +1210,7 @@ class SlurmGpuTui(App):
                 cached_results[name] = NodeSSHResult(gpus, mem, "")
                 stale_now.append(name)
         phase1_nodes = build_nodes(nodes_raw, node_jobs, cached_results, stale_now)
-        apply_gpu_alloc(phase1_nodes, gpu_alloc, jobs)
+        apply_gpu_alloc(phase1_nodes, gpu_alloc, jobs, alloc_user_map)
         loading_msg = f"loading GPUs from {len(node_names)} nodes..."
         self.call_from_thread(self._apply, phase1_nodes, jobs, pending, loading_msg if node_names else err1)
 
@@ -1228,7 +1222,7 @@ class SlurmGpuTui(App):
             )
             all_errors = [x for x in [err1] + ssh_errors if x]
             phase2_nodes = build_nodes(nodes_raw, node_jobs, ssh_results, stale_nodes)
-            apply_gpu_alloc(phase2_nodes, gpu_alloc, jobs)
+            apply_gpu_alloc(phase2_nodes, gpu_alloc, jobs, alloc_user_map)
             self.call_from_thread(self._apply, phase2_nodes, jobs, pending, " | ".join(all_errors) if all_errors else "")
 
     def _toast_check(self, nodes: List[NodeInfo], jobs: List[JobInfo],
@@ -1739,11 +1733,11 @@ def _oneshot_snapshot() -> dict:
             return json.loads(_DAEMON_DATA_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         pass
-    nodes_raw, jobs, pending, node_jobs, gpu_alloc, err = collect_basic()
+    nodes_raw, jobs, pending, node_jobs, gpu_alloc, alloc_user_map, err = collect_basic()
     node_names = [n["name"] for n in nodes_raw]
     ssh_results, stale_nodes, ssh_errors = collect_node_data_parallel(node_names)
     nodes = build_nodes(nodes_raw, node_jobs, ssh_results, stale_nodes)
-    apply_gpu_alloc(nodes, gpu_alloc, jobs)
+    apply_gpu_alloc(nodes, gpu_alloc, jobs, alloc_user_map)
     return {
         "version": 1,
         "ts": datetime.now().isoformat(),
@@ -2030,6 +2024,19 @@ def _cli_doctor() -> int:
         ok, out = run_cmd(cmd, timeout=10)
         report(ok, cmd.split()[0], "reachable" if ok else out.splitlines()[0][:70])
 
+    # Doctor may run as a different user (e.g. root) than the collector, so
+    # home-relative defaults would point at the wrong account. The data.json
+    # owner IS the collector user — use their identity for state/webhook/
+    # sudoers checks below.
+    collector_user: Optional[str] = None
+    collector_home: Optional[Path] = None
+    try:
+        import pwd
+        pw = pwd.getpwuid(_DAEMON_DATA_FILE.stat().st_uid)
+        collector_user, collector_home = pw.pw_name, Path(pw.pw_dir)
+    except (OSError, KeyError):
+        pass
+
     # collector data
     srcs: Dict[str, int] = {}
     try:
@@ -2064,8 +2071,13 @@ def _cli_doctor() -> int:
         agent_dir = Path(os.getenv("SLURM_GPU_TUI_AGENT_DIR", str(Path.home() / ".sgpu" / "nodes")))
         report(None, "node delivery", f"no node data yet (checked {agent_dir})")
 
-    # persistent state
+    # persistent state — fall back to the collector user's home when ours
+    # has no state (doctor as root, collector as a regular user)
     state_dir = Path(os.getenv("SLURM_GPU_TUI_STATE_DIR", str(Path.home() / ".sgpu" / "state")))
+    if (not (state_dir / "usage.json").exists()
+            and not os.getenv("SLURM_GPU_TUI_STATE_DIR") and collector_home
+            and (collector_home / ".sgpu" / "state" / "usage.json").exists()):
+        state_dir = collector_home / ".sgpu" / "state"
     usage = state_dir / "usage.json"
     if usage.exists():
         report(True, "usage history", f"{usage} age {(time.time() - usage.stat().st_mtime):.0f}s")
@@ -2093,17 +2105,41 @@ def _cli_doctor() -> int:
         else:
             report(None, "sacct backfill", "sacct works but no backfill yet (collector runs it hourly)")
 
-    # script sharing (sudoers)
-    ok, out = run_cmd("sudo -n scontrol write batch_script 999999999 -", timeout=10)
-    if "Invalid job id" in out or ok:
-        report(True, "script sharing", "sudoers rule active (all-user script view)")
+    # script sharing (sudoers). What matters is whether the COLLECTOR user
+    # holds the grant — it does the fetching. Probing `sudo -n` as root is
+    # meaningless (root always passes), so read the rule itself instead.
+    if os.geteuid() == 0 and collector_user not in (None, "root"):
+        grantee = None
+        try:
+            for line in Path("/etc/sudoers.d/sgpu").read_text().splitlines():
+                if line.strip() and not line.lstrip().startswith("#"):
+                    grantee = line.split()[0]
+                    break
+        except OSError:
+            pass
+        if grantee == collector_user:
+            report(True, "script sharing", f"sudoers rule active (grants {grantee})")
+        elif grantee:
+            report(None, "script sharing", f"sudoers rule grants '{grantee}' but "
+                   f"collector runs as '{collector_user}' — rerun installer as {collector_user}")
+        else:
+            report(None, "script sharing", "not configured (own jobs only) — rerun installer to enable")
     else:
-        report(None, "script sharing", "not configured (own jobs only) — rerun installer to enable")
+        ok, out = run_cmd("sudo -n scontrol write batch_script 999999999 -", timeout=10)
+        if "Invalid job id" in out or ok:
+            report(True, "script sharing", "sudoers rule active (all-user script view)")
+        else:
+            report(None, "script sharing", "not configured (own jobs only) — rerun installer to enable")
 
-    # webhook notifier (optional)
+    # webhook notifier (optional) — same collector-home fallback as state
     from .notify import Notifier
     try:
-        nf = Notifier(state_dir)
+        cfg = Path.home() / ".sgpu" / "webhook.json"
+        if not cfg.exists() and collector_home:
+            alt = collector_home / ".sgpu" / "webhook.json"
+            if alt.exists():
+                cfg = alt
+        nf = Notifier(state_dir, cfg_path=cfg)
         if nf.enabled:
             mode = f"bot→{nf.channel} daily-thread" if nf._bot_mode else "incoming-webhook"
             on = [k for k, v in (("node", nf.node_health), ("collect", nf.collect_alert),
@@ -2115,8 +2151,9 @@ def _cli_doctor() -> int:
     except Exception as e:
         report(False, "webhook", f"config error: {e}")
 
-    # prometheus
-    prom = _DAEMON_DATA_FILE.parent / "metrics.prom"
+    # prometheus (honors SLURM_GPU_TUI_METRICS_FILE override)
+    prom = Path(os.getenv("SLURM_GPU_TUI_METRICS_FILE",
+                          str(_DAEMON_DATA_FILE.parent / "metrics.prom")))
     report(True if prom.exists() else None, "prometheus",
            str(prom) if prom.exists() else "no metrics file yet")
 

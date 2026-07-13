@@ -54,17 +54,45 @@ SCONTROL_PENDING = "JobId=999 JobName=w UserId=b(2) JobState=PENDING Nodes=gpu1 
 
 
 def test_parse_gpu_alloc_single():
-    alloc = parse_gpu_alloc(SCONTROL_LINE)
+    alloc, users = parse_gpu_alloc(SCONTROL_LINE)
     assert alloc == {"gpu4": {"0": "37671"}}
+    assert users == {"37671": "jwsong"}
 
 
 def test_parse_gpu_alloc_multinode_range():
-    alloc = parse_gpu_alloc(SCONTROL_MULTI)
+    alloc, users = parse_gpu_alloc(SCONTROL_MULTI)
     assert alloc == {"gpu1": {"2": "100", "3": "100"}, "gpu2": {"2": "100", "3": "100"}}
+    assert users == {"100": "a"}
 
 
 def test_parse_gpu_alloc_skips_pending():
-    assert parse_gpu_alloc(SCONTROL_PENDING) == {}
+    assert parse_gpu_alloc(SCONTROL_PENDING) == ({}, {})
+
+
+def test_parse_gpu_alloc_keeps_completing():
+    # epilog/teardown window: processes may still sit on the GPU — not rogue
+    line = ("JobId=555 JobName=t UserId=c(3) JobState=COMPLETING "
+            "Nodes=gpu2 CPU_IDs=0 Mem=0 GRES=gpu:1(IDX:4) ")
+    assert parse_gpu_alloc(line) == ({"gpu2": {"4": "555"}}, {"555": "c"})
+
+
+def test_resolve_user():
+    from sgpu.common import resolve_user
+    assert resolve_user("untaek") == "untaek"   # already a name → unchanged
+    assert resolve_user("") == ""
+    assert resolve_user("4000000000") == "4000000000"  # unknown UID → passthrough
+    assert resolve_user("0") == "root"           # uid 0 is root on every POSIX host
+
+
+def test_parse_gpu_alloc_array_task_user():
+    # array task: real JobId (38192) never appears in squeue's 38182_0 form,
+    # so the UserId map is the only join to a login name
+    line = ("JobId=38192 ArrayJobId=38182 ArrayTaskId=0 JobName=stb "
+            "UserId=untaek(1019) JobState=RUNNING "
+            "Nodes=gpu2 CPU_IDs=2-5 Mem=0 GRES=gpu:2080ti:1(IDX:0) ")
+    alloc, users = parse_gpu_alloc(line)
+    assert alloc == {"gpu2": {"0": "38192"}}
+    assert users == {"38192": "untaek"}
 
 
 # ── SSH node payload (nvidia-smi + pmon + meminfo + ps) ───────────────────
@@ -234,3 +262,117 @@ def test_payload_without_minor_falls_back_to_index():
     node = NodeInfo(name="n1", gpus=gpus)
     apply_gpu_alloc([node], {"n1": {"0": "9"}}, [JobInfo(jobid="9", user="u")])
     assert gpus[0].alloc_jobid == "9"
+
+
+def test_prometheus_metrics_summary():
+    from sgpu.collector import _format_metrics
+
+    text = _format_metrics({
+        "jobs": [{"jobid": "1"}],
+        "pending": [{"jobid": "2"}],
+        "nodes": [{
+            "name": "gpu1",
+            "partition": "gpu",
+            "source": "agent",
+            "error": "",
+            "stale": False,
+            "gpus": [
+                {
+                    "index": "0", "name": "A100", "util": "75",
+                    "mem_used": "20480", "mem_total": "40960",
+                    "temp": "70", "power": "250",
+                    "alloc_jobid": "10", "alloc_user": "alice",
+                    "users": ["alice"], "idle_sec": 0, "parked_sec": 0,
+                },
+                {
+                    "index": "1", "name": "A100", "util": "0",
+                    "mem_used": "0", "mem_total": "40960",
+                    "alloc_jobid": "", "alloc_user": "",
+                    "users": [], "idle_sec": 0, "parked_sec": 0,
+                },
+                {
+                    "index": "2", "name": "A100", "util": "90",
+                    "mem_used": "1024", "mem_total": "40960",
+                    "alloc_jobid": "", "alloc_user": "",
+                    "users": ["bob"], "idle_sec": 0, "parked_sec": 0,
+                },
+                {
+                    "index": "3", "name": "A100", "util": "0",
+                    "mem_used": "30000", "mem_total": "40960",
+                    "alloc_jobid": "11", "alloc_user": "carol",
+                    "users": [], "idle_sec": 800, "parked_sec": 900,
+                },
+            ],
+        }],
+    })
+
+    assert "sgpu_jobs_running 1" in text
+    assert "sgpu_jobs_pending 1" in text
+    assert "sgpu_nodes_total 1" in text
+    assert "sgpu_gpus_total 4" in text
+    assert "sgpu_gpus_allocated 2" in text
+    assert "sgpu_gpus_free 1" in text
+    assert "sgpu_gpus_rogue 1" in text
+    assert "sgpu_gpus_idle 1" in text
+    assert "sgpu_gpus_parked 1" in text
+    assert 'sgpu_node_info{node="gpu1",partition="gpu",source="agent"} 1' in text
+    assert 'sgpu_gpu_mem_used_percent{node="gpu1",gpu="0"} 50' in text
+
+
+# ── rogue alert grace (notify) ────────────────────────────────────────────
+
+def _mk_notifier(tmp_path):
+    import json as _json
+    from sgpu.notify import Notifier
+    cfg = tmp_path / "webhook.json"
+    cfg.write_text(_json.dumps({
+        "url": "http://example.invalid/hook", "rogue_alert": True,
+        "node_health": False, "collect_alert": False, "ecc_alert": False,
+    }))
+    n = Notifier(tmp_path, cfg_path=cfg)
+    sent = []
+    n._post = sent.append
+    return n, sent
+
+
+def _rogue_data(users=("intruder",), errors="", stale=False):
+    return {"nodes": [{"name": "gpu1", "state": "idle", "stale": stale, "gpus": [
+        {"index": "0", "users": list(users), "alloc_jobid": "", "alloc_user": ""},
+    ]}], "errors": errors}
+
+
+def test_notify_rogue_needs_grace(tmp_path):
+    n, sent = _mk_notifier(tmp_path)
+    n.process(_rogue_data())
+    assert sent == []  # first sighting: pending, no alert yet
+    for k in n._pending_rogue:
+        n._pending_rogue[k] -= n.rogue_grace_sec + 1
+    n.process(_rogue_data())
+    assert len(sent) == 1 and "intruder" in sent[0]
+
+
+def test_notify_rogue_pending_clears_when_gone(tmp_path):
+    n, sent = _mk_notifier(tmp_path)
+    n.process(_rogue_data())
+    assert n._pending_rogue
+    n.process(_rogue_data(users=()))  # condition cleared -> clock restarts
+    assert n._pending_rogue == {}
+    assert sent == []
+
+
+def test_notify_rogue_skips_on_collect_error(tmp_path):
+    n, sent = _mk_notifier(tmp_path)
+    n.process(_rogue_data(errors="scontrol failed: timeout"))
+    assert sent == [] and n._pending_rogue == {}
+
+
+def test_notify_rogue_skips_stale_node(tmp_path):
+    n, sent = _mk_notifier(tmp_path)
+    n.process(_rogue_data(stale=True))
+    assert sent == [] and n._pending_rogue == {}
+
+
+def test_notify_rogue_ignores_system_users(tmp_path):
+    n, sent = _mk_notifier(tmp_path)
+    n.process(_rogue_data(users=("root", "gdm")))
+    assert sent == [] and n._pending_rogue == {}
