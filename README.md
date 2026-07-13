@@ -1,8 +1,7 @@
 # sgpu - SLURM GPU Operations Monitor
 
-Real-time SLURM cluster monitoring for GPU operations: a terminal TUI, a
-collector daemon, push agents for compute nodes, usage/waste accounting, and
-Slack alerts for the conditions operators need to act on.
+Real-time SLURM GPU monitoring: a terminal TUI, a collector daemon, push agents
+for compute nodes, usage/waste accounting, and Slack alerts.
 
 ![CI](https://github.com/eightmm/slurm-gpu-tui/actions/workflows/test.yml/badge.svg)
 ![Python](https://img.shields.io/badge/python-3.10+-blue)
@@ -27,133 +26,140 @@ Slack alerts for the conditions operators need to act on.
 
 ## What You Get
 
-- Per-node GPU status (utilization, VRAM, temperature, power)
-- CPU allocation & memory usage per node
-- Who's using which GPU (matched to SLURM jobs, correct even when the driver's
-  probe order differs from `/dev/nvidiaN`)
-- Pending job queue with reason codes and estimated start times
-- Per-user GPU-hours, efficiency, and wasted (idle/parked) hours, with a
-  per-day cluster trend — backfilled from slurmdbd so figures survive
-  collector downtime
-- Job history and monthly reports (outcomes, GPU-hours, queue waits) — `--jobs`, `--report`
-- Cancel your own jobs from the TUI (`x`)
-- Collapsible nodes, idle-only filter, real-time search
-- Collector daemon for instant startup — no SSH wait on launch
+- Per-node GPU status (utilization, VRAM, temperature, power) and CPU/memory
+- Who holds which GPU, matched to SLURM jobs — correct even when the driver's
+  probe order differs from `/dev/nvidiaN`
+- Pending queue with reason codes and estimated start times
+- Per-user GPU-hours, efficiency, and wasted (idle/parked) hours with a per-day
+  trend — backfilled from slurmdbd so figures survive collector downtime
+- Job history and monthly reports (`--jobs`, `--report`)
+- Cancel your own jobs (`x`), collapsible nodes, idle filter, live search
+- Collector daemon for instant startup (no SSH wait on launch)
 - Slack alerts: node down/recovered, GPU health (temp/ECC), wasted/rogue GPUs,
-  and lost collection — grouped into a daily thread, in English or Korean
+  lost collection — daily thread, English or Korean
 
-## Operations Model
+## How It Works
 
-`sgpu` is built for a Slurm login/master node that already has `sinfo`,
-`squeue`, `sacct` (optional), and passwordless SSH to GPU nodes.
+`sgpu` runs on a SLURM login/master node with `sinfo`/`squeue` (and optionally
+`sacct`) and passwordless SSH to GPU nodes.
 
-- `sgpu-collector` runs continuously on the master and writes the latest merged
-  cluster state to `/tmp/slurm-gpu-tui/data.json`.
-- `sgpu-agent` can run on each GPU node and push local `nvidia-smi` data into a
-  shared filesystem. If push mode is not available, the collector falls back to
-  SSH-pull automatically.
-- The TUI reads the collector output first, so opening `sgpu` is instant even on
-  a large cluster.
-- Slack alerting is driven by the collector snapshot and persistent state under
-  `~/.sgpu/state`, so restarts do not re-fire old standing alerts.
-- `sgpu doctor` is the first check after install or when alerts/data look wrong.
+```
+[sgpu-agent @ each node]  ──3s──→  <AGENT_DIR>/<node>.json   (shared FS push)
+                                          │
+[sgpu-collector @ master] ──merge──→  /tmp/slurm-gpu-tui/data.json
+                                          ↑
+[sgpu TUI]                ──reads──┘   (instant, no SSH on launch)
+```
+
+- **Push mode (preferred):** each GPU node runs a tiny resident `sgpu-agent`
+  that writes stats to a shared-FS directory; the collector reads them locally
+  — no SSH in the hot path. The collector deploys and repairs agents itself
+  (rate-limited per node); no per-node install.
+- **SSH-pull fallback:** nodes without a live agent are polled over SSH
+  (ControlMaster-pooled, async). The two modes mix freely.
+- The TUI reads the merged JSON, so startup is instant at any cluster size.
+  Without a collector it falls back to direct SSH (slower first load).
+- The collector also writes `/tmp/slurm-gpu-tui/metrics.prom` (Prometheus
+  textfile) — point node_exporter at it and import the bundled dashboard.
+  **→ [docs/GRAFANA.md](docs/GRAFANA.md)**
+- `sgpu doctor` is the first check after install or when data looks wrong.
 
 ---
 
 ## Installation
 
-> **Already installed on your server?** Just run `sgpu`.
+> **Already installed? Just run `sgpu`.**
 
-### One-line install / upgrade
+One line to install or upgrade in place (resets to latest, rebuilds the venv,
+restarts the collector; running agents restart on the next cycle):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstrap.sh | bash
 ```
 
-> **Recommended: run as root (or with passwordless sudo).** That installs a
-> system-wide service and `/usr/local/bin/sgpu` for every user on the login
-> node. A non-root install works too, but only sets up your own user.
+> **Run as root (or passwordless sudo)** for a system-wide service and
+> `/usr/local/bin/sgpu` for every user. A non-root install sets up only your
+> own user.
 
-Run the same command again anytime to **upgrade in place**: it resets to the
-latest release, rebuilds the venv, restarts the collector, and running node
-agents are restarted automatically on the next collector cycle.
+### Install location (`SGPU_INSTALL_DIR`)
 
-Install dir defaults to `~/.sgpu/app` (as root: `/opt/sgpu`, since `/root` is
-not readable by other users). To override, put the variable on the `bash` side
-of the pipe — pick a shared-filesystem path if you want push-mode agents
-(compute nodes must be able to run the venv from it; otherwise SSH-pull mode
-is used automatically):
+Defaults to `~/.sgpu/app` (root: `/opt/sgpu`). Override by putting the variable
+on the **`bash` side** of the pipe. For **push mode**, point both the install
+dir and `SLURM_GPU_TUI_AGENT_DIR` at a shared filesystem the compute nodes
+mount at the same path (otherwise SSH-pull is used automatically):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstrap.sh | SGPU_INSTALL_DIR=/shared/path/sgpu bash
+# local install (SSH-pull mode)
+curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstrap.sh \
+  | SGPU_INSTALL_DIR=/opt/sgpu bash
+
+# push mode across nodes (install + agent dir on shared FS, e.g. NFS /home)
+curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstrap.sh \
+  | SGPU_INSTALL_DIR=/home/shared/sgpu SLURM_GPU_TUI_AGENT_DIR=/home/shared/sgpu-nodes bash
 ```
 
-The installer detects your environment and handles everything automatically:
+The installer bakes those paths into the systemd unit and picks the right
+service mode automatically:
 
-| Situation | What the installer does |
-|-----------|---------------------|
-| **root or sudo** | systemd system service + `/usr/local/bin/sgpu` symlink for all users |
-| **no sudo, systemd --user works** | systemd user service (auto-starts on login) + PATH added to shell config |
-| **no sudo, no systemd** | background process + PATH added to shell config |
+| Environment | Service |
+|-------------|---------|
+| root / sudo | systemd system service + `/usr/local/bin/sgpu` for all users |
+| no sudo, systemd `--user` | user service (auto-starts on login) + PATH line |
+| no sudo, no systemd | background process + PATH line |
 
-After install, apply PATH changes if prompted:
+If prompted, apply PATH changes with `source ~/.bashrc` (or a new terminal).
+With sudo the symlink is created automatically. Moving the install dir? Re-run
+the command above.
 
-```bash
-source ~/.bashrc   # or open a new terminal
-sgpu
-```
-
-If sudo was available, the symlink is created automatically — no PATH change needed.
-
-> **Moving the install directory?** Re-run the install command above.
+> Push mode also needs root→node passwordless SSH and, on `root_squash` NFS, a
+> writable agent dir. **→ [docs/PUSH.md](docs/PUSH.md)**
 
 ---
 
 ## Usage
 
 ```bash
-sgpu        # Launch the GPU monitor
+sgpu        # launch the GPU monitor
 ```
 
 ### Keyboard Shortcuts
 
 | Key | Action |
 |-----|--------|
-| `1` `2` `3` | Switch tabs: GPU / CPU / Usage — the CPU tab includes CPU-only nodes, with a cluster core summary and per-user core TOP |
+| `1` `2` `3` | Tabs: GPU / CPU / Usage (CPU tab adds CPU-only nodes + per-user core TOP) |
 | `r` | Refresh now |
 | `s` | Cycle sort: Node → Utilization → User → Free |
-| `u` | Filter by user — pick from a list (me first); press again to clear |
-| `i` | Free-GPU filter (only nodes with truly free GPUs) |
+| `u` | Filter by user (me first); press again to clear |
+| `i` | Free-GPU filter |
 | `d` | Toggle detail columns (Temp / Power / JobID / JobName) |
-| `Space` | Collapse / expand node (cursor on node header row) |
-| `/` | Search by node name or username — `Esc` to clear |
-| `j` / `k` | Move cursor down / up (vim-style) |
-| `Enter` | Job / node details popup (`scontrol show`) |
+| `Space` | Collapse / expand node |
+| `/` | Search by node or username (`Esc` clears) |
+| `j` / `k` | Cursor down / up |
+| `Enter` | Job / node details (`scontrol show`) |
 | `w` | Wasted GPUs popup (idle / parked, worst first) |
-| `x` | Cancel the job under the cursor (own jobs only, asks first) |
-| `g` | Open the Usage tab (GPU-hours by user) |
-| `e` | Export current snapshot as JSON |
-| `?` | Help overlay |
-| `q` | Quit |
+| `x` | Cancel the job under the cursor (own jobs, asks first) |
+| `e` | Export snapshot as JSON |
+| `?` / `q` | Help / quit |
 
-While the TUI is open it also pops toast notifications: your jobs starting/finishing, and nodes going down or recovering. (For alerts without a TUI open, see the webhook config in Environment Variables.)
+The TUI also pops toasts while open: your jobs starting/finishing, nodes going
+down or recovering. (For alerts without a TUI, see Slack Alerts.)
 
-### One-shot CLI mode
+### One-shot CLI
 
 ```bash
-sgpu --once          # plain-text snapshot (for quick checks / logs)
-sgpu --json          # JSON snapshot (for scripts: sgpu --json | jq ...)
-sgpu --waste [-v]    # idle/parked/rogue GPUs; exit 1 if any — -v adds Command/WorkDir
-sgpu doctor          # self-diagnosis: data freshness, agents, slurm, sacct, webhook, sharing
-sgpu --usage [days]  # per-user GPU-hours + efficiency + waste (default 7 days)
-sgpu --usage 7 --daily                 # adds per-day cluster GPU-hours trend bars
-sgpu --jobs [days] [--user U]          # job history: outcomes, GPU-hours sunk, queue waits
-sgpu --report [YYYY-MM]                # markdown monthly report (users, trend, outcomes, waits)
-sgpu --wait-free 2 --partition heavy   # block until 2 GPUs are free, then exit 0
-chkgpu               # classic one-shot user x node GPU/CPU matrix with per-node next-free ETA
+sgpu --once          # plain-text snapshot
+sgpu --json          # JSON snapshot (sgpu --json | jq ...)
+sgpu --waste [-v]    # idle/parked/rogue GPUs; exit 1 if any (-v adds Command/WorkDir)
+sgpu doctor          # self-diagnosis: data, agents, slurm, sacct, webhook, sharing
+sgpu --usage [days]  # per-user GPU-hours + efficiency + waste (default 7d)
+sgpu --usage 7 --daily                 # + per-day cluster trend bars
+sgpu --jobs [days] [--user U]          # job history: outcomes, GPU-hours, queue waits
+sgpu --report [YYYY-MM]                # markdown monthly report
+sgpu --wait-free 2 --partition heavy   # block until 2 GPUs free, then exit 0
+chkgpu               # one-shot user × node GPU/CPU matrix with next-free ETA
 ```
 
-`--waste` in a daily cron + mail is a zero-setup GPU-hoarding digest.
+`--waste` in a daily cron + mail is a zero-setup hoarding digest;
 `--wait-free` lets scripts submit the moment capacity opens.
 
 ### Reading the Display
@@ -162,226 +168,82 @@ chkgpu               # classic one-shot user x node GPU/CPU matrix with per-node
 ▼ node01   ● idle   gpu_short   32/64   ████░░░░ 128/256G
                0   A100    ████████░  85%   █████░░  40/80G   72C   280W   eightmm  12345   2:30h
                1   A100    ░░░░░░░░░   0%   ░░░░░░░   0/80G   35C    45W
-▼ node02   ○ alloc  heavy       12/64   ██░░░░░░  48/256G
-               0   H100    ████████░  91%   ███████  64/80G   78C   400W   jaemin  67890   10:15h
 ```
 
-- **Node header row** (dark green): node name, state, partition, CPU alloc/total, RAM bar, plus a per-GPU glyph strip (`█` busy · `▅` parked · `▂` reserved-idle · `▁` free · `!` rogue) with busy/free/waste counts — collapse nodes (`Space`) for a one-line-per-node cluster overview
-- **`user !gres` / `user !slurm` markers (red)**: GPU process with **no SLURM allocation for that GPU**. `!gres` = the user has a job on the node that skipped `--gres` (jobid linked in the `w` popup); `!slurm` = raw process outside SLURM entirely. Both raise the red ROGUE chip and top the `--waste` list. System daemons are ignored (`SLURM_GPU_TUI_ROGUE_IGNORE`, default `root,gdm,xdm`)
-- **FREE chip** (summary bar): total free GPUs and which nodes have them
-- **`parked` badge**: VRAM held at ~0% utilization (memory hog, no compute)
-- **GPU rows**: indented — utilization bar, VRAM, temperature, power, user, job, time remaining
-- **State symbols**: `●` idle · `◐` mixed · `○` alloc · `✖` drain
-- **`user idle 3.2h` marker**: GPU allocated to that user's job but no process running on it, with how long it has sat idle (bold yellow after 1h — reclaim candidates)
-- **Stale nodes**: specific error label (e.g., `~timeout`, `~unreachable`, `~smi_err`)
+- **Node header** (green): name, state, partition, CPU alloc/total, RAM bar, and
+  a per-GPU glyph strip (`█` busy · `▅` parked · `▂` reserved-idle · `▁` free ·
+  `!` rogue) with busy/free/waste counts. Collapse (`Space`) for one line/node.
+- **`user !gres` / `user !slurm` (red)**: GPU process with no SLURM allocation
+  for that GPU. `!gres` = a job on the node skipped `--gres` (jobid linked in
+  the `w` popup); `!slurm` = raw process outside SLURM. Both raise the ROGUE
+  chip and top `--waste`. Daemons ignored (`SLURM_GPU_TUI_ROGUE_IGNORE`).
+- **`user idle 3.2h`**: GPU allocated but no process running, with idle age
+  (bold yellow after 1h — reclaim candidate).
+- **`parked` badge**: VRAM held at ~0% util. **FREE chip**: free GPUs + nodes.
+- **State symbols**: `●` idle · `◐` mixed · `○` alloc · `✖` drain.
+- **Stale nodes**: error label (`~timeout`, `~unreachable`, `~smi_err`).
 
 ---
 
 ## Slack Alerts
 
-The collector can push cluster alerts to Slack — node down/recovered, GPU
-health (temp/ECC), wasted/rogue GPUs, lost collection — grouped into a daily
-thread, in English or Korean. Config is `~/.sgpu/webhook.json` (hot-reloaded);
-the installer sets it up and `sgpu doctor` shows the active mode.
+The collector pushes cluster alerts to Slack — node down/recovered, GPU health
+(temp/ECC), wasted/rogue GPUs, lost collection — grouped into a daily thread,
+English or Korean. Config is `~/.sgpu/webhook.json` (hot-reloaded); the
+installer sets it up and `sgpu doctor` shows the active mode.
 
-**→ Full setup, bot/thread mode, and all config keys: [docs/ALERTS.md](docs/ALERTS.md)**
-
-The TUI also shows job/node transitions as toasts while it's open, so you don't
-need Slack for at-the-terminal awareness.
+**→ Full setup, bot/thread mode, all config keys: [docs/ALERTS.md](docs/ALERTS.md)**
 
 ---
 
-## Architecture
-
-```
-[sgpu-agent @ each node]  ──3s──→  ~/.sgpu/nodes/<node>.json   (shared FS push)
-                                          │
-[sgpu-collector @ master] ──merge──→  /tmp/slurm-gpu-tui/data.json
-                                          ↑
-[sgpu TUI]                ──reads──┘   (instant, no SSH on launch)
-```
-
-**Push mode (preferred):** each GPU node runs a tiny resident `sgpu-agent` that writes its own stats to a shared-filesystem directory every few seconds. The collector on the master reads those files locally — no SSH in the hot path, so a flaky sshd or busy node can't stall collection.
-
-**Self-healing:** the collector deploys and repairs agents automatically. If a node's file goes stale (agent died, node rebooted, old agent version), the collector re-launches the agent over SSH — rate-limited per node. No per-node installation needed; the shared venv is executed directly.
-
-**SSH pull fallback:** nodes without a live agent are polled via SSH (ControlMaster-pooled, async per node) exactly as before. The two modes mix freely during migration.
-
-The TUI reads the merged JSON on each refresh — startup is instant regardless of cluster size. Without the collector, the TUI falls back to direct SSH collection (slower first load).
-
-The collector also writes `/tmp/slurm-gpu-tui/metrics.prom` (Prometheus
-textfile format: GPU util/memory/temp/power, allocation, free/rogue/waste
-counts, idle seconds, node health). Point node_exporter's textfile collector at
-it and import the bundled Grafana dashboard.
-
-**-> Grafana setup and dashboard import: [docs/GRAFANA.md](docs/GRAFANA.md)**
-
----
-
-## Node Delivery: Push vs SSH-pull
-
-Nodes are read either by a resident **push agent** (writes to a shared FS, no
-SSH in the hot path — scales better) or by **SSH-pull** (collector SSHes each
-node — automatic fallback, also fine). Push turns on when both the install dir
-and `SLURM_GPU_TUI_AGENT_DIR` are on a shared filesystem the nodes mount.
-`sgpu doctor` shows the active mode.
-
-**→ Enabling push, requirements (NFS `root_squash`), and safe reinstall on a
-shared FS: [docs/PUSH.md](docs/PUSH.md)**
-
----
-
-## Managing the Collector Daemon
-
-### With sudo (system service)
+## Managing the Collector
 
 ```bash
-# Status
-sudo systemctl status sgpu-collector
+# system service (root/sudo)
+systemctl status|restart|stop sgpu-collector
+journalctl -u sgpu-collector -f
 
-# Restart
-sudo systemctl restart sgpu-collector
-
-# Live logs
-sudo journalctl -u sgpu-collector -f
-
-# Recent logs
-sudo journalctl -u sgpu-collector --since "10 minutes ago"
-
-# Stop / disable
-sudo systemctl stop sgpu-collector
-sudo systemctl disable sgpu-collector
-```
-
-### Without sudo (user service)
-
-```bash
-# Status
-systemctl --user status sgpu-collector
-
-# Restart
-systemctl --user restart sgpu-collector
-
-# Live logs
+# user service (no sudo)
+systemctl --user status|restart|stop sgpu-collector
 journalctl --user -u sgpu-collector -f
 
-# Stop / disable
-systemctl --user stop sgpu-collector
-systemctl --user disable sgpu-collector
+# background process (no systemd)
+pgrep -a -f sgpu-collector      # check
+tail -f /tmp/sgpu-collector.log # log
+pkill -f sgpu-collector         # stop
 ```
 
-### Without sudo (background process)
-
-```bash
-# Check if running
-pgrep -a -f sgpu-collector
-
-# Live log
-tail -f /tmp/sgpu-collector.log
-
-# Stop
-pkill -f sgpu-collector
-```
-
----
+Deploying from a dev checkout to a separate prod venv? See `deploy.sh`.
 
 ## Uninstall
 
 One line — stops the collector and node agents, removes services, symlinks,
-data, and the install directory:
+data, and the install dir:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/uninstall.sh | bash
 ```
 
-<details>
-<summary>Manual steps (what the script does)</summary>
-
-### With sudo (system service)
-
+Node agents specifically:
 ```bash
-sudo systemctl stop sgpu-collector
-sudo systemctl disable sgpu-collector
-sudo rm -f /etc/systemd/system/sgpu-collector.service
-sudo rm -f /usr/local/bin/sgpu /usr/local/bin/sgpu-collector
-sudo systemctl daemon-reload
-rm -rf ~/.sgpu/app    # or your SGPU_INSTALL_DIR
-```
-
-### Without sudo (user service)
-
-```bash
-systemctl --user stop sgpu-collector
-systemctl --user disable sgpu-collector
-rm -f ~/.config/systemd/user/sgpu-collector.service
-systemctl --user daemon-reload
-# Remove the PATH line from ~/.bashrc
-rm -rf ~/.sgpu/app    # or your SGPU_INSTALL_DIR
-```
-
-### Node agents (all modes)
-
-```bash
-# Stop push agents and remove their data
 for n in $(sinfo -N -h -o %N | sort -u); do ssh "$n" 'pkill -f "bin/[s]gpu-agent"' 2>/dev/null; done
-rm -rf ~/.sgpu/nodes
+rm -rf "$SLURM_GPU_TUI_AGENT_DIR"   # default ~/.sgpu/nodes
 ```
-
-### Without sudo (background process)
-
-```bash
-pkill -f sgpu-collector
-# Remove the nohup and PATH lines from ~/.bashrc
-rm -rf ~/.sgpu/app    # or your SGPU_INSTALL_DIR
-```
-
-</details>
 
 ---
 
 ## Troubleshooting
 
-**`sgpu` not found**
-```bash
-ls ~/.sgpu/app/bin/sgpu            # check wrapper exists
-export PATH="$HOME/.sgpu/app/bin:$PATH"   # apply manually
-```
+| Symptom | Check |
+|---------|-------|
+| `sgpu` not found | `export PATH="$HOME/.sgpu/app/bin:$PATH"` (or your install dir) |
+| Slow startup every launch | collector not running — `systemctl status sgpu-collector` |
+| Node `~timeout` / `~unreachable` | `ssh <node>` from master fails — test with `ssh -v <node>` |
+| Node `~smi_err` / `~no_smi` | `ssh <node> nvidia-smi` |
+| Collector crashing | `journalctl -u sgpu-collector -n 50 --no-pager` (or `/tmp/sgpu-collector.log`) |
+| Anything else | `sgpu doctor` |
 
-**Slow startup / "loading GPUs..." on every launch**
-
-The collector daemon is not running. Check its status and restart:
-```bash
-sudo systemctl status sgpu-collector       # system service
-systemctl --user status sgpu-collector    # user service
-pgrep -a -f sgpu-collector                # background process
-```
-
-**Node shows `~timeout` or `~unreachable`**
-
-SSH from the master node to that compute node is failing:
-```bash
-ssh <node-name>       # test manually
-ssh -v <node-name>    # verbose output
-```
-
-**Node shows `~smi_err` or `~no_smi`**
-
-`nvidia-smi` is not working on that node:
-```bash
-ssh <node-name> nvidia-smi
-```
-
-**Collector keeps crashing**
-```bash
-sudo journalctl -u sgpu-collector -n 50 --no-pager    # system service
-journalctl --user -u sgpu-collector -n 50 --no-pager   # user service
-cat /tmp/sgpu-collector.log                             # background process
-```
-
-**Reinstall cleanly**
-```bash
-curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstrap.sh | bash
-```
+Reinstall cleanly by re-running the one-line install.
 
 ---
 
@@ -389,33 +251,35 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstra
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SLURM_GPU_TUI_REFRESH_SEC` | `3` | TUI refresh interval (seconds) |
+| `SLURM_GPU_TUI_REFRESH_SEC` | `3` | TUI refresh interval |
 | `SLURM_GPU_TUI_COLLECTOR_SEC` | `3` | Collector cycle interval |
 | `SLURM_GPU_TUI_NODE_TIMEOUT_SEC` | `30` | SSH timeout per node |
 | `SLURM_GPU_TUI_MAX_WORKERS` | `8` | Parallel SSH workers (fallback mode) |
-| `SLURM_GPU_TUI_DATA_DIR` | `/tmp/slurm-gpu-tui` | Daemon JSON output directory |
-| `SLURM_GPU_TUI_STATE_DIR` | `~/.sgpu/state` | Persistent state (usage history, waste ages, inventory) — survives reboots |
-| `SLURM_GPU_TUI_AGENT_DIR` | `~/.sgpu/nodes` | Push-agent payload directory (shared FS) |
+| `SLURM_GPU_TUI_DATA_DIR` | `/tmp/slurm-gpu-tui` | Daemon JSON output dir |
+| `SLURM_GPU_TUI_STATE_DIR` | `~/.sgpu/state` | Persistent state (usage, waste ages, inventory) |
+| `SLURM_GPU_TUI_AGENT_DIR` | `~/.sgpu/nodes` | Push-agent payload dir (shared FS for push mode) |
 | `SLURM_GPU_TUI_AGENT_SEC` | `3` | Agent collect interval on nodes |
 | `SLURM_GPU_TUI_AGENT_MAX_AGE_SEC` | `45` | Agent payload freshness limit |
 | `SLURM_GPU_TUI_AGENT_REPAIR_SEC` | `180` | Min interval between agent repairs per node |
-| `SLURM_GPU_TUI_AGENT_DISABLE` | (unset) | Set to disable push agents entirely |
+| `SLURM_GPU_TUI_AGENT_DISABLE` | (unset) | Disable push agents entirely |
 | `SLURM_GPU_TUI_WASTE_MIN_SEC` | `600` | Threshold for the waste view / `--waste` |
-| `SLURM_GPU_TUI_AUTO_COLLAPSE_NODES` | `12` | Start with nodes collapsed when the cluster has at least this many GPU nodes |
+| `SLURM_GPU_TUI_AUTO_COLLAPSE_NODES` | `12` | Collapse nodes when cluster has ≥ this many GPU nodes |
 | `SLURM_GPU_TUI_USAGE_KEEP_DAYS` | `30` | GPU-hour history retention |
-| `SLURM_GPU_TUI_SACCT_SEC` | `3600` | slurmdbd (sacct) alloc backfill interval; `0` disables. Optional — without accounting it auto-disables after 3 failed tries and alloc stays sampling-based |
-| `SLURM_GPU_TUI_WEBHOOK_URL` | (unset) | Slack webhook URL (URL-only shortcut). Full alert config lives in `~/.sgpu/webhook.json` — see the [Slack Alerts](#slack-alerts) section |
-| `SLURM_GPU_TUI_SLACK_BOT_TOKEN` | (unset) | Slack bot token for daily-thread mode (alternative to putting it in `webhook.json`) |
-| `SLURM_GPU_TUI_WEBHOOK_DEBOUNCE_SEC` | `1800` | Min interval between repeated alerts for the same event key |
-| `SLURM_GPU_TUI_WEBHOOK_NAG_SEC` | `21600` | Re-alert interval for standing conditions (waste / rogue / temp / ECC) |
+| `SLURM_GPU_TUI_SACCT_SEC` | `3600` | slurmdbd alloc backfill interval; `0` disables (auto-disables after 3 failures) |
+| `SLURM_GPU_TUI_WEBHOOK_URL` | (unset) | Slack webhook URL shortcut (full config in `~/.sgpu/webhook.json`) |
+| `SLURM_GPU_TUI_SLACK_BOT_TOKEN` | (unset) | Slack bot token for daily-thread mode |
+| `SLURM_GPU_TUI_WEBHOOK_DEBOUNCE_SEC` | `1800` | Min interval between repeated alerts (same event key) |
+| `SLURM_GPU_TUI_WEBHOOK_NAG_SEC` | `21600` | Re-alert interval for standing conditions (waste/rogue/temp/ECC) |
 | `SLURM_GPU_TUI_ROGUE_IGNORE` | `root,gdm,xdm` | Users never flagged as rogue |
-| `SLURM_GPU_TUI_SHARE_SCRIPTS` | (unset) | Collector publishes every job's batch script so all users see them in the Enter popup. **Shares script contents (and any secrets in them) with everyone** — the installer asks about this (`[Y/n]`); `SGPU_SHARE_SCRIPTS=0/1` skips the question |
+| `SLURM_GPU_TUI_SHARE_SCRIPTS` | (unset) | Publish every job's batch script to all users in the Enter popup. **Shares script contents (and secrets) with everyone** — installer asks (`SGPU_SHARE_SCRIPTS=0/1` skips) |
+
+Install-time only: `SGPU_INSTALL_DIR` (repo + venv location).
 
 ---
 
 ## Requirements
 
 - Python 3.10+
-- SLURM cluster with `sinfo` / `squeue` available on the master node
-- SSH access from the master node to compute nodes (passwordless)
-- `nvidia-smi` installed on GPU nodes
+- SLURM with `sinfo` / `squeue` on the master node
+- Passwordless SSH from master to compute nodes
+- `nvidia-smi` on GPU nodes
