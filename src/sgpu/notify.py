@@ -30,9 +30,11 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import socket
 import threading
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -150,6 +152,13 @@ class Notifier:
         self._thread_day: str = st.get("thread_day", "")
         self._thread_ts: str = st.get("thread_ts", "")
         self._post_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        # single consumer thread: preserves alert order (down before recovered)
+        # and stops a hung webhook from stacking one thread per alert
+        self._queue: "queue.Queue[tuple[str, str, float]]" = queue.Queue(maxsize=200)
+        self._consumer: Optional[threading.Thread] = None
+        self._parent_fail_ts = 0.0
+        self._save_failed = False
         self._blind: Dict[str, float] = st.get("blind", {})
         # first-seen ts of an unconfirmed down/blind; deliberately NOT persisted
         # so a collector restart re-starts the grace clock (cold start looks
@@ -245,7 +254,8 @@ class Notifier:
                                          ngpu=len(n.get("gpus", [])), njobs=len(njobs))
                         if users:
                             detail += " — " + ", ".join(f"{u}×{c}" for u, c in sorted(users.items()))
-                        self._post(self._m("down", name=name, why=why[:120], detail=detail))
+                        self._post(self._m("down", name=name, why=why[:120],
+                                           detail=detail), key=f"down:{name}")
                         self._down[name] = first
                 else:
                     self._pending_down.pop(name, None)
@@ -272,7 +282,8 @@ class Notifier:
                     if not confirmed and now - first >= self.collect_grace_sec \
                             and self._ok_to_send(f"blind:{name}", now, NAG_REALERT_SEC):
                         self._post(self._m("collect_lost", name=name,
-                                           state=n.get("state", "?")))
+                                           state=n.get("state", "?")),
+                                   key=f"blind:{name}")
                         self._blind[name] = first
                 else:
                     self._pending_blind.pop(name, None)
@@ -281,7 +292,10 @@ class Notifier:
                                            dur=_fmt_dur(now - confirmed, self.lang)))
                     self._blind[name] = 0
 
-        if self.job_done_users:
+        # A failed squeue/controller query yields an empty jobs list — diffing
+        # against it would fire a false "finished" for every tracked job (and
+        # wipe _jobs so it can't recover). Only diff when the snapshot is clean.
+        if self.job_done_users and not data.get("errors"):
             current = {j["jobid"]: j for j in data.get("jobs", [])
                        if j.get("user") in self.job_done_users}
             for jid, j in self._jobs.items():
@@ -310,7 +324,8 @@ class Notifier:
                         if self._ok_to_send(key, now, NAG_REALERT_SEC):
                             self._post(self._m("waste", loc=loc, kind=kind,
                                                dur=_fmt_dur(wasted, self.lang),
-                                               user=g.get("alloc_user", "?"), jid=jid or "?"))
+                                               user=g.get("alloc_user", "?"),
+                                               jid=jid or "?"), key=key)
                     if node_rogue_ok and not g.get("alloc_jobid") and not g.get("alloc_user"):
                         rogues = [u for u in (g.get("users") or [])
                                   if u and u not in ROGUE_IGNORE]
@@ -322,7 +337,7 @@ class Notifier:
                             # gaps look identical to real off-SLURM use
                             if now - first >= self.rogue_grace_sec \
                                     and self._ok_to_send(key, now, NAG_REALERT_SEC):
-                                self._post(self._m("rogue", loc=loc, user=u))
+                                self._post(self._m("rogue", loc=loc, user=u), key=key)
             if rogue_ok:
                 # condition cleared (or node data untrusted) → restart clock
                 for key in list(self._pending_rogue):
@@ -340,19 +355,21 @@ class Notifier:
                                 and self._ok_to_send(f"temp:{n['name']}:{g.get('index')}",
                                                      now, NAG_REALERT_SEC):
                             self._post(self._m("temp", loc=loc, temp=temp,
-                                               thr=int(self.temp_alert_c), hw=hw))
+                                               thr=int(self.temp_alert_c), hw=hw),
+                                       key=f"temp:{n['name']}:{g.get('index')}")
                     if self.ecc_alert:
                         ecc = _to_int(g.get("ecc"))
                         if ecc and ecc > 0 \
                                 and self._ok_to_send(f"ecc:{n['name']}:{g.get('index')}",
                                                      now, NAG_REALERT_SEC):
-                            self._post(self._m("ecc", loc=loc, n=ecc, hw=hw))
+                            self._post(self._m("ecc", loc=loc, n=ecc, hw=hw),
+                                       key=f"ecc:{n['name']}:{g.get('index')}")
 
         if self.free_gpus_min > 0:
             free = sum(1 for n in nodes for g in n.get("gpus", []) if _gpu_is_free(g))
             if free >= self.free_gpus_min:
                 if self._free_was_below and self._ok_to_send("free_gpus", now):
-                    self._post(self._m("free", free=free))
+                    self._post(self._m("free", free=free), key="free_gpus")
                 self._free_was_below = False
             else:
                 self._free_was_below = True
@@ -360,51 +377,70 @@ class Notifier:
         self._save()
 
     def _ok_to_send(self, key: str, now: float, min_gap: float = DEBOUNCE_SEC) -> bool:
+        """Debounce check. Marks the slot immediately so the next collect
+        cycle doesn't enqueue a duplicate, but the consumer rolls the mark
+        back if delivery ultimately fails, so the alert can re-fire."""
         if now - self._last_sent.get(key, 0) < min_gap:
             return False
         self._last_sent[key] = now
         return True
 
-    def _post(self, text: str) -> None:
+    def _post(self, text: str, key: str = "") -> None:
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         body = f"{text}\n_{self._origin} · {stamp}_"
+        if self._consumer is None or not self._consumer.is_alive():
+            self._consumer = threading.Thread(target=self._drain, daemon=True,
+                                              name="webhook")
+            self._consumer.start()
+        try:
+            self._queue.put_nowait((body, key, time.time()))
+        except queue.Full:
+            print("[notify] alert queue full, dropping alert", flush=True)
 
-        def worker() -> None:
-            try:
-                if self._bot_mode:
-                    self._post_bot(body)
-                else:
-                    req = urllib.request.Request(
-                        self.url,
-                        data=json.dumps({
-                            "text": body,
-                            # honored by legacy incoming webhooks, ignored by
-                            # app-scoped ones (those show the app's own name)
-                            "username": self.sender,
-                            "icon_emoji": ":robot_face:",
-                        }).encode(),
-                        headers={"Content-Type": "application/json"})
-                    urllib.request.urlopen(req, timeout=10).read()
-            except Exception as e:
-                print(f"[notify] post failed: {e}", flush=True)
+    def _drain(self) -> None:
+        while True:
+            body, key, enq_ts = self._queue.get()
+            ok = self._deliver(body)
+            if not ok and key:
+                # free the debounce slot so the condition re-alerts next cycle
+                with self._state_lock:
+                    if self._last_sent.get(key, 0) <= enq_ts:
+                        self._last_sent.pop(key, None)
+                self._save()
+            self._queue.task_done()
 
-        threading.Thread(target=worker, daemon=True, name="webhook").start()
+    def _deliver(self, body: str) -> bool:
+        if self._bot_mode:
+            return self._post_bot(body)
+        payload = {
+            "text": body,
+            # honored by legacy incoming webhooks, ignored by
+            # app-scoped ones (those show the app's own name)
+            "username": self.sender,
+            "icon_emoji": ":robot_face:",
+        }
+        return self._http_post(self.url, payload,
+                               {"Content-Type": "application/json"}) is not None
 
-    def _post_bot(self, body: str) -> None:
+    def _post_bot(self, body: str) -> bool:
         """chat.postMessage as a reply under today's parent message."""
         thread_ts = self._ensure_daily_parent()
         payload = {"channel": self.channel, "text": body}
         if thread_ts:
             payload["thread_ts"] = thread_ts
-        self._slack_api("chat.postMessage", payload)
+        return self._slack_api("chat.postMessage", payload) is not None
 
     def _ensure_daily_parent(self) -> str:
         """Return today's thread parent ts, creating the parent if needed.
-        Serialized so a burst of alerts doesn't spawn duplicate parents."""
+        Serialized so a burst of alerts doesn't spawn duplicate parents;
+        a failed create is not retried for 60s so a Slack outage doesn't
+        add a parent attempt to every queued alert."""
         today = datetime.now().strftime("%Y-%m-%d")
         with self._post_lock:
             if self._thread_day == today and self._thread_ts:
                 return self._thread_ts
+            if time.time() - self._parent_fail_ts < 60:
+                return ""
             resp = self._slack_api("chat.postMessage", {
                 "channel": self.channel,
                 "text": self._m("parent", date=today, sender=self.sender),
@@ -413,32 +449,70 @@ class Notifier:
             if ts:
                 self._thread_day, self._thread_ts = today, ts
                 self._save()
+            else:
+                self._parent_fail_ts = time.time()
             return ts
 
     def _slack_api(self, method: str, payload: dict) -> Optional[dict]:
-        try:
-            req = urllib.request.Request(
-                f"{SLACK_API_BASE}/{method}",
-                data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json; charset=utf-8",
-                         "Authorization": f"Bearer {self.bot_token}"})
-            resp = json.loads(urllib.request.urlopen(req, timeout=10).read())
-            if not resp.get("ok"):
-                print(f"[notify] slack {method} error: {resp.get('error')}", flush=True)
-            return resp
-        except Exception as e:
-            print(f"[notify] slack {method} failed: {e}", flush=True)
+        resp = self._http_post(
+            f"{SLACK_API_BASE}/{method}", payload,
+            {"Content-Type": "application/json; charset=utf-8",
+             "Authorization": f"Bearer {self.bot_token}"})
+        if resp is not None and not resp.get("ok"):
+            print(f"[notify] slack {method} error: {resp.get('error')}", flush=True)
             return None
+        return resp
+
+    def _http_post(self, url: str, payload: dict,
+                   headers: dict) -> Optional[dict]:
+        """POST with bounded retry: 3 attempts, exponential backoff, honoring
+        Retry-After on 429. Returns parsed JSON ({} for non-JSON 2xx bodies
+        like a webhook's \"ok\") or None after the last failure."""
+        data = json.dumps(payload).encode()
+        last_err: object = None
+        for attempt in range(3):
+            if attempt:
+                time.sleep(min(2 ** attempt, 30))
+            try:
+                req = urllib.request.Request(url, data=data, headers=headers)
+                raw = urllib.request.urlopen(req, timeout=10).read()
+                try:
+                    return json.loads(raw)
+                except ValueError:
+                    return {}
+            except urllib.error.HTTPError as e:
+                last_err = e
+                if e.code == 429:
+                    try:
+                        time.sleep(min(int(e.headers.get("Retry-After", "5")), 60))
+                    except ValueError:
+                        time.sleep(5)
+                elif e.code < 500:
+                    break  # 4xx other than 429 won't heal on retry
+            except Exception as e:
+                last_err = e
+        print(f"[notify] post failed after retries: {last_err}", flush=True)
+        return None
 
     def _save(self) -> None:
-        try:
-            tmp = self._state_file.with_suffix(".tmp")
-            tmp.write_text(json.dumps({
+        with self._state_lock:
+            # drop expired debounce slots — per-job keys (waste:node:idx:jid)
+            # otherwise accumulate forever in memory and on disk
+            cutoff = time.time() - max(DEBOUNCE_SEC, NAG_REALERT_SEC) * 2
+            for k in [k for k, ts in self._last_sent.items() if ts < cutoff]:
+                del self._last_sent[k]
+            payload = json.dumps({
                 "down": self._down, "blind": self._blind, "jobs": self._jobs,
                 "last_sent": self._last_sent,
                 "free_was_below": self._free_was_below,
                 "thread_day": self._thread_day, "thread_ts": self._thread_ts,
-            }))
+            })
+        try:
+            tmp = self._state_file.with_suffix(".tmp")
+            tmp.write_text(payload)
             tmp.rename(self._state_file)
-        except OSError:
-            pass
+            self._save_failed = False
+        except OSError as e:
+            if not self._save_failed:  # log once, not every 3s cycle
+                print(f"[notify] state save failed: {e}", flush=True)
+                self._save_failed = True
