@@ -7,9 +7,8 @@ import re
 import subprocess
 import subprocess as sp
 from datetime import datetime
-from functools import partial
+from functools import lru_cache
 from collections import defaultdict
-from multiprocessing import Pool
 
 
 # ==============================================
@@ -104,51 +103,78 @@ def extract_gpu_count(tres_str):
     return sum(int(m) for m in re.findall(r'gpu(?::[^:,\s]+)*:(\d+)', tres_str))
 
 
-def find_user_jobs(squeue, user):
-    """GPU job 집계: squeue %b(TresPerNode) %e(EndTime) 필드 직접 사용, nodelist 확장으로 multi-node 정확 집계"""
-    user_usage     = defaultdict(int)
-    node_end_times = {}
-    tot_usage      = 0
+@lru_cache(maxsize=None)
+def expand_hostlist(expr):
+    """'gpu[1-3,5],node7' -> ('gpu1','gpu2','gpu3','gpu5','node7'), in Python.
+    Forking `scontrol show hostnames` per job cost ~2N subprocesses per run."""
+    hosts = []
+    for part in re.findall(r'[^,\[\]]+(?:\[[^\]]*\])?', expr):
+        m = re.match(r'^(.*?)\[([^\]]+)\]$', part)
+        if not m:
+            if part:
+                hosts.append(part.split('.')[0])
+            continue
+        prefix, ranges = m.group(1), m.group(2)
+        for r in ranges.split(','):
+            if '-' in r:
+                a, b = r.split('-', 1)
+                width = len(a)
+                hosts.extend(f'{prefix}{str(i).zfill(width)}'
+                             for i in range(int(a), int(b) + 1))
+            else:
+                hosts.append(f'{prefix}{r}')
+    return tuple(hosts)
+
+
+def split_squeue(line):
+    """Pipe-delimited squeue row -> stripped fields (whitespace splitting
+    breaks on job names containing spaces)."""
+    return [f.strip() for f in line.split('|')]
+
+
+def aggregate_gpu_jobs(squeue):
+    """GPU job 집계: squeue %b(TresPerNode) %e(EndTime) 필드 직접 사용,
+    nodelist 확장으로 multi-node 정확 집계. 단일 패스, 서브프로세스 없음.
+    Returns [(user, {node: gpus}, total, {node: earliest_end})] sorted."""
+    per_user = {}
 
     for job in squeue:
-        parts = job.split()
+        parts = split_squeue(job)
         if len(parts) < 13:
             continue
-        if parts[3] != user or parts[4] != 'RUNNING':
+        user, state = parts[3], parts[4]
+        if state != 'RUNNING':
             continue
 
         gres_str = parts[10]   # %b  TresPerNode
         end_str  = parts[11]   # %e  EndTime
-        nodelist = parts[-1]   # %R  NodeList
+        nodelist = parts[12]   # %R  NodeList
 
-        if nodelist in ('(null)', 'N/A', 'None'):
+        if nodelist in ('(null)', 'N/A', 'None', ''):
             continue
 
         gpu_per_node = extract_gpu_count(gres_str)
         if gpu_per_node == 0:
             continue
 
-        # nodelist 확장 (gpu[1,3] 같은 형식 처리)
-        exp = sp.run(f'scontrol show hostnames {nodelist}',
-                     shell=True, stdout=subprocess.PIPE, text=True)
-        nodes = [n.split('.')[0] for n in exp.stdout.splitlines() if n.strip()]
-        if not nodes:
-            nodes = [nodelist.split('.')[0]]
+        nodes = list(expand_hostlist(nodelist)) or [nodelist.split('.')[0]]
 
+        u = per_user.setdefault(user, [defaultdict(int), 0, {}])
         for node in nodes:
-            user_usage[node] += gpu_per_node
-            tot_usage += gpu_per_node
+            u[0][node] += gpu_per_node
+            u[1] += gpu_per_node
 
         if end_str not in ('Unknown', 'N/A', 'None', 'NONE'):
             try:
                 end_dt = datetime.strptime(end_str, '%Y-%m-%dT%H:%M:%S')
                 for node in nodes:
-                    if node not in node_end_times or end_dt < node_end_times[node]:
-                        node_end_times[node] = end_dt
+                    if node not in u[2] or end_dt < u[2][node]:
+                        u[2][node] = end_dt
             except ValueError:
                 pass
 
-    return (user, user_usage, tot_usage, node_end_times)
+    rows = [(user, usage, tot, ends) for user, (usage, tot, ends) in per_user.items() if tot]
+    return sorted(rows, key=lambda x: (-x[2], x[0]))
 
 
 def compute_thread_usage(squeue_lines):
@@ -157,24 +183,21 @@ def compute_thread_usage(squeue_lines):
     node_used_cpu  = defaultdict(int)
     user_total_cpu = defaultdict(int)
 
-    jobs = [j for j in squeue_lines
-            if len(j.split()) > 8 and j.split()[4] == 'RUNNING']
-
-    for job in jobs:
-        parts      = job.split()
+    for job in squeue_lines:
+        parts = split_squeue(job)
+        if len(parts) < 13 or parts[4] != 'RUNNING':
+            continue
         user       = parts[3]
         cpus_str   = parts[7]
-        nodelist   = parts[-1]
+        nodelist   = parts[12]
 
         if not cpus_str.isdigit():
             continue
         total_cpus = int(cpus_str)
-        if total_cpus == 0 or nodelist in ('(null)', 'N/A'):
+        if total_cpus == 0 or nodelist in ('(null)', 'N/A', ''):
             continue
 
-        exp = sp.run(f'scontrol show hostnames {nodelist}',
-                     shell=True, stdout=subprocess.PIPE, text=True)
-        nodes = [n.split('.')[0] for n in exp.stdout.splitlines() if n.strip()]
+        nodes = list(expand_hostlist(nodelist))
         if not nodes:
             continue
 
@@ -255,8 +278,8 @@ else:
     print(f'{C_WARN}slurm.conf not found (set $SLURM_CONF); GPU section skipped{C_RST}')
     gpu_nodes, gpu_nums = [], []
 
-# squeue / sinfo 병렬 호출
-cmd_squeue = "squeue -o '%.13i %.12P %.10j %.15u %.8T %.8M %.4D %.3C %.10p %Q %b %e %R'"
+# squeue / sinfo 병렬 호출 — 파이프 구분자: 공백 포함 잡 이름에도 안전
+cmd_squeue = "squeue --noheader -o '%i|%P|%j|%u|%T|%M|%D|%C|%p|%Q|%b|%e|%R'"
 proc_sq   = sp.Popen(cmd_squeue,                       stdout=subprocess.PIPE, text=True, shell=True)
 proc_si   = sp.Popen("sinfo --noheader -o '%n %T'",    stdout=subprocess.PIPE, text=True, shell=True)
 proc_cpu  = sp.Popen('sinfo -Nho "%N %C"',             stdout=subprocess.PIPE, text=True, shell=True)
@@ -302,20 +325,12 @@ for line in partinfo_out.splitlines():
 # Pending job 집계: {user: {partition: count}}
 pending_by_user = defaultdict(lambda: defaultdict(int))
 for job in squeue:
-    parts = job.split()
+    parts = split_squeue(job)
     if len(parts) > 4 and parts[4] == 'PENDING':
         pending_by_user[parts[3]][parts[1]] += 1
 
-# GPU job 집계 (병렬 Pool) — 유저 목록은 squeue RUNNING 잡에서 추출
-active_users = sorted(set(
-    j.split()[3] for j in squeue
-    if len(j.split()) > 4 and j.split()[4] == 'RUNNING'
-))
-my_func   = partial(find_user_jobs, squeue)
-pool_size = min(len(active_users), 8) if active_users else 1
-with Pool(pool_size) as p:
-    ret = p.map(my_func, active_users)
-ret = sorted([i for i in ret if i[2] != 0], key=lambda x: (-x[2], x[0]))
+# GPU job 집계 — 단일 패스 (nodelist 확장이 순수 파이썬이라 병렬 불필요)
+ret = aggregate_gpu_jobs(squeue)
 
 tota_usage    = 0
 node_usage    = defaultdict(int)
@@ -379,7 +394,6 @@ print('|' + hdr(tcell('Total')))
 # 유저별 행
 for i in ret:
     user      = i[0]
-    gpu_info  = i
     gpu_total = i[2]
 
     print(C_USER + user.rjust(USER_W - 2) + C_RST + ' |', end='')
