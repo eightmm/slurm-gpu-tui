@@ -55,7 +55,10 @@ SCRIPT_MAX_BYTES = 16384
 
 # ── Long-lived executors / shared node results ───────────────────────────
 
-_node_executor = ThreadPoolExecutor(max_workers=16)
+_node_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+# Repairs (~40s each: pkill + sleep + launch over SSH) get their own small
+# pool so a batch of dead nodes can't starve the polling executor
+_repair_executor = ThreadPoolExecutor(max_workers=2)
 
 # Latest per-node SSH results, updated by background pollers.
 # name -> {"gpus": [dict], "mem": dict, "error": str, "error_kind": str, "stale": bool}
@@ -92,6 +95,28 @@ def _read_state_json(path: Path):
     return None
 
 
+_state_write_warned: set = set()
+_state_write_lock = threading.Lock()
+
+
+def _write_state_json(path: Path, text: str) -> None:
+    """Atomic + fsync'd write for files that must survive a reboot.
+    Failures (disk full, permissions) are logged once, not every cycle."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.rename(path)
+        _state_write_warned.discard(str(path))
+    except OSError as e:
+        if str(path) not in _state_write_warned:
+            _state_write_warned.add(str(path))
+            print(f"[collector] state write failed for {path}: {e}", flush=True)
+
+
 def _load_inventory() -> None:
     raw = _read_state_json(INVENTORY_FILE)
     if isinstance(raw, dict):
@@ -107,16 +132,13 @@ def _update_inventory(name: str, gpu_dicts: List[dict]) -> None:
     ]
     if not static:
         return
-    if _inventory.get(name) == static and INVENTORY_FILE.exists():
-        return
-    _inventory[name] = static
-    try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = INVENTORY_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(_inventory, ensure_ascii=False))
-        tmp.rename(INVENTORY_FILE)
-    except Exception:
-        pass
+    # called from poller threads and the main loop — serialize the check-
+    # mutate-write sequence so two threads can't interleave on the tmp file
+    with _state_write_lock:
+        if _inventory.get(name) == static and INVENTORY_FILE.exists():
+            return
+        _inventory[name] = static
+        _write_state_json(INVENTORY_FILE, json.dumps(_inventory, ensure_ascii=False))
 
 
 def _skeleton_gpus(name: str, gres: str) -> List[dict]:
@@ -148,12 +170,8 @@ def _load_idle_state() -> None:
 
 
 def _save_idle_state() -> None:
-    try:
-        tmp = IDLE_STATE_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"idle": _idle_since, "parked": _parked_since}))
-        tmp.rename(IDLE_STATE_FILE)
-    except Exception:
-        pass
+    _write_state_json(IDLE_STATE_FILE,
+                      json.dumps({"idle": _idle_since, "parked": _parked_since}))
 
 
 def _track_waste(node: str, gpu: dict, now: float) -> None:
@@ -194,27 +212,40 @@ def _track_waste(node: str, gpu: dict, now: float) -> None:
 # ── Batch-script sharing (opt-in) ─────────────────────────────────────────
 
 _script_cache: Dict[str, str] = {}  # jobid -> script text ("" = unreadable)
+_script_inflight: set = set()
+# one background worker: a burst of new jobs (array submit) would otherwise
+# serialize N scontrol calls inside the 3s collect cycle
+_script_executor = ThreadPoolExecutor(max_workers=1)
 
 
-def _fetch_scripts(jobs: List[JobInfo]) -> Dict[str, str]:
-    """Fetch each running job's batch script once (needs privileges)."""
-    if not SHARE_SCRIPTS:
-        return {}
-    live = {j.jobid for j in jobs}
-    for jid in [j for j in _script_cache if j not in live]:
-        del _script_cache[jid]
-    for j in jobs:
-        if j.jobid in _script_cache:
-            continue
-        cmd = f"scontrol write batch_script {j.jobid} -"
+def _fetch_one_script(jid: str) -> None:
+    try:
+        cmd = f"scontrol write batch_script {jid} -"
         if os.geteuid() != 0:
             # install.sh provisions a sudoers rule for exactly this command
             cmd = "sudo -n " + cmd
         ok, out = run_cmd(cmd)
         out = out.strip()
         good = ok and out and not out.startswith("job script retrieval failed")
-        _script_cache[j.jobid] = out[:SCRIPT_MAX_BYTES] if good else ""
-    return _script_cache
+        _script_cache[jid] = out[:SCRIPT_MAX_BYTES] if good else ""
+    finally:
+        _script_inflight.discard(jid)
+
+
+def _fetch_scripts(jobs: List[JobInfo]) -> Dict[str, str]:
+    """Return cached batch scripts; fetch missing ones in the background.
+    A job's script appears one or two cycles after the job does."""
+    if not SHARE_SCRIPTS:
+        return {}
+    live = {j.jobid for j in jobs}
+    for jid in [j for j in _script_cache if j not in live]:
+        del _script_cache[jid]
+    for j in jobs:
+        if j.jobid in _script_cache or j.jobid in _script_inflight:
+            continue
+        _script_inflight.add(j.jobid)
+        _script_executor.submit(_fetch_one_script, j.jobid)
+    return dict(_script_cache)
 
 
 # ── Per-user GPU-hour accounting ──────────────────────────────────────────
@@ -256,12 +287,7 @@ def _load_usage() -> None:
 
 
 def _save_usage() -> None:
-    try:
-        tmp = USAGE_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(_usage))
-        tmp.rename(USAGE_FILE)
-    except Exception:
-        pass
+    _write_state_json(USAGE_FILE, json.dumps(_usage))
 
 
 def _accumulate_usage(result_nodes: List[dict], now: float) -> None:
@@ -401,7 +427,7 @@ _INTERVAL_COLD = 20  # idle node: poll every 20s
 _INTERVAL_DOWN = 60  # down/drain node: poll every 60s
 
 
-def _should_poll_node(name: str, slurm_state: str) -> bool:
+def _should_poll_node(name: str) -> bool:
     now = time.monotonic()
     state = _node_poll_state.get(name, {"last_poll": 0.0, "interval": _INTERVAL_HOT})
     return (now - state["last_poll"]) >= state["interval"]
@@ -460,27 +486,46 @@ def _pending_to_dict(pj: PendingJob) -> dict:
     }
 
 
+_agent_build_cache: tuple = (0.0, "0")  # (checked monotonic ts, value)
+
+
 def _expected_agent_build() -> str:
     """Current agent.py fingerprint, read live so upgrades are noticed even
-    if this collector predates them (relaunched agents then match again)."""
-    try:
-        return str(int(os.path.getmtime(_agent_module.__file__)))
-    except OSError:
-        return "0"
+    if this collector predates them (relaunched agents then match again).
+    Cached 60s — this ran one stat per node per 3s cycle."""
+    global _agent_build_cache
+    now = time.monotonic()
+    if now - _agent_build_cache[0] > 60:
+        try:
+            v = str(int(os.path.getmtime(_agent_module.__file__)))
+        except OSError:
+            v = "0"
+        _agent_build_cache = (now, v)
+    return _agent_build_cache[1]
+
+
+_agent_payload_cache: Dict[str, tuple] = {}  # name -> (mtime, parsed payload or None)
 
 
 def _read_agent_payload(name: str) -> dict | None:
-    """Return a node's push-agent payload if fresh and version-compatible."""
+    """Return a node's push-agent payload if fresh and version-compatible.
+    Parsed payloads are cached by mtime — agents rewrite every AGENT_SEC,
+    so most 3s cycles can skip the read+parse."""
     p = AGENT_DIR / f"{name}.json"
     try:
+        mtime = p.stat().st_mtime
         # mtime is stamped by the NFS server (= this host), so no clock skew
-        if time.time() - p.stat().st_mtime > AGENT_MAX_AGE:
+        if time.time() - mtime > AGENT_MAX_AGE:
             return None
+        cached = _agent_payload_cache.get(name)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
         payload = json.loads(p.read_text())
         if payload.get("agent_version") != AGENT_PAYLOAD_VERSION:
-            return None  # old agent — treated as stale, repair will upgrade it
-        if not AGENT_DISABLE and payload.get("agent_build") != _expected_agent_build():
-            return None  # agent runs outdated code — repair restarts it
+            payload = None  # old agent — treated as stale, repair will upgrade it
+        elif not AGENT_DISABLE and payload.get("agent_build") != _expected_agent_build():
+            payload = None  # agent runs outdated code — repair restarts it
+        _agent_payload_cache[name] = (mtime, payload)
         return payload
     except Exception:
         return None
@@ -526,7 +571,7 @@ def _maybe_repair_agent(name: str) -> None:
             return
         print(f"[collector] agent repair {name}: {'ok' if ok else out}", flush=True)
 
-    _node_executor.submit(_run)
+    _repair_executor.submit(_run)
 
 
 def _poll_node_bg(n: dict, has_jobs: bool) -> None:
@@ -610,7 +655,7 @@ def collect_all() -> dict:
                 _update_poll_state(name, success=True, node_is_cold=node_is_cold, slurm_state=n["state"])
             _update_inventory(name, gpu_dicts)
             continue
-        if _should_poll_node(name, n["state"]):
+        if _should_poll_node(name):
             _poll_node_bg(n, has_jobs=has_jobs)
         _maybe_repair_agent(name)
 
@@ -759,6 +804,8 @@ def _format_metrics(data: dict) -> str:
         "# TYPE sgpu_gpu_idle_seconds gauge",
         "# HELP sgpu_gpu_parked_seconds Seconds GPU has held VRAM with near-zero utilization",
         "# TYPE sgpu_gpu_parked_seconds gauge",
+        "# HELP sgpu_gpu_ecc_errors Uncorrectable ECC error count (aggregate)",
+        "# TYPE sgpu_gpu_ecc_errors gauge",
         "# HELP sgpu_gpu_info Static GPU identity labels",
         "# TYPE sgpu_gpu_info gauge",
         "# HELP sgpu_node_info Static node identity labels",
@@ -813,7 +860,8 @@ def _format_metrics(data: dict) -> str:
         for g in n.get("gpus", []):
             lbl = f'node="{node}",gpu="{_prom_escape(g.get("index", ""))}"'
             lines.append(
-                f'sgpu_gpu_info{{{lbl},name="{_prom_escape(g.get("name", ""))}"}} 1'
+                f'sgpu_gpu_info{{{lbl},name="{_prom_escape(g.get("name", ""))}"'
+                f',uuid="{_prom_escape(g.get("uuid", ""))}"}} 1'
             )
             for metric, key in (
                 ("sgpu_gpu_util", "util"),
@@ -821,6 +869,7 @@ def _format_metrics(data: dict) -> str:
                 ("sgpu_gpu_mem_total_mib", "mem_total"),
                 ("sgpu_gpu_temp_celsius", "temp"),
                 ("sgpu_gpu_power_watts", "power"),
+                ("sgpu_gpu_ecc_errors", "ecc"),
             ):
                 v = num(g.get(key))
                 if v is not None:
@@ -963,22 +1012,41 @@ def daemonize():
     os.setsid()
     if os.fork() > 0:
         sys.exit(0)
-    sys.stdin = open(os.devnull, "r")
     log = DATA_DIR / "collector.log"
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     global _log_path
     _log_path = log
     _rotate_log_if_big()
-    sys.stdout = open(log, "a")
-    sys.stderr = sys.stdout
+    # dup2 over the real fds — merely rebinding sys.stdout would leave the
+    # inherited ssh/terminal pipe open (a remote `sgpu-collector --daemon`
+    # launch would hang) and C-level writes to fd 2 would miss the log
+    null_fd = os.open(os.devnull, os.O_RDONLY)
+    log_fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+    os.dup2(null_fd, 0)
+    os.dup2(log_fd, 1)
+    os.dup2(log_fd, 2)
+    os.close(null_fd)
+    os.close(log_fd)
+    sys.stdin = os.fdopen(0, "r")
+    sys.stdout = os.fdopen(1, "w", buffering=1)
+    sys.stderr = os.fdopen(2, "w", buffering=1)
     run_collector()
 
 
+def _read_pid() -> int | None:
+    """PID file content, or None when absent/corrupt (crash mid-write)."""
+    try:
+        return int(PID_FILE.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
 def stop_daemon():
-    if not PID_FILE.exists():
-        print("No collector running (no pid file)")
+    pid = _read_pid()
+    if pid is None:
+        print("No collector running (no/invalid pid file)")
+        PID_FILE.unlink(missing_ok=True)
         return
-    pid = int(PID_FILE.read_text().strip())
     try:
         os.kill(pid, signal.SIGTERM)
         print(f"Sent SIGTERM to collector (pid={pid})")
@@ -988,10 +1056,10 @@ def stop_daemon():
 
 
 def check_status():
-    if not PID_FILE.exists():
+    pid = _read_pid()
+    if pid is None:
         print("Collector: not running")
         return
-    pid = int(PID_FILE.read_text().strip())
     try:
         os.kill(pid, 0)
         age = ""

@@ -10,6 +10,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -111,6 +112,11 @@ def run_agent() -> None:
         t0 = time.time()
         try:
             payload = collect_local()
+            # nvidia-smi present but no GPUs parsed = wedged driver. Writing a
+            # fresh empty payload would make the collector treat the node as
+            # healthy-with-zero-GPUs; failing lets the file go stale instead.
+            if not payload["gpus"] and shutil.which("nvidia-smi"):
+                raise RuntimeError("nvidia-smi returned no GPUs (driver problem?)")
             took = time.time() - t0
             if took > INTERVAL * 3:
                 print(f"[agent] slow collect: {took:.1f}s")

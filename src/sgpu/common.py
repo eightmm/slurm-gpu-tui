@@ -8,6 +8,8 @@ import re
 import shlex
 import subprocess
 import tempfile
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -66,6 +68,11 @@ def run_cmd(cmd: str, timeout: int = 12) -> Tuple[bool, str]:
             shlex.split(cmd), stderr=subprocess.STDOUT, timeout=timeout, text=True
         )
         return True, out.strip()
+    except subprocess.CalledProcessError as e:
+        # the captured stderr is what error classification and logs need,
+        # not "returned non-zero exit status 1"
+        out = (e.output or "").strip()
+        return False, out or str(e)
     except Exception as e:
         return False, str(e)
 
@@ -74,6 +81,12 @@ def run_cmd(cmd: str, timeout: int = 12) -> Tuple[bool, str]:
 
 _SSH_CONTROL_DIR: str = ""
 _SSH_BASE_OPTS: str = ""
+# node -> monotonic ts of the last confirmed-alive master check; skips the
+# extra `ssh -O check` subprocess per command while the master is trusted
+_MASTER_ALIVE_TTL = 60.0
+_master_alive: Dict[str, float] = {}
+_master_locks: Dict[str, threading.Lock] = {}
+_master_locks_guard = threading.Lock()
 
 
 def init_ssh_pool() -> None:
@@ -82,8 +95,10 @@ def init_ssh_pool() -> None:
     if _SSH_CONTROL_DIR:
         return
     _SSH_CONTROL_DIR = tempfile.mkdtemp(prefix="sgpu-ssh-")
+    # %h only: the check path below must match what ssh resolves, and %r
+    # (remote user) is not knowable here when USER differs from it
     _SSH_BASE_OPTS = (
-        f"-o ControlPath={_SSH_CONTROL_DIR}/%r@%h "
+        f"-o ControlPath={_SSH_CONTROL_DIR}/%h "
         "-o StrictHostKeyChecking=no -o BatchMode=yes"
     )
     atexit.register(cleanup_ssh_pool)
@@ -96,35 +111,49 @@ def cleanup_ssh_pool() -> None:
         shutil.rmtree(_SSH_CONTROL_DIR, ignore_errors=True)
 
 
+def _node_lock(node: str) -> threading.Lock:
+    with _master_locks_guard:
+        return _master_locks.setdefault(node, threading.Lock())
+
+
 def ssh_ensure_master(node: str) -> None:
-    """Start a ControlMaster connection to a node if not already running."""
+    """Start a ControlMaster connection to a node if not already running.
+    Per-node locked so parallel pollers don't spawn duplicate masters."""
     init_ssh_pool()
-    sock = f"{_SSH_CONTROL_DIR}/{os.getenv('USER', 'user')}@{node}"
-    if os.path.exists(sock):
-        try:
-            alive = subprocess.call(
-                ["ssh", "-o", f"ControlPath={sock}", "-O", "check", node],
-                stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=5,
-            ) == 0
-        except Exception:
-            alive = False
-        if alive:
+    if time.monotonic() - _master_alive.get(node, 0.0) < _MASTER_ALIVE_TTL:
+        return
+    with _node_lock(node):
+        if time.monotonic() - _master_alive.get(node, 0.0) < _MASTER_ALIVE_TTL:
             return
-        # Dead master leaves a stale socket behind; remove it so we reconnect
-        try:
-            os.unlink(sock)
-        except OSError:
-            pass
-    cmd = (
-        f"ssh -o ControlMaster=yes {_SSH_BASE_OPTS} "
-        f"-o ConnectTimeout=10 -o ControlPersist=1800 -fN {node}"
-    )
-    try:
-        subprocess.call(
-            shlex.split(cmd), stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=20,
+        sock = f"{_SSH_CONTROL_DIR}/{node}"
+        if os.path.exists(sock):
+            try:
+                alive = subprocess.call(
+                    ["ssh", "-o", f"ControlPath={sock}", "-O", "check", node],
+                    stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=5,
+                ) == 0
+            except Exception:
+                alive = False
+            if alive:
+                _master_alive[node] = time.monotonic()
+                return
+            # Dead master leaves a stale socket behind; remove it so we reconnect
+            try:
+                os.unlink(sock)
+            except OSError:
+                pass
+        cmd = (
+            f"ssh -o ControlMaster=yes {_SSH_BASE_OPTS} "
+            f"-o ConnectTimeout=10 -o ControlPersist=1800 -fN {node}"
         )
-    except Exception:
-        pass  # per-command ssh will surface the real error
+        try:
+            rc = subprocess.call(
+                shlex.split(cmd), stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=20,
+            )
+            if rc == 0:
+                _master_alive[node] = time.monotonic()
+        except Exception:
+            pass  # per-command ssh will surface the real error
 
 
 def ssh_cmd(node: str, inner_cmd: str, timeout: int = 10) -> Tuple[bool, str]:
@@ -134,7 +163,12 @@ def ssh_cmd(node: str, inner_cmd: str, timeout: int = 10) -> Tuple[bool, str]:
         f"ssh -o ControlMaster=no {_SSH_BASE_OPTS} "
         f"-o ConnectTimeout=3 {node} {shlex.quote(inner_cmd)}"
     )
-    return run_cmd(wrapped, timeout=timeout)
+    ok, out = run_cmd(wrapped, timeout=timeout)
+    if not ok:
+        # connection-level failure: distrust the cached master so the next
+        # call re-checks (command-level failures also drop it — cheap re-check)
+        _master_alive.pop(node, None)
+    return ok, out
 
 
 # ── Data models ───────────────────────────────────────────────────────────
