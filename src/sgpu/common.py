@@ -306,10 +306,7 @@ def collect_jobs() -> Tuple[List[JobInfo], str]:
         if len(p) < 7:
             continue
         gres = p[6].strip()
-        gc = 0
-        m = re.search(r"gpu(?::[^:,]+)?:(\d+)", gres)
-        if m:
-            gc = int(m.group(1))
+        gc = _gpu_count_from_gres(gres)
         tlimit = p[7].strip() if len(p) > 7 else ""
         try:
             cc = int(p[8].strip()) if len(p) > 8 else 0
@@ -330,10 +327,7 @@ def collect_pending_jobs() -> Tuple[List[PendingJob], str]:
         if len(p) < 8:
             continue
         gres = p[5].strip()
-        gc = 0
-        m = re.search(r"gpu(?::[^:,]+)?:(\d+)", gres)
-        if m:
-            gc = int(m.group(1))
+        gc = _gpu_count_from_gres(gres)
         start = p[8].strip() if len(p) > 8 else ""
         rows.append(PendingJob(p[0], p[1], p[2], p[3], p[4], gc, p[6].strip(), p[7].strip(), start))
     return rows, ""
@@ -412,6 +406,17 @@ def _expand_idx(spec: str) -> List[str]:
     return out
 
 
+def _gpu_count_from_gres(gres: str) -> int:
+    """Total GPUs in an squeue ``%b`` value, including mixed typed GRES.
+
+    Examples: ``gpu:2`` and ``gpu:h100:1,gpu:a6000:2``.  The previous
+    first-match parser under-counted jobs requesting more than one GPU type.
+    """
+    return sum(int(n) for n in re.findall(
+        r"(?:^|,)gpu(?::[^:,()]+)?:(\d+)(?=\(|,|$)", gres,
+    ))
+
+
 def parse_gres_models(gres: str) -> List[str]:
     """Expand sinfo GRES like 'gpu:h100:1(S:0-1),gpu:3' into per-GPU model names."""
     out: List[str] = []
@@ -447,10 +452,12 @@ def parse_gpu_alloc(out: str) -> Tuple[Dict[str, Dict[str, str]], Dict[str, str]
             jobid_user[jobid] = m_u.group(1)
         for m in re.finditer(r"Nodes=(\S+)\s+CPU_IDs=\S+\s+Mem=\S+\s+GRES=(\S+)", line):
             nodes_expr, gres = m.group(1), m.group(2)
-            gm = re.search(r"gpu[^(]*\(IDX:([^)]+)\)", gres)
-            if not gm:
+            idx_groups = re.findall(
+                r"(?:^|,)gpu(?::[^,()]*)?\(IDX:([^)]+)\)", gres,
+            )
+            if not idx_groups:
                 continue
-            idxs = _expand_idx(gm.group(1))
+            idxs = [idx for group in idx_groups for idx in _expand_idx(group)]
             for node in expand_nodelist(nodes_expr):
                 d = alloc.setdefault(node, {})
                 for i in idxs:

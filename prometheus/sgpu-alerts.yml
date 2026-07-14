@@ -1,0 +1,24 @@
+groups:
+  - name: sgpu
+    rules:
+      - alert: SgpuCollectorStale
+        expr: time() - sgpu_collector_last_success_timestamp_seconds > 90
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: sgpu collector data is stale
+          description: >-
+            The sgpu collector has not published a successful snapshot for
+            more than 90 seconds. Check sgpu-collector and its journal.
+
+      - alert: SgpuCollectorMetricMissing
+        expr: absent(sgpu_collector_last_success_timestamp_seconds)
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: sgpu collector metric is missing
+          description: >-
+            Prometheus cannot see the sgpu collector heartbeat. Check the
+            node_exporter scrape target and its textfile collector path.

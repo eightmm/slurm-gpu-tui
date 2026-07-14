@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from . import __build__, __version__
 from .cells import (
     WASTE_MIN_SEC, _waste_thr, classify_gpu, collect_waste, fmt_idle_age,
     fmt_span, fmt_start_time, mb_to_gb,
@@ -39,6 +40,8 @@ def _oneshot_snapshot() -> dict:
     apply_gpu_alloc(nodes, gpu_alloc, jobs, alloc_user_map)
     return {
         "version": 1,
+        "release": __version__,
+        "build": __build__,
         "ts": datetime.now().isoformat(),
         "nodes": [asdict(n) for n in nodes],
         "jobs": [asdict(j) for j in jobs],
@@ -338,6 +341,7 @@ def _cli_doctor() -> int:
 
     # collector data
     srcs: Dict[str, int] = {}
+    raw: dict = {}
     try:
         age = time.time() - _DAEMON_DATA_FILE.stat().st_mtime
         raw = json.loads(_DAEMON_DATA_FILE.read_text())
@@ -349,6 +353,19 @@ def _cli_doctor() -> int:
         stale_n = srcs.get("stale", 0)
         report(stale_n == 0 if srcs else None, "node sources",
                " ".join(f"{k}:{v}" for k, v in sorted(srcs.items())) or "no nodes")
+        collector_release = str(raw.get("release") or "")
+        collector_build = str(raw.get("build") or "")
+        if collector_release:
+            same_release = collector_release == __version__
+            same_build = collector_build == __build__ if collector_build else False
+            same = same_release and same_build
+            report(same if same else None, "release",
+                   f"cli={__version__}+{__build__} "
+                   f"collector={collector_release}+{collector_build or 'unknown'}"
+                   + ("" if same else " — restart/deploy collector"))
+        else:
+            report(None, "release",
+                   f"cli={__version__} collector=unknown — restart/deploy collector")
     except (OSError, ValueError):
         report(False, "collector data", f"{_DAEMON_DATA_FILE} missing — collector not running (TUI falls back to slow SSH)")
 
@@ -361,9 +378,11 @@ def _cli_doctor() -> int:
             if home and (home / ".config/systemd/user/sgpu-collector.service").exists():
                 unit = home / ".config/systemd/user/sgpu-collector.service"
                 break
+    unit_text = ""
     try:
+        unit_text = unit.read_text()
         restart = next((ln.split("=", 1)[1].strip()
-                        for ln in unit.read_text().splitlines()
+                        for ln in unit_text.splitlines()
                         if ln.startswith("Restart=")), "unset")
         if restart == "always":
             report(True, "collector unit", f"{unit} Restart=always")
@@ -429,7 +448,14 @@ def _cli_doctor() -> int:
     # script sharing (sudoers). What matters is whether the COLLECTOR user
     # holds the grant — it does the fetching. Probing `sudo -n` as root is
     # meaningless (root always passes), so read the rule itself instead.
-    if os.geteuid() == 0 and collector_user not in (None, "root"):
+    if collector_user == "root":
+        sharing_enabled = _unit_env_enabled(
+            unit_text, "SLURM_GPU_TUI_SHARE_SCRIPTS",
+        )
+        report(True if sharing_enabled else None, "script sharing",
+               "root collector; enabled in unit" if sharing_enabled
+               else "root collector; disabled in unit")
+    elif os.geteuid() == 0 and collector_user is not None:
         grantee = None
         try:
             for line in Path("/etc/sudoers.d/sgpu").read_text().splitlines():
@@ -490,9 +516,19 @@ def _arg_value(argv: List[str], flag: str, default: str) -> str:
     return default
 
 
+def _unit_env_enabled(unit_text: str, name: str) -> bool:
+    return any(
+        line.strip() == f"Environment={name}=1"
+        for line in unit_text.splitlines()
+    )
+
+
 def main():
     argv = sys.argv[1:]
     try:
+        if "--version" in argv or (argv and argv[0] == "version"):
+            print(f"sgpu {__version__} (build {__build__})")
+            return
         if "--json" in argv or "--once" in argv:
             data = _oneshot_snapshot()
             if "--json" in argv:
@@ -519,9 +555,10 @@ def main():
             interval = int(_arg_value(argv, "--interval", "10"))
             sys.exit(_cli_wait_free(want, part, interval))
         if argv and argv[0] in ("-h", "--help"):
-            print("usage: sgpu [--json | --once | --waste [-v] | --usage [days] [--daily] |\n"
+            print("usage: sgpu [--version | --json | --once | --waste [-v] | --usage [days] [--daily] |\n"
                   "             --jobs [days] [--user U] | --report [YYYY-MM] | --wait-free N | doctor]\n"
                   "  (no args)      interactive TUI\n"
+                  "  --version      print installed release and exit\n"
                   "  --json         print snapshot as JSON and exit\n"
                   "  --once         print snapshot as plain text and exit\n"
                   "  --waste [-v]   list idle/parked/rogue GPUs; exit 1 if any (cron-friendly)\n"
