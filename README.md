@@ -60,7 +60,8 @@ for compute nodes, usage/waste accounting, and Slack alerts.
 - The TUI reads the merged JSON, so startup is instant at any cluster size.
   Without a collector it falls back to direct SSH (slower first load).
 - The collector also writes `/tmp/slurm-gpu-tui/metrics.prom` (Prometheus
-  textfile) — point node_exporter at it and import the bundled dashboard.
+  textfile) — point node_exporter at it, import the bundled dashboard, and load
+  the dead-man alert rules for collector failure.
   **→ [docs/GRAFANA.md](docs/GRAFANA.md)**
 - `sgpu doctor` is the first check after install or when data looks wrong.
 
@@ -151,6 +152,7 @@ down or recovering. (For alerts without a TUI, see Slack Alerts.)
 
 ```bash
 sgpu --once          # plain-text snapshot
+sgpu --version       # installed CLI release
 sgpu --json          # JSON snapshot (sgpu --json | jq ...)
 sgpu --waste [-v]    # idle/parked/rogue GPUs; exit 1 if any (-v adds Command/WorkDir)
 sgpu doctor          # self-diagnosis: data, agents, slurm, sacct, webhook, sharing
@@ -263,6 +265,7 @@ Reinstall cleanly by re-running the one-line install.
 | `SLURM_GPU_TUI_AGENT_DIR` | `~/.sgpu/nodes` | Push-agent payload dir (shared FS for push mode) |
 | `SLURM_GPU_TUI_AGENT_SEC` | `3` | Agent collect interval on nodes |
 | `SLURM_GPU_TUI_AGENT_MAX_AGE_SEC` | `45` | Agent payload freshness limit |
+| `SLURM_GPU_TUI_AGENT_MAX_BYTES` | `1048576` | Maximum accepted agent payload size |
 | `SLURM_GPU_TUI_AGENT_REPAIR_SEC` | `180` | Min interval between agent repairs per node |
 | `SLURM_GPU_TUI_AGENT_DISABLE` | (unset) | Disable push agents entirely |
 | `SLURM_GPU_TUI_WASTE_MIN_SEC` | `600` | Threshold for the waste view / `--waste` |

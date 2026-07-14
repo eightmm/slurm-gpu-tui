@@ -19,6 +19,7 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
+from . import __build__, __version__
 from .common import NODE_PAYLOAD_CMD, parse_node_payload
 
 AGENT_DIR = Path(os.getenv("SLURM_GPU_TUI_AGENT_DIR", str(Path.home() / ".sgpu" / "nodes")))
@@ -59,6 +60,8 @@ def collect_local() -> dict:
     gpus, mem = parse_node_payload(out)
     return {
         "agent_version": AGENT_PAYLOAD_VERSION,
+        "release": __version__,
+        "package_build": __build__,
         "agent_build": AGENT_BUILD,
         "ts": time.time(),
         "hostname": socket.gethostname().split(".")[0],
@@ -115,8 +118,11 @@ def run_agent() -> None:
             # nvidia-smi present but no GPUs parsed = wedged driver. Writing a
             # fresh empty payload would make the collector treat the node as
             # healthy-with-zero-GPUs; failing lets the file go stale instead.
-            if not payload["gpus"] and shutil.which("nvidia-smi"):
-                raise RuntimeError("nvidia-smi returned no GPUs (driver problem?)")
+            if not payload["gpus"]:
+                installed = "installed" if shutil.which("nvidia-smi") else "missing"
+                raise RuntimeError(
+                    f"nvidia-smi returned no GPUs (binary {installed}; driver problem?)"
+                )
             took = time.time() - t0
             if took > INTERVAL * 3:
                 print(f"[agent] slow collect: {took:.1f}s")

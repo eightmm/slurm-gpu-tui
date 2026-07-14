@@ -76,7 +76,32 @@ sgpu_gpus_total
 sgpu_gpu_util
 ```
 
-## 4. Import dashboard
+## 4. Alert when the collector dies
+
+The collector cannot send its own Slack message after it has stopped. Load the
+included Prometheus rules so Alertmanager provides the external dead-man check:
+
+```yaml
+rule_files:
+  - /etc/prometheus/rules/sgpu-alerts.yml
+```
+
+```bash
+sudo install -m 644 prometheus/sgpu-alerts.yml /etc/prometheus/rules/sgpu-alerts.yml
+promtool check rules /etc/prometheus/rules/sgpu-alerts.yml
+sudo systemctl reload prometheus
+```
+
+The rules cover both cases:
+
+- `SgpuCollectorStale`: the textfile remains present but its timestamp stops.
+- `SgpuCollectorMetricMissing`: the metric or node_exporter scrape disappears.
+
+Route `severity="critical"` to Slack in Alertmanager. This is separate from
+the collector's built-in Slack alerts, which cover node and GPU conditions
+while the collector itself is alive.
+
+## 5. Import dashboard
 
 In Grafana:
 
@@ -102,6 +127,7 @@ Cluster summary:
 - `sgpu_collector_last_success_timestamp_seconds` (Unix time of the snapshot;
   `time() - <this>` = data age. The dashboard's **Data Age** stat goes
   orange/red when the collector freezes or dies.)
+- `sgpu_build_info{version,build}` (exact collector build; compare with `sgpu --version`)
 
 Per node/GPU:
 

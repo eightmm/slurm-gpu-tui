@@ -7,6 +7,7 @@ import os
 import re
 import shlex
 import signal
+import stat
 import sys
 import threading
 import time
@@ -23,6 +24,7 @@ from .common import (
 from .agent import AGENT_PAYLOAD_VERSION
 from . import agent as _agent_module
 from .notify import Notifier
+from . import __build__, __version__
 
 # ── Config ────────────────────────────────────────────────────────────────
 
@@ -45,6 +47,7 @@ AGENT_DIR = Path(os.getenv("SLURM_GPU_TUI_AGENT_DIR", str(Path.home() / ".sgpu" 
 AGENT_MAX_AGE = int(os.getenv("SLURM_GPU_TUI_AGENT_MAX_AGE_SEC", "45"))
 AGENT_REPAIR_SEC = int(os.getenv("SLURM_GPU_TUI_AGENT_REPAIR_SEC", "180"))
 AGENT_DISABLE = bool(os.getenv("SLURM_GPU_TUI_AGENT_DISABLE", ""))
+AGENT_PAYLOAD_MAX_BYTES = int(os.getenv("SLURM_GPU_TUI_AGENT_MAX_BYTES", str(1024 * 1024)))
 
 # Opt-in: publish every running job's batch script in data.json so all users
 # can view them in the TUI. Requires a collector that may read them (root).
@@ -507,13 +510,47 @@ def _expected_agent_build() -> str:
 _agent_payload_cache: Dict[str, tuple] = {}  # name -> (mtime, parsed payload or None)
 
 
+def _valid_agent_payload(name: str, payload: object) -> bool:
+    """Validate the push payload shape before it reaches the merge loop."""
+    if not isinstance(payload, dict) or payload.get("hostname") != name:
+        return False
+    if not isinstance(payload.get("agent_build"), str):
+        return False
+    if not isinstance(payload.get("ts"), (int, float)):
+        return False
+    mem = payload.get("mem")
+    if not isinstance(mem, dict) or not all(k in mem for k in ("total", "used", "avail")):
+        return False
+    gpus = payload.get("gpus")
+    if not isinstance(gpus, list) or not 0 < len(gpus) <= 64:
+        return False
+    seen = set()
+    for gpu in gpus:
+        if not isinstance(gpu, dict):
+            return False
+        if not all(k in gpu for k in ("index", "name", "mem_total", "pids", "users")):
+            return False
+        index = str(gpu["index"])
+        if not index or index in seen:
+            return False
+        seen.add(index)
+        if not isinstance(gpu["pids"], list) or not isinstance(gpu["users"], list):
+            return False
+    return True
+
+
 def _read_agent_payload(name: str) -> dict | None:
     """Return a node's push-agent payload if fresh and version-compatible.
     Parsed payloads are cached by mtime — agents rewrite every AGENT_SEC,
     so most 3s cycles can skip the read+parse."""
     p = AGENT_DIR / f"{name}.json"
     try:
-        mtime = p.stat().st_mtime
+        file_stat = p.lstat()
+        if not stat.S_ISREG(file_stat.st_mode):
+            return None
+        if not 0 < file_stat.st_size <= AGENT_PAYLOAD_MAX_BYTES:
+            return None
+        mtime = file_stat.st_mtime
         # mtime is stamped by the NFS server (= this host), so no clock skew
         if time.time() - mtime > AGENT_MAX_AGE:
             return None
@@ -521,7 +558,9 @@ def _read_agent_payload(name: str) -> dict | None:
         if cached is not None and cached[0] == mtime:
             return cached[1]
         payload = json.loads(p.read_text())
-        if payload.get("agent_version") != AGENT_PAYLOAD_VERSION:
+        if not _valid_agent_payload(name, payload):
+            payload = None
+        elif payload.get("agent_version") != AGENT_PAYLOAD_VERSION:
             payload = None  # old agent — treated as stale, repair will upgrade it
         elif not AGENT_DISABLE and payload.get("agent_build") != _expected_agent_build():
             payload = None  # agent runs outdated code — repair restarts it
@@ -647,6 +686,12 @@ def collect_all() -> dict:
     for n in nodes_raw:
         name = n["name"]
         has_jobs = name in node_jobs_from_basic
+        if not n.get("has_gpu", True):
+            # CPU-only nodes still need memory/CPU data, but never need the
+            # resident nvidia-smi agent or its repair traffic.
+            if _should_poll_node(name):
+                _poll_node_bg(n, has_jobs=has_jobs)
+            continue
         payload = _read_agent_payload(name)
         if payload is not None:
             agent_nodes.add(name)
@@ -737,6 +782,8 @@ def collect_all() -> dict:
     scripts = _fetch_scripts(jobs)
     return {
         "version": 1,
+        "release": __version__,
+        "build": __build__,
         "ts": datetime.now().isoformat(),
         "nodes": result_nodes,
         "jobs": [dict(_job_to_dict(j), script=scripts.get(j.jobid, "")) for j in jobs],
@@ -821,8 +868,14 @@ def _format_metrics(data: dict) -> str:
         "# TYPE sgpu_node_info gauge",
         "# HELP sgpu_collector_last_success_timestamp_seconds Unix time of this snapshot",
         "# TYPE sgpu_collector_last_success_timestamp_seconds gauge",
+        "# HELP sgpu_build_info sgpu collector release information",
+        "# TYPE sgpu_build_info gauge",
     ]
     lines.append(f"sgpu_collector_last_success_timestamp_seconds {time.time():.0f}")
+    lines.append(
+        f'sgpu_build_info{{version="{_prom_escape(data.get("release", __version__))}"'
+        f',build="{_prom_escape(data.get("build", __build__))}"}} 1'
+    )
     n_run = len(data.get("jobs", []))
     n_pend = len(data.get("pending", []))
     nodes = data.get("nodes", [])

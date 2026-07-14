@@ -1,8 +1,8 @@
 """Parser tests against captured real-cluster output."""
 from sgpu.common import (
-    NodeErrorKind, _classify_error, _expand_idx, assign_node_jobs,
-    expand_nodelist, parse_gpu_alloc, parse_gres_models, parse_node_payload,
-    shorten_gpu_name,
+    NodeErrorKind, _classify_error, _expand_idx, _gpu_count_from_gres,
+    assign_node_jobs, expand_nodelist, parse_gpu_alloc, parse_gres_models,
+    parse_node_payload, shorten_gpu_name,
 )
 from sgpu.common import GpuInfo, JobInfo, NodeInfo
 from sgpu.cells import (
@@ -63,6 +63,17 @@ def test_parse_gpu_alloc_multinode_range():
     alloc, users = parse_gpu_alloc(SCONTROL_MULTI)
     assert alloc == {"gpu1": {"2": "100", "3": "100"}, "gpu2": {"2": "100", "3": "100"}}
     assert users == {"100": "a"}
+
+
+def test_parse_gpu_alloc_mixed_gpu_types():
+    line = (
+        "JobId=101 JobName=mixed UserId=a(1) JobState=RUNNING "
+        "Nodes=gpu1 CPU_IDs=0-7 Mem=0 "
+        "GRES=gpu:h100:1(IDX:0),gpu:6000pro_maxq:2(IDX:1-2) "
+    )
+    alloc, users = parse_gpu_alloc(line)
+    assert alloc == {"gpu1": {"0": "101", "1": "101", "2": "101"}}
+    assert users == {"101": "a"}
 
 
 def test_parse_gpu_alloc_skips_pending():
@@ -133,6 +144,13 @@ def test_parse_gres_models():
     assert parse_gres_models("gpu:8(S:0-1)") == [""] * 8
     assert parse_gres_models("gpu:2080ti:4") == ["2080ti"] * 4
     assert parse_gres_models("") == []
+
+
+def test_gpu_count_from_mixed_gres():
+    assert _gpu_count_from_gres("gpu:2") == 2
+    assert _gpu_count_from_gres("gpu:h100:1,gpu:6000pro_maxq:3") == 4
+    assert _gpu_count_from_gres("gpu:h100:1(S:0-1),gpu:a5000:2") == 3
+    assert _gpu_count_from_gres("N/A") == 0
 
 
 # ── misc pure helpers ─────────────────────────────────────────────────────
@@ -265,6 +283,7 @@ def test_payload_without_minor_falls_back_to_index():
 
 
 def test_prometheus_metrics_summary():
+    from sgpu import __build__, __version__
     from sgpu.collector import _format_metrics
 
     text = _format_metrics({
@@ -307,6 +326,7 @@ def test_prometheus_metrics_summary():
     })
 
     assert "sgpu_jobs_running 1" in text
+    assert f'sgpu_build_info{{version="{__version__}",build="{__build__}"}} 1' in text
     assert "sgpu_jobs_pending 1" in text
     assert "sgpu_nodes_total 1" in text
     assert "sgpu_gpus_total 4" in text
