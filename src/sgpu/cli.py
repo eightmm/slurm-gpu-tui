@@ -352,6 +352,28 @@ def _cli_doctor() -> int:
     except (OSError, ValueError):
         report(False, "collector data", f"{_DAEMON_DATA_FILE} missing — collector not running (TUI falls back to slow SSH)")
 
+    # collector unit: site-wide kill sweeps (pkill -f python and friends) send
+    # SIGTERM, the collector exits 0, and Restart=on-failure leaves it dead
+    # until someone notices — only Restart=always survives a clean kill.
+    unit = Path("/etc/systemd/system/sgpu-collector.service")
+    if not unit.exists():
+        for home in (Path.home(), collector_home):
+            if home and (home / ".config/systemd/user/sgpu-collector.service").exists():
+                unit = home / ".config/systemd/user/sgpu-collector.service"
+                break
+    try:
+        restart = next((ln.split("=", 1)[1].strip()
+                        for ln in unit.read_text().splitlines()
+                        if ln.startswith("Restart=")), "unset")
+        if restart == "always":
+            report(True, "collector unit", f"{unit} Restart=always")
+        else:
+            report(None, "collector unit",
+                   f"{unit} Restart={restart} — a clean kill (exit 0) stays dead; "
+                   "set Restart=always (rerun installer or deploy.sh)")
+    except OSError:
+        pass  # no unit installed (nohup mode) — nothing to check
+
     # node delivery: trust data.json's per-node source counts (authoritative —
     # what the collector actually produced). A disk glob of AGENT_DIR is
     # unreliable here: an interactive `sgpu doctor` doesn't see the collector's
