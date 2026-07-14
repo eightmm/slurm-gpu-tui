@@ -241,6 +241,129 @@ for var in SLURM_GPU_TUI_AGENT_DIR SLURM_GPU_TUI_STATE_DIR SLURM_GPU_TUI_DATA_DI
     [ -n "$val" ] && sed -i "/^User=/a Environment=$var=$val" "$GENERATED_SERVICE"
 done
 
+# Root installs provision persistence mode on actual GPU nodes. Keeping the
+# driver initialized avoids multi-second nvidia-smi startup costs on otherwise
+# idle/headless nodes. Slurm GRES narrows the candidates; nvidia-smi -L is the
+# hardware check, so a stale/misconfigured GRES cannot receive the unit.
+#
+# The NVIDIA-packaged unit is deliberately left untouched: distributions use
+# different flags (often --no-persistence-mode). Our oneshot runs after it and
+# reapplies `nvidia-smi -pm 1` on every boot. A node failure is non-fatal to the
+# master install. Set SGPU_ENABLE_PERSISTENCE=0 to skip this remote change.
+PERSISTENCE_REQUEST="${SGPU_ENABLE_PERSISTENCE:-auto}"
+PERSISTENCE_SERVICE="$INSTALL_DIR/sgpu-gpu-persistence.service"
+_persistence_requested=false
+case "${PERSISTENCE_REQUEST,,}" in
+    0|false|no|off) ;;
+    auto) [ "$(id -u)" = "0" ] && _persistence_requested=true ;;
+    *) _persistence_requested=true ;;
+esac
+
+_install_persistence_local() {
+    local modes
+    if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi -L >/dev/null 2>&1; then
+        echo "nvidia-smi GPU probe failed"
+        return 1
+    fi
+    if [ "$(id -u)" != "0" ] && ! sudo -n true 2>/dev/null; then
+        echo "root or passwordless sudo required"
+        return 77
+    fi
+    $SUDO install -m 0644 "$PERSISTENCE_SERVICE" \
+        /etc/systemd/system/sgpu-gpu-persistence.service
+    $SUDO systemctl daemon-reload
+    if $SUDO systemctl cat nvidia-persistenced.service >/dev/null 2>&1; then
+        $SUDO systemctl start nvidia-persistenced.service >/dev/null 2>&1 || true
+        $SUDO systemctl enable nvidia-persistenced.service >/dev/null 2>&1 || true
+    fi
+    $SUDO systemctl enable --now sgpu-gpu-persistence.service >/dev/null
+    modes="$(nvidia-smi --query-gpu=persistence_mode --format=csv,noheader 2>/dev/null)" || return
+    printf '%s\n' "$modes" | awk '
+        BEGIN { count=0; bad=0 }
+        { gsub(/^[[:space:]]+|[[:space:]]+$/, ""); count++; if ($0 != "Enabled") bad=1 }
+        END { exit !(count > 0 && bad == 0) }
+    '
+}
+
+if $_persistence_requested; then
+    if [ ! -r "$PERSISTENCE_SERVICE" ]; then
+        echo "[3c] WARNING: persistence unit template missing: $PERSISTENCE_SERVICE"
+    elif ! command -v sinfo >/dev/null 2>&1; then
+        echo "[3c] WARNING: sinfo unavailable — GPU persistence provisioning skipped"
+    else
+        mapfile -t GPU_NODES < <(
+            sinfo -h -N -o '%N|%G' 2>/dev/null \
+                | awk -F'|' '$2 ~ /(^|,)gpu(:|=|$)/ { print $1 }' \
+                | sort -u
+        )
+        if [ "${#GPU_NODES[@]}" -eq 0 ]; then
+            echo "[3c] No GPU nodes found in Slurm GRES — persistence provisioning skipped"
+        else
+            echo "[3c] Enabling GPU persistence on ${#GPU_NODES[@]} detected node(s)..."
+            PERSIST_OK=0
+            PERSIST_FAIL=0
+            LOCAL_HOST="$(hostname -s)"
+            REMOTE_INSTALL_SCRIPT='set -e
+as_root() {
+    if [ "$(id -u)" = "0" ]; then
+        "$@"
+    else
+        sudo -n "$@"
+    fi
+}
+if [ "$(id -u)" != "0" ] && ! sudo -n true 2>/dev/null; then
+    echo "root or passwordless sudo required"
+    exit 77
+fi
+as_root install -m 0644 /dev/stdin /etc/systemd/system/sgpu-gpu-persistence.service
+as_root systemctl daemon-reload
+if as_root systemctl cat nvidia-persistenced.service >/dev/null 2>&1; then
+    as_root systemctl start nvidia-persistenced.service >/dev/null 2>&1 || true
+    as_root systemctl enable nvidia-persistenced.service >/dev/null 2>&1 || true
+fi
+as_root systemctl enable --now sgpu-gpu-persistence.service >/dev/null
+modes="$(nvidia-smi --query-gpu=persistence_mode --format=csv,noheader 2>/dev/null)"
+printf "%s\n" "$modes" | awk '\''
+    BEGIN { count=0; bad=0 }
+    { gsub(/^[[:space:]]+|[[:space:]]+$/, ""); count++; if ($0 != "Enabled") bad=1 }
+    END { exit !(count > 0 && bad == 0) }
+'\'''
+            for node in "${GPU_NODES[@]}"; do
+                if [ "${node%%.*}" = "$LOCAL_HOST" ]; then
+                    if out="$(_install_persistence_local 2>&1)"; then
+                        echo "     $node: enabled (local)"
+                        PERSIST_OK=$((PERSIST_OK + 1))
+                    else
+                        echo "     $node: WARNING: ${out:-provisioning failed}"
+                        PERSIST_FAIL=$((PERSIST_FAIL + 1))
+                    fi
+                    continue
+                fi
+                SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=3)
+                if ! probe="$(timeout 8 ssh "${SSH_OPTS[@]}" "$node" \
+                        'command -v nvidia-smi >/dev/null && nvidia-smi -L' 2>&1)"; then
+                    echo "     $node: WARNING: GPU probe failed: ${probe%%$'\n'*}"
+                    PERSIST_FAIL=$((PERSIST_FAIL + 1))
+                    continue
+                fi
+                if out="$(timeout 30 ssh "${SSH_OPTS[@]}" "$node" \
+                        "$REMOTE_INSTALL_SCRIPT" < "$PERSISTENCE_SERVICE" 2>&1)"; then
+                    echo "     $node: enabled"
+                    PERSIST_OK=$((PERSIST_OK + 1))
+                else
+                    echo "     $node: WARNING: ${out%%$'\n'*}"
+                    PERSIST_FAIL=$((PERSIST_FAIL + 1))
+                fi
+            done
+            echo "     persistence summary: $PERSIST_OK enabled, $PERSIST_FAIL skipped/failed"
+        fi
+    fi
+elif [ "${PERSISTENCE_REQUEST,,}" = "auto" ]; then
+    echo "[3c] GPU persistence provisioning skipped (automatic only for root installs)"
+else
+    echo "[3c] GPU persistence provisioning disabled (SGPU_ENABLE_PERSISTENCE=$PERSISTENCE_REQUEST)"
+fi
+
 SYSTEMD_MODE="none"
 
 if $HAS_SUDO; then

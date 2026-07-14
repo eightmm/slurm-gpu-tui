@@ -82,6 +82,13 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstra
 > `/usr/local/bin/sgpu` for every user. A non-root install sets up only your
 > own user.
 
+On root installs, the installer detects GPU nodes from Slurm GRES, verifies
+them with `nvidia-smi -L`, and installs `sgpu-gpu-persistence.service` on each
+reachable node. The oneshot enables NVIDIA persistence mode now and after
+reboots, reducing idle-node driver initialization latency. Node provisioning
+failures are warnings and do not abort the master install. Set
+`SGPU_ENABLE_PERSISTENCE=0` to skip this remote system change.
+
 ### Install location (`SGPU_INSTALL_DIR`)
 
 Defaults: `~/.sgpu/app` for a user install; as root, `/home/shared/sgpu` when
@@ -279,7 +286,9 @@ Reinstall cleanly by re-running the one-line install.
 | `SLURM_GPU_TUI_ROGUE_IGNORE` | `root,gdm,xdm` | Users never flagged as rogue |
 | `SLURM_GPU_TUI_SHARE_SCRIPTS` | (unset) | Publish every job's batch script to all users in the Enter popup. **Shares script contents (and secrets) with everyone** — installer asks (`SGPU_SHARE_SCRIPTS=0/1` skips) |
 
-Install-time only: `SGPU_INSTALL_DIR` (repo + venv location).
+Install-time only: `SGPU_INSTALL_DIR` (repo + venv location) and
+`SGPU_ENABLE_PERSISTENCE` (`auto`; root installs provision GPU nodes, `0`
+disables).
 
 ---
 

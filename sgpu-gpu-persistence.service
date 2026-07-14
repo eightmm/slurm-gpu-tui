@@ -1,0 +1,13 @@
+[Unit]
+Description=Enable NVIDIA GPU persistence mode for sgpu monitoring
+After=nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env nvidia-smi -pm 1
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

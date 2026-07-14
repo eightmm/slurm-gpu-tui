@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -19,6 +20,7 @@ from .cells import (
 from .common import (
     GpuInfo, JobInfo, NodeInfo, apply_gpu_alloc, build_nodes, cleanup_ssh_pool,
     collect_basic, collect_node_data_parallel, run_cmd,
+    ssh_cmd,
 )
 from .tui import _DAEMON_DATA_FILE, _DAEMON_MAX_AGE, SlurmGpuTui
 from .usage import _read_usage_raw, load_usage_daily, load_usage_totals
@@ -411,6 +413,50 @@ def _cli_doctor() -> int:
         agent_dir = Path(os.getenv("SLURM_GPU_TUI_AGENT_DIR", str(Path.home() / ".sgpu" / "nodes")))
         report(None, "node delivery", f"no node data yet (checked {agent_dir})")
 
+    # Persistence avoids repeated NVIDIA driver initialization on idle/headless
+    # nodes. Check actual GPU state as well as sgpu's boot unit: distro-provided
+    # nvidia-persistenced units can be active while explicitly using
+    # --no-persistence-mode.
+    gpu_nodes = sorted({
+        str(n.get("name")) for n in raw.get("nodes", [])
+        if n.get("name") and (n.get("has_gpu") is True or n.get("gpus"))
+    })
+    if gpu_nodes:
+        enabled_nodes: List[str] = []
+        inactive_units: List[str] = []
+        persistence_bad: List[str] = []
+
+        def check_persistence(node: str) -> Tuple[str, bool, str]:
+            ok, out = ssh_cmd(node, _PERSISTENCE_STATUS_CMD, timeout=10)
+            modes, unit = _parse_persistence_status(out)
+            return node, bool(ok and modes and all(m == "Enabled" for m in modes)), unit
+
+        with ThreadPoolExecutor(max_workers=min(8, len(gpu_nodes))) as pool:
+            futures = {
+                pool.submit(check_persistence, node): node for node in gpu_nodes
+            }
+            for future in as_completed(futures):
+                try:
+                    node, enabled, unit_state = future.result()
+                except Exception:
+                    node = futures[future]
+                    persistence_bad.append(node)
+                    inactive_units.append(node)
+                    continue
+                if enabled:
+                    enabled_nodes.append(node)
+                else:
+                    persistence_bad.append(node)
+                if unit_state != "active":
+                    inactive_units.append(node)
+        detail = f"{len(enabled_nodes)}/{len(gpu_nodes)} nodes enabled"
+        if persistence_bad:
+            detail += f"; disabled/unreachable: {','.join(sorted(persistence_bad))}"
+        if inactive_units:
+            detail += f"; boot unit inactive/missing: {','.join(sorted(inactive_units))}"
+        report(True if not persistence_bad and not inactive_units else None,
+               "GPU persistence", detail)
+
     # persistent state — fall back to the collector user's home when ours
     # has no state (doctor as root, collector as a regular user)
     state_dir = Path(os.getenv("SLURM_GPU_TUI_STATE_DIR", str(Path.home() / ".sgpu" / "state")))
@@ -521,6 +567,26 @@ def _unit_env_enabled(unit_text: str, name: str) -> bool:
         line.strip() == f"Environment={name}=1"
         for line in unit_text.splitlines()
     )
+
+
+_PERSISTENCE_STATUS_CMD = (
+    "printf 'modes='; "
+    "nvidia-smi --query-gpu=persistence_mode --format=csv,noheader 2>/dev/null "
+    "| tr '\\n' ','; "
+    "printf '\\nunit='; "
+    "systemctl is-active sgpu-gpu-persistence.service 2>/dev/null || true"
+)
+
+
+def _parse_persistence_status(out: str) -> Tuple[List[str], str]:
+    """Parse the compact node-side persistence probe used by doctor."""
+    fields = {}
+    for line in out.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            fields[key.strip()] = value.strip()
+    modes = [m.strip() for m in fields.get("modes", "").split(",") if m.strip()]
+    return modes, fields.get("unit", "")
 
 
 def main():

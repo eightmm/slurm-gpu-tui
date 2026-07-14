@@ -79,9 +79,17 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstra
 > **root(또는 passwordless sudo)로 실행** 시 시스템 서비스 + 모든 유저용
 > `/usr/local/bin/sgpu`. 일반 유저 설치는 본인 계정만 설정.
 
+root 설치에서는 Slurm GRES로 GPU 노드 후보를 찾고 `nvidia-smi -L`로 실제
+GPU를 확인한 뒤, 접근 가능한 각 노드에 `sgpu-gpu-persistence.service`를
+설치한다. 이 oneshot 서비스는 지금과 재부팅 후 NVIDIA persistence mode를
+활성화해 유휴 노드의 드라이버 초기화 지연을 줄인다. 노드별 설정 실패는
+경고만 내고 마스터 설치를 중단하지 않는다. 이 원격 시스템 변경을 생략하려면
+`SGPU_ENABLE_PERSISTENCE=0`을 지정한다.
+
 ### 설치 위치 (`SGPU_INSTALL_DIR`)
 
-기본값 `~/.sgpu/app` (root면 `/opt/sgpu`). 변경하려면 변수를 파이프의
+기본값 `~/.sgpu/app` (root면 `/home/shared`가 있을 때 `/home/shared/sgpu`,
+없으면 `/opt/sgpu`). 변경하려면 변수를 파이프의
 **`bash` 쪽**에 붙일 것. **push 모드**를 쓰려면 설치 디렉토리와
 `SLURM_GPU_TUI_AGENT_DIR`을 둘 다 노드가 같은 경로로 마운트하는 공유
 파일시스템에 둘 것(아니면 자동으로 SSH-pull):
@@ -270,7 +278,8 @@ rm -rf "$SLURM_GPU_TUI_AGENT_DIR"   # 기본 ~/.sgpu/nodes
 | `SLURM_GPU_TUI_ROGUE_IGNORE` | `root,gdm,xdm` | rogue로 안 잡을 유저 |
 | `SLURM_GPU_TUI_SHARE_SCRIPTS` | (없음) | 전체 잡 batch script를 모든 유저에게 Enter 팝업에 공개. **스크립트 내용(비밀키 포함)이 전원 공개** — 설치 시 질문(`SGPU_SHARE_SCRIPTS=0/1`이면 생략) |
 
-설치 시에만: `SGPU_INSTALL_DIR` (repo + venv 위치).
+설치 시에만: `SGPU_INSTALL_DIR` (repo + venv 위치),
+`SGPU_ENABLE_PERSISTENCE` (`auto`; root 설치면 GPU 노드에 적용, `0`이면 생략).
 
 ---
 
