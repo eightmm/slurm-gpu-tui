@@ -364,6 +364,117 @@ else
     echo "[3c] GPU persistence provisioning disabled (SGPU_ENABLE_PERSISTENCE=$PERSISTENCE_REQUEST)"
 fi
 
+# CPU-only push agents avoid creating a new SSH session when a busy node is
+# hardest to reach. They read only /proc/meminfo at a slow interval and are
+# kept alive locally by systemd; stale/missing payloads still fall back to the
+# collector's existing SSH poll. Automatic provisioning requires a root
+# install whose venv and AGENT_DIR are visible at the same path on the node.
+# Set SGPU_ENABLE_CPU_PUSH=0 to keep CPU nodes on SSH-only telemetry.
+CPU_PUSH_REQUEST="${SGPU_ENABLE_CPU_PUSH:-auto}"
+CPU_AGENT_SEC="${SLURM_GPU_TUI_CPU_AGENT_SEC:-20}"
+case "$CPU_AGENT_SEC" in
+    ''|*[!0-9]*|0) echo "WARNING: invalid SLURM_GPU_TUI_CPU_AGENT_SEC=$CPU_AGENT_SEC; using 20"; CPU_AGENT_SEC=20 ;;
+esac
+_cpu_push_requested=false
+case "${CPU_PUSH_REQUEST,,}" in
+    0|false|no|off) ;;
+    auto) [ "$(id -u)" = "0" ] && _cpu_push_requested=true ;;
+    *) _cpu_push_requested=true ;;
+esac
+
+CPU_AGENT_TEMPLATE="$INSTALL_DIR/sgpu-cpu-agent.service"
+GENERATED_CPU_AGENT_SERVICE=""
+if $_cpu_push_requested; then
+    if [ -n "${SLURM_GPU_TUI_AGENT_DISABLE:-}" ]; then
+        echo "[3d] CPU push provisioning skipped (SLURM_GPU_TUI_AGENT_DISABLE is set)"
+    elif [ -z "${SLURM_GPU_TUI_AGENT_DIR:-}" ]; then
+        echo "[3d] WARNING: no shared agent dir — CPU push provisioning skipped"
+    elif [ ! -r "$CPU_AGENT_TEMPLATE" ]; then
+        echo "[3d] WARNING: CPU agent unit template missing: $CPU_AGENT_TEMPLATE"
+    elif ! command -v sinfo >/dev/null 2>&1; then
+        echo "[3d] WARNING: sinfo unavailable — CPU push provisioning skipped"
+    else
+        GENERATED_CPU_AGENT_SERVICE="$(mktemp)"
+        sed -e "s|@SGPU_AGENT_BIN@|$VENV_DIR/bin/sgpu-agent|g" \
+            -e "s|@SGPU_AGENT_DIR@|$SLURM_GPU_TUI_AGENT_DIR|g" \
+            -e "s|@CPU_AGENT_SEC@|$CPU_AGENT_SEC|g" \
+            "$CPU_AGENT_TEMPLATE" > "$GENERATED_CPU_AGENT_SERVICE"
+        mapfile -t CPU_NODES < <(
+            sinfo -h -N -o '%N|%G' 2>/dev/null \
+                | awk -F'|' '$2 !~ /(^|,)gpu(:|=|$)/ { print $1 }' \
+                | sort -u
+        )
+        if [ "${#CPU_NODES[@]}" -eq 0 ]; then
+            echo "[3d] No CPU-only nodes found — CPU push provisioning skipped"
+        else
+            echo "[3d] Installing CPU push agents on ${#CPU_NODES[@]} detected node(s)..."
+            CPU_PUSH_OK=0
+            CPU_PUSH_FAIL=0
+            LOCAL_HOST="$(hostname -s)"
+            printf -v CPU_AGENT_BIN_Q '%q' "$VENV_DIR/bin/sgpu-agent"
+            printf -v CPU_AGENT_DIR_Q '%q' "$SLURM_GPU_TUI_AGENT_DIR"
+            REMOTE_CPU_INSTALL='set -e
+as_root() {
+    if [ "$(id -u)" = "0" ]; then
+        "$@"
+    else
+        sudo -n "$@"
+    fi
+}
+if [ "$(id -u)" != "0" ] && ! sudo -n true 2>/dev/null; then
+    echo "root or passwordless sudo required"
+    exit 77
+fi
+as_root install -m 0644 /dev/stdin /etc/systemd/system/sgpu-cpu-agent.service
+as_root systemctl daemon-reload
+as_root systemctl enable sgpu-cpu-agent.service >/dev/null
+as_root systemctl restart sgpu-cpu-agent.service
+as_root systemctl is-active --quiet sgpu-cpu-agent.service'
+            for node in "${CPU_NODES[@]}"; do
+                if [ "${node%%.*}" = "$LOCAL_HOST" ]; then
+                    if [ ! -x "$VENV_DIR/bin/sgpu-agent" ] || [ ! -d "$SLURM_GPU_TUI_AGENT_DIR" ]; then
+                        echo "     $node: WARNING: shared agent paths unavailable"
+                        CPU_PUSH_FAIL=$((CPU_PUSH_FAIL + 1))
+                    elif $SUDO install -m 0644 "$GENERATED_CPU_AGENT_SERVICE" \
+                            /etc/systemd/system/sgpu-cpu-agent.service \
+                            && $SUDO systemctl daemon-reload \
+                            && $SUDO systemctl enable sgpu-cpu-agent.service >/dev/null \
+                            && $SUDO systemctl restart sgpu-cpu-agent.service \
+                            && $SUDO systemctl is-active --quiet sgpu-cpu-agent.service; then
+                        echo "     $node: CPU push active (local)"
+                        CPU_PUSH_OK=$((CPU_PUSH_OK + 1))
+                    else
+                        echo "     $node: WARNING: CPU agent service failed"
+                        CPU_PUSH_FAIL=$((CPU_PUSH_FAIL + 1))
+                    fi
+                    continue
+                fi
+                SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=3)
+                if ! probe="$(timeout 8 ssh "${SSH_OPTS[@]}" "$node" \
+                        "test -x $CPU_AGENT_BIN_Q && test -d $CPU_AGENT_DIR_Q" 2>&1)"; then
+                    echo "     $node: WARNING: shared agent paths unavailable: ${probe%%$'\n'*}"
+                    CPU_PUSH_FAIL=$((CPU_PUSH_FAIL + 1))
+                    continue
+                fi
+                if out="$(timeout 30 ssh "${SSH_OPTS[@]}" "$node" \
+                        "$REMOTE_CPU_INSTALL" < "$GENERATED_CPU_AGENT_SERVICE" 2>&1)"; then
+                    echo "     $node: CPU push active"
+                    CPU_PUSH_OK=$((CPU_PUSH_OK + 1))
+                else
+                    echo "     $node: WARNING: ${out%%$'\n'*}"
+                    CPU_PUSH_FAIL=$((CPU_PUSH_FAIL + 1))
+                fi
+            done
+            echo "     CPU push summary: $CPU_PUSH_OK active, $CPU_PUSH_FAIL fallback/skipped"
+        fi
+        rm -f "$GENERATED_CPU_AGENT_SERVICE"
+    fi
+elif [ "${CPU_PUSH_REQUEST,,}" = "auto" ]; then
+    echo "[3d] CPU push provisioning skipped (automatic only for root installs)"
+else
+    echo "[3d] CPU push provisioning disabled (SGPU_ENABLE_CPU_PUSH=$CPU_PUSH_REQUEST)"
+fi
+
 SYSTEMD_MODE="none"
 
 if $HAS_SUDO; then

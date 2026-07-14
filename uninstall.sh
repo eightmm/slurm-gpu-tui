@@ -29,21 +29,25 @@ else
     done
 fi
 
-# ── Stop node agents and remove sgpu's persistence unit (best effort) ──────
+# ── Stop node agents and remove sgpu's node units (best effort) ────────────
 # Do not run `nvidia-smi -pm 0`: persistence may have been enabled by the site
 # before sgpu was installed. Removing our boot unit preserves that policy.
 if command -v sinfo >/dev/null 2>&1; then
-    echo "[uninstall] stopping node agents and removing persistence units..."
+    echo "[uninstall] stopping node agents and removing node units..."
     for n in $(sinfo -N -h -o %N 2>/dev/null | sort -u); do
         timeout 8 ssh -o BatchMode=yes -o ConnectTimeout=3 "$n" \
             'as_root() { if [ "$(id -u)" = "0" ]; then "$@"; else sudo -n "$@"; fi; }
+             if [ -f /etc/systemd/system/sgpu-cpu-agent.service ]; then
+                 as_root systemctl disable --now sgpu-cpu-agent.service >/dev/null 2>&1 || true
+                 as_root rm -f /etc/systemd/system/sgpu-cpu-agent.service
+             fi
              pkill -f "bin/[s]gpu-agent" 2>/dev/null || true
              rm -f /tmp/sgpu-agent.lock /tmp/sgpu-agent.log*
              if [ -f /etc/systemd/system/sgpu-gpu-persistence.service ]; then
                  as_root systemctl disable --now sgpu-gpu-persistence.service >/dev/null 2>&1 || true
                  as_root rm -f /etc/systemd/system/sgpu-gpu-persistence.service
-                 as_root systemctl daemon-reload >/dev/null 2>&1 || true
-             fi' \
+             fi
+             as_root systemctl daemon-reload >/dev/null 2>&1 || true' \
             >/dev/null 2>&1 &
     done
     wait

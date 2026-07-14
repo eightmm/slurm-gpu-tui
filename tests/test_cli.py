@@ -62,9 +62,10 @@ def test_split_node_sources_infers_legacy_gpu_rows():
 def test_tui_source_counts_do_not_call_cpu_poll_gpu_fallback():
     counts = _node_source_counts([
         NodeInfo(name="cpu1", has_gpu=False, source="ssh"),
+        NodeInfo(name="cpu2", has_gpu=False, source="agent"),
         NodeInfo(name="gpu1", has_gpu=True, source="agent"),
         NodeInfo(name="gpu2", has_gpu=True, source="ssh"),
         NodeInfo(name="gpu3", has_gpu=True, source="stale", stale=True),
     ])
 
-    assert counts == (1, 1, 1, 1)
+    assert counts == (1, 1, 1, 1, 1)

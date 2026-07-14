@@ -1,0 +1,21 @@
+[Unit]
+Description=sgpu CPU telemetry push agent
+After=network-online.target remote-fs.target
+Wants=network-online.target
+RequiresMountsFor=@SGPU_AGENT_BIN@ @SGPU_AGENT_DIR@
+ConditionFileIsExecutable=@SGPU_AGENT_BIN@
+ConditionPathIsDirectory=@SGPU_AGENT_DIR@
+
+[Service]
+Type=simple
+Environment="SLURM_GPU_TUI_AGENT_DIR=@SGPU_AGENT_DIR@"
+Environment="SLURM_GPU_TUI_CPU_AGENT_SEC=@CPU_AGENT_SEC@"
+ExecStart=@SGPU_AGENT_BIN@ --mode cpu
+Restart=always
+RestartSec=10
+TimeoutStopSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

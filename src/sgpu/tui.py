@@ -131,13 +131,14 @@ def _parse_daemon_data(raw: dict) -> Tuple[List[NodeInfo], List[JobInfo], List[P
     return nodes, jobs, pending, daemon_errors
 
 
-def _node_source_counts(nodes: List[NodeInfo]) -> Tuple[int, int, int, int]:
+def _node_source_counts(nodes: List[NodeInfo]) -> Tuple[int, int, int, int, int]:
     """GPU push/fallback, CPU telemetry polling, and all stale nodes."""
     agent = sum(1 for n in nodes if n.has_gpu and n.source == "agent")
     gpu_fallback = sum(1 for n in nodes if n.has_gpu and n.source == "ssh")
+    cpu_push = sum(1 for n in nodes if not n.has_gpu and n.source == "agent")
     cpu_poll = sum(1 for n in nodes if not n.has_gpu and n.source == "ssh")
     stale = sum(1 for n in nodes if n.source == "stale" or (n.stale and not n.source))
-    return agent, gpu_fallback, cpu_poll, stale
+    return agent, gpu_fallback, cpu_push, cpu_poll, stale
 
 
 
@@ -1101,16 +1102,19 @@ class SlurmGpuTui(App):
         summary.append("  ")
         # Data-source health. CPU-only SSH is normal telemetry for live RAM;
         # only a GPU node on SSH means the push agent fell back.
-        n_agent, n_gpu_fallback, n_cpu_poll, n_stale = _node_source_counts(nodes)
+        (n_agent, n_gpu_fallback, n_cpu_push,
+         n_cpu_poll, n_stale) = _node_source_counts(nodes)
         n_rogue_total = sum(cl.count("rogue") for cl in node_classes.values())
         if n_rogue_total:
             summary.append(" ROGUE ", style="bold white on red")
             summary.append(f" {n_rogue_total} ", style="bold red")
-        if n_agent or n_gpu_fallback or n_cpu_poll or n_stale:
+        if n_agent or n_gpu_fallback or n_cpu_push or n_cpu_poll or n_stale:
             summary.append(" SRC ", style="bold white on grey37")
             summary.append(f" agent:{n_agent}", style="green" if n_agent else "dim")
             if n_gpu_fallback:
                 summary.append(f" fallback:{n_gpu_fallback}", style="yellow")
+            if n_cpu_push:
+                summary.append(f" cpu-push:{n_cpu_push}", style="green")
             if n_cpu_poll:
                 summary.append(f" cpu-poll:{n_cpu_poll}", style="cyan")
             if n_stale:

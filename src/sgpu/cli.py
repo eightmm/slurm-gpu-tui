@@ -405,8 +405,12 @@ def _cli_doctor() -> int:
     # unreliable here: an interactive `sgpu doctor` doesn't see the collector's
     # SLURM_GPU_TUI_AGENT_DIR (that's baked into the service unit), so it would
     # look in the wrong dir and cry "no push agents" while push is working.
-    cpu_poll = cpu_srcs.get("ssh", 0)
-    cpu_suffix = f"; CPU/RAM poll: {cpu_poll} nodes via SSH" if cpu_poll else ""
+    cpu_details = []
+    if cpu_srcs.get("agent", 0):
+        cpu_details.append(f"CPU push: {cpu_srcs['agent']} nodes")
+    if cpu_srcs.get("ssh", 0):
+        cpu_details.append(f"CPU/RAM fallback: {cpu_srcs['ssh']} nodes via SSH")
+    cpu_suffix = f"; {', '.join(cpu_details)}" if cpu_details else ""
     if gpu_srcs.get("agent", 0) > 0 and gpu_srcs.get("ssh", 0) > 0:
         report(True, "node delivery",
                f"GPU mixed: {gpu_srcs['agent']} push + "

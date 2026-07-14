@@ -3,11 +3,17 @@
 `sgpu doctor` shows which mode is active (`node delivery`). Both are fine —
 push just scales better and keeps SSH out of the hot path.
 
-- **Push mode:** each GPU node runs a small resident `sgpu-agent` that writes
-  its stats to a shared-filesystem directory every few seconds; the collector
-  reads those files locally. No SSH in the hot path.
+- **Push mode:** GPU agents write `nvidia-smi` stats every 3 seconds and
+  CPU-only agents write `/proc/meminfo` every 20 seconds to a shared-filesystem
+  directory; the collector reads those files locally. No SSH in the hot path.
 - **SSH-pull:** the collector SSHes into each node per cycle. Automatic
   fallback when push isn't possible — a valid mode, not an error.
+
+GPU agents are launched and repaired by the collector. A root/shared-FS
+install provisions CPU-only agents as `sgpu-cpu-agent.service` with
+`Restart=always`, so an overloaded node does not need to accept a new SSH
+session to keep publishing RAM telemetry. Either kind falls back to SSH when
+its payload is missing or stale.
 
 ## Push turns on automatically when two conditions hold
 
@@ -54,8 +60,8 @@ sgpu doctor        # node delivery → "push mode (N nodes via agent)"
   runs as root, node-side agents (also root) write as `nobody`. The installer
   pre-creates the agent dir mode 1777 so this works out of the box; if you
   created the dir by hand, `chmod 1777` it (or export `no_root_squash`).
-- CPU-only / GPU-less nodes are never agent targets; SSH-pull-only, and they
-  never raise alerts for it.
+- CPU-only nodes use the systemd push agent after a root/shared-FS install.
+  Set `SGPU_ENABLE_CPU_PUSH=0` to keep them SSH-pull-only.
 
 ## Operational checks
 
@@ -63,12 +69,14 @@ sgpu doctor        # node delivery → "push mode (N nodes via agent)"
 sgpu doctor
 systemctl status sgpu-collector          # system service
 systemctl --user status sgpu-collector   # user service
+ssh <cpu-node> systemctl status sgpu-cpu-agent
 ```
 
 Healthy push mode usually shows:
 
 - fresh collector data
-- `node delivery -> push mode (N nodes via agent)` or a mixed push/SSH state
+- `node delivery -> GPU push mode (...)` with `CPU push: ...`, or a mixed
+  push/SSH fallback state
 - writable `SLURM_GPU_TUI_AGENT_DIR`
 - no stale agent payloads older than `SLURM_GPU_TUI_AGENT_MAX_AGE_SEC`
 
@@ -89,7 +97,8 @@ sudo systemctl stop sgpu-collector
 # 2. kill agents on every node (they hold the shared venv open over NFS)
 for n in $(sinfo -h -N -o %N | sort -u); do
   timeout 8 ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$n" \
-    'pkill -f "bin/[s]gpu-agent"' 2>/dev/null
+    'sudo systemctl stop sgpu-cpu-agent 2>/dev/null || true;
+     pkill -f "bin/[s]gpu-agent"' 2>/dev/null
 done
 sleep 2
 

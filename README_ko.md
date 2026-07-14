@@ -40,24 +40,26 @@ SLURM GPU 실시간 모니터링: 터미널 TUI, collector 데몬, compute node 
 
 ## 동작 방식
 
-`sgpu`는 `sinfo`/`squeue`(선택적으로 `sacct`)가 있고 GPU 노드로 passwordless
+`sgpu`는 `sinfo`/`squeue`(선택적으로 `sacct`)가 있고 컴퓨트 노드로 passwordless
 SSH가 되는 SLURM 로그인/마스터 노드에서 운영합니다.
 
 ```
-[sgpu-agent @ each node]  ──3s──→  <AGENT_DIR>/<node>.json   (shared FS push)
+[sgpu-agent @ each node] ──3/20s─→ <AGENT_DIR>/<node>.json   (shared FS push)
                                           │
 [sgpu-collector @ master] ──merge──→  /tmp/slurm-gpu-tui/data.json
                                           ↑
 [sgpu TUI]                ──reads──┘   (instant, no SSH on launch)
 ```
 
-- **Push 모드 (권장):** 각 GPU 노드의 상주 `sgpu-agent`가 통계를 공유 FS
-  디렉토리에 기록하고, collector는 로컬로 읽음 — 핫패스에 SSH 없음. collector가
-  에이전트를 자동 배포·수리(노드별 rate-limit)하므로 노드별 설치 불필요.
+- **Push 모드 (권장):** GPU agent는 3초마다 `nvidia-smi` 데이터를, CPU-only
+  agent는 20초마다 가벼운 `/proc/meminfo` 데이터를 공유 FS에 기록한다.
+  collector는 둘 다 로컬로 읽으므로 핫패스에 SSH가 없다. GPU agent는 collector가
+  수리하고, root 설치가 CPU agent를 `Restart=always` systemd 서비스로 배치해
+  노드가 과부하되어 SSH가 어려워도 자체 복구한다.
 - **SSH-pull 폴백:** 살아있는 에이전트가 없는 노드는 SSH로 수집(ControlMaster
   풀, 비동기). 두 모드는 자유롭게 혼용.
-- CPU-only 노드는 실시간 RAM 정보를 위해 저빈도 SSH polling을 사용한다. 이는
-  `cpu-poll`로 따로 표시하며 GPU push 실패가 아니다.
+- CPU payload가 없거나 stale이면 실시간 RAM 정보를 저빈도 SSH polling으로
+  수집하며 `cpu-poll`로 따로 표시한다.
 - TUI는 병합 JSON을 읽으므로 클러스터 규모와 무관하게 즉시 시작. collector가
   없으면 직접 SSH 수집으로 폴백(첫 로딩 느림).
 - collector는 `/tmp/slurm-gpu-tui/metrics.prom`(Prometheus textfile)도 기록 —
@@ -87,6 +89,10 @@ GPU를 확인한 뒤, 접근 가능한 각 노드에 `sgpu-gpu-persistence.servi
 활성화해 유휴 노드의 드라이버 초기화 지연을 줄인다. 노드별 설정 실패는
 경고만 내고 마스터 설치를 중단하지 않는다. 이 원격 시스템 변경을 생략하려면
 `SGPU_ENABLE_PERSISTENCE=0`을 지정한다.
+
+설치 경로와 agent-data 경로가 컴퓨트 노드에서도 보이면 같은 root 설치가
+CPU-only 노드에 `sgpu-cpu-agent.service`도 배치한다. CPU telemetry를 SSH로만
+유지하려면 `SGPU_ENABLE_CPU_PUSH=0`을 지정한다.
 
 ### 설치 위치 (`SGPU_INSTALL_DIR`)
 
@@ -268,6 +274,7 @@ rm -rf "$SLURM_GPU_TUI_AGENT_DIR"   # 기본 ~/.sgpu/nodes
 | `SLURM_GPU_TUI_AGENT_MAX_AGE_SEC` | `45` | 에이전트 데이터 신선도 한계 |
 | `SLURM_GPU_TUI_AGENT_MAX_BYTES` | `1048576` | 허용할 에이전트 payload 최대 크기 |
 | `SLURM_GPU_TUI_AGENT_REPAIR_SEC` | `180` | 노드당 에이전트 수리 최소 간격 |
+| `SLURM_GPU_TUI_CPU_AGENT_SEC` | `20` | CPU-only push agent 수집 주기 |
 | `SLURM_GPU_TUI_AGENT_DISABLE` | (없음) | push 에이전트 완전 비활성화 |
 | `SLURM_GPU_TUI_WASTE_MIN_SEC` | `600` | 낭비 뷰 / `--waste` 임계값 |
 | `SLURM_GPU_TUI_AUTO_COLLAPSE_NODES` | `12` | GPU 노드가 이 수 이상이면 접힌 상태로 시작 |
@@ -281,7 +288,9 @@ rm -rf "$SLURM_GPU_TUI_AGENT_DIR"   # 기본 ~/.sgpu/nodes
 | `SLURM_GPU_TUI_SHARE_SCRIPTS` | (없음) | 전체 잡 batch script를 모든 유저에게 Enter 팝업에 공개. **스크립트 내용(비밀키 포함)이 전원 공개** — 설치 시 질문(`SGPU_SHARE_SCRIPTS=0/1`이면 생략) |
 
 설치 시에만: `SGPU_INSTALL_DIR` (repo + venv 위치),
-`SGPU_ENABLE_PERSISTENCE` (`auto`; root 설치면 GPU 노드에 적용, `0`이면 생략).
+`SGPU_ENABLE_PERSISTENCE` (`auto`; root 설치면 GPU 노드에 적용, `0`이면 생략),
+`SGPU_ENABLE_CPU_PUSH` (`auto`; root/shared-FS 설치면 CPU-only 노드에 적용,
+`0`이면 생략).
 
 ---
 

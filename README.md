@@ -41,24 +41,25 @@ for compute nodes, usage/waste accounting, and Slack alerts.
 ## How It Works
 
 `sgpu` runs on a SLURM login/master node with `sinfo`/`squeue` (and optionally
-`sacct`) and passwordless SSH to GPU nodes.
+`sacct`) and passwordless SSH to compute nodes.
 
 ```
-[sgpu-agent @ each node]  ──3s──→  <AGENT_DIR>/<node>.json   (shared FS push)
+[sgpu-agent @ each node] ──3/20s─→ <AGENT_DIR>/<node>.json   (shared FS push)
                                           │
 [sgpu-collector @ master] ──merge──→  /tmp/slurm-gpu-tui/data.json
                                           ↑
 [sgpu TUI]                ──reads──┘   (instant, no SSH on launch)
 ```
 
-- **Push mode (preferred):** each GPU node runs a tiny resident `sgpu-agent`
-  that writes stats to a shared-FS directory; the collector reads them locally
-  — no SSH in the hot path. The collector deploys and repairs agents itself
-  (rate-limited per node); no per-node install.
+- **Push mode (preferred):** GPU agents write `nvidia-smi` data every 3s; CPU-only
+  agents write lightweight `/proc/meminfo` data every 20s. The collector reads
+  both from a shared-FS directory, so SSH is not in the hot path. GPU agents are
+  collector-repaired; root installs provision CPU agents as `Restart=always`
+  systemd services so they survive node overload without needing SSH repair.
 - **SSH-pull fallback:** nodes without a live agent are polled over SSH
   (ControlMaster-pooled, async). The two modes mix freely.
-- CPU-only nodes use low-frequency SSH polling for live RAM telemetry; this is
-  shown separately as `cpu-poll` and is not a GPU push fallback.
+- A missing or stale CPU payload falls back to low-frequency SSH polling for
+  live RAM telemetry, shown separately as `cpu-poll`.
 - The TUI reads the merged JSON, so startup is instant at any cluster size.
   Without a collector it falls back to direct SSH (slower first load).
 - The collector also writes `/tmp/slurm-gpu-tui/metrics.prom` (Prometheus
@@ -90,6 +91,10 @@ reachable node. The oneshot enables NVIDIA persistence mode now and after
 reboots, reducing idle-node driver initialization latency. Node provisioning
 failures are warnings and do not abort the master install. Set
 `SGPU_ENABLE_PERSISTENCE=0` to skip this remote system change.
+
+When the install and agent-data directories are visible on the compute nodes,
+the same root install also provisions `sgpu-cpu-agent.service` on CPU-only
+nodes. Set `SGPU_ENABLE_CPU_PUSH=0` to keep CPU telemetry on SSH polling.
 
 ### Install location (`SGPU_INSTALL_DIR`)
 
@@ -272,6 +277,7 @@ Reinstall cleanly by re-running the one-line install.
 | `SLURM_GPU_TUI_DATA_DIR` | `/tmp/slurm-gpu-tui` | Daemon JSON output dir |
 | `SLURM_GPU_TUI_STATE_DIR` | `~/.sgpu/state` | Persistent state (usage, waste ages, inventory) |
 | `SLURM_GPU_TUI_AGENT_DIR` | `~/.sgpu/nodes` | Push-agent payload dir (shared FS for push mode) |
+| `SLURM_GPU_TUI_CPU_AGENT_SEC` | `20` | CPU-only push-agent interval |
 | `SLURM_GPU_TUI_AGENT_SEC` | `3` | Agent collect interval on nodes |
 | `SLURM_GPU_TUI_AGENT_MAX_AGE_SEC` | `45` | Agent payload freshness limit |
 | `SLURM_GPU_TUI_AGENT_MAX_BYTES` | `1048576` | Maximum accepted agent payload size |
@@ -290,7 +296,8 @@ Reinstall cleanly by re-running the one-line install.
 
 Install-time only: `SGPU_INSTALL_DIR` (repo + venv location) and
 `SGPU_ENABLE_PERSISTENCE` (`auto`; root installs provision GPU nodes, `0`
-disables).
+disables), `SGPU_ENABLE_CPU_PUSH` (`auto`; root/shared-FS installs provision
+CPU-only nodes, `0` disables).
 
 ---
 

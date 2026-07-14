@@ -507,12 +507,15 @@ def _expected_agent_build() -> str:
     return _agent_build_cache[1]
 
 
-_agent_payload_cache: Dict[str, tuple] = {}  # name -> (mtime, parsed payload or None)
+_agent_payload_cache: Dict[str, tuple] = {}  # name -> (mtime, expected kind, payload or None)
 
 
-def _valid_agent_payload(name: str, payload: object) -> bool:
+def _valid_agent_payload(name: str, payload: object, expected_kind: str | None = None) -> bool:
     """Validate the push payload shape before it reaches the merge loop."""
     if not isinstance(payload, dict) or payload.get("hostname") != name:
+        return False
+    kind = payload.get("node_kind")
+    if kind not in ("gpu", "cpu") or (expected_kind and kind != expected_kind):
         return False
     if not isinstance(payload.get("agent_build"), str):
         return False
@@ -522,7 +525,9 @@ def _valid_agent_payload(name: str, payload: object) -> bool:
     if not isinstance(mem, dict) or not all(k in mem for k in ("total", "used", "avail")):
         return False
     gpus = payload.get("gpus")
-    if not isinstance(gpus, list) or not 0 < len(gpus) <= 64:
+    if not isinstance(gpus, list) or len(gpus) > 64:
+        return False
+    if (kind == "gpu" and not gpus) or (kind == "cpu" and gpus):
         return False
     seen = set()
     for gpu in gpus:
@@ -539,9 +544,9 @@ def _valid_agent_payload(name: str, payload: object) -> bool:
     return True
 
 
-def _read_agent_payload(name: str) -> dict | None:
+def _read_agent_payload(name: str, expected_kind: str = "gpu") -> dict | None:
     """Return a node's push-agent payload if fresh and version-compatible.
-    Parsed payloads are cached by mtime — agents rewrite every AGENT_SEC,
+    Parsed payloads are cached by mtime — agents rewrite at their configured interval,
     so most 3s cycles can skip the read+parse."""
     p = AGENT_DIR / f"{name}.json"
     try:
@@ -555,16 +560,16 @@ def _read_agent_payload(name: str) -> dict | None:
         if time.time() - mtime > AGENT_MAX_AGE:
             return None
         cached = _agent_payload_cache.get(name)
-        if cached is not None and cached[0] == mtime:
-            return cached[1]
+        if cached is not None and cached[0] == mtime and cached[1] == expected_kind:
+            return cached[2]
         payload = json.loads(p.read_text())
-        if not _valid_agent_payload(name, payload):
+        if not _valid_agent_payload(name, payload, expected_kind):
             payload = None
         elif payload.get("agent_version") != AGENT_PAYLOAD_VERSION:
             payload = None  # old agent — treated as stale, repair will upgrade it
         elif not AGENT_DISABLE and payload.get("agent_build") != _expected_agent_build():
             payload = None  # agent runs outdated code — repair restarts it
-        _agent_payload_cache[name] = (mtime, payload)
+        _agent_payload_cache[name] = (mtime, expected_kind, payload)
         return payload
     except Exception:
         return None
@@ -680,19 +685,15 @@ def collect_all() -> dict:
     jobid_user = {j.jobid: j.user for j in jobs}
     jobid_user.update({k: v for k, v in alloc_user_map.items() if v})
 
-    # Prefer push-agent payloads (local NFS read, every cycle). Nodes without
-    # a live agent fall back to async SSH polls + agent repair.
+    # Prefer push-agent payloads (local NFS read, every cycle). GPU agents are
+    # collector-repaired; CPU agents are systemd-managed on their node. Either
+    # kind falls back to async SSH when its payload is absent or stale.
     agent_nodes: set = set()
     for n in nodes_raw:
         name = n["name"]
         has_jobs = name in node_jobs_from_basic
-        if not n.get("has_gpu", True):
-            # CPU-only nodes still need memory/CPU data, but never need the
-            # resident nvidia-smi agent or its repair traffic.
-            if _should_poll_node(name):
-                _poll_node_bg(n, has_jobs=has_jobs)
-            continue
-        payload = _read_agent_payload(name)
+        has_gpu = n.get("has_gpu", True)
+        payload = _read_agent_payload(name, "gpu" if has_gpu else "cpu")
         if payload is not None:
             agent_nodes.add(name)
             gpu_dicts = payload.get("gpus", [])
@@ -701,9 +702,9 @@ def collect_all() -> dict:
                     "gpus": gpu_dicts, "mem": payload.get("mem", {}),
                     "error": "", "error_kind": NodeErrorKind.OK.value, "stale": False,
                 }
-                node_is_cold = (
-                    all(g.get("util") in ("0", "", "N/A") for g in gpu_dicts)
-                    and not has_jobs
+                node_is_cold = not has_jobs and (
+                    not has_gpu
+                    or all(g.get("util") in ("0", "", "N/A") for g in gpu_dicts)
                 )
                 # Mark polled so the SSH path stays quiet while the agent lives
                 _update_poll_state(name, success=True, node_is_cold=node_is_cold, slurm_state=n["state"])
@@ -711,7 +712,8 @@ def collect_all() -> dict:
             continue
         if _should_poll_node(name):
             _poll_node_bg(n, has_jobs=has_jobs)
-        _maybe_repair_agent(name)
+        if has_gpu:
+            _maybe_repair_agent(name)
 
     with _results_lock:
         results = {name: dict(r) for name, r in _node_results.items()}
