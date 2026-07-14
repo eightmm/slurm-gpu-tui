@@ -19,6 +19,11 @@ Config: ~/.sgpu/webhook.json (or SLURM_GPU_TUI_WEBHOOK_URL for URL only)
   "temp_alert_c": 0,              # GPU temperature >= N°C (0 = off; ~90 typical)
   "ecc_alert": true,             # uncorrectable ECC errors (silent HW failure)
   "job_done_users": ["alice"],    # notify when these users' jobs finish
+  "job_fail_users": ["*"],        # FAILED/OOM/TIMEOUT alerts; ["*"] = everyone
+  "pending_alert_hours": 0,       # job stuck PENDING >= N hours (0 = off;
+                                  #   user holds/dependencies never alert)
+  "dm_users": {"alice": "U012AB"},# per-user Slack DMs (member id) for alerts
+                                  #   about their own jobs (bot mode only)
   "free_gpus_min": 0              # alert when free-GPU count reaches N (0 = off)
 }
 
@@ -40,7 +45,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from .common import ROGUE_IGNORE
+from .common import ROGUE_IGNORE, run_cmd
 
 DEBOUNCE_SEC = int(os.getenv("SLURM_GPU_TUI_WEBHOOK_DEBOUNCE_SEC", "1800"))
 # waste/rogue conditions persist for hours — re-nag much less often
@@ -64,6 +69,8 @@ MSG = {
         "ecc": ":warning: *{loc} uncorrectable ECC errors: {n}* — GPU may be failing\n{hw}",
         "collect_lost": ":electric_plug: *{name}: sgpu can't collect GPU data* — agent/SSH down, node still {state} in SLURM",
         "collect_ok": ":arrows_counterclockwise: *{name}: sgpu collection restored* after {dur}",
+        "job_fail": ":x: *job {jid} ({name}) by {user} {state}* after {elapsed}",
+        "pend_stuck": ":hourglass_flowing_sand: *job {jid} ({name}) by {user} pending {dur}* — {reason}",
         "idle": "idle", "parked": "parked",
     },
     "ko": {
@@ -79,9 +86,16 @@ MSG = {
         "ecc": ":warning: *{loc} uncorrectable ECC 에러 {n}건* — GPU 이상 가능\n{hw}",
         "collect_lost": ":electric_plug: *{name}: sgpu GPU 데이터 수집 불가* — 에이전트/SSH 끊김, SLURM상 {state}",
         "collect_ok": ":arrows_counterclockwise: *{name}: sgpu 수집 복구* — {dur} 만에",
+        "job_fail": ":x: *작업 {jid} ({name}, {user}) {state}* — {elapsed} 경과",
+        "pend_stuck": ":hourglass_flowing_sand: *작업 {jid} ({name}, {user}) {dur}째 대기* — {reason}",
         "idle": "유휴", "parked": "점유",
     },
 }
+
+# job outcomes worth a failure alert (sacct State prefixes)
+_FAIL_STATES = ("FAILED", "OUT_OF_MEMORY", "TIMEOUT", "NODE_FAIL")
+# pending reasons that are the user's own doing — waiting is expected
+_PEND_QUIET = ("held", "dependency", "begintime", "jobarraytasklimit")
 
 
 def _gpu_is_free(g: dict) -> bool:
@@ -146,6 +160,7 @@ class Notifier:
             pass
         self._down: Dict[str, float] = st.get("down", {})
         self._jobs: Dict[str, dict] = st.get("jobs", {})
+        self._pend_seen: Dict[str, float] = st.get("pend_seen", {})
         self._last_sent: Dict[str, float] = st.get("last_sent", {})
         self._free_was_below = bool(st.get("free_was_below", True))
         # daily thread parent (bot mode): reuse across restarts within a day
@@ -155,7 +170,7 @@ class Notifier:
         self._state_lock = threading.Lock()
         # single consumer thread: preserves alert order (down before recovered)
         # and stops a hung webhook from stacking one thread per alert
-        self._queue: "queue.Queue[tuple[str, str, float]]" = queue.Queue(maxsize=200)
+        self._queue: "queue.Queue[tuple[str, str, float, str]]" = queue.Queue(maxsize=200)
         self._consumer: Optional[threading.Thread] = None
         self._parent_fail_ts = 0.0
         self._save_failed = False
@@ -182,6 +197,12 @@ class Notifier:
         self.collect_alert: bool = bool(cfg.get("collect_alert", True))
         self.collect_grace_sec: float = float(cfg.get("collect_grace_sec", 600))
         self.job_done_users: List[str] = list(cfg.get("job_done_users", []))
+        # job failure alerts: list of users, or ["*"] for everyone
+        self.job_fail_users: List[str] = list(cfg.get("job_fail_users", []))
+        # job stuck in the queue (scheduler wait, not user holds) >= N hours
+        self.pending_alert_hours: float = float(cfg.get("pending_alert_hours", 0))
+        # personal Slack DMs: {"login": "U0123ABC"} member ids (bot mode only)
+        self.dm_users: Dict[str, str] = dict(cfg.get("dm_users", {}))
         self.free_gpus_min: int = int(cfg.get("free_gpus_min", 0))
         self.waste_alert_hours: float = float(cfg.get("waste_alert_hours", 0))
         self.rogue_alert: bool = bool(cfg.get("rogue_alert", False))
@@ -295,15 +316,54 @@ class Notifier:
         # A failed squeue/controller query yields an empty jobs list — diffing
         # against it would fire a false "finished" for every tracked job (and
         # wipe _jobs so it can't recover). Only diff when the snapshot is clean.
-        if self.job_done_users and not data.get("errors"):
+        fail_all = "*" in self.job_fail_users
+        if (self.job_done_users or self.job_fail_users) and not data.get("errors"):
+            def _watched(u: str) -> bool:
+                return fail_all or u in self.job_done_users or u in self.job_fail_users
             current = {j["jobid"]: j for j in data.get("jobs", [])
-                       if j.get("user") in self.job_done_users}
+                       if _watched(j.get("user", ""))}
             for jid, j in self._jobs.items():
-                if jid not in current:
-                    self._post(self._m("job_done", jid=jid, name=j.get("jobname", "?"),
-                                       user=j.get("user", "?"), elapsed=j.get("elapsed", "?")))
+                if jid in current:
+                    continue
+                user = j.get("user", "?")
+                state = ""
+                if fail_all or user in self.job_fail_users:
+                    state = self._job_final_state(jid)
+                if state.startswith(_FAIL_STATES):
+                    text = self._m("job_fail", jid=jid, name=j.get("jobname", "?"),
+                                   user=user, state=state,
+                                   elapsed=j.get("elapsed", "?"))
+                    self._post(text)
+                    self._post_dm(user, text)
+                elif user in self.job_done_users:
+                    text = self._m("job_done", jid=jid, name=j.get("jobname", "?"),
+                                   user=user, elapsed=j.get("elapsed", "?"))
+                    self._post(text)
+                    self._post_dm(user, text)
             self._jobs = {jid: {"jobname": j.get("jobname", ""), "user": j.get("user", ""),
                                 "elapsed": j.get("elapsed", "")} for jid, j in current.items()}
+
+        # A job stuck PENDING on the scheduler (not a user hold/dependency)
+        # for hours usually means an impossible request or a starved queue.
+        if self.pending_alert_hours > 0 and not data.get("errors"):
+            pend_now: Dict[str, float] = {}
+            for p in data.get("pending", []):
+                jid = p.get("jobid", "")
+                if not jid:
+                    continue
+                if any(r in (p.get("reason") or "").lower() for r in _PEND_QUIET):
+                    continue
+                first = self._pend_seen.get(jid, now)
+                pend_now[jid] = first
+                if now - first >= self.pending_alert_hours * 3600 \
+                        and self._ok_to_send(f"pend:{jid}", now, NAG_REALERT_SEC):
+                    text = self._m("pend_stuck", jid=jid, name=p.get("jobname", "?"),
+                                   user=p.get("user", "?"),
+                                   dur=_fmt_dur(now - first, self.lang),
+                                   reason=p.get("reason", "?"))
+                    self._post(text, key=f"pend:{jid}")
+                    self._post_dm(p.get("user", ""), text)
+            self._pend_seen = pend_now
 
         if self.waste_alert_hours > 0 or self.rogue_alert:
             # Rogue needs trustworthy allocation data: a failed controller
@@ -376,6 +436,20 @@ class Notifier:
 
         self._save()
 
+    def _job_final_state(self, jid: str) -> str:
+        """Outcome of a finished job from slurmdbd ('' when sacct is absent)."""
+        ok, out = run_cmd(f"sacct -j {jid} -X -n -o State --parsable2", timeout=10)
+        if not ok or not out.strip():
+            return ""
+        return out.strip().splitlines()[0].split()[0]  # "CANCELLED by 1234" -> CANCELLED
+
+    def _post_dm(self, user: str, text: str) -> None:
+        """Also deliver an alert as a Slack DM to the user it concerns.
+        Needs bot mode and a dm_users mapping; silently skipped otherwise."""
+        member_id = self.dm_users.get(user, "")
+        if member_id and self._bot_mode:
+            self._post(text, channel=member_id)
+
     def _ok_to_send(self, key: str, now: float, min_gap: float = DEBOUNCE_SEC) -> bool:
         """Debounce check. Marks the slot immediately so the next collect
         cycle doesn't enqueue a duplicate, but the consumer rolls the mark
@@ -385,7 +459,7 @@ class Notifier:
         self._last_sent[key] = now
         return True
 
-    def _post(self, text: str, key: str = "") -> None:
+    def _post(self, text: str, key: str = "", channel: str = "") -> None:
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         body = f"{text}\n_{self._origin} · {stamp}_"
         if self._consumer is None or not self._consumer.is_alive():
@@ -393,14 +467,14 @@ class Notifier:
                                               name="webhook")
             self._consumer.start()
         try:
-            self._queue.put_nowait((body, key, time.time()))
+            self._queue.put_nowait((body, key, time.time(), channel))
         except queue.Full:
             print("[notify] alert queue full, dropping alert", flush=True)
 
     def _drain(self) -> None:
         while True:
-            body, key, enq_ts = self._queue.get()
-            ok = self._deliver(body)
+            body, key, enq_ts, channel = self._queue.get()
+            ok = self._deliver(body, channel)
             if not ok and key:
                 # free the debounce slot so the condition re-alerts next cycle
                 with self._state_lock:
@@ -409,9 +483,9 @@ class Notifier:
                 self._save()
             self._queue.task_done()
 
-    def _deliver(self, body: str) -> bool:
+    def _deliver(self, body: str, channel: str = "") -> bool:
         if self._bot_mode:
-            return self._post_bot(body)
+            return self._post_bot(body, channel)
         payload = {
             "text": body,
             # honored by legacy incoming webhooks, ignored by
@@ -422,8 +496,12 @@ class Notifier:
         return self._http_post(self.url, payload,
                                {"Content-Type": "application/json"}) is not None
 
-    def _post_bot(self, body: str) -> bool:
-        """chat.postMessage as a reply under today's parent message."""
+    def _post_bot(self, body: str, channel: str = "") -> bool:
+        """chat.postMessage as a reply under today's parent message.
+        A channel override (e.g. a DM member id) posts standalone instead."""
+        if channel:
+            return self._slack_api("chat.postMessage",
+                                   {"channel": channel, "text": body}) is not None
         thread_ts = self._ensure_daily_parent()
         payload = {"channel": self.channel, "text": body}
         if thread_ts:
@@ -503,6 +581,7 @@ class Notifier:
                 del self._last_sent[k]
             payload = json.dumps({
                 "down": self._down, "blind": self._blind, "jobs": self._jobs,
+                "pend_seen": self._pend_seen,
                 "last_sent": self._last_sent,
                 "free_was_below": self._free_was_below,
                 "thread_day": self._thread_day, "thread_ts": self._thread_ts,

@@ -135,6 +135,72 @@ def test_save_prunes_expired_debounce_keys(tmp_path):
     assert "fresh" in n._last_sent
 
 
+# ── job-fail ──────────────────────────────────────────────────────────────
+
+def test_job_fail_alerts_on_bad_outcome(tmp_path):
+    n, sent = _mk(tmp_path, job_fail_users=["*"])
+    n._job_final_state = lambda jid: "OUT_OF_MEMORY"
+    n.process({"nodes": [], "jobs": [_job()], "errors": ""})
+    n.process({"nodes": [], "jobs": [], "errors": ""})
+    assert len(sent) == 1 and "OUT_OF_MEMORY" in sent[0]
+
+
+def test_job_fail_quiet_on_clean_finish(tmp_path):
+    # COMPLETED job of a non-job_done user: no alert at all
+    n, sent = _mk(tmp_path, job_fail_users=["*"])
+    n._job_final_state = lambda jid: "COMPLETED"
+    n.process({"nodes": [], "jobs": [_job()], "errors": ""})
+    n.process({"nodes": [], "jobs": [], "errors": ""})
+    assert sent == []
+
+
+# ── pending-stuck ─────────────────────────────────────────────────────────
+
+def _pend(jid="9", reason="Resources"):
+    return {"jobid": jid, "user": "alice", "jobname": "big", "reason": reason}
+
+
+def test_pending_stuck_alerts_after_threshold(tmp_path):
+    n, sent = _mk(tmp_path, pending_alert_hours=1)
+    snap = {"nodes": [], "jobs": [], "pending": [_pend()], "errors": ""}
+    n.process(snap)
+    assert sent == []  # just seen
+    n._pend_seen["9"] -= 3601
+    n.process(snap)
+    assert len(sent) == 1 and "pending" in sent[0]
+
+
+def test_pending_stuck_ignores_user_holds(tmp_path):
+    n, sent = _mk(tmp_path, pending_alert_hours=1)
+    snap = {"nodes": [], "jobs": [],
+            "pending": [_pend(reason="Dependency")], "errors": ""}
+    n.process(snap)
+    assert n._pend_seen == {}  # never tracked, never alerts
+
+
+# ── slack DM ──────────────────────────────────────────────────────────────
+
+def test_job_done_also_dms_the_user(tmp_path):
+    n, _ = _mk(tmp_path, job_done_users=["alice"],
+               bot_token="xoxb-x", channel="#gpu",
+               dm_users={"alice": "U012AB"})
+    calls = []
+    n._post = lambda text, key="", channel="": calls.append((text, channel))
+    n.process({"nodes": [], "jobs": [_job()], "errors": ""})
+    n.process({"nodes": [], "jobs": [], "errors": ""})
+    channels = [c for _, c in calls]
+    assert "" in channels and "U012AB" in channels  # channel post + DM
+
+
+def test_dm_skipped_without_bot_mode(tmp_path):
+    n, _ = _mk(tmp_path, job_done_users=["alice"], dm_users={"alice": "U012AB"})
+    calls = []
+    n._post = lambda text, key="", channel="": calls.append(channel)
+    n.process({"nodes": [], "jobs": [_job()], "errors": ""})
+    n.process({"nodes": [], "jobs": [], "errors": ""})
+    assert calls == [""]  # webhook mode: no DM attempted
+
+
 # ── misc ──────────────────────────────────────────────────────────────────
 
 def test_fmt_dur():

@@ -58,6 +58,9 @@ home directory.
 | `temp_alert_c` | `0` | GPU temperature ≥ N °C (`0` = off; ~90 typical) |
 | `ecc_alert` | `true` | Uncorrectable ECC errors — silent hardware failure; alert carries UUID / PCI bus / serial for RMA |
 | `job_done_users` | `[]` | Notify when these users' jobs finish |
+| `job_fail_users` | `[]` | FAILED / OOM / TIMEOUT / NODE_FAIL alerts for these users; `["*"]` = everyone (needs sacct) |
+| `pending_alert_hours` | `0` | Job stuck `PENDING` on the scheduler ≥ N hours (`0` = off; user holds / dependencies never alert) |
+| `dm_users` | `{}` | `{"login": "U012AB..."}` Slack member ids — alerts about a user's own jobs are also DMed to them (bot mode only) |
 | `free_gpus_min` | `0` | Notify when free-GPU count reaches N (`0` = off) |
 
 Repeated conditions are debounced (30 min for events, 6 h for standing
@@ -85,6 +88,15 @@ CPU/GPU-less nodes, and those collection failures never raise a false "down".
   `free_gpus_min`.
 - **Job done:** tracks currently visible jobs for `job_done_users`; when a job
   disappears from the running queue, a completion alert is sent.
+- **Job failed:** when a tracked job (for `job_fail_users`) leaves the queue,
+  slurmdbd is asked for its outcome; `FAILED`, `OUT_OF_MEMORY`, `TIMEOUT` and
+  `NODE_FAIL` raise an alert. Clean finishes stay silent unless the user is
+  also in `job_done_users`.
+- **Pending stuck:** a job waiting on the *scheduler* (`Resources`,
+  `Priority`, …) for `pending_alert_hours`. Holds, dependencies and
+  begin-times are the user's own doing and never alert.
+- **Personal DMs:** with `dm_users` set (bot mode), job done/failed and
+  pending-stuck alerts about a user's jobs are also sent to them directly.
 
 ## Minimal bot config
 

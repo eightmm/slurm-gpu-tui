@@ -91,8 +91,8 @@ def _snapshot_nodes() -> List[NodeInfo]:
                 ("index", ""), ("minor", ""), ("uuid", ""), ("pci_bus", ""), ("serial", ""),
                 ("name", ""), ("util", ""), ("mem_used", ""),
                 ("mem_total", ""), ("temp", ""), ("power", ""), ("power_cap", ""), ("ecc", ""),
-                ("pids", []), ("users", []), ("alloc_jobid", ""),
-                ("alloc_user", ""), ("idle_sec", 0), ("parked_sec", 0),
+                ("pids", []), ("users", []), ("pid_mem", {}), ("pid_jobid", {}),
+                ("alloc_jobid", ""), ("alloc_user", ""), ("idle_sec", 0), ("parked_sec", 0),
             )})
             for g in n.get("gpus", [])
         ]
@@ -124,6 +124,80 @@ def _cli_waste(verbose: bool = False) -> int:
                 for m in re.finditer(r"(JobName|Command|WorkDir)=(\S+)", out):
                     print(f"    {m.group(1)}: {m.group(2)}")
     return 1  # non-zero so cron/scripts can alert on it
+
+
+def _cli_fit(want: int, vram_gb: float = 0, partition: str = "") -> int:
+    """Where can a job run right now: nodes with >= N free GPUs (optionally
+    with >= vram_gb per GPU), plus a ready-to-paste sbatch line."""
+    nodes = _snapshot_nodes()
+    hits: List[Tuple[str, str, int, List[GpuInfo]]] = []
+    for n in nodes:
+        parts = [p for p in (n.partition or "").split(",") if p]
+        if partition and partition not in parts:
+            continue
+        if any(s in n.state.lower() for s in ("down", "drain", "fail")):
+            continue
+        free = [g for g in n.gpus if classify_gpu(g) == "free"]
+        if vram_gb > 0:
+            free = [g for g in free
+                    if g.mem_total.isdigit() and float(g.mem_total) / 1024 >= vram_gb]
+        if len(free) >= want:
+            hits.append((n.name, parts[0] if parts else "", len(free), free))
+    if not hits:
+        where = f" in partition {partition}" if partition else ""
+        vr = f" with ≥{vram_gb:.0f}G VRAM" if vram_gb else ""
+        print(f"no node has {want} free GPU(s){vr}{where} right now")
+        print("tip: sgpu --wait-free N blocks until enough GPUs free up")
+        return 1
+    hits.sort(key=lambda h: h[2])  # tightest fit first: leave big nodes free
+    print(f"{'node':<10}{'partition':<14}{'free':>5}  models (VRAM)")
+    for name, part, nfree, free in hits:
+        models: Dict[str, int] = {}
+        for g in free:
+            vr = f"{float(g.mem_total) / 1024:.0f}G" if g.mem_total.isdigit() else "?"
+            key = f"{g.name} ({vr})"
+            models[key] = models.get(key, 0) + 1
+        desc = ", ".join(f"{c}x {m}" for m, c in models.items())
+        print(f"{name:<10}{part:<14}{nfree:>5}  {desc}")
+    name, part, _, _ = hits[0]
+    part_arg = f" -p {part}" if part else ""
+    print(f"\nsbatch{part_arg} --gres=gpu:{want} -w {name} your_job.sh")
+    return 0
+
+
+def _cli_me() -> int:
+    """Personal dashboard: my jobs, my waste, my week."""
+    me = os.environ.get("USER") or ""
+    data = _oneshot_snapshot()
+    running = [j for j in data.get("jobs", []) if j.get("user") == me]
+    pending = [p for p in data.get("pending", []) if p.get("user") == me]
+    print(f"{me} — {len(running)} running, {len(pending)} pending")
+    for j in running:
+        print(f"  {j['jobid']}  {j.get('jobname', '')[:24]:<24} {j.get('node', ''):<8}"
+              f" x{j.get('gpu_count', 0)}  {j.get('elapsed', '')}"
+              f" / {j.get('time_limit', '')}")
+    for p in pending:
+        start = fmt_start_time(p.get("start_time", ""))
+        print(f"  {p['jobid']}  {p.get('jobname', '')[:24]:<24} PENDING "
+              f"({p.get('reason', '')})" + (f"  est.start {start}" if start else ""))
+    # my waste: GPUs I hold that do nothing (idle) or merely park VRAM
+    mine_waste = [r for r in collect_waste(_snapshot_nodes(), WASTE_MIN_SEC)
+                  if r["user"] == me or me in r["user"].split(",")]
+    if mine_waste:
+        print("\nwasting:")
+        for r in mine_waste:
+            span = fmt_span(r["sec"]) or "<1m"
+            print(f"  {r['node']}/GPU{r['gpu']}  {r['kind']} {span}"
+                  + (f"  job {r['jobid']}" if r["jobid"] else ""))
+    loaded = load_usage_totals(7)
+    if loaded:
+        for user, alloc, busy, sampled_alloc, waste in loaded[0]:
+            if user == me:
+                eff = busy / sampled_alloc if sampled_alloc > 0 else 0
+                print(f"\nlast 7d: alloc {alloc / 3600:.1f}h · busy {busy / 3600:.1f}h"
+                      f" · eff {eff:.0%} · wasted {waste / 3600:.1f}h")
+                break
+    return 1 if mine_waste else 0
 
 
 def _cli_usage(days: int, daily: bool = False) -> int:
@@ -375,6 +449,30 @@ def _cli_doctor() -> int:
                    f"cli={__version__} collector=unknown — restart/deploy collector")
     except (OSError, ValueError):
         report(False, "collector data", f"{_DAEMON_DATA_FILE} missing — collector not running (TUI falls back to slow SSH)")
+
+    # GPU→job attribution sanity: a process's cgroup names its own job. If a
+    # card runs job X's process but the snapshot binds job Y (or nothing),
+    # allocation mapping is broken (heterogeneous-node IDX drift regression).
+    if raw:
+        mismatches: List[str] = []
+        probed = 0
+        for n in raw.get("nodes", []):
+            for g in n.get("gpus", []):
+                jids = set((g.get("pid_jobid") or {}).values())
+                if not jids:
+                    continue
+                probed += 1
+                if g.get("alloc_jobid", "") not in jids:
+                    mismatches.append(
+                        f"{n['name']}/GPU{g.get('index')} runs job "
+                        f"{','.join(sorted(jids))} but bound to "
+                        f"'{g.get('alloc_jobid', '')}'")
+        if mismatches:
+            report(False, "gpu-job binding",
+                   f"{len(mismatches)} mismatch(es): " + "; ".join(mismatches[:4]))
+        elif probed:
+            report(True, "gpu-job binding",
+                   f"{probed} busy GPU(s) cgroup-verified against allocation")
 
     # collector unit: site-wide kill sweeps (pkill -f python and friends) send
     # SIGTERM, the collector exits 0, and Restart=on-failure leaves it dead
@@ -645,6 +743,15 @@ def main():
             v = _arg_value(argv, "--jobs", "7")
             sys.exit(_cli_jobs(int(v) if v.isdigit() else 7,
                                user=_arg_value(argv, "--user", "")))
+        if "--fit" in argv or "fit" in argv[:1]:
+            flag = "--fit" if "--fit" in argv else "fit"
+            v = _arg_value(argv, flag, "1")
+            vram = _arg_value(argv, "--vram", "0")
+            sys.exit(_cli_fit(int(v) if v.isdigit() else 1,
+                              vram_gb=float(vram) if vram.replace(".", "").isdigit() else 0,
+                              partition=_arg_value(argv, "--partition", "")))
+        if "--me" in argv or "me" in argv[:1]:
+            sys.exit(_cli_me())
         if "--wait-free" in argv:
             want = int(_arg_value(argv, "--wait-free", "1"))
             part = _arg_value(argv, "--partition", "")
@@ -652,7 +759,8 @@ def main():
             sys.exit(_cli_wait_free(want, part, interval))
         if argv and argv[0] in ("-h", "--help"):
             print("usage: sgpu [--version | --json | --once | --waste [-v] | --usage [days] [--daily] |\n"
-                  "             --jobs [days] [--user U] | --report [YYYY-MM] | --wait-free N | doctor]\n"
+                  "             --jobs [days] [--user U] | --report [YYYY-MM] | --wait-free N |\n"
+                  "             fit N [--vram G] [--partition P] | me | doctor]\n"
                   "  (no args)      interactive TUI\n"
                   "  --version      print installed release and exit\n"
                   "  --json         print snapshot as JSON and exit\n"
@@ -666,6 +774,9 @@ def main():
                   "  --report [M]   markdown monthly report (default: current month)\n"
                   "  --wait-free N  block until N GPUs are free\n"
                   "                 [--partition P] [--interval sec]\n"
+                  "  fit N          nodes that fit N free GPUs now + sbatch line\n"
+                  "                 [--vram G] minimum VRAM per GPU, [--partition P]\n"
+                  "  me             my jobs, my wasted GPUs, my week (exit 1 if wasting)\n"
                   "  doctor         self-diagnosis: data freshness, agents, slurm, sharing")
             return
     finally:

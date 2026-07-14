@@ -34,7 +34,7 @@ LOCK_FILE = Path("/tmp/sgpu-agent.lock")
 LOG_FILE = Path("/tmp/sgpu-agent.log")
 LOG_MAX_BYTES = 2 * 1024 * 1024
 
-AGENT_PAYLOAD_VERSION = 5  # v5: explicit node_kind supports CPU-only payloads
+AGENT_PAYLOAD_VERSION = 6  # v6: pid_mem + pid_jobid (cgroup) per GPU
 
 # Fingerprint of the agent source (shared FS ⇒ same value on all hosts).
 # The collector compares this against agent.py's current mtime and restarts

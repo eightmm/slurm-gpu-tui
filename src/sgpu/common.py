@@ -191,6 +191,8 @@ class GpuInfo:
     ecc: str = ""        # uncorrectable ECC error count ("" / N/A on consumer GPUs)
     pids: List[str] = field(default_factory=list)
     users: List[str] = field(default_factory=list)
+    pid_mem: Dict[str, str] = field(default_factory=dict)    # pid -> FB MiB (pmon)
+    pid_jobid: Dict[str, str] = field(default_factory=dict)  # pid -> SLURM job (cgroup)
     alloc_jobid: str = ""  # job holding this GPU per SLURM allocation
     alloc_user: str = ""
     idle_sec: int = 0    # how long allocated with no GPU process (collector only)
@@ -503,7 +505,15 @@ NODE_PAYLOAD_CMD = (
     # minor order can differ from nvidia-smi (PCI) order on some boards.
     "for d in /proc/driver/nvidia/gpus/*/information; do "
     "awk '/Bus Location/{b=$NF} /Device Minor/{m=$NF} END{print b, m}' \"$d\" 2>/dev/null; "
-    "done"
+    "done; "
+    "echo '---SEP---'; "
+    # PID -> SLURM jobid from the process's cgroup path (job_<id> under the
+    # slurmstepd scope). World-readable, so this works for any user's PID —
+    # gives exact GPU->job attribution with no user-name heuristics.
+    "if [ -n \"$PIDS\" ]; then for p in $(echo ${PIDS%,} | tr ',' ' '); do "
+    "j=$(grep -m1 -oE 'job_[0-9]+' /proc/$p/cgroup 2>/dev/null); "
+    "[ -n \"$j\" ] && echo \"$p ${j#job_}\"; "
+    "done; fi"
 )
 
 
@@ -524,6 +534,7 @@ def parse_node_payload(out: str) -> Tuple[List[GpuInfo], NodeMemInfo]:
     mem_raw = sections[2].strip() if len(sections) > 2 else ""
     ps_raw = sections[3].strip() if len(sections) > 3 else ""
     minor_raw = sections[4].strip() if len(sections) > 4 else ""
+    jobid_raw = sections[5].strip() if len(sections) > 5 else ""
 
     # "0000:06:00.0 2" -> {"06:00.0": "2"}; nvidia-smi prints the bus id with
     # a longer domain ("00000000:06:00.0"), so compare on the bus:dev.fn tail
@@ -538,8 +549,9 @@ def parse_node_payload(out: str) -> Tuple[List[GpuInfo], NodeMemInfo]:
     if len(mem_parts) >= 3:
         mem_info = NodeMemInfo(total=mem_parts[0], used=mem_parts[1], avail=mem_parts[2])
 
-    # Parse pmon: gpu_idx -> list of PIDs
+    # Parse pmon (-s m: gpu pid type fb ccpm cmd): gpu_idx -> PIDs, pid -> FB MiB
     gpu_pids: Dict[str, List[str]] = {}
+    pid_fb: Dict[str, str] = {}
     for line in pmon_raw.splitlines():
         line = line.strip()
         if line.startswith("#") or not line:
@@ -547,6 +559,8 @@ def parse_node_payload(out: str) -> Tuple[List[GpuInfo], NodeMemInfo]:
         parts = line.split()
         if len(parts) >= 2 and parts[1] != "-":
             gpu_pids.setdefault(parts[0], []).append(parts[1])
+            if len(parts) >= 4 and parts[3] not in ("-", ""):
+                pid_fb[parts[1]] = parts[3]
 
     # Resolve PIDs to usernames via ps output from combined SSH call
     pid_to_user: Dict[str, str] = {}
@@ -554,6 +568,13 @@ def parse_node_payload(out: str) -> Tuple[List[GpuInfo], NodeMemInfo]:
         ps_parts = line.split()
         if len(ps_parts) >= 2:
             pid_to_user[ps_parts[0]] = ps_parts[1]
+
+    # PID -> SLURM jobid from the node-side cgroup probe (exact attribution)
+    pid_jobid_all: Dict[str, str] = {}
+    for line in jobid_raw.splitlines():
+        jp = line.split()
+        if len(jp) == 2 and jp[1].isdigit():
+            pid_jobid_all[jp[0]] = jp[1]
 
     gpus: List[GpuInfo] = []
     for line in metrics_raw.splitlines():
@@ -576,6 +597,8 @@ def parse_node_payload(out: str) -> Tuple[List[GpuInfo], NodeMemInfo]:
             name=shorten_gpu_name(p[2]), util=p[3],
             mem_used=p[4], mem_total=p[5], temp=p[6], power=p[7], power_cap=p[8],
             ecc=ecc, pids=pids, users=users,
+            pid_mem={pid: pid_fb[pid] for pid in pids if pid in pid_fb},
+            pid_jobid={pid: pid_jobid_all[pid] for pid in pids if pid in pid_jobid_all},
         ))
     return gpus, mem_info
 
@@ -634,29 +657,38 @@ def assign_node_jobs(jobs: List[JobInfo]) -> Dict[str, List[JobInfo]]:
 
 def reconcile_gpu_alloc(
     node_alloc: Dict[str, str], jobid_user: Dict[str, str],
-    gpus: List[Tuple[List[str], str]],
+    gpus: List[Tuple[List[str], str, List[str]]],
 ) -> List[Tuple[str, str]]:
     """Bind one node's SLURM allocations to physical GPUs: [(jobid, user)].
 
-    ``gpus`` is one (real process users, minor-or-index key) pair per card.
+    ``gpus`` is one (real process users, minor-or-index key, process jobids
+    from the node-side cgroup probe) triple per card.
     SLURM's GRES IDX only equals the device minor on single-type nodes; on
     heterogeneous nodes (e.g. an H100 alongside RTX-6000s) SLURM's per-type
     index order does not track /dev/nvidiaN, so keying purely on IDX paints
     the allocation onto the wrong physical card — a job shows up on an empty
     GPU while its process runs elsewhere. With task/cgroup + ConstrainDevices,
     a job's process can only touch its allocated GPU, so the GPU's real process
-    owner is authoritative: match each allocation to the card its user actually
-    runs on, and place only genuinely idle reservations by the raw IDX hint.
+    owner is authoritative: bind by the process's own cgroup jobid first, then
+    by process user, and place only genuinely idle reservations by the IDX hint.
     """
     # one entry per allocated GPU on this node (a job holding N GPUs
     # appears N times); consumed as we bind each to a physical card
     remaining = list(node_alloc.values())
     out: List[Tuple[str, str]] = [("", "")] * len(gpus)
+    # 0) cgroup-exact: the process's own cgroup names its jobid — no
+    #    heuristics, disambiguates same-user multi-job nodes.
+    for i, (_users, _key, jobids) in enumerate(gpus):
+        jid = next((j for j in jobids if j in remaining), "")
+        if jid:
+            out[i] = (jid, jobid_user.get(jid, ""))
+            remaining.remove(jid)
     # 1) process-confirmed: a GPU running user U's process, where U holds
-    #    an allocation here, belongs to that job. Authoritative and
-    #    self-correcting when the IDX->minor hint is wrong on mixed nodes.
-    for i, (users, _key) in enumerate(gpus):
-        if not users:
+    #    an allocation here, belongs to that job. Covers payloads without
+    #    the cgroup probe (old agents); self-correcting when the IDX->minor
+    #    hint is wrong on mixed nodes.
+    for i, (users, _key, _jobids) in enumerate(gpus):
+        if out[i][0] or not users:
             continue
         jid = next((j for j in remaining if jobid_user.get(j, "") in users), "")
         if jid:
@@ -667,7 +699,7 @@ def reconcile_gpu_alloc(
     #    minor/index matches the raw IDX (exact on single-type nodes).
     for jid in remaining:
         pref = {k for k, j in node_alloc.items() if j == jid}
-        free = [i for i, (users, _key) in enumerate(gpus)
+        free = [i for i, (users, _key, _jobids) in enumerate(gpus)
                 if not out[i][0] and not users]
         tgt = next((i for i in free if gpus[i][1] in pref),
                    free[0] if free else None)
@@ -692,7 +724,8 @@ def apply_gpu_alloc(
             g.users = [resolve_user(u) for u in g.users]
         pairs = reconcile_gpu_alloc(
             gpu_alloc.get(node.name, {}), jobid_user,
-            [([u for u in g.users if u not in ROGUE_IGNORE], g.minor or g.index)
+            [([u for u in g.users if u not in ROGUE_IGNORE], g.minor or g.index,
+              list(dict.fromkeys(g.pid_jobid.values())))
              for g in node.gpus])
         for g, (jid, user) in zip(node.gpus, pairs):
             g.alloc_jobid = jid

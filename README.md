@@ -106,6 +106,7 @@ sgpu        # launch the monitor
 | `1` `2` `3` | Tabs: GPU / CPU / Usage |
 | `r` / `s` | Refresh / cycle sort (Node → Util → User → Free) |
 | `u` / `i` | Filter by user (me first) / free-GPU filter |
+| `p` / `m` | Cycle partition filter / my jobs only |
 | `d` | Detail columns (Temp / Power / JobID / JobName) |
 | `Space` / `j` `k` | Collapse node / move cursor |
 | `/` | Search node or username (`Esc` clears) |
@@ -128,6 +129,8 @@ sgpu --usage [days] [--daily]          # per-user GPU-hours + efficiency + waste
 sgpu --jobs [days] [--user U]          # job history: outcomes, GPU-hours, waits
 sgpu --report [YYYY-MM]                # markdown monthly report
 sgpu --wait-free 2 --partition heavy   # block until 2 GPUs free
+sgpu fit 2 [--vram 40] [--partition P] # where 2 GPUs fit right now + sbatch line
+sgpu me              # my jobs, my wasted GPUs, my week (exit 1 if wasting)
 chkgpu               # one-shot user × node matrix with next-free ETA
 ```
 

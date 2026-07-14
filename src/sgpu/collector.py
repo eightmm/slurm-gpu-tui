@@ -759,7 +759,8 @@ def collect_all() -> dict:
         # SLURM's IDX hint misplaces jobs on heterogeneous nodes
         alloc_pairs = reconcile_gpu_alloc(node_alloc, jobid_user, [
             ([u for u in g.get("users", []) if u not in ROGUE_IGNORE],
-             g.get("minor") or g.get("index", ""))
+             g.get("minor") or g.get("index", ""),
+             list(dict.fromkeys((g.get("pid_jobid") or {}).values())))
             for g in gpus])
         for g, (jid, _user) in zip(gpus, alloc_pairs):
             g["alloc_jobid"] = jid

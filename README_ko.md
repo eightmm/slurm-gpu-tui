@@ -106,6 +106,7 @@ sgpu        # 모니터 실행
 | `1` `2` `3` | 탭: GPU / CPU / Usage |
 | `r` / `s` | 새로고침 / 정렬 순환(노드 → 사용률 → 유저 → 빈 GPU) |
 | `u` / `i` | 유저 필터(내가 첫 항목) / 빈 GPU 필터 |
+| `p` / `m` | 파티션 필터 순환 / 내 잡만 보기 |
 | `d` | 상세 컬럼(온도 / 전력 / JobID / JobName) |
 | `Space` / `j` `k` | 노드 접기 / 커서 이동 |
 | `/` | 노드명 또는 유저명 검색(`Esc` 초기화) |
@@ -127,6 +128,8 @@ sgpu --usage [일수] [--daily]          # 유저별 GPU-hours + 효율 + 낭비
 sgpu --jobs [일수] [--user U]          # 잡 히스토리: 결과, GPU-hours, 대기
 sgpu --report [YYYY-MM]                # 월간 리포트(마크다운)
 sgpu --wait-free 2 --partition heavy   # 빈 GPU 2개 생길 때까지 대기
+sgpu fit 2 [--vram 40] [--partition P] # 지금 GPU 2장 들어갈 노드 + sbatch 예시
+sgpu me              # 내 잡 · 내 낭비 GPU · 최근 7일 (낭비 있으면 exit 1)
 chkgpu               # 원샷 유저×노드 매트릭스 + next-free 예상시각
 ```
 

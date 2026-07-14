@@ -297,17 +297,32 @@ def test_apply_gpu_alloc_hetero_binds_to_real_process_gpu():
 
 def test_reconcile_gpu_alloc_dict_path():
     # the collector's dict-based merge path delegates here — same gpu1
-    # scenario as above, expressed as (users, idx-key) pairs
+    # scenario as above, expressed as (users, idx-key, jobids) triples
     from sgpu.common import reconcile_gpu_alloc
     pairs = reconcile_gpu_alloc(
         {"0": "38211", "1": "38246"},
         {"38211": "jwsong", "38246": "jwsong"},
-        [(["jwsong"], "0"), ([], "1"), (["jwsong"], "2"), ([], "3")],
+        [(["jwsong"], "0", []), ([], "1", []), (["jwsong"], "2", []), ([], "3", [])],
     )
     jids = [j for j, _ in pairs]
     assert jids[1] == "" and jids[3] == ""          # empty cards: no phantom
     assert sorted([jids[0], jids[2]]) == ["38211", "38246"]
     assert pairs[0][1] == pairs[2][1] == "jwsong"
+
+
+def test_reconcile_gpu_alloc_cgroup_exact_beats_user_heuristic():
+    # same user holds two jobs; the cgroup probe names each process's job,
+    # so the binding must be exact (not first-match by user)
+    from sgpu.common import reconcile_gpu_alloc
+    pairs = reconcile_gpu_alloc(
+        {"0": "38211", "1": "38246"},
+        {"38211": "jwsong", "38246": "jwsong"},
+        [(["jwsong"], "0", ["38246"]), ([], "1", []),
+         (["jwsong"], "2", ["38211"]), ([], "3", [])],
+    )
+    assert pairs[0] == ("38246", "jwsong")
+    assert pairs[2] == ("38211", "jwsong")
+    assert pairs[1][0] == "" and pairs[3][0] == ""
 
 
 def test_apply_gpu_alloc_idle_reservation_and_rogue():

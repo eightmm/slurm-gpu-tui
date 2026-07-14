@@ -82,6 +82,8 @@ HELP_TEXT = """\
  S        Reverse current sort order
  z        Collapse / expand ALL nodes
  u        Filter by user (pick from list; u again clears)
+ p        Cycle partition filter (all → each partition)
+ m        My jobs only (m again clears)
  i        Idle filter (truly free GPUs only)
  d        Detail columns (Temp / Power / JobID / JobName)
  Space    Collapse / expand node (on header row)
@@ -109,7 +111,7 @@ HELP_TEXT = """\
    user !slurm      GPU process with no SLURM allocation
 
  Korean IME: same physical keys work without switching
- (ㅂ=q, ㄱ=r, ㄴ=s, ㅇ=d, ㅑ=i, ㅕ=u, ㄷ=e, ㅈ=w, ㅎ=g, ㅓ=j, ㅏ=k)
+ (ㅂ=q, ㄱ=r, ㄴ=s, ㅇ=d, ㅑ=i, ㅕ=u, ㅔ=p, ㅡ=m, ㄷ=e, ㅈ=w, ㅎ=g, ㅓ=j, ㅏ=k)
 """
 
 
@@ -257,6 +259,8 @@ _JAMO_ACTIONS = {
     "ㄱ": "refresh",       # r
     "ㄴ": "toggle_sort",   # s
     "ㅕ": "toggle_user_filter",  # u
+    "ㅔ": "toggle_partition_filter",  # p
+    "ㅡ": "toggle_my_filter",    # m
     "ㅑ": "toggle_idle_filter",  # i
     "ㅇ": "toggle_details",      # d
     "ㄷ": "export_json",         # e

@@ -97,6 +97,8 @@ def _parse_daemon_data(raw: dict) -> Tuple[List[NodeInfo], List[JobInfo], List[P
                 power=g.get("power", ""), power_cap=g.get("power_cap", ""),
                 ecc=g.get("ecc", ""),
                 pids=g.get("pids", []), users=g.get("users", []),
+                pid_mem=g.get("pid_mem", {}) or {},
+                pid_jobid=g.get("pid_jobid", {}) or {},
                 alloc_jobid=g.get("alloc_jobid", ""), alloc_user=g.get("alloc_user", ""),
                 idle_sec=g.get("idle_sec", 0), parked_sec=g.get("parked_sec", 0),
             )
@@ -168,6 +170,8 @@ class SlurmGpuTui(App):
         ("S", "reverse_sort", "Rev-sort"),
         ("z", "collapse_all", "Fold all"),
         ("u", "toggle_user_filter", "User"),
+        ("p", "toggle_partition_filter", "Partition"),
+        ("m", "toggle_my_filter", "Mine"),
         ("i", "toggle_idle_filter", "Free GPUs"),
         ("space", "toggle_collapse", "Collapse"),
         ("d", "toggle_details", "Details"),
@@ -258,6 +262,7 @@ class SlurmGpuTui(App):
         self.sort_by = "node"  # "node", "util", "user", "free"
         self.sort_reverse = False
         self.filter_user = ""  # show only this user's jobs ("" = everyone)
+        self.filter_partition = ""  # show only nodes in this partition
         self._user_gpu_count: Dict[str, int] = {}
         self._collapsed: set = set()  # node names that are collapsed
         self._last_data_mtime: float | None = None
@@ -353,6 +358,34 @@ class SlurmGpuTui(App):
                 self._rerender()
 
         self.push_screen(UserSelectScreen(entries), _apply_filter)
+
+    def action_toggle_partition_filter(self) -> None:
+        """Cycle: all -> partition A -> partition B -> ... -> all."""
+        parts: List[str] = []
+        for n in self._nodes_cache:
+            if not n.has_gpu:
+                continue
+            for p in (n.partition or "").split(","):
+                if p and p not in parts:
+                    parts.append(p)
+        if not parts:
+            return
+        order = [""] + sorted(parts)
+        cur = order.index(self.filter_partition) if self.filter_partition in order else 0
+        self.filter_partition = order[(cur + 1) % len(order)]
+        self.status_w.update(f"Partition: {self.filter_partition or 'all'}"
+                             + (" (p to cycle)" if self.filter_partition else ""))
+        self._rerender()
+
+    def action_toggle_my_filter(self) -> None:
+        """Shortcut: filter to my own jobs (same as picking myself under u)."""
+        if self.filter_user == self.current_user:
+            self.filter_user = ""
+            self.status_w.update("All Jobs")
+        else:
+            self.filter_user = self.current_user
+            self.status_w.update(f"My jobs ({self.current_user}) — m to clear")
+        self._rerender()
 
     def _job_under_cursor(self) -> str:
         """jobid of the row under the cursor, in whichever table has focus."""
@@ -494,11 +527,35 @@ class SlurmGpuTui(App):
             if jid:
                 self._show_detail("job", jid)
 
+    def _gpu_proc_table(self, node_name: str) -> str:
+        """Per-GPU process lines (pid/user/VRAM/job) for the node detail modal."""
+        node = next((n for n in self._nodes_cache if n.name == node_name), None)
+        if node is None or not node.gpus:
+            return ""
+        lines = ["", "GPU processes:"]
+        for g in node.gpus:
+            if not g.pids:
+                lines.append(f"  GPU{g.index} ({g.name})  —")
+                continue
+            for pid in g.pids:
+                jid = g.pid_jobid.get(pid, "")
+                j = self._jobs_by_id.get(jid)
+                # users is a de-duped list, not pid-aligned — the job's owner
+                # is exact; fall back to the sole user when unambiguous
+                user = j.user if j else (g.users[0] if len(g.users) == 1 else "?")
+                vram = g.pid_mem.get(pid, "")
+                vram = f"{float(vram) / 1024:.1f}G" if vram.isdigit() else "?"
+                job = f"  job {jid}" if jid else ""
+                lines.append(f"  GPU{g.index} ({g.name})  pid {pid}  {user}  VRAM {vram}{job}")
+        return "\n".join(lines)
+
     @work(thread=True)
     def _show_detail(self, kind: str, name: str) -> None:
         ok, out = run_cmd(f"scontrol show {kind} {name}")
         if not ok:
             out = f"scontrol failed: {out}"
+        if kind == "node":
+            out += self._gpu_proc_table(name)
         if kind == "job":
             script, src = "", ""
             # 1) collector-shared script (SHARE_SCRIPTS on a privileged collector)
@@ -675,7 +732,12 @@ class SlurmGpuTui(App):
         self._toast_down = down_now
 
     def _node_visible(self, node: NodeInfo, node_classes: Dict[str, List[str]]) -> bool:
-        """GPU-tab filters: user filter, free-GPU filter, live search."""
+        """GPU-tab filters: user/partition filters, free-GPU filter, live search."""
+        if self.filter_partition:
+            node_parts = {p for p in (node.partition or "").split(",") if p}
+            node_parts.update(j.partition for j in node.jobs if j.partition)
+            if self.filter_partition not in node_parts:
+                return False
         if self.filter_user:
             fu = self.filter_user
             has_user = any(fu in g.users or fu == g.alloc_user for g in node.gpus)
