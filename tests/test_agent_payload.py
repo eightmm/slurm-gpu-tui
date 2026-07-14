@@ -88,7 +88,7 @@ def test_collect_all_prefers_cpu_agent_over_ssh(monkeypatch):
     nodes = [{
         "name": "cpu1", "state": "alloc", "partition": "cpu",
         "has_gpu": False, "cpus": "64", "cpu_alloc": "64",
-        "cpu_load": "60", "mem_total": "250000", "mem_free": "20000",
+        "cpu_load": "60", "mem_total": "1", "mem_free": "20000",
         "mem_alloc": "200000", "gres": "(null)",
     }]
     payload = _payload("cpu1", "cpu")
@@ -107,7 +107,14 @@ def test_collect_all_prefers_cpu_agent_over_ssh(monkeypatch):
 
     assert polled == []
     assert data["nodes"][0]["source"] == "agent"
+    assert data["nodes"][0]["mem_total"] == "250000"
     assert data["nodes"][0]["mem_avail"] == "249000"
+
+
+def test_effective_mem_total_falls_back_for_invalid_live_value():
+    assert collector._effective_mem_total({}, "64000") == "64000"
+    assert collector._effective_mem_total({"total": "0"}, "64000") == "64000"
+    assert collector._effective_mem_total({"total": "N/A"}, "64000") == "64000"
 
 
 def test_cpu_agent_collects_meminfo_without_gpus(tmp_path, monkeypatch):

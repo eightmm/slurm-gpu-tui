@@ -669,6 +669,18 @@ def _poll_node_bg(n: dict, has_jobs: bool) -> None:
     _node_executor.submit(_run)
 
 
+def _effective_mem_total(mem: object, slurm_total: str) -> str:
+    """Prefer live OS RAM over Slurm RealMemory when the payload has it."""
+    if isinstance(mem, dict):
+        live_total = mem.get("total")
+        try:
+            if float(live_total) > 0:
+                return str(live_total)
+        except (TypeError, ValueError):
+            pass
+    return slurm_total
+
+
 def collect_all() -> dict:
     """One collection cycle: fast local data + latest async node results.
 
@@ -771,7 +783,8 @@ def collect_all() -> dict:
             "source": source, "has_gpu": n.get("has_gpu", True),
             "cpus": n["cpus"],
             "cpu_alloc": n.get("cpu_alloc", ""), "cpu_load": n["cpu_load"],
-            "mem_total": n["mem_total"], "mem_free": n["mem_free"],
+            "mem_total": _effective_mem_total(mem, n["mem_total"]),
+            "mem_free": n["mem_free"],
             "mem_alloc": n.get("mem_alloc", ""), "gres": n["gres"],
             "mem_used": mem.get("used", ""), "mem_avail": mem.get("avail", ""),
             "gpus": gpus, "jobs": node_jobs.get(name, []),
