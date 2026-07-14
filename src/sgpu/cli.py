@@ -342,7 +342,8 @@ def _cli_doctor() -> int:
         pass
 
     # collector data
-    srcs: Dict[str, int] = {}
+    gpu_srcs: Dict[str, int] = {}
+    cpu_srcs: Dict[str, int] = {}
     raw: dict = {}
     try:
         age = time.time() - _DAEMON_DATA_FILE.stat().st_mtime
@@ -350,11 +351,15 @@ def _cli_doctor() -> int:
         fresh = age <= _DAEMON_MAX_AGE
         report(fresh, "collector data", f"{_DAEMON_DATA_FILE} age {age:.0f}s"
                + ("" if fresh else " — STALE, is sgpu-collector running?"))
-        for n in raw.get("nodes", []):
-            srcs[n.get("source", "?")] = srcs.get(n.get("source", "?"), 0) + 1
-        stale_n = srcs.get("stale", 0)
-        report(stale_n == 0 if srcs else None, "node sources",
-               " ".join(f"{k}:{v}" for k, v in sorted(srcs.items())) or "no nodes")
+        gpu_srcs, cpu_srcs = _split_node_sources(raw.get("nodes", []))
+        stale_n = gpu_srcs.get("stale", 0) + cpu_srcs.get("stale", 0)
+        source_parts = [f"gpu-{k}:{v}" for k, v in sorted(gpu_srcs.items())]
+        source_parts += [
+            f"cpu-{'ssh-poll' if k == 'ssh' else k}:{v}"
+            for k, v in sorted(cpu_srcs.items())
+        ]
+        report(stale_n == 0 if source_parts else None, "node sources",
+               " ".join(source_parts) or "no nodes")
         collector_release = str(raw.get("release") or "")
         collector_build = str(raw.get("build") or "")
         if collector_release:
@@ -400,15 +405,22 @@ def _cli_doctor() -> int:
     # unreliable here: an interactive `sgpu doctor` doesn't see the collector's
     # SLURM_GPU_TUI_AGENT_DIR (that's baked into the service unit), so it would
     # look in the wrong dir and cry "no push agents" while push is working.
-    if srcs.get("agent", 0) > 0 and srcs.get("ssh", 0) > 0:
+    cpu_poll = cpu_srcs.get("ssh", 0)
+    cpu_suffix = f"; CPU/RAM poll: {cpu_poll} nodes via SSH" if cpu_poll else ""
+    if gpu_srcs.get("agent", 0) > 0 and gpu_srcs.get("ssh", 0) > 0:
         report(True, "node delivery",
-               f"mixed: {srcs['agent']} push + {srcs['ssh']} SSH-pull")
-    elif srcs.get("agent", 0) > 0:
-        report(True, "node delivery", f"push mode ({srcs['agent']} nodes via agent)")
-    elif srcs.get("ssh", 0) > 0:
+               f"GPU mixed: {gpu_srcs['agent']} push + "
+               f"{gpu_srcs['ssh']} SSH-pull{cpu_suffix}")
+    elif gpu_srcs.get("agent", 0) > 0:
+        report(True, "node delivery",
+               f"GPU push mode ({gpu_srcs['agent']} nodes via agent){cpu_suffix}")
+    elif gpu_srcs.get("ssh", 0) > 0:
         # SSH-pull is a fully supported mode, not a problem
-        report(True, "node delivery", f"SSH-pull mode ({srcs['ssh']} nodes) — "
-               "push agents not in use (shared-FS install enables them)")
+        report(True, "node delivery",
+               f"GPU SSH-pull mode ({gpu_srcs['ssh']} nodes) — push agents not "
+               f"in use (shared-FS install enables them){cpu_suffix}")
+    elif cpu_srcs:
+        report(None, "node delivery", f"no GPU nodes; CPU/RAM polling only{cpu_suffix}")
     else:
         agent_dir = Path(os.getenv("SLURM_GPU_TUI_AGENT_DIR", str(Path.home() / ".sgpu" / "nodes")))
         report(None, "node delivery", f"no node data yet (checked {agent_dir})")
@@ -567,6 +579,20 @@ def _unit_env_enabled(unit_text: str, name: str) -> bool:
         line.strip() == f"Environment={name}=1"
         for line in unit_text.splitlines()
     )
+
+
+def _split_node_sources(nodes: List[dict]) -> Tuple[Dict[str, int], Dict[str, int]]:
+    """Split collector delivery sources into GPU transport and CPU polling."""
+    gpu: Dict[str, int] = {}
+    cpu: Dict[str, int] = {}
+    for node in nodes:
+        has_gpu = node.get("has_gpu")
+        if has_gpu is None:  # backward compatibility with older data.json
+            has_gpu = bool(node.get("gpus")) or "gpu" in str(node.get("gres", "")).lower()
+        bucket = gpu if has_gpu else cpu
+        source = str(node.get("source") or "?")
+        bucket[source] = bucket.get(source, 0) + 1
+    return gpu, cpu
 
 
 _PERSISTENCE_STATUS_CMD = (

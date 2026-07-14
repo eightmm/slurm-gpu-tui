@@ -33,3 +33,25 @@ def test_parse_persistence_status_handles_missing_gpu_output():
 
     assert modes == []
     assert unit == "inactive"
+
+
+def test_split_node_sources_separates_cpu_poll_from_gpu_fallback():
+    gpu, cpu = cli._split_node_sources([
+        {"name": "cpu1", "has_gpu": False, "source": "ssh", "gpus": []},
+        {"name": "cpu2", "has_gpu": False, "source": "ssh", "gpus": []},
+        {"name": "gpu1", "has_gpu": True, "source": "agent", "gpus": [{}]},
+        {"name": "gpu2", "has_gpu": True, "source": "ssh", "gpus": [{}]},
+    ])
+
+    assert gpu == {"agent": 1, "ssh": 1}
+    assert cpu == {"ssh": 2}
+
+
+def test_split_node_sources_infers_legacy_gpu_rows():
+    gpu, cpu = cli._split_node_sources([
+        {"source": "agent", "gres": "gpu:a5000:2", "gpus": []},
+        {"source": "ssh", "gres": "(null)", "gpus": []},
+    ])
+
+    assert gpu == {"agent": 1}
+    assert cpu == {"ssh": 1}
