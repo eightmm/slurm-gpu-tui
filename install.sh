@@ -384,6 +384,20 @@ esac
 
 CPU_AGENT_TEMPLATE="$INSTALL_DIR/sgpu-cpu-agent.service"
 GENERATED_CPU_AGENT_SERVICE=""
+_stop_legacy_cpu_agent_local() {
+    # Releases /tmp/sgpu-agent.lock held by the pre-v5 collector-managed
+    # `sgpu-agent --daemon` before the systemd CPU agent is started.
+    $SUDO systemctl stop sgpu-cpu-agent.service >/dev/null 2>&1 || true
+    $SUDO pkill -f 'bin/[s]gpu-agent' >/dev/null 2>&1 || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if ! $SUDO pgrep -f 'bin/[s]gpu-agent' >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.5
+    done
+    echo "legacy sgpu-agent did not stop" >&2
+    return 1
+}
 if $_cpu_push_requested; then
     if [ -n "${SLURM_GPU_TUI_AGENT_DISABLE:-}" ]; then
         echo "[3d] CPU push provisioning skipped (SLURM_GPU_TUI_AGENT_DISABLE is set)"
@@ -426,6 +440,18 @@ if [ "$(id -u)" != "0" ] && ! sudo -n true 2>/dev/null; then
     exit 77
 fi
 as_root install -m 0644 /dev/stdin /etc/systemd/system/sgpu-cpu-agent.service
+as_root systemctl stop sgpu-cpu-agent.service >/dev/null 2>&1 || true
+as_root pkill -f "bin/[s]gpu-agent" >/dev/null 2>&1 || true
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if ! as_root pgrep -f "bin/[s]gpu-agent" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 0.5
+done
+if as_root pgrep -f "bin/[s]gpu-agent" >/dev/null 2>&1; then
+    echo "legacy sgpu-agent did not stop"
+    exit 1
+fi
 as_root systemctl daemon-reload
 as_root systemctl enable sgpu-cpu-agent.service >/dev/null
 as_root systemctl restart sgpu-cpu-agent.service
@@ -437,6 +463,7 @@ as_root systemctl is-active --quiet sgpu-cpu-agent.service'
                         CPU_PUSH_FAIL=$((CPU_PUSH_FAIL + 1))
                     elif $SUDO install -m 0644 "$GENERATED_CPU_AGENT_SERVICE" \
                             /etc/systemd/system/sgpu-cpu-agent.service \
+                            && _stop_legacy_cpu_agent_local \
                             && $SUDO systemctl daemon-reload \
                             && $SUDO systemctl enable sgpu-cpu-agent.service >/dev/null \
                             && $SUDO systemctl restart sgpu-cpu-agent.service \

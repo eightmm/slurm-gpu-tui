@@ -5,6 +5,8 @@ Wants=network-online.target
 RequiresMountsFor=@SGPU_AGENT_BIN@ @SGPU_AGENT_DIR@
 ConditionFileIsExecutable=@SGPU_AGENT_BIN@
 ConditionPathIsDirectory=@SGPU_AGENT_DIR@
+StartLimitIntervalSec=60
+StartLimitBurst=6
 
 [Service]
 Type=simple
