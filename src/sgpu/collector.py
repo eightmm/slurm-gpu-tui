@@ -571,7 +571,16 @@ def _maybe_repair_agent(name: str) -> None:
             return
         print(f"[collector] agent repair {name}: {'ok' if ok else out}", flush=True)
 
-    _repair_executor.submit(_run)
+    def _run_logged() -> None:
+        # An exception escaping into the executor is swallowed silently (the
+        # Future is never inspected) — the repair just stops happening with no
+        # trace in the journal. Surface it instead.
+        try:
+            _run()
+        except Exception as e:
+            print(f"[collector] agent repair {name} crashed: {e!r}", flush=True)
+
+    _repair_executor.submit(_run_logged)
 
 
 def _poll_node_bg(n: dict, has_jobs: bool) -> None:
