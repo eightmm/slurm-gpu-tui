@@ -270,6 +270,46 @@ def test_payload_minor_mapping_and_alloc():
     assert gpus[2].alloc_jobid == ""  # smi GPU2 (minor 0) is truly free
 
 
+def test_apply_gpu_alloc_hetero_binds_to_real_process_gpu():
+    # gpu1: mixed H100 + RTX-6000s. SLURM's typed-GRES IDX does not track
+    # /dev/nvidiaN, so the raw IDX hint (here 0 and 1) misses the cards the
+    # processes actually run on (smi 0 and 2). Under ConstrainDevices the
+    # process owner is authoritative -> allocations must bind to smi 0 and 2,
+    # leaving the empty cards (smi 1, 3) unallocated (no phantom).
+    from sgpu.common import apply_gpu_alloc
+    gpus = [
+        GpuInfo(index="0", minor="0", util="75", users=["jwsong"], pids=["635929"]),
+        GpuInfo(index="1", minor="1", util="0", users=[]),
+        GpuInfo(index="2", minor="2", util="99", users=["jwsong"], pids=["528425"]),
+        GpuInfo(index="3", minor="3", util="0", users=[]),
+    ]
+    node = NodeInfo(name="gpu1", gpus=gpus)
+    apply_gpu_alloc(
+        [node], {"gpu1": {"0": "38211", "1": "38246"}},
+        [JobInfo(jobid="38211", user="jwsong"), JobInfo(jobid="38246", user="jwsong")],
+    )
+    assert gpus[0].alloc_user == "jwsong" and gpus[0].alloc_jobid in ("38211", "38246")
+    assert gpus[2].alloc_user == "jwsong" and gpus[2].alloc_jobid in ("38211", "38246")
+    assert gpus[0].alloc_jobid != gpus[2].alloc_jobid
+    assert gpus[1].alloc_jobid == "" and gpus[1].alloc_user == ""  # empty card, no phantom
+    assert gpus[3].alloc_jobid == ""
+
+
+def test_apply_gpu_alloc_idle_reservation_and_rogue():
+    # userA holds a reservation but hasn't launched (idle) -> lands on a free
+    # card by IDX hint; userB runs without any allocation -> stays a rogue
+    # (alloc left blank so classify_gpu flags it).
+    from sgpu.common import apply_gpu_alloc
+    gpus = [
+        GpuInfo(index="0", minor="0", util="90", users=["userB"], pids=["1"]),  # rogue
+        GpuInfo(index="1", minor="1", util="0", users=[]),                        # idle resv
+    ]
+    node = NodeInfo(name="gpu9", gpus=gpus)
+    apply_gpu_alloc([node], {"gpu9": {"1": "500"}}, [JobInfo(jobid="500", user="userA")])
+    assert gpus[0].alloc_jobid == ""  # rogue: userB has no allocation
+    assert gpus[1].alloc_jobid == "500" and gpus[1].alloc_user == "userA"
+
+
 def test_payload_without_minor_falls_back_to_index():
     # macOS-style / old-agent payload with no minor section, no pci column
     payload = ("0, GPU-aaa, A100, 50, 100, 40000, 50, 100, 300\n"
