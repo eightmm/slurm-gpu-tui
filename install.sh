@@ -217,6 +217,21 @@ sed -e "s|ExecStart=.*|ExecStart=$VENV_DIR/bin/sgpu-collector|" \
 if [ -n "$SHARE" ] && [ "$SHARE" != "0" ]; then
     sed -i "/^User=/a Environment=SLURM_GPU_TUI_SHARE_SCRIPTS=1" "$GENERATED_SERVICE"
 fi
+# Root install: default the agent dir to a sibling of the install dir
+# (/home/shared/sgpu -> /home/shared/sgpu-nodes) so a shared-FS install gets
+# push mode with zero configuration. Root's own default (~root/.sgpu/nodes)
+# is useless — mode-700 home, not on the shared FS.
+if [ "$(id -u)" = "0" ] && [ -z "${SLURM_GPU_TUI_AGENT_DIR:-}" ]; then
+    export SLURM_GPU_TUI_AGENT_DIR="${INSTALL_DIR}-nodes"
+fi
+# Pre-create it world-writable+sticky: node agents run as root, and under an
+# NFS export with root_squash they write as nobody — 1777 keeps push working
+# either way (the agent only mkdirs it when missing, it never re-chmods).
+if [ -n "${SLURM_GPU_TUI_AGENT_DIR:-}" ]; then
+    mkdir -p "$SLURM_GPU_TUI_AGENT_DIR"
+    chmod 1777 "$SLURM_GPU_TUI_AGENT_DIR"
+fi
+
 # Propagate path overrides into the unit: a systemd service does NOT inherit
 # the installing shell's env, so push mode (agents on a shared FS) needs
 # SLURM_GPU_TUI_AGENT_DIR baked into the unit, else the collector falls back

@@ -83,19 +83,22 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstra
 
 ### Install location (`SGPU_INSTALL_DIR`)
 
-Defaults to `~/.sgpu/app` (root: `/opt/sgpu`). Override by putting the variable
-on the **`bash` side** of the pipe. For **push mode**, point both the install
-dir and `SLURM_GPU_TUI_AGENT_DIR` at a shared filesystem the compute nodes
-mount at the same path (otherwise SSH-pull is used automatically):
+Defaults: `~/.sgpu/app` for a user install; as root, `/home/shared/sgpu` when
+`/home/shared` exists (shared FS → **push mode works out of the box**, agent
+dir defaults to `/home/shared/sgpu-nodes`), else `/opt/sgpu` (local disk,
+SSH-pull). Override by putting the variables on the **`bash` side** of the
+pipe. For push mode both paths must be on a shared filesystem the compute
+nodes mount at the same path (otherwise SSH-pull is used automatically):
 
 ```bash
 # local install (SSH-pull mode)
 curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstrap.sh \
   | SGPU_INSTALL_DIR=/opt/sgpu bash
 
-# push mode across nodes (install + agent dir on shared FS, e.g. NFS /home)
+# push mode with custom shared-FS paths (root default already does this
+# with /home/shared/sgpu + /home/shared/sgpu-nodes)
 curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstrap.sh \
-  | SGPU_INSTALL_DIR=/home/shared/sgpu SLURM_GPU_TUI_AGENT_DIR=/home/shared/sgpu-nodes bash
+  | SGPU_INSTALL_DIR=/nfs/apps/sgpu SLURM_GPU_TUI_AGENT_DIR=/nfs/apps/sgpu-nodes bash
 ```
 
 The installer bakes those paths into the systemd unit and picks the right

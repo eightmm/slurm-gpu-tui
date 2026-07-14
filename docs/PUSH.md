@@ -21,13 +21,20 @@ see the venv → SSH-pull is used automatically.
 
 ## Enabling push mode
 
-Install onto the shared FS and point the agent dir there — both paths must be
-visible to master and every compute node at the same location:
+A **root install picks push-friendly defaults by itself**: when `/home/shared`
+exists, the installer uses `/home/shared/sgpu` as the install dir and
+`/home/shared/sgpu-nodes` as the agent dir (pre-created mode 1777), so
 
 ```bash
-# example: /home is NFS-shared to all nodes
-SGPU_INSTALL_DIR=/home/shared/sgpu \
-SLURM_GPU_TUI_AGENT_DIR=/home/shared/sgpu-nodes \
+curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstrap.sh | sudo bash
+```
+
+is all it takes. For a different shared-FS layout, point both paths there —
+they must be visible to master and every compute node at the same location:
+
+```bash
+SGPU_INSTALL_DIR=/nfs/apps/sgpu \
+SLURM_GPU_TUI_AGENT_DIR=/nfs/apps/sgpu-nodes \
   bash <(curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstrap.sh)
 ```
 
@@ -44,9 +51,9 @@ sgpu doctor        # node delivery → "push mode (N nodes via agent)"
 - Master needs **passwordless SSH to every compute node** (the collector
   launches agents over SSH). As a root system service that means root SSH.
 - If the shared FS is exported with **NFS `root_squash`** and the collector
-  runs as root, node-side agents (also root) can't write to the shared agent
-  dir. Either export that path `no_root_squash`, make the agent dir
-  world-writable (`chmod 1777`), or install under a normal user's shared home.
+  runs as root, node-side agents (also root) write as `nobody`. The installer
+  pre-creates the agent dir mode 1777 so this works out of the box; if you
+  created the dir by hand, `chmod 1777` it (or export `no_root_squash`).
 - CPU-only / GPU-less nodes are never agent targets; SSH-pull-only, and they
   never raise alerts for it.
 

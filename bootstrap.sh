@@ -13,10 +13,14 @@ set -e
 REPO="https://github.com/eightmm/slurm-gpu-tui.git"
 
 # Default install dir. As root, $HOME is /root (mode 700) — other users could
-# not traverse it, so use /opt/sgpu instead. For push-mode agents prefer a
-# shared-FS path via SGPU_INSTALL_DIR (nodes must exec the venv from it).
+# not traverse it. Prefer /home/shared/sgpu when that shared-FS dir exists:
+# compute nodes can exec the venv from it, which is what enables push-mode
+# agents out of the box. Fall back to /opt/sgpu (local disk, SSH-pull only).
+# Override either with SGPU_INSTALL_DIR.
 if [ -n "$SGPU_INSTALL_DIR" ]; then
     DIR="$SGPU_INSTALL_DIR"
+elif [ "$(id -u)" = "0" ] && [ -d /home/shared ]; then
+    DIR="/home/shared/sgpu"
 elif [ "$(id -u)" = "0" ]; then
     DIR="/opt/sgpu"
 else
