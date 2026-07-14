@@ -56,6 +56,8 @@ SSH가 되는 SLURM 로그인/마스터 노드에서 운영합니다.
   에이전트를 자동 배포·수리(노드별 rate-limit)하므로 노드별 설치 불필요.
 - **SSH-pull 폴백:** 살아있는 에이전트가 없는 노드는 SSH로 수집(ControlMaster
   풀, 비동기). 두 모드는 자유롭게 혼용.
+- CPU-only 노드는 실시간 RAM 정보를 위해 저빈도 SSH polling을 사용한다. 이는
+  `cpu-poll`로 따로 표시하며 GPU push 실패가 아니다.
 - TUI는 병합 JSON을 읽으므로 클러스터 규모와 무관하게 즉시 시작. collector가
   없으면 직접 SSH 수집으로 폴백(첫 로딩 느림).
 - collector는 `/tmp/slurm-gpu-tui/metrics.prom`(Prometheus textfile)도 기록 —

@@ -131,6 +131,15 @@ def _parse_daemon_data(raw: dict) -> Tuple[List[NodeInfo], List[JobInfo], List[P
     return nodes, jobs, pending, daemon_errors
 
 
+def _node_source_counts(nodes: List[NodeInfo]) -> Tuple[int, int, int, int]:
+    """GPU push/fallback, CPU telemetry polling, and all stale nodes."""
+    agent = sum(1 for n in nodes if n.has_gpu and n.source == "agent")
+    gpu_fallback = sum(1 for n in nodes if n.has_gpu and n.source == "ssh")
+    cpu_poll = sum(1 for n in nodes if not n.has_gpu and n.source == "ssh")
+    stale = sum(1 for n in nodes if n.source == "stale" or (n.stale and not n.source))
+    return agent, gpu_fallback, cpu_poll, stale
+
+
 
 # ── TUI App ───────────────────────────────────────────────────────────────
 
@@ -1090,19 +1099,20 @@ class SlurmGpuTui(App):
         if len(free_by_node) > 4:
             summary.append(" …", style="dim cyan")
         summary.append("  ")
-        # Data-source health: how each node's stats arrived this cycle
-        n_agent = sum(1 for n in nodes if n.source == "agent")
-        n_ssh = sum(1 for n in nodes if n.source == "ssh")
-        n_stale = sum(1 for n in nodes if n.source == "stale" or (n.stale and not n.source))
+        # Data-source health. CPU-only SSH is normal telemetry for live RAM;
+        # only a GPU node on SSH means the push agent fell back.
+        n_agent, n_gpu_fallback, n_cpu_poll, n_stale = _node_source_counts(nodes)
         n_rogue_total = sum(cl.count("rogue") for cl in node_classes.values())
         if n_rogue_total:
             summary.append(" ROGUE ", style="bold white on red")
             summary.append(f" {n_rogue_total} ", style="bold red")
-        if n_agent or n_ssh or n_stale:
+        if n_agent or n_gpu_fallback or n_cpu_poll or n_stale:
             summary.append(" SRC ", style="bold white on grey37")
             summary.append(f" agent:{n_agent}", style="green" if n_agent else "dim")
-            if n_ssh:
-                summary.append(f" ssh:{n_ssh}", style="yellow")
+            if n_gpu_fallback:
+                summary.append(f" fallback:{n_gpu_fallback}", style="yellow")
+            if n_cpu_poll:
+                summary.append(f" cpu-poll:{n_cpu_poll}", style="cyan")
             if n_stale:
                 summary.append(f" stale:{n_stale}", style="bold red")
             summary.append("  ")

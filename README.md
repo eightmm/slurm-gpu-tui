@@ -57,6 +57,8 @@ for compute nodes, usage/waste accounting, and Slack alerts.
   (rate-limited per node); no per-node install.
 - **SSH-pull fallback:** nodes without a live agent are polled over SSH
   (ControlMaster-pooled, async). The two modes mix freely.
+- CPU-only nodes use low-frequency SSH polling for live RAM telemetry; this is
+  shown separately as `cpu-poll` and is not a GPU push fallback.
 - The TUI reads the merged JSON, so startup is instant at any cluster size.
   Without a collector it falls back to direct SSH (slower first load).
 - The collector also writes `/tmp/slurm-gpu-tui/metrics.prom` (Prometheus
