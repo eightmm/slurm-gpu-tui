@@ -295,6 +295,21 @@ def test_apply_gpu_alloc_hetero_binds_to_real_process_gpu():
     assert gpus[3].alloc_jobid == ""
 
 
+def test_reconcile_gpu_alloc_dict_path():
+    # the collector's dict-based merge path delegates here — same gpu1
+    # scenario as above, expressed as (users, idx-key) pairs
+    from sgpu.common import reconcile_gpu_alloc
+    pairs = reconcile_gpu_alloc(
+        {"0": "38211", "1": "38246"},
+        {"38211": "jwsong", "38246": "jwsong"},
+        [(["jwsong"], "0"), ([], "1"), (["jwsong"], "2"), ([], "3")],
+    )
+    jids = [j for j, _ in pairs]
+    assert jids[1] == "" and jids[3] == ""          # empty cards: no phantom
+    assert sorted([jids[0], jids[2]]) == ["38211", "38246"]
+    assert pairs[0][1] == pairs[2][1] == "jwsong"
+
+
 def test_apply_gpu_alloc_idle_reservation_and_rogue():
     # userA holds a reservation but hasn't launched (idle) -> lands on a free
     # card by IDX hint; userB runs without any allocation -> stays a rogue

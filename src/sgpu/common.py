@@ -632,12 +632,13 @@ def assign_node_jobs(jobs: List[JobInfo]) -> Dict[str, List[JobInfo]]:
     return node_jobs
 
 
-def apply_gpu_alloc(
-    nodes: List[NodeInfo], gpu_alloc: Dict[str, Dict[str, str]], jobs: List[JobInfo],
-    alloc_user_map: Dict[str, str] | None = None,
-) -> None:
-    """Annotate GPUs with the job/user that holds them per SLURM allocation.
+def reconcile_gpu_alloc(
+    node_alloc: Dict[str, str], jobid_user: Dict[str, str],
+    gpus: List[Tuple[List[str], str]],
+) -> List[Tuple[str, str]]:
+    """Bind one node's SLURM allocations to physical GPUs: [(jobid, user)].
 
+    ``gpus`` is one (real process users, minor-or-index key) pair per card.
     SLURM's GRES IDX only equals the device minor on single-type nodes; on
     heterogeneous nodes (e.g. an H100 alongside RTX-6000s) SLURM's per-type
     index order does not track /dev/nvidiaN, so keying purely on IDX paints
@@ -647,48 +648,55 @@ def apply_gpu_alloc(
     owner is authoritative: match each allocation to the card its user actually
     runs on, and place only genuinely idle reservations by the raw IDX hint.
     """
+    # one entry per allocated GPU on this node (a job holding N GPUs
+    # appears N times); consumed as we bind each to a physical card
+    remaining = list(node_alloc.values())
+    out: List[Tuple[str, str]] = [("", "")] * len(gpus)
+    # 1) process-confirmed: a GPU running user U's process, where U holds
+    #    an allocation here, belongs to that job. Authoritative and
+    #    self-correcting when the IDX->minor hint is wrong on mixed nodes.
+    for i, (users, _key) in enumerate(gpus):
+        if not users:
+            continue
+        jid = next((j for j in remaining if jobid_user.get(j, "") in users), "")
+        if jid:
+            out[i] = (jid, jobid_user.get(jid, ""))
+            remaining.remove(jid)
+    # 2) idle reservations: allocations with no observed process yet. Place
+    #    each on an unbound, process-free card, preferring the one whose
+    #    minor/index matches the raw IDX (exact on single-type nodes).
+    for jid in remaining:
+        pref = {k for k, j in node_alloc.items() if j == jid}
+        free = [i for i, (users, _key) in enumerate(gpus)
+                if not out[i][0] and not users]
+        tgt = next((i for i in free if gpus[i][1] in pref),
+                   free[0] if free else None)
+        if tgt is not None:
+            out[tgt] = (jid, jobid_user.get(jid, ""))
+    return out
+
+
+def apply_gpu_alloc(
+    nodes: List[NodeInfo], gpu_alloc: Dict[str, Dict[str, str]], jobs: List[JobInfo],
+    alloc_user_map: Dict[str, str] | None = None,
+) -> None:
+    """Annotate GPUs with the job/user that holds them (see reconcile_gpu_alloc)."""
     # squeue's jobid can't be joined to an array task's real jobid; scontrol's
     # UserId map (alloc_user_map) can, so it wins where present.
     jobid_user = {j.jobid: j.user for j in jobs}
     if alloc_user_map:
         jobid_user.update({k: v for k, v in alloc_user_map.items() if v})
     for node in nodes:
-        node_alloc = gpu_alloc.get(node.name, {})
         # node-side ps reports a bare UID when the node lacks the account
         for g in node.gpus:
             g.users = [resolve_user(u) for u in g.users]
-            g.alloc_jobid = ""
-            g.alloc_user = ""
-        # one entry per allocated GPU on this node (a job holding N GPUs
-        # appears N times); consumed as we bind each to a physical card
-        remaining = list(node_alloc.values())
-
-        def real_users(g: GpuInfo) -> List[str]:
-            return [u for u in g.users if u not in ROGUE_IGNORE]
-
-        # 1) process-confirmed: a GPU running user U's process, where U holds
-        #    an allocation here, belongs to that job. Authoritative and
-        #    self-correcting when the IDX->minor hint is wrong on mixed nodes.
-        for g in node.gpus:
-            ru = real_users(g)
-            if not ru:
-                continue
-            jid = next((j for j in remaining if jobid_user.get(j, "") in ru), "")
-            if jid:
-                g.alloc_jobid = jid
-                g.alloc_user = jobid_user.get(jid, "")
-                remaining.remove(jid)
-        # 2) idle reservations: allocations with no observed process yet. Place
-        #    each on an unbound, process-free card, preferring the one whose
-        #    minor/index matches the raw IDX (exact on single-type nodes).
-        for jid in remaining:
-            pref = {i for i, j in node_alloc.items() if j == jid}
-            free = [g for g in node.gpus if not g.alloc_jobid and not real_users(g)]
-            g = next((g for g in free if (g.minor or g.index) in pref), None) \
-                or (free[0] if free else None)
-            if g is not None:
-                g.alloc_jobid = jid
-                g.alloc_user = jobid_user.get(jid, "")
+        pairs = reconcile_gpu_alloc(
+            gpu_alloc.get(node.name, {}), jobid_user,
+            [([u for u in g.users if u not in ROGUE_IGNORE], g.minor or g.index)
+             for g in node.gpus])
+        for g, (jid, user) in zip(node.gpus, pairs):
+            g.alloc_jobid = jid
+            g.alloc_user = user
 
 
 def build_nodes(

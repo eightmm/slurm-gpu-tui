@@ -17,9 +17,9 @@ from pathlib import Path
 from typing import Dict, List
 
 from .common import (
-    GpuInfo, JobInfo, NodeErrorKind, NodeMemInfo, PendingJob,
-    collect_basic, collect_node_data, parse_gres_models, resolve_user,
-    run_cmd, ssh_cmd, _classify_error,
+    GpuInfo, JobInfo, NodeErrorKind, NodeMemInfo, PendingJob, ROGUE_IGNORE,
+    collect_basic, collect_node_data, parse_gres_models, reconcile_gpu_alloc,
+    resolve_user, run_cmd, ssh_cmd, _classify_error,
 )
 from .agent import AGENT_PAYLOAD_VERSION
 from . import agent as _agent_module
@@ -749,17 +749,21 @@ def collect_all() -> dict:
             stale_nodes.append(name)
         node_alloc = gpu_alloc.get(name, {})
         now = time.time()
-        gpus = []
-        for g in r["gpus"]:
-            g = dict(g)
-            # SLURM GRES IDX = device minor, not nvidia-smi order
-            jid = node_alloc.get(g.get("minor") or g.get("index", ""), "")
-            g["alloc_jobid"] = jid
-            g["alloc_user"] = jobid_user.get(jid, "")
+        gpus = [dict(g) for g in r["gpus"]]
+        for g in gpus:
             # node-side ps reports a bare UID when the node lacks the account;
             # resolve it here on the master, where the name service knows it
             if g.get("users"):
                 g["users"] = [resolve_user(u) for u in g["users"]]
+        # bind allocations to the cards their processes actually run on —
+        # SLURM's IDX hint misplaces jobs on heterogeneous nodes
+        alloc_pairs = reconcile_gpu_alloc(node_alloc, jobid_user, [
+            ([u for u in g.get("users", []) if u not in ROGUE_IGNORE],
+             g.get("minor") or g.get("index", ""))
+            for g in gpus])
+        for g, (jid, _user) in zip(gpus, alloc_pairs):
+            g["alloc_jobid"] = jid
+            g["alloc_user"] = _user
             if skeleton_mode:
                 # Placeholder rows carry no process info — show previously
                 # tracked waste ages but never start or reset the timers.
@@ -770,7 +774,6 @@ def collect_all() -> dict:
                 g["parked_sec"] = int(now - st["since"]) if st else 0
             else:
                 _track_waste(name, g, now)
-            gpus.append(g)
         mem = r["mem"]
         if name in agent_nodes:
             source = "agent"
