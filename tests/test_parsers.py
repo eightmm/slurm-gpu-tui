@@ -386,7 +386,7 @@ def test_prometheus_metrics_summary():
     from sgpu.collector import _format_metrics
 
     text = _format_metrics({
-        "jobs": [{"jobid": "1"}],
+        "jobs": [{"jobid": "10", "jobname": "train run"}],
         "pending": [{"jobid": "2"}],
         "nodes": [{
             "name": "gpu1",
@@ -394,6 +394,10 @@ def test_prometheus_metrics_summary():
             "source": "agent",
             "error": "",
             "stale": False,
+            "cpus": "32", "cpu_alloc": "24", "cpu_load": "4.03",
+            "mem_total": "257610", "mem_used": "23761",
+            "mem_alloc": "0", "mem_avail": "233848",
+            "cpu_power": "142.5", "ram_power": "18.2", "sys_power": "612",
             "gpus": [
                 {
                     "index": "0", "name": "A100", "util": "75",
@@ -432,6 +436,23 @@ def test_prometheus_metrics_summary():
     assert "sgpu_gpus_allocated 2" in text
     assert "sgpu_gpus_free 1" in text
     assert "sgpu_gpus_rogue 1" in text
+    assert (
+        'sgpu_gpu_job_info{node="gpu1",gpu="0",user="alice"'
+        ',jobid="10",jobname="train run"} 1'
+    ) in text
+    assert (
+        'sgpu_gpu_job_info{node="gpu1",gpu="3",user="carol"'
+        ',jobid="11",jobname=""} 1'
+    ) in text
+    assert text.count("sgpu_gpu_job_info{") == 2
+    assert 'sgpu_node_cpus_total{node="gpu1"} 32' in text
+    assert 'sgpu_node_cpus_alloc{node="gpu1"} 24' in text
+    assert 'sgpu_node_cpu_load{node="gpu1"} 4.03' in text
+    assert 'sgpu_node_mem_total_mib{node="gpu1"} 257610' in text
+    assert 'sgpu_node_mem_used_mib{node="gpu1"} 23761' in text
+    assert 'sgpu_node_cpu_power_watts{node="gpu1"} 142.5' in text
+    assert 'sgpu_node_ram_power_watts{node="gpu1"} 18.2' in text
+    assert 'sgpu_node_sys_power_watts{node="gpu1"} 612' in text
     assert "sgpu_gpus_idle 1" in text
     assert "sgpu_gpus_parked 1" in text
     assert 'sgpu_node_info{node="gpu1",partition="gpu",source="agent"} 1' in text

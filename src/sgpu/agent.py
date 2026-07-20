@@ -34,7 +34,7 @@ LOCK_FILE = Path("/tmp/sgpu-agent.lock")
 LOG_FILE = Path("/tmp/sgpu-agent.log")
 LOG_MAX_BYTES = 2 * 1024 * 1024
 
-AGENT_PAYLOAD_VERSION = 6  # v6: pid_mem + pid_jobid (cgroup) per GPU
+AGENT_PAYLOAD_VERSION = 7  # v7: node power dict (RAPL cpu/ram + IPMI sys watts)
 
 # Fingerprint of the agent source (shared FS ⇒ same value on all hosts).
 # The collector compares this against agent.py's current mtime and restarts
@@ -72,6 +72,97 @@ def _read_meminfo(path: Path = Path("/proc/meminfo")) -> dict:
     return {"total": str(total), "used": str(used), "avail": str(avail)}
 
 
+RAPL_ROOT = Path("/sys/class/powercap")
+# domain-name -> payload key: top-level packages are CPU; "dram" subdomains
+# are RAM. Other subdomains (core/uncore) are subsets of package — skip to
+# avoid double counting.
+_rapl_prev: dict = {}  # sysfs dir -> (monotonic_ts, energy_uj)
+
+
+def _read_rapl_power(root: Path = RAPL_ROOT, now: float | None = None) -> dict:
+    """Return {"cpu": watts, "ram": watts} from RAPL energy deltas.
+
+    Needs a previous sample: the first call (and any counter wrap) yields no
+    value for that domain. Requires root — energy_uj is 0400 — so failures
+    just produce an empty dict.
+    """
+    now = time.monotonic() if now is None else now
+    watts = {"cpu": 0.0, "ram": 0.0}
+    seen = {"cpu": False, "ram": False}
+    try:
+        domains = sorted(root.glob("intel-rapl:*"))
+    except OSError:
+        return {}
+    for d in domains:
+        depth = d.name.count(":")
+        try:
+            name = (d / "name").read_text().strip()
+            if depth == 1:
+                key = "cpu"  # package-N
+            elif name == "dram":
+                key = "ram"
+            else:
+                continue
+            uj = int((d / "energy_uj").read_text())
+        except (OSError, ValueError):
+            continue
+        prev = _rapl_prev.get(str(d))
+        _rapl_prev[str(d)] = (now, uj)
+        if prev is None:
+            continue
+        dt = now - prev[0]
+        duj = uj - prev[1]
+        if dt <= 0 or duj < 0:  # counter wrapped — resync next cycle
+            continue
+        watts[key] += duj / dt / 1e6
+        seen[key] = True
+    return {k: f"{v:.1f}" for k, v in watts.items() if seen[k]}
+
+
+IPMI_MIN_INTERVAL = 10.0   # BMC reads are slow-ish; power moves slowly anyway
+IPMI_FAIL_BACKOFF = 60.0
+_ipmi_cache = [0.0, ""]  # next-read-not-before (monotonic), last value
+
+
+def _parse_ipmi_power(out: str) -> str:
+    """Extract watts from `ipmitool dcmi power reading` output."""
+    for line in out.splitlines():
+        if "Instantaneous power reading" in line and ":" in line:
+            parts = line.split(":", 1)[1].split()
+            if parts:
+                try:
+                    float(parts[0])
+                except ValueError:
+                    return ""
+                return parts[0]
+    return ""
+
+
+def _read_ipmi_power() -> str:
+    """Whole-node wall power from the BMC (root + /dev/ipmi0 required)."""
+    now = time.monotonic()
+    if now < _ipmi_cache[0]:
+        return _ipmi_cache[1]
+    err = ""
+    try:
+        r = subprocess.run(
+            ["ipmitool", "dcmi", "power", "reading"],
+            capture_output=True, text=True, timeout=5,
+        )
+        val = _parse_ipmi_power(r.stdout)
+        if not val:
+            err = (r.stderr or r.stdout).strip().splitlines()[:1]
+            err = err[0] if err else f"exit {r.returncode}, unparsable output"
+    except Exception as e:
+        val, err = "", repr(e)
+    if err and not _ipmi_cache[1]:
+        # log only on failure streaks, once per backoff window
+        print(f"[agent] ipmi power read failed: {err}")
+    _ipmi_cache[0] = now + (IPMI_MIN_INTERVAL if val else IPMI_FAIL_BACKOFF)
+    _ipmi_cache[1] = val
+    return val
+
+
 def collect_local(mode: str = "gpu") -> dict:
     """Collect a GPU or CPU-only payload locally."""
     if mode == "cpu":
@@ -97,6 +188,10 @@ def collect_local(mode: str = "gpu") -> dict:
         "node_kind": mode,
         "gpus": gpu_dicts,
         "mem": mem_dict,
+        "power": {
+            **_read_rapl_power(),
+            **({"sys": v} if (v := _read_ipmi_power()) else {}),
+        },
     }
 
 

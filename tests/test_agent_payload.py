@@ -128,3 +128,49 @@ def test_cpu_agent_collects_meminfo_without_gpus(tmp_path, monkeypatch):
     assert payload["node_kind"] == "cpu"
     assert payload["gpus"] == []
     assert payload["mem"] == {"total": "1024", "used": "768", "avail": "256"}
+
+
+def test_read_rapl_power_deltas_and_domains(tmp_path):
+    # package-0 (cpu) + dram subdomain (ram) + core subdomain (must be skipped)
+    def domain(name, dirname):
+        d = tmp_path / dirname
+        d.mkdir()
+        (d / "name").write_text(name + "\n")
+        return d
+    pkg = domain("package-0", "intel-rapl:0")
+    dram = domain("dram", "intel-rapl:0:0")
+    core = domain("core", "intel-rapl:0:1")
+    pkg_uj, dram_uj, core_uj = 1_000_000_000, 500_000_000, 400_000_000
+    for d, uj in ((pkg, pkg_uj), (dram, dram_uj), (core, core_uj)):
+        (d / "energy_uj").write_text(str(uj))
+
+    agent._rapl_prev.clear()
+    assert agent._read_rapl_power(tmp_path, now=100.0) == {}  # first sample: no delta
+
+    # +120 J cpu, +12 J ram over 2s -> 60 W / 6 W; core grows too but is ignored
+    (pkg / "energy_uj").write_text(str(pkg_uj + 120_000_000))
+    (dram / "energy_uj").write_text(str(dram_uj + 12_000_000))
+    (core / "energy_uj").write_text(str(core_uj + 99_000_000))
+    assert agent._read_rapl_power(tmp_path, now=102.0) == {"cpu": "60.0", "ram": "6.0"}
+
+    # counter wrap (delta < 0) drops that domain for one cycle
+    (pkg / "energy_uj").write_text("5")
+    (dram / "energy_uj").write_text(str(dram_uj + 24_000_000))
+    assert agent._read_rapl_power(tmp_path, now=104.0) == {"ram": "6.0"}
+    agent._rapl_prev.clear()
+
+
+def test_read_rapl_power_missing_root_returns_empty(tmp_path):
+    agent._rapl_prev.clear()
+    assert agent._read_rapl_power(tmp_path / "nope", now=1.0) == {}
+
+
+def test_parse_ipmi_power():
+    out = (
+        "    Instantaneous power reading:                   612 Watts\n"
+        "    Minimum during sampling period:                 24 Watts\n"
+        "    IPMI timestamp:                           Mon Jul 20 07:00:00 2026\n"
+    )
+    assert agent._parse_ipmi_power(out) == "612"
+    assert agent._parse_ipmi_power("") == ""
+    assert agent._parse_ipmi_power("Instantaneous power reading: N/A Watts") == ""

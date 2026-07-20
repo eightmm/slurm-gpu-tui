@@ -64,7 +64,7 @@ _node_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 _repair_executor = ThreadPoolExecutor(max_workers=2)
 
 # Latest per-node SSH results, updated by background pollers.
-# name -> {"gpus": [dict], "mem": dict, "error": str, "error_kind": str, "stale": bool}
+# name -> {"gpus": [dict], "mem": dict, "power": dict, "error": str, "error_kind": str, "stale": bool}
 _results_lock = threading.Lock()
 _node_results: Dict[str, dict] = {}
 _inflight: set = set()
@@ -712,6 +712,7 @@ def collect_all() -> dict:
             with _results_lock:
                 _node_results[name] = {
                     "gpus": gpu_dicts, "mem": payload.get("mem", {}),
+                    "power": payload.get("power", {}),
                     "error": "", "error_kind": NodeErrorKind.OK.value, "stale": False,
                 }
                 node_is_cold = not has_jobs and (
@@ -791,6 +792,9 @@ def collect_all() -> dict:
             "mem_free": n["mem_free"],
             "mem_alloc": n.get("mem_alloc", ""), "gres": n["gres"],
             "mem_used": mem.get("used", ""), "mem_avail": mem.get("avail", ""),
+            "cpu_power": r.get("power", {}).get("cpu", ""),
+            "ram_power": r.get("power", {}).get("ram", ""),
+            "sys_power": r.get("power", {}).get("sys", ""),
             "gpus": gpus, "jobs": node_jobs.get(name, []),
             "error": r["error"], "stale": r["stale"],
             "error_kind": r["error_kind"],
@@ -849,6 +853,26 @@ def _format_metrics(data: dict) -> str:
         "# TYPE sgpu_node_up gauge",
         "# HELP sgpu_node_stale Node stale-data state by node",
         "# TYPE sgpu_node_stale gauge",
+        "# HELP sgpu_node_cpus_total CPU cores on the node per Slurm",
+        "# TYPE sgpu_node_cpus_total gauge",
+        "# HELP sgpu_node_cpus_alloc CPU cores allocated by Slurm",
+        "# TYPE sgpu_node_cpus_alloc gauge",
+        "# HELP sgpu_node_cpu_load Node load average",
+        "# TYPE sgpu_node_cpu_load gauge",
+        "# HELP sgpu_node_mem_total_mib Node memory total in MiB",
+        "# TYPE sgpu_node_mem_total_mib gauge",
+        "# HELP sgpu_node_mem_used_mib Node memory used in MiB",
+        "# TYPE sgpu_node_mem_used_mib gauge",
+        "# HELP sgpu_node_mem_alloc_mib Node memory allocated by Slurm in MiB",
+        "# TYPE sgpu_node_mem_alloc_mib gauge",
+        "# HELP sgpu_node_mem_avail_mib Node memory available in MiB",
+        "# TYPE sgpu_node_mem_avail_mib gauge",
+        "# HELP sgpu_node_cpu_power_watts CPU package power via RAPL (not full system)",
+        "# TYPE sgpu_node_cpu_power_watts gauge",
+        "# HELP sgpu_node_ram_power_watts DRAM power via RAPL (Intel only)",
+        "# TYPE sgpu_node_ram_power_watts gauge",
+        "# HELP sgpu_node_sys_power_watts Whole-node wall power from the BMC (ipmitool dcmi)",
+        "# TYPE sgpu_node_sys_power_watts gauge",
         "# HELP sgpu_gpus_total GPUs visible to sgpu",
         "# TYPE sgpu_gpus_total gauge",
         "# HELP sgpu_gpus_allocated GPUs allocated by Slurm",
@@ -875,6 +899,8 @@ def _format_metrics(data: dict) -> str:
         "# TYPE sgpu_gpu_power_watts gauge",
         "# HELP sgpu_gpu_allocated GPU allocation state by Slurm user",
         "# TYPE sgpu_gpu_allocated gauge",
+        "# HELP sgpu_gpu_job_info Slurm job holding this GPU",
+        "# TYPE sgpu_gpu_job_info gauge",
         "# HELP sgpu_gpu_idle_seconds Seconds GPU has been allocated with no process",
         "# TYPE sgpu_gpu_idle_seconds gauge",
         "# HELP sgpu_gpu_parked_seconds Seconds GPU has held VRAM with near-zero utilization",
@@ -928,6 +954,7 @@ def _format_metrics(data: dict) -> str:
     lines.append(f"sgpu_gpus_idle {idle_gpus}")
     lines.append(f"sgpu_gpus_parked {parked_gpus}")
     lines.append(f"sgpu_gpus_rogue {rogue_gpus}")
+    jobs_by_id = {str(j.get("jobid", "")): j for j in data.get("jobs", [])}
     for n in nodes:
         node = _prom_escape(n["name"])
         partition = _prom_escape(n.get("partition", ""))
@@ -938,6 +965,21 @@ def _format_metrics(data: dict) -> str:
         )
         lines.append(f'sgpu_node_up{{node="{node}"}} {up}')
         lines.append(f'sgpu_node_stale{{node="{node}"}} {1 if n.get("stale") else 0}')
+        for metric, key in (
+            ("sgpu_node_cpus_total", "cpus"),
+            ("sgpu_node_cpus_alloc", "cpu_alloc"),
+            ("sgpu_node_cpu_load", "cpu_load"),
+            ("sgpu_node_mem_total_mib", "mem_total"),
+            ("sgpu_node_mem_used_mib", "mem_used"),
+            ("sgpu_node_mem_alloc_mib", "mem_alloc"),
+            ("sgpu_node_mem_avail_mib", "mem_avail"),
+            ("sgpu_node_cpu_power_watts", "cpu_power"),
+            ("sgpu_node_ram_power_watts", "ram_power"),
+            ("sgpu_node_sys_power_watts", "sys_power"),
+        ):
+            v = num(n.get(key))
+            if v is not None:
+                lines.append(f'{metric}{{node="{node}"}} {v:g}')
         for g in n.get("gpus", []):
             lbl = f'node="{node}",gpu="{_prom_escape(g.get("index", ""))}"'
             lines.append(
@@ -962,6 +1004,14 @@ def _format_metrics(data: dict) -> str:
             user = _prom_escape(g.get("alloc_user", ""))
             allocated = 1 if (g.get("alloc_jobid") or g.get("alloc_user")) else 0
             lines.append(f'sgpu_gpu_allocated{{{lbl},user="{user}"}} {allocated}')
+            if allocated:
+                jid = str(g.get("alloc_jobid", ""))
+                job = jobs_by_id.get(jid, {})
+                lines.append(
+                    f'sgpu_gpu_job_info{{{lbl},user="{user}"'
+                    f',jobid="{_prom_escape(jid)}"'
+                    f',jobname="{_prom_escape(job.get("jobname", ""))}"}} 1'
+                )
             lines.append(f"sgpu_gpu_idle_seconds{{{lbl}}} {g.get('idle_sec', 0)}")
             lines.append(f"sgpu_gpu_parked_seconds{{{lbl}}} {g.get('parked_sec', 0)}")
     return "\n".join(lines) + "\n"
