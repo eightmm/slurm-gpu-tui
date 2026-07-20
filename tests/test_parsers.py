@@ -1,4 +1,6 @@
 """Parser tests against captured real-cluster output."""
+from datetime import datetime
+
 from sgpu.common import (
     NodeErrorKind, _classify_error, _expand_idx, _gpu_count_from_gres,
     assign_node_jobs, expand_nodelist, parse_gpu_alloc, parse_gres_models,
@@ -420,6 +422,8 @@ def _mk_notifier(tmp_path):
         "node_health": False, "collect_alert": False, "ecc_alert": False,
     }))
     n = Notifier(tmp_path, cfg_path=cfg)
+    n._thread_day = datetime.now().strftime("%Y-%m-%d")
+    n._thread_ts = "parent-ts"
     sent = []
     n._post = lambda text, key="": sent.append(text)
     return n, sent

@@ -2,6 +2,7 @@
 job-done diffing, debounce, persistence. No network — _post is stubbed."""
 import json
 import time
+from datetime import datetime
 
 import pytest
 
@@ -15,6 +16,10 @@ def _mk(tmp_path, **cfg_over):
     p = tmp_path / "webhook.json"
     p.write_text(json.dumps(cfg))
     n = Notifier(tmp_path, cfg_path=p)
+    # Existing state-machine tests focus on alert replies. Treat today's
+    # proactive parent as already created unless a test explicitly clears it.
+    n._thread_day = datetime.now().strftime("%Y-%m-%d")
+    n._thread_ts = "parent-ts"
     sent = []
     n._post = lambda text, key="": sent.append(text)
     return n, sent
@@ -215,6 +220,28 @@ def test_delivery_always_uses_slack_api(tmp_path):
     n._post_bot = lambda body, channel="": calls.append((body, channel)) or True
     assert n._deliver("alert", "U012AB")
     assert calls == [("alert", "U012AB")]
+
+
+def test_daily_parent_created_without_alerts(tmp_path):
+    n, sent = _mk(tmp_path)
+    n._thread_day = ""
+    n._thread_ts = ""
+    calls = []
+    n._slack_api = lambda method, payload: calls.append((method, payload)) or {"ts": "123.456"}
+
+    n.process({"nodes": [], "jobs": [], "errors": ""})
+    assert n._parent_worker is not None
+    n._parent_worker.join(timeout=1)
+
+    assert sent == []
+    assert calls == [("chat.postMessage", {
+        "channel": "#gpu",
+        "text": n._m("parent", date=n._thread_day, sender=n.sender),
+    })]
+    assert n._thread_ts == "123.456"
+
+    n.process({"nodes": [], "jobs": [], "errors": ""})
+    assert len(calls) == 1
 
 
 # ── misc ──────────────────────────────────────────────────────────────────

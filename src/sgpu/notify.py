@@ -176,6 +176,7 @@ class Notifier:
         # and stops a hung Slack call from stacking one thread per alert
         self._queue: "queue.Queue[tuple[str, str, float, str]]" = queue.Queue(maxsize=200)
         self._consumer: Optional[threading.Thread] = None
+        self._parent_worker: Optional[threading.Thread] = None
         self._parent_fail_ts = 0.0
         self._save_failed = False
         self._blind: Dict[str, float] = st.get("blind", {})
@@ -242,6 +243,7 @@ class Notifier:
         self._maybe_reload()
         if not self.enabled:
             return
+        self._maybe_start_daily_parent()
         now = time.time()
         nodes = data.get("nodes", [])
 
@@ -520,6 +522,27 @@ class Notifier:
                 self._parent_fail_ts = time.time()
             return ts
 
+    def _maybe_start_daily_parent(self) -> None:
+        """Create today's parent even when there are no alert replies.
+
+        The Slack request stays off the collect loop. A failed attempt uses the
+        same cooldown as alert-triggered parent creation, then a later collect
+        cycle retries it.
+        """
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self._thread_day == today and self._thread_ts:
+            return
+        if time.time() - self._parent_fail_ts < 60:
+            return
+        if self._parent_worker is not None and self._parent_worker.is_alive():
+            return
+        self._parent_worker = threading.Thread(
+            target=self._ensure_daily_parent,
+            daemon=True,
+            name="slack-daily-parent",
+        )
+        self._parent_worker.start()
+
     def _slack_api(self, method: str, payload: dict) -> Optional[dict]:
         resp = self._http_post(
             f"{SLACK_API_BASE}/{method}", payload,
@@ -575,12 +598,15 @@ class Notifier:
                 "free_was_below": self._free_was_below,
                 "thread_day": self._thread_day, "thread_ts": self._thread_ts,
             })
-        try:
-            tmp = self._state_file.with_suffix(".tmp")
-            tmp.write_text(payload)
-            tmp.rename(self._state_file)
-            self._save_failed = False
-        except OSError as e:
-            if not self._save_failed:  # log once, not every 3s cycle
-                print(f"[notify] state save failed: {e}", flush=True)
-                self._save_failed = True
+            # Parent creation and alert delivery run in separate workers. Keep
+            # their shared temp-file write inside the lock as well as snapshot
+            # construction so concurrent saves cannot rename each other's file.
+            try:
+                tmp = self._state_file.with_suffix(".tmp")
+                tmp.write_text(payload)
+                tmp.rename(self._state_file)
+                self._save_failed = False
+            except OSError as e:
+                if not self._save_failed:  # log once, not every 3s cycle
+                    print(f"[notify] state save failed: {e}", flush=True)
+                    self._save_failed = True

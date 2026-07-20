@@ -36,7 +36,8 @@ terminal TUI · collector daemon · push agents · usage/waste accounting · Sla
   matched to SLURM jobs even when driver probe order differs from `/dev/nvidiaN`
 - Idle / parked / rogue GPU detection, pending queue with reasons and start estimates
 - Per-user GPU-hours, efficiency, and wasted hours, backfilled from slurmdbd
-- Slack alerts (node down/recovered, GPU health, waste/rogue) in a daily thread
+- Slack alerts (node down/recovered, GPU health, waste/rogue) in a daily thread,
+  with one parent posted every day even when there are no alerts
 - Prometheus metrics + bundled Grafana dashboard — **[docs/GRAFANA.md](docs/GRAFANA.md)**
 
 ## How It Works

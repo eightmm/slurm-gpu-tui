@@ -15,10 +15,12 @@ by the TUI. They continue even when no terminal UI is open.
 Create a Slack app with the `chat:write` scope, install it, invite it to the
 channel (`/invite @your-bot`), and give the installer the bot token
 (`xoxb-...`) and channel. Alerts post as replies under **one parent message per
-day** (`📅 GPU cluster alerts — date`), keeping the channel tidy. An existing
-value is shown before the installer asks whether to reuse it; the bot token is
-masked except for enough characters to identify it. When an existing config is
-found, the installer also prints its full path before asking any questions.
+day** (`📅 GPU cluster alerts — date`), keeping the channel tidy. The collector
+creates that parent at the start of each day even when there are no alerts, so
+a healthy day remains visible with zero replies. An existing value is shown
+before the installer asks whether to reuse it; the bot token is masked except
+for enough characters to identify it. When an existing config is found, the
+installer also prints its full path before asking any questions.
 
 Non-interactive: `SGPU_SLACK_BOT_TOKEN`, `SGPU_SLACK_CHANNEL`,
 `SGPU_SLACK_SENDER`, and `SGPU_SLACK_LANG` skip the matching prompts.
