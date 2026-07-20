@@ -91,6 +91,7 @@ def _parse_daemon_data(raw: dict) -> Tuple[List[NodeInfo], List[JobInfo], List[P
             GpuInfo(
                 index=g.get("index", ""), minor=g.get("minor", ""),
                 uuid=g.get("uuid", ""), pci_bus=g.get("pci_bus", ""),
+                slot=g.get("slot", ""),
                 serial=g.get("serial", ""), name=g.get("name", ""),
                 util=g.get("util", ""), mem_used=g.get("mem_used", ""),
                 mem_total=g.get("mem_total", ""), temp=g.get("temp", ""),

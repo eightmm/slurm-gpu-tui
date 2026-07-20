@@ -462,7 +462,7 @@ def _update_poll_state(name: str, success: bool, node_is_cold: bool, slurm_state
 def _gpu_to_dict(gpu: GpuInfo) -> dict:
     return {
         "index": gpu.index, "minor": gpu.minor, "uuid": gpu.uuid,
-        "pci_bus": gpu.pci_bus, "serial": gpu.serial,
+        "pci_bus": gpu.pci_bus, "slot": gpu.slot, "serial": gpu.serial,
         "name": gpu.name, "util": gpu.util,
         "mem_used": gpu.mem_used, "mem_total": gpu.mem_total,
         "temp": gpu.temp, "power": gpu.power, "power_cap": gpu.power_cap,

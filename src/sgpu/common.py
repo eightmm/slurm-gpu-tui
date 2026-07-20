@@ -180,6 +180,7 @@ class GpuInfo:
                          # Can differ from index (probe order != PCI order)!
     uuid: str = ""       # durable hardware id (RMA / physical identification)
     pci_bus: str = ""    # PCI bus address
+    slot: str = ""       # physical PCIe slot (SMBIOS number; "" when unknown)
     serial: str = ""     # board serial ("" / N/A on consumer GPUs)
     name: str = ""
     util: str = ""       # %
@@ -513,7 +514,22 @@ NODE_PAYLOAD_CMD = (
     "if [ -n \"$PIDS\" ]; then for p in $(echo ${PIDS%,} | tr ',' ' '); do "
     "j=$(grep -m1 -oE 'job_[0-9]+' /proc/$p/cgroup 2>/dev/null); "
     "[ -n \"$j\" ] && echo \"$p ${j#job_}\"; "
-    "done; fi"
+    "done; fi; "
+    "echo '---SEP---'; "
+    # PCI bus -> physical slot number (SMBIOS, via /sys/bus/pci/slots — no
+    # root needed). A GPU behind a riser/PLX bridge has no slot entry of its
+    # own, so walk the sysfs ancestor chain and take the deepest ancestor
+    # whose bus address matches a slot.
+    "SLOTS=$(for s in /sys/bus/pci/slots/*/address; do [ -e \"$s\" ] || continue; "
+    "p=${s%/address}; printf '%s %s\\n' \"${p##*/}\" \"$(cat \"$s\")\"; done 2>/dev/null); "
+    "for d in /proc/driver/nvidia/gpus/*/information; do "
+    "b=$(awk '/Bus Location/{print $NF}' \"$d\" 2>/dev/null); "
+    "if [ -n \"$b\" ]; then "
+    "rp=$(readlink -f \"/sys/bus/pci/devices/$b\" 2>/dev/null); slot=; "
+    "for c in $(printf '%s\\n' \"$rp\" | tr '/' ' '); do case \"$c\" in *:*.*) "
+    "m=$(printf '%s\\n' \"$SLOTS\" | awk -v a=\"${c%.*}\" '$2==a{print $1; exit}'); "
+    "[ -n \"$m\" ] && slot=$m;; esac; done; "
+    "if [ -n \"$slot\" ]; then echo \"$b $slot\"; fi; fi; done; true"
 )
 
 
@@ -535,6 +551,7 @@ def parse_node_payload(out: str) -> Tuple[List[GpuInfo], NodeMemInfo]:
     ps_raw = sections[3].strip() if len(sections) > 3 else ""
     minor_raw = sections[4].strip() if len(sections) > 4 else ""
     jobid_raw = sections[5].strip() if len(sections) > 5 else ""
+    slot_raw = sections[6].strip() if len(sections) > 6 else ""
 
     # "0000:06:00.0 2" -> {"06:00.0": "2"}; nvidia-smi prints the bus id with
     # a longer domain ("00000000:06:00.0"), so compare on the bus:dev.fn tail
@@ -543,6 +560,13 @@ def parse_node_payload(out: str) -> Tuple[List[GpuInfo], NodeMemInfo]:
         parts = line.split()
         if len(parts) == 2 and ":" in parts[0]:
             bus_to_minor[parts[0].split(":", 1)[1].lower()] = parts[1]
+
+    # "0000:06:00.0 4" -> {"06:00.0": "4"} (physical slot; same tail-matching)
+    bus_to_slot: Dict[str, str] = {}
+    for line in slot_raw.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and ":" in parts[0]:
+            bus_to_slot[parts[0].split(":", 1)[1].lower()] = parts[1]
 
     mem_info = NodeMemInfo()
     mem_parts = mem_raw.split()
@@ -587,13 +611,16 @@ def parse_node_payload(out: str) -> Tuple[List[GpuInfo], NodeMemInfo]:
             pid_to_user[pid] for pid in pids if pid in pid_to_user
         ))
         pci_bus = p[9] if len(p) >= 10 else ""
-        minor = ""
+        minor = slot = ""
         if pci_bus and ":" in pci_bus:
-            minor = bus_to_minor.get(pci_bus.split(":", 1)[1].lower(), "")
+            tail = pci_bus.split(":", 1)[1].lower()
+            minor = bus_to_minor.get(tail, "")
+            slot = bus_to_slot.get(tail, "")
         ecc = p[10] if len(p) >= 11 else ""
         serial = p[11] if len(p) >= 12 else ""
         gpus.append(GpuInfo(
-            index=idx, minor=minor, uuid=p[1], pci_bus=pci_bus, serial=serial,
+            index=idx, minor=minor, uuid=p[1], pci_bus=pci_bus, slot=slot,
+            serial=serial,
             name=shorten_gpu_name(p[2]), util=p[3],
             mem_used=p[4], mem_total=p[5], temp=p[6], power=p[7], power_cap=p[8],
             ecc=ecc, pids=pids, users=users,

@@ -88,7 +88,8 @@ def _snapshot_nodes() -> List[NodeInfo]:
     for n in data.get("nodes", []):
         gpus = [
             GpuInfo(**{k: g.get(k, d) for k, d in (
-                ("index", ""), ("minor", ""), ("uuid", ""), ("pci_bus", ""), ("serial", ""),
+                ("index", ""), ("minor", ""), ("uuid", ""), ("pci_bus", ""),
+                ("slot", ""), ("serial", ""),
                 ("name", ""), ("util", ""), ("mem_used", ""),
                 ("mem_total", ""), ("temp", ""), ("power", ""), ("power_cap", ""), ("ecc", ""),
                 ("pids", []), ("users", []), ("pid_mem", {}), ("pid_jobid", {}),

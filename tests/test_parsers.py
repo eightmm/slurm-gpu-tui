@@ -342,6 +342,33 @@ def test_apply_gpu_alloc_idle_reservation_and_rogue():
     assert gpus[1].alloc_jobid == "500" and gpus[1].alloc_user == "userA"
 
 
+def test_payload_slot_mapping():
+    # section 7 maps PCI bus -> physical slot (captured shape from gpu1);
+    # a GPU with no slot entry (riser mapping failed) stays ""
+    payload = (
+        "0, GPU-aaa, H100, 7, 2603, 81559, 60, 100, 300, 00000000:AB:00.0\n"
+        "1, GPU-bbb, RTX 6000 Ada, 0, 0, 49140, 40, 20, 300, 00000000:BD:00.0\n"
+        "---SEP---\n\n---SEP---\n1 1 0\n---SEP---\n\n---SEP---\n"
+        "0000:ab:00.0 2\n0000:bd:00.0 3\n"
+        "---SEP---\n\n---SEP---\n"
+        "0000:ab:00.0 9\n"
+    )
+    gpus, _ = parse_node_payload(payload)
+    assert [g.slot for g in gpus] == ["9", ""]
+    assert [g.minor for g in gpus] == ["2", "3"]
+
+
+def test_payload_without_slot_section_is_fine():
+    # old-agent payload (6 sections) — slot just stays empty
+    payload = (
+        "0, GPU-aaa, A100, 50, 100, 40000, 50, 100, 300, 00000000:06:00.0\n"
+        "---SEP---\n\n---SEP---\n1 1 0\n---SEP---\n\n---SEP---\n"
+        "0000:06:00.0 0\n---SEP---\n"
+    )
+    gpus, _ = parse_node_payload(payload)
+    assert gpus[0].slot == "" and gpus[0].minor == "0"
+
+
 def test_payload_without_minor_falls_back_to_index():
     # macOS-style / old-agent payload with no minor section, no pci column
     payload = ("0, GPU-aaa, A100, 50, 100, 40000, 50, 100, 300\n"

@@ -55,7 +55,7 @@ home directory.
 | `rogue_alert` | `true` | GPU used outside SLURM |
 | `rogue_grace_sec` | `300` | Rogue use must persist this long before alerting (rides out job start/end races) |
 | `temp_alert_c` | `0` | GPU temperature ≥ N °C (`0` = off; ~90 typical) |
-| `ecc_alert` | `true` | Uncorrectable ECC errors — silent hardware failure; alert carries UUID / PCI bus / serial for RMA |
+| `ecc_alert` | `true` | Uncorrectable ECC errors — silent hardware failure; alert carries physical slot / /dev/nvidiaN / UUID / PCI bus / serial for RMA |
 | `job_done_users` | `[]` | Notify when these users' jobs finish |
 | `job_fail_users` | `[]` | FAILED / OOM / TIMEOUT / NODE_FAIL alerts for these users; `["*"]` = everyone (needs sacct) |
 | `pending_alert_hours` | `0` | Job stuck `PENDING` on the scheduler ≥ N hours (`0` = off; user holds / dependencies never alert) |

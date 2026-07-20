@@ -33,6 +33,19 @@ def _node(name="gpu1", state="idle", gpus=None, **kw):
     return d
 
 
+def test_ecc_alert_names_slot_and_device_node(tmp_path):
+    n, sent = _mk(tmp_path, ecc_alert=True)
+    gpu = {"index": "4", "minor": "4", "slot": "7", "name": "RTX 4090",
+           "uuid": "GPU-29e3b221", "pci_bus": "00000000:81:00.0",
+           "serial": "[N/A]", "ecc": "2", "pids": [], "users": []}
+    n.process({"nodes": [_node(name="gpu7", gpus=[gpu])], "jobs": [], "errors": ""})
+    assert len(sent) == 1
+    assert "gpu7 GPU4" in sent[0]
+    assert "slot 7" in sent[0] and "/dev/nvidia4" in sent[0]
+    assert "UUID GPU-29e3b221" in sent[0] and "bus 00000000:81:00.0" in sent[0]
+    assert "S/N" not in sent[0]  # [N/A] serial must be skipped
+
+
 # ── node down / recovered ─────────────────────────────────────────────────
 
 def test_node_down_respects_grace_then_alerts_and_recovers(tmp_path):

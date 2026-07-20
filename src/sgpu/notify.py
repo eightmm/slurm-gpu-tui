@@ -115,11 +115,16 @@ def _to_int(v) -> Optional[int]:
 
 
 def _hw_id(g: dict) -> str:
-    """Physical-identity line for a GPU (UUID / PCI bus / serial), skipping
-    fields the driver reports as N/A."""
+    """Physical-identity line for a GPU (slot / device node / UUID / PCI bus /
+    serial), skipping fields the driver reports as N/A. Slot and /dev/nvidiaN
+    come first — that's what someone standing at the machine needs."""
     def ok(v: str) -> bool:
         return bool(v) and "N/A" not in v and "Not Supported" not in v
     parts = []
+    if ok(g.get("slot", "")):
+        parts.append(f"slot {g['slot']}")
+    if ok(g.get("minor", "")):
+        parts.append(f"/dev/nvidia{g['minor']}")
     if ok(g.get("uuid", "")):
         parts.append(f"UUID {g['uuid']}")
     if ok(g.get("pci_bus", "")):
