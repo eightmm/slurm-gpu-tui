@@ -1778,7 +1778,7 @@
       "targets": [
         {
           "expr": "sum(rate(node_network_receive_bytes_total{device!=\"lo\"}[2m]))",
-          "legendFormat": "RX",
+          "legendFormat": "Inbound (RX)",
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
@@ -1787,7 +1787,7 @@
         },
         {
           "expr": "sum(rate(node_network_transmit_bytes_total{device!=\"lo\"}[2m]))",
-          "legendFormat": "TX",
+          "legendFormat": "Outbound (TX)",
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
