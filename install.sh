@@ -165,9 +165,8 @@ if [ "$BOT_TOKEN" = "__ask__" ]; then
         if [ -n "$OLD_BOT" ] && _keep_existing "Slack bot token" "$(_mask_token "$OLD_BOT")"; then
             :
         else
-            printf "Slack bot token (xoxb-…; Enter to disable Slack alerts): " > /dev/tty
-            read -rs BOT_TOKEN < /dev/tty || BOT_TOKEN=""
-            echo > /dev/tty
+            printf "Slack bot token (xoxb-…; visible while typing, Enter to disable): " > /dev/tty
+            read -r BOT_TOKEN < /dev/tty || BOT_TOKEN=""
         fi
     fi
 fi

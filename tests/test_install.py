@@ -48,6 +48,8 @@ def test_installer_configures_slack_bot_only_and_shows_existing_values():
     assert 'Use this? [Y/n]' in installer
     assert "Existing Slack settings found in %s" in installer
     assert "_mask_token" in installer
+    assert "visible while typing" in installer
+    assert "read -rs BOT_TOKEN" not in installer
     assert 'cfg.pop("url", None)' in installer
     assert "SGPU_WEBHOOK_URL" not in installer
     assert "Slack webhook URL" not in installer

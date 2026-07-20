@@ -20,7 +20,8 @@ creates that parent at the start of each day even when there are no alerts, so
 a healthy day remains visible with zero replies. An existing value is shown
 before the installer asks whether to reuse it; the bot token is masked except
 for enough characters to identify it. When an existing config is found, the
-installer also prints its full path before asking any questions.
+installer also prints its full path before asking any questions. A replacement
+token is visible while it is pasted or typed so the input is unambiguous.
 
 Non-interactive: `SGPU_SLACK_BOT_TOKEN`, `SGPU_SLACK_CHANNEL`,
 `SGPU_SLACK_SENDER`, and `SGPU_SLACK_LANG` skip the matching prompts.
