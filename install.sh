@@ -122,57 +122,100 @@ if [ -n "$SHARE" ] && [ "$SHARE" != "0" ]; then
     fi
 fi
 
-# Slack alerts config (~/.sgpu/webhook.json). Prompts run on both fresh
-# installs and re-installs; every field defaults to its existing value, so
-# each answer only overrides what you type (empty = keep). This lets an
-# existing install gain a bot token / language without a hand-edit.
-# Skip a question with: SGPU_WEBHOOK_URL / _SENDER / _LANG,
-# SGPU_SLACK_BOT_TOKEN / _CHANNEL. Non-interactive with none set = no change.
-WEBHOOK_CFG="$HOME/.sgpu/webhook.json"
-CFG_EXISTS=false; [ -f "$WEBHOOK_CFG" ] && CFG_EXISTS=true
+# Slack bot alerts config. The legacy filename is retained so existing
+# installations keep their alert tuning, but incoming-webhook delivery is no
+# longer supported. Non-interactive runs can set SGPU_SLACK_BOT_TOKEN,
+# SGPU_SLACK_CHANNEL, SGPU_SLACK_SENDER, and SGPU_SLACK_LANG.
+SLACK_CFG="$HOME/.sgpu/webhook.json"
 _tty() { [ -r /dev/tty ] && [ -w /dev/tty ]; }
+_cfg_get() {
+    "$VENV_DIR/bin/python" - "$SLACK_CFG" "$1" << 'PYEOF'
+import json, sys
+try:
+    value = json.load(open(sys.argv[1])).get(sys.argv[2], "")
+except (OSError, ValueError, AttributeError):
+    value = ""
+print(value if isinstance(value, (str, int, float)) else "")
+PYEOF
+}
+_mask_token() {
+    case "$1" in
+        ????????*) printf '%s…%s' "${1:0:5}" "${1: -4}" ;;
+        *) printf '(set)' ;;
+    esac
+}
+_keep_existing() {
+    printf '%s currently: %s. Use this? [Y/n] ' "$1" "$2" > /dev/tty
+    read -r ans < /dev/tty || ans=""
+    case "$ans" in n|N|no|NO|No) return 1 ;; *) return 0 ;; esac
+}
 
-WEBHOOK_URL="${SGPU_WEBHOOK_URL-__ask__}"
-if [ "$WEBHOOK_URL" = "__ask__" ]; then
-    WEBHOOK_URL=""
+OLD_BOT="$(_cfg_get bot_token)"
+OLD_CHANNEL="$(_cfg_get channel)"
+OLD_SENDER="$(_cfg_get sender_name)"
+OLD_LANG="$(_cfg_get lang)"
+if _tty && [ -f "$SLACK_CFG" ]; then
+    printf 'Existing Slack settings found in %s\n' "$SLACK_CFG" > /dev/tty
+fi
+
+BOT_TOKEN="${SGPU_SLACK_BOT_TOKEN-__ask__}"
+if [ "$BOT_TOKEN" = "__ask__" ]; then
+    BOT_TOKEN="$OLD_BOT"
     if _tty; then
-        if $CFG_EXISTS; then
-            printf "Slack webhook URL — Enter to keep existing: " > /dev/tty
+        if [ -n "$OLD_BOT" ] && _keep_existing "Slack bot token" "$(_mask_token "$OLD_BOT")"; then
+            :
         else
-            printf "Slack webhook URL for cluster alerts (node down/up) — Enter to skip: " > /dev/tty
+            printf "Slack bot token (xoxb-…; Enter to disable Slack alerts): " > /dev/tty
+            read -rs BOT_TOKEN < /dev/tty || BOT_TOKEN=""
+            echo > /dev/tty
         fi
-        read -r WEBHOOK_URL < /dev/tty || WEBHOOK_URL=""
     fi
 fi
 
-if $CFG_EXISTS || [ -n "$WEBHOOK_URL" ]; then
-    SENDER="${SGPU_WEBHOOK_SENDER-__ask__}"
-    if [ "$SENDER" = "__ask__" ]; then
-        SENDER=""
-        _tty && { printf "Sender name shown in alerts (Enter to keep/default AI-master): " > /dev/tty; read -r SENDER < /dev/tty || SENDER=""; }
-    fi
-    # Optional bot token -> daily-thread grouping (needs chat:write in channel)
-    BOT_TOKEN="${SGPU_SLACK_BOT_TOKEN-__ask__}"
-    if [ "$BOT_TOKEN" = "__ask__" ]; then
-        BOT_TOKEN=""
-        _tty && { printf "Slack bot token for daily-thread grouping (xoxb-…, Enter to keep/skip): " > /dev/tty; read -rs BOT_TOKEN < /dev/tty || BOT_TOKEN=""; echo > /dev/tty; }
-    fi
-    CHANNEL="${SGPU_SLACK_CHANNEL-__ask__}"
+CHANNEL="${SGPU_SLACK_CHANNEL-__ask__}"
+SENDER="${SGPU_SLACK_SENDER-${SGPU_WEBHOOK_SENDER-__ask__}}"
+LANG_SEL="${SGPU_SLACK_LANG-${SGPU_WEBHOOK_LANG-__ask__}}"
+if [ -n "$BOT_TOKEN" ] && _tty; then
     if [ "$CHANNEL" = "__ask__" ]; then
-        CHANNEL=""
-        _tty && { printf "Channel for threaded alerts (e.g. #gpu-cluster, Enter to keep): " > /dev/tty; read -r CHANNEL < /dev/tty || CHANNEL=""; }
+        CHANNEL="$OLD_CHANNEL"
+        if [ -z "$OLD_CHANNEL" ] || ! _keep_existing "Slack channel" "$OLD_CHANNEL"; then
+            printf "Slack channel for threaded alerts (e.g. #gpu-cluster): " > /dev/tty
+            read -r CHANNEL < /dev/tty || CHANNEL=""
+        fi
     fi
-    LANG_SEL="${SGPU_WEBHOOK_LANG-__ask__}"
+    if [ "$SENDER" = "__ask__" ]; then
+        SENDER="$OLD_SENDER"
+        if [ -z "$OLD_SENDER" ] || ! _keep_existing "Alert sender" "$OLD_SENDER"; then
+            printf "Alert sender name (Enter for AI-master): " > /dev/tty
+            read -r SENDER < /dev/tty || SENDER=""
+            SENDER="${SENDER:-AI-master}"
+        fi
+    fi
     if [ "$LANG_SEL" = "__ask__" ]; then
-        LANG_SEL=""
-        _tty && { printf "Alert language en/ko (Enter to keep/default en): " > /dev/tty; read -r LANG_SEL < /dev/tty || LANG_SEL=""; }
+        LANG_SEL="$OLD_LANG"
+        if [ -z "$OLD_LANG" ] || ! _keep_existing "Alert language" "$OLD_LANG"; then
+            printf "Alert language (en/ko; Enter for en): " > /dev/tty
+            read -r LANG_SEL < /dev/tty || LANG_SEL=""
+            LANG_SEL="${LANG_SEL:-en}"
+        fi
     fi
+fi
+[ "$CHANNEL" = "__ask__" ] && CHANNEL="$OLD_CHANNEL"
+[ "$SENDER" = "__ask__" ] && SENDER="$OLD_SENDER"
+[ "$LANG_SEL" = "__ask__" ] && LANG_SEL="$OLD_LANG"
+
+if [ -n "$BOT_TOKEN" ] && [ -z "$CHANNEL" ]; then
+    echo "WARNING: Slack bot token is set but channel is empty — alerts are disabled."
+fi
+
+if [ -f "$SLACK_CFG" ] || [ -n "$BOT_TOKEN" ] || [ -n "$CHANNEL" ]; then
     mkdir -p "$HOME/.sgpu"
-    # Merge into existing config in Python: only non-empty answers override;
-    # unknown/tuned keys (node_health, thresholds, …) are preserved. Seeds
-    # sensible defaults for keys absent on a fresh file.
-    SGPU_CFG="$WEBHOOK_CFG" NEW_URL="$WEBHOOK_URL" NEW_SENDER="$SENDER" \
-    NEW_BOT="$BOT_TOKEN" NEW_CHANNEL="$CHANNEL" NEW_LANG="$LANG_SEL" \
+    touch "$SLACK_CFG"
+    chmod 600 "$SLACK_CFG"
+    # Preserve tuned alert keys, replace delivery credentials explicitly, and
+    # discard the retired incoming-webhook URL.
+    SGPU_CFG="$SLACK_CFG" NEW_SENDER="$SENDER" NEW_BOT="$BOT_TOKEN" \
+    NEW_CHANNEL="$CHANNEL" NEW_LANG="$LANG_SEL" \
     "$VENV_DIR/bin/python" - << 'PYEOF'
 import json, os
 p = os.environ["SGPU_CFG"]
@@ -180,16 +223,12 @@ try:
     cfg = json.load(open(p))
 except Exception:
     cfg = {}
-def setval(key, val):
-    if val:
-        cfg[key] = val
-setval("url", os.environ.get("NEW_URL"))
-setval("bot_token", os.environ.get("NEW_BOT"))
-setval("channel", os.environ.get("NEW_CHANNEL"))
-setval("sender_name", os.environ.get("NEW_SENDER"))
+cfg.pop("url", None)
+cfg["bot_token"] = os.environ.get("NEW_BOT", "")
+cfg["channel"] = os.environ.get("NEW_CHANNEL", "")
+cfg["sender_name"] = os.environ.get("NEW_SENDER") or "AI-master"
 lang = os.environ.get("NEW_LANG")
-if lang in ("en", "ko"):
-    cfg["lang"] = lang
+cfg["lang"] = lang if lang in ("en", "ko") else "en"
 # seed defaults only when absent (don't clobber tuned values)
 defaults = {"sender_name": "AI-master", "lang": "en", "node_health": True,
             "down_grace_sec": 180, "collect_alert": True, "collect_grace_sec": 600,
@@ -198,15 +237,12 @@ defaults = {"sender_name": "AI-master", "lang": "en", "node_health": True,
             "job_done_users": [], "free_gpus_min": 0}
 for k, v in defaults.items():
     cfg.setdefault(k, v)
-if not cfg.get("url") and not (cfg.get("bot_token") and cfg.get("channel")):
-    print("SKIP")  # no delivery configured -> leave file as-is/absent
-else:
-    json.dump(cfg, open(p, "w"), indent=2)
-    print("OK")
+json.dump(cfg, open(p, "w"), indent=2)
 PYEOF
-    if [ -f "$WEBHOOK_CFG" ]; then
-        chmod 600 "$WEBHOOK_CFG"
-        echo "[3b] Webhook alerts configured ($WEBHOOK_CFG) — edit it any time; the collector hot-reloads it"
+    if [ -n "$BOT_TOKEN" ] && [ -n "$CHANNEL" ]; then
+        echo "[3b] Slack bot alerts configured ($SLACK_CFG) — the collector hot-reloads it"
+    else
+        echo "[3b] Slack bot alerts are not configured ($SLACK_CFG)"
     fi
 fi
 

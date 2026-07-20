@@ -39,3 +39,15 @@ def test_installer_replaces_legacy_cpu_agent_before_restart():
     assert stop < kill < restart
     assert "legacy sgpu-agent did not stop" in remote
     assert "_stop_legacy_cpu_agent_local" in installer
+
+
+def test_installer_configures_slack_bot_only_and_shows_existing_values():
+    installer = (ROOT / "install.sh").read_text()
+
+    assert "Slack bot token" in installer
+    assert 'Use this? [Y/n]' in installer
+    assert "Existing Slack settings found in %s" in installer
+    assert "_mask_token" in installer
+    assert 'cfg.pop("url", None)' in installer
+    assert "SGPU_WEBHOOK_URL" not in installer
+    assert "Slack webhook URL" not in installer

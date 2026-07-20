@@ -1,12 +1,10 @@
-"""Webhook notifications, driven by the collector's per-cycle snapshot.
+"""Slack bot notifications, driven by the collector's per-cycle snapshot.
 
-Config: ~/.sgpu/webhook.json (or SLURM_GPU_TUI_WEBHOOK_URL for URL only)
+Config: ~/.sgpu/webhook.json
 {
-  "url": "https://hooks.slack.com/services/...",   # Slack-compatible {"text": ...}
-  "bot_token": "xoxb-...",        # optional: Slack bot token -> alerts become
+  "bot_token": "xoxb-...",        # Slack bot token; alerts become
   "channel": "#gpu-cluster",      #   replies under one parent message per day
-                                  #   (incoming webhooks can't thread; needs a
-                                  #   bot with chat:write invited to the channel)
+                                  #   (needs chat:write and a bot invited to it)
   "sender_name": "AI-master",     # identity in the alert footer/username
   "lang": "en",                   # alert language: "en" or "ko"
   "node_health": true,            # node down/recovered alerts (SLURM state)
@@ -27,8 +25,8 @@ Config: ~/.sgpu/webhook.json (or SLURM_GPU_TUI_WEBHOOK_URL for URL only)
   "free_gpus_min": 0              # alert when free-GPU count reaches N (0 = off)
 }
 
-No config and no env URL -> notifier is inert. POSTs run in a daemon
-thread so a slow webhook never blocks the collect loop. State persists
+No bot token/channel -> notifier is inert. POSTs run in a daemon thread so a
+slow Slack API call never blocks the collect loop. State persists
 so restarts don't re-fire old alerts.
 """
 from __future__ import annotations
@@ -47,9 +45,15 @@ from typing import Dict, List, Optional
 
 from .common import ROGUE_IGNORE, run_cmd
 
-DEBOUNCE_SEC = int(os.getenv("SLURM_GPU_TUI_WEBHOOK_DEBOUNCE_SEC", "1800"))
+DEBOUNCE_SEC = int(os.getenv(
+    "SLURM_GPU_TUI_SLACK_DEBOUNCE_SEC",
+    os.getenv("SLURM_GPU_TUI_WEBHOOK_DEBOUNCE_SEC", "1800"),
+))
 # waste/rogue conditions persist for hours — re-nag much less often
-NAG_REALERT_SEC = int(os.getenv("SLURM_GPU_TUI_WEBHOOK_NAG_SEC", "21600"))
+NAG_REALERT_SEC = int(os.getenv(
+    "SLURM_GPU_TUI_SLACK_NAG_SEC",
+    os.getenv("SLURM_GPU_TUI_WEBHOOK_NAG_SEC", "21600"),
+))
 # override for tests; real Slack Web API otherwise
 SLACK_API_BASE = os.getenv("SLURM_GPU_TUI_SLACK_API_BASE", "https://slack.com/api")
 
@@ -169,7 +173,7 @@ class Notifier:
         self._post_lock = threading.Lock()
         self._state_lock = threading.Lock()
         # single consumer thread: preserves alert order (down before recovered)
-        # and stops a hung webhook from stacking one thread per alert
+        # and stops a hung Slack call from stacking one thread per alert
         self._queue: "queue.Queue[tuple[str, str, float, str]]" = queue.Queue(maxsize=200)
         self._consumer: Optional[threading.Thread] = None
         self._parent_fail_ts = 0.0
@@ -189,8 +193,7 @@ class Notifier:
             cfg = json.loads(self._cfg_path.read_text())
         except (OSError, ValueError):
             self._cfg_mtime = None
-        self.url: str = cfg.get("url") or os.getenv("SLURM_GPU_TUI_WEBHOOK_URL", "")
-        # bot mode: threads alerts under one parent per day (needs chat:write)
+        # Threads alerts under one parent per day (needs chat:write).
         self.bot_token: str = cfg.get("bot_token", "") or os.getenv("SLURM_GPU_TUI_SLACK_BOT_TOKEN", "")
         self.channel: str = cfg.get("channel", "")
         self.node_health: bool = bool(cfg.get("node_health", True))
@@ -201,7 +204,7 @@ class Notifier:
         self.job_fail_users: List[str] = list(cfg.get("job_fail_users", []))
         # job stuck in the queue (scheduler wait, not user holds) >= N hours
         self.pending_alert_hours: float = float(cfg.get("pending_alert_hours", 0))
-        # personal Slack DMs: {"login": "U0123ABC"} member ids (bot mode only)
+        # personal Slack DMs: {"login": "U0123ABC"} member ids
         self.dm_users: Dict[str, str] = dict(cfg.get("dm_users", {}))
         self.free_gpus_min: int = int(cfg.get("free_gpus_min", 0))
         self.waste_alert_hours: float = float(cfg.get("waste_alert_hours", 0))
@@ -218,25 +221,21 @@ class Notifier:
         self._origin = self.sender + (f" ({ip})" if ip else "")
 
     def _maybe_reload(self) -> None:
-        """Pick up webhook.json edits without a collector restart."""
+        """Pick up Slack config edits without a collector restart."""
         try:
             mtime = self._cfg_path.stat().st_mtime
         except OSError:
             mtime = None
         if mtime != self._cfg_mtime:
             self._load_config()
-            print(f"[notify] webhook config reloaded (enabled={self.enabled})", flush=True)
+            print(f"[notify] Slack config reloaded (enabled={self.enabled})", flush=True)
 
     def _m(self, key: str, **kw) -> str:
         return MSG.get(self.lang, MSG["en"])[key].format(**kw)
 
     @property
-    def _bot_mode(self) -> bool:
-        return bool(self.bot_token and self.channel)
-
-    @property
     def enabled(self) -> bool:
-        return bool(self.url) or self._bot_mode
+        return bool(self.bot_token and self.channel)
 
     def process(self, data: dict) -> None:
         """Diff one collector snapshot against remembered state; fire alerts."""
@@ -445,9 +444,9 @@ class Notifier:
 
     def _post_dm(self, user: str, text: str) -> None:
         """Also deliver an alert as a Slack DM to the user it concerns.
-        Needs bot mode and a dm_users mapping; silently skipped otherwise."""
+        Needs a dm_users mapping; silently skipped otherwise."""
         member_id = self.dm_users.get(user, "")
-        if member_id and self._bot_mode:
+        if member_id and self.enabled:
             self._post(text, channel=member_id)
 
     def _ok_to_send(self, key: str, now: float, min_gap: float = DEBOUNCE_SEC) -> bool:
@@ -464,7 +463,7 @@ class Notifier:
         body = f"{text}\n_{self._origin} · {stamp}_"
         if self._consumer is None or not self._consumer.is_alive():
             self._consumer = threading.Thread(target=self._drain, daemon=True,
-                                              name="webhook")
+                                              name="slack")
             self._consumer.start()
         try:
             self._queue.put_nowait((body, key, time.time(), channel))
@@ -484,17 +483,7 @@ class Notifier:
             self._queue.task_done()
 
     def _deliver(self, body: str, channel: str = "") -> bool:
-        if self._bot_mode:
-            return self._post_bot(body, channel)
-        payload = {
-            "text": body,
-            # honored by legacy incoming webhooks, ignored by
-            # app-scoped ones (those show the app's own name)
-            "username": self.sender,
-            "icon_emoji": ":robot_face:",
-        }
-        return self._http_post(self.url, payload,
-                               {"Content-Type": "application/json"}) is not None
+        return self._post_bot(body, channel)
 
     def _post_bot(self, body: str, channel: str = "") -> bool:
         """chat.postMessage as a reply under today's parent message.
@@ -544,8 +533,8 @@ class Notifier:
     def _http_post(self, url: str, payload: dict,
                    headers: dict) -> Optional[dict]:
         """POST with bounded retry: 3 attempts, exponential backoff, honoring
-        Retry-After on 429. Returns parsed JSON ({} for non-JSON 2xx bodies
-        like a webhook's \"ok\") or None after the last failure."""
+        Retry-After on 429. Returns parsed JSON, or None after the last
+        failure."""
         data = json.dumps(payload).encode()
         last_err: object = None
         for attempt in range(3):

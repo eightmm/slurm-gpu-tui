@@ -416,7 +416,7 @@ def _mk_notifier(tmp_path):
     from sgpu.notify import Notifier
     cfg = tmp_path / "webhook.json"
     cfg.write_text(_json.dumps({
-        "url": "http://example.invalid/hook", "rogue_alert": True,
+        "bot_token": "xoxb-test", "channel": "#gpu", "rogue_alert": True,
         "node_health": False, "collect_alert": False, "ecc_alert": False,
     }))
     n = Notifier(tmp_path, cfg_path=cfg)

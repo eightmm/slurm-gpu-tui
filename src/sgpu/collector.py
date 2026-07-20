@@ -1033,8 +1033,8 @@ def run_collector():
     _load_usage()
     notifier = Notifier(STATE_DIR)
     if notifier.enabled:
-        mode = f"bot->{notifier.channel} (daily thread)" if notifier._bot_mode else "incoming-webhook"
-        print(f"[collector] webhook notifier on ({mode}, sender={notifier.sender}, "
+        print(f"[collector] Slack bot notifier on ({notifier.channel}, daily thread, "
+              f"sender={notifier.sender}, "
               f"node_health={notifier.node_health}, grace={notifier.down_grace_sec:.0f}s, "
               f"collect_alert={notifier.collect_alert}, "
               f"waste_alert_hours={notifier.waste_alert_hours}, rogue={notifier.rogue_alert}, "

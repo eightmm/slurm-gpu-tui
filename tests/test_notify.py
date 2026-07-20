@@ -9,7 +9,7 @@ from sgpu.notify import Notifier, _fmt_dur, DEBOUNCE_SEC
 
 
 def _mk(tmp_path, **cfg_over):
-    cfg = {"url": "http://example.invalid/hook", "node_health": False,
+    cfg = {"bot_token": "xoxb-test", "channel": "#gpu", "node_health": False,
            "collect_alert": False, "rogue_alert": False, "ecc_alert": False}
     cfg.update(cfg_over)
     p = tmp_path / "webhook.json"
@@ -192,13 +192,29 @@ def test_job_done_also_dms_the_user(tmp_path):
     assert "" in channels and "U012AB" in channels  # channel post + DM
 
 
-def test_dm_skipped_without_bot_mode(tmp_path):
-    n, _ = _mk(tmp_path, job_done_users=["alice"], dm_users={"alice": "U012AB"})
+def test_notifier_disabled_without_bot_token(tmp_path):
+    n, _ = _mk(tmp_path, bot_token="", job_done_users=["alice"],
+               dm_users={"alice": "U012AB"})
     calls = []
     n._post = lambda text, key="", channel="": calls.append(channel)
     n.process({"nodes": [], "jobs": [_job()], "errors": ""})
     n.process({"nodes": [], "jobs": [], "errors": ""})
-    assert calls == [""]  # webhook mode: no DM attempted
+    assert calls == []
+
+
+def test_legacy_webhook_url_does_not_enable_notifier(tmp_path):
+    p = tmp_path / "webhook.json"
+    p.write_text(json.dumps({"url": "https://example.invalid/hook"}))
+    n = Notifier(tmp_path, cfg_path=p)
+    assert not n.enabled
+
+
+def test_delivery_always_uses_slack_api(tmp_path):
+    n, _ = _mk(tmp_path)
+    calls = []
+    n._post_bot = lambda body, channel="": calls.append((body, channel)) or True
+    assert n._deliver("alert", "U012AB")
+    assert calls == [("alert", "U012AB")]
 
 
 # ── misc ──────────────────────────────────────────────────────────────────

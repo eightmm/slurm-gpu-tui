@@ -404,7 +404,7 @@ def _cli_doctor() -> int:
 
     # Doctor may run as a different user (e.g. root) than the collector, so
     # home-relative defaults would point at the wrong account. The data.json
-    # owner IS the collector user — use their identity for state/webhook/
+    # owner IS the collector user — use their identity for state/Slack/
     # sudoers checks below.
     collector_user: Optional[str] = None
     collector_home: Optional[Path] = None
@@ -638,7 +638,7 @@ def _cli_doctor() -> int:
         else:
             report(None, "script sharing", "not configured (own jobs only) — rerun installer to enable")
 
-    # webhook notifier (optional) — same collector-home fallback as state
+    # Slack notifier (optional) — same collector-home fallback as state
     from .notify import Notifier
     try:
         cfg = Path.home() / ".sgpu" / "webhook.json"
@@ -648,15 +648,15 @@ def _cli_doctor() -> int:
                 cfg = alt
         nf = Notifier(state_dir, cfg_path=cfg)
         if nf.enabled:
-            mode = f"bot→{nf.channel} daily-thread" if nf._bot_mode else "incoming-webhook"
             on = [k for k, v in (("node", nf.node_health), ("collect", nf.collect_alert),
                                  ("waste", nf.waste_alert_hours > 0), ("rogue", nf.rogue_alert),
                                  ("ecc", nf.ecc_alert), ("temp", nf.temp_alert_c > 0)) if v]
-            report(True, "webhook", f"{mode}, lang={nf.lang}, alerts: {'+'.join(on) or 'none'}")
+            report(True, "slack", f"bot→{nf.channel} daily-thread, lang={nf.lang}, "
+                   f"alerts: {'+'.join(on) or 'none'}")
         else:
-            report(None, "webhook", "not configured (optional) — ~/.sgpu/webhook.json")
+            report(None, "slack", "not configured (optional) — ~/.sgpu/webhook.json")
     except Exception as e:
-        report(False, "webhook", f"config error: {e}")
+        report(False, "slack", f"config error: {e}")
 
     # prometheus (honors SLURM_GPU_TUI_METRICS_FILE override)
     prom = Path(os.getenv("SLURM_GPU_TUI_METRICS_FILE",
