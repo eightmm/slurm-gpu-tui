@@ -1,0 +1,39 @@
+# Bridge master's node_exporter metrics into the sgpu_node_* namespace so the
+# dashboard's Node dropdown / repeated rows include the login node. Only the
+# metrics the per-node panels read are recorded; cpus_alloc is deliberately
+# absent (master is not a Slurm node) and cluster occupancy excludes master.
+groups:
+  - name: sgpu-master-bridge
+    rules:
+      - record: sgpu_node_up
+        expr: up{job="node"}
+        labels:
+          node: master
+      - record: sgpu_node_stale
+        expr: vector(0)
+        labels:
+          node: master
+      - record: sgpu_node_cpu_load
+        expr: node_load1
+        labels:
+          node: master
+      - record: sgpu_node_cpus_total
+        expr: count(node_cpu_seconds_total{mode="idle"})
+        labels:
+          node: master
+      - record: sgpu_node_mem_total_mib
+        expr: node_memory_MemTotal_bytes / 1048576
+        labels:
+          node: master
+      - record: sgpu_node_mem_used_mib
+        expr: (node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / 1048576
+        labels:
+          node: master
+      - record: sgpu_node_mem_avail_mib
+        expr: node_memory_MemAvailable_bytes / 1048576
+        labels:
+          node: master
+      - record: sgpu_node_sys_power_watts
+        expr: node_hwmon_power_average_watt
+        labels:
+          node: master

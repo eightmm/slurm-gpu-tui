@@ -50,7 +50,7 @@ EOF
 echo "== [4/6] prometheus: scrape config + sgpu rules, localhost only =="
 sed -i 's|^ARGS=.*|ARGS="--web.listen-address=127.0.0.1:9090"|' /etc/default/prometheus
 mkdir -p /etc/prometheus/rules
-install -m 644 "$REPO/prometheus/sgpu-alerts.yml" /etc/prometheus/rules/sgpu-alerts.yml
+install -m 644 "$REPO"/prometheus/*.yml /etc/prometheus/rules/
 if [ -f /etc/prometheus/prometheus.yml ] && [ ! -f /etc/prometheus/prometheus.yml.dist ]; then
     cp /etc/prometheus/prometheus.yml /etc/prometheus/prometheus.yml.dist
 fi
@@ -60,7 +60,7 @@ global:
   evaluation_interval: 15s
 
 rule_files:
-  - /etc/prometheus/rules/sgpu-alerts.yml
+  - /etc/prometheus/rules/*.yml
 
 scrape_configs:
   - job_name: prometheus

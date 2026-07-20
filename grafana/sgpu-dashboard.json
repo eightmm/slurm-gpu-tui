@@ -57,6 +57,18 @@
       "tooltip": ""
     },
     {
+      "title": "master",
+      "type": "link",
+      "icon": "dashboard",
+      "url": "/d/sgpu-slurm-gpu-ops?var-node=master",
+      "asDropdown": false,
+      "includeVars": false,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "tooltip": ""
+    },
+    {
       "title": "gpu1",
       "type": "link",
       "icon": "dashboard",
@@ -400,7 +412,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "100 * sum(sgpu_node_cpus_alloc) / clamp_min(sum(sgpu_node_cpus_total), 1)",
+          "expr": "100 * sum(sgpu_node_cpus_alloc) / clamp_min(sum(sgpu_node_cpus_total{node!=\"master\"}), 1)",
           "refId": "A"
         }
       ],
@@ -1105,13 +1117,13 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(sgpu_node_sys_power_watts) + (sum(node_hwmon_power_average_watt) or vector(0))",
+          "expr": "sum(sgpu_node_sys_power_watts)",
           "refId": "A"
         }
       ],
       "title": "Total Wall Power",
       "type": "stat",
-      "description": "All Slurm nodes (BMC) + master (ACPI meter)."
+      "description": "All Slurm nodes (BMC) + master (ACPI meter, bridged via recording rule)."
     },
     {
       "collapsed": false,
@@ -1694,7 +1706,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "100 * (1 - node_filesystem_avail_bytes{mountpoint=~\"/|/home|/data1|/appl/.*\"} / node_filesystem_size_bytes{mountpoint=~\"/|/home|/data1|/appl/.*\"})",
+          "expr": "100 * (1 - node_filesystem_avail_bytes{mountpoint=~\"/|/home|/data1\"} / node_filesystem_size_bytes{mountpoint=~\"/|/home|/data1\"})",
           "legendFormat": "{{mountpoint}}",
           "refId": "A"
         }
