@@ -1,5 +1,19 @@
 # Grafana Dashboard
 
+## Quick install (Ubuntu/Debian, collector host)
+
+```bash
+sudo grafana/install.sh
+```
+
+One idempotent script sets up the full stack: node_exporter (textfile
+collector, `127.0.0.1:9100`), Prometheus (scrape + sgpu alert rules,
+`127.0.0.1:9090`), and Grafana (provisioned datasource + this repo's
+dashboard, `0.0.0.0:3000` — login required, sign-up disabled; create Viewer
+accounts for read-only users). Every unit gets `Restart=always` so site
+cron kill sweeps cannot leave the stack dead. The sections below describe
+the same setup step by step for other distros or custom layouts.
+
 `sgpu-collector` writes Prometheus textfile metrics to:
 
 ```bash
@@ -134,6 +148,18 @@ Per node/GPU:
 - `sgpu_node_up{node}`
 - `sgpu_node_stale{node}`
 - `sgpu_node_info{node,partition,source}`
+- `sgpu_node_cpus_total{node}` / `sgpu_node_cpus_alloc{node}` (Slurm view)
+- `sgpu_node_cpu_load{node}` (load average)
+- `sgpu_node_mem_total_mib{node}` / `sgpu_node_mem_used_mib{node}` /
+  `sgpu_node_mem_alloc_mib{node}` / `sgpu_node_mem_avail_mib{node}`
+- `sgpu_node_cpu_power_watts{node}` / `sgpu_node_ram_power_watts{node}` —
+  RAPL package/DRAM power measured by the node agent (needs root; RAM only
+  on Intel). CPU+DRAM only — no fans/board/PSU losses, so this is not
+  wall-plug power. GPU power is separate (`sgpu_gpu_power_watts`).
+- `sgpu_node_sys_power_watts{node}` — whole-node wall power from the BMC
+  (`ipmitool dcmi power reading`; needs root + `/dev/ipmi0`, i.e. the
+  `ipmi_devintf` module). Read every ~10s and cached between agent cycles;
+  absent when the node has no BMC or ipmitool.
 - `sgpu_gpu_info{node,gpu,name}`
 - `sgpu_gpu_util{node,gpu}`
 - `sgpu_gpu_mem_used_mib{node,gpu}`
@@ -142,6 +168,7 @@ Per node/GPU:
 - `sgpu_gpu_temp_celsius{node,gpu}`
 - `sgpu_gpu_power_watts{node,gpu}`
 - `sgpu_gpu_allocated{node,gpu,user}`
+- `sgpu_gpu_job_info{node,gpu,user,jobid,jobname}` (only while allocated)
 - `sgpu_gpu_idle_seconds{node,gpu}`
 - `sgpu_gpu_parked_seconds{node,gpu}`
 
