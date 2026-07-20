@@ -115,6 +115,18 @@
       "tags": [],
       "targetBlank": false,
       "tooltip": ""
+    },
+    {
+      "title": "Node Detail \u2192",
+      "type": "link",
+      "icon": "doc",
+      "url": "/d/sgpu-node-detail",
+      "asDropdown": false,
+      "includeVars": false,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "tooltip": "\ub178\ub4dc \uc0c1\uc138 (Nebius \uc2a4\ud0c0\uc77c)"
     }
   ],
   "liveNow": false,

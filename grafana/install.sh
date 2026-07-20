@@ -125,23 +125,23 @@ providers:
       path: /var/lib/grafana/dashboards
 EOF
 mkdir -p /var/lib/grafana/dashboards
-# The repo dashboard is a UI export: fix the datasource input for file
+# Repo dashboards are UI exports: fix the datasource input for file
 # provisioning (import-style ${DS_PROMETHEUS} is not resolved there).
-python3 - "$REPO/grafana/sgpu-dashboard.json" \
-    /var/lib/grafana/dashboards/sgpu-dashboard.json <<'EOF'
-import json, sys
-src, dst = sys.argv[1], sys.argv[2]
-d = json.loads(open(src).read().replace('${DS_PROMETHEUS}', 'prometheus'))
-d.pop('__inputs', None)
-d.pop('__requires', None)
-d['id'] = None
-json.dump(d, open(dst, 'w'), indent=2)
+python3 - "$REPO/grafana" /var/lib/grafana/dashboards <<'EOF'
+import glob, json, os, sys
+srcdir, dstdir = sys.argv[1], sys.argv[2]
+for src in glob.glob(os.path.join(srcdir, '*.json')):
+    d = json.loads(open(src).read().replace('${DS_PROMETHEUS}', 'prometheus'))
+    d.pop('__inputs', None)
+    d.pop('__requires', None)
+    d['id'] = None
+    json.dump(d, open(os.path.join(dstdir, os.path.basename(src)), 'w'), indent=2)
 EOF
 # Owner = the invoking user so dashboard iterations don't need sudo;
 # grafana only needs read.
 chown -R "$DASH_OWNER":grafana /var/lib/grafana/dashboards
 chmod 755 /var/lib/grafana/dashboards
-chmod 644 /var/lib/grafana/dashboards/sgpu-dashboard.json
+chmod 644 /var/lib/grafana/dashboards/*.json
 fi
 
 SERVICES=(prometheus-node-exporter prometheus)
