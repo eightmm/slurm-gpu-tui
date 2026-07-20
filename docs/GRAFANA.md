@@ -115,13 +115,24 @@ Route `severity="critical"` to Slack in Alertmanager. This is separate from
 the collector's built-in Slack alerts, which cover node and GPU conditions
 while the collector itself is alive.
 
-## 5. Import dashboard
+## 5. Import dashboards
 
-In Grafana:
+Two dashboards ship in `grafana/` (the installer provisions both):
 
-1. Dashboards -> New -> Import.
-2. Upload `grafana/sgpu-dashboard.json`.
-3. Select your Prometheus data source.
+- `sgpu-dashboard.json` — cluster overview: summary gauges/stats, master
+  block (node_exporter), per-node repeated rows, collapsed cluster trends.
+- `sgpu-node-detail.json` — single-node drill-down: per-GPU repeated rows
+  (card model, util/mem trend + gauges, temp, power, user·job), aggregate
+  trends, power split, idle/parked, allocation table. Linked both ways
+  with the overview.
+
+Manual import: Dashboards -> New -> Import -> upload the JSON -> select
+your Prometheus data source.
+
+`prometheus/sgpu-master-bridge.yml` (recording rules) bridges the master's
+node_exporter metrics into `sgpu_node_*{node="master"}` so the Node
+dropdown includes the login node. Install it with the alert rules
+(section 4) — the installer already copies every `prometheus/*.yml`.
 
 ## Metrics
 
