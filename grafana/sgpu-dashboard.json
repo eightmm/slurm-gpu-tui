@@ -1105,12 +1105,13 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(sgpu_node_sys_power_watts)",
+          "expr": "sum(sgpu_node_sys_power_watts) + (sum(node_hwmon_power_average_watt) or vector(0))",
           "refId": "A"
         }
       ],
       "title": "Total Wall Power",
-      "type": "stat"
+      "type": "stat",
+      "description": "All Slurm nodes (BMC) + master (ACPI meter)."
     },
     {
       "collapsed": false,
