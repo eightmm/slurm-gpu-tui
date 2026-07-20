@@ -115,6 +115,15 @@ Route `severity="critical"` to Slack in Alertmanager. This is separate from
 the collector's built-in Slack alerts, which cover node and GPU conditions
 while the collector itself is alive.
 
+`grafana/install.sh` automates this: it installs `prometheus-alertmanager`
+(bound to `127.0.0.1:9093`), points Prometheus at it, and builds a Slack
+route from the collector's own credentials in `/root/.sgpu/webhook.json`
+(bot token + channel, posted via `chat.postMessage`). If that file is
+missing the alertmanager starts with a null route — fill in
+`/etc/prometheus/alertmanager.yml` by hand. The installer also sets
+`--storage.tsdb.retention.time=180d` so power/usage history keeps for six
+months (~1 GB at this cluster's series count).
+
 ## 5. Import dashboards
 
 Two dashboards ship in `grafana/` (the installer provisions both):
@@ -182,6 +191,9 @@ Per node/GPU:
 - `sgpu_gpu_job_info{node,gpu,user,jobid,jobname}` (only while allocated)
 - `sgpu_gpu_idle_seconds{node,gpu}`
 - `sgpu_gpu_parked_seconds{node,gpu}`
+- `sgpu_gpu_sm_clock_mhz{node,gpu}` / `sgpu_gpu_mem_clock_mhz{node,gpu}`
+- `sgpu_pending_job_info{jobid,user,partition,jobname,reason,gpus}` (one
+  series per queued job; disappears when the job starts)
 
 ## Notes
 

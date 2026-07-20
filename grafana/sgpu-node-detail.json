@@ -779,7 +779,7 @@
       },
       "gridPos": {
         "h": 5,
-        "w": 8,
+        "w": 7,
         "x": 2,
         "y": 4
       },
@@ -862,7 +862,7 @@
       "gridPos": {
         "h": 5,
         "w": 3,
-        "x": 10,
+        "x": 9,
         "y": 4
       },
       "id": 25,
@@ -937,7 +937,7 @@
       "gridPos": {
         "h": 5,
         "w": 3,
-        "x": 13,
+        "x": 12,
         "y": 4
       },
       "id": 26,
@@ -1005,7 +1005,7 @@
       "gridPos": {
         "h": 5,
         "w": 2,
-        "x": 16,
+        "x": 15,
         "y": 4
       },
       "id": 27,
@@ -1065,7 +1065,7 @@
       "gridPos": {
         "h": 5,
         "w": 2,
-        "x": 18,
+        "x": 17,
         "y": 4
       },
       "id": 28,
@@ -1118,6 +1118,66 @@
                 "value": null
               }
             ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 2,
+        "x": 19,
+        "y": 4
+      },
+      "id": 30,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sgpu_gpu_sm_clock_mhz{node=~\"$node\",gpu=~\"$gpu\"}",
+          "refId": "A"
+        }
+      ],
+      "title": "SM MHz",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
           },
           "noValue": "FREE"
         },
@@ -1125,8 +1185,8 @@
       },
       "gridPos": {
         "h": 5,
-        "w": 4,
-        "x": 20,
+        "w": 3,
+        "x": 21,
         "y": 4
       },
       "id": 29,

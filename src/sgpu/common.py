@@ -190,6 +190,8 @@ class GpuInfo:
     power: str = ""      # W
     power_cap: str = ""  # W
     ecc: str = ""        # uncorrectable ECC error count ("" / N/A on consumer GPUs)
+    sm_clock: str = ""   # current SM clock MHz
+    mem_clock: str = ""  # current memory clock MHz
     pids: List[str] = field(default_factory=list)
     users: List[str] = field(default_factory=list)
     pid_mem: Dict[str, str] = field(default_factory=dict)    # pid -> FB MiB (pmon)
@@ -491,7 +493,7 @@ NODE_PAYLOAD_CMD = (
     # columns append after. Consumer GPUs report ecc/serial as [N/A].
     "nvidia-smi --query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total,"
     "temperature.gpu,power.draw,power.limit,pci.bus_id,"
-    "ecc.errors.uncorrected.aggregate.total,serial "
+    "ecc.errors.uncorrected.aggregate.total,serial,clocks.sm,clocks.mem "
     "--format=csv,noheader,nounits 2>/dev/null; "
     "echo '---SEP---'; "
     "nvidia-smi pmon -c 1 -s m 2>/dev/null; "
@@ -618,12 +620,15 @@ def parse_node_payload(out: str) -> Tuple[List[GpuInfo], NodeMemInfo]:
             slot = bus_to_slot.get(tail, "")
         ecc = p[10] if len(p) >= 11 else ""
         serial = p[11] if len(p) >= 12 else ""
+        sm_clock = p[12] if len(p) >= 13 else ""
+        mem_clock = p[13] if len(p) >= 14 else ""
         gpus.append(GpuInfo(
             index=idx, minor=minor, uuid=p[1], pci_bus=pci_bus, slot=slot,
             serial=serial,
             name=shorten_gpu_name(p[2]), util=p[3],
             mem_used=p[4], mem_total=p[5], temp=p[6], power=p[7], power_cap=p[8],
-            ecc=ecc, pids=pids, users=users,
+            ecc=ecc, sm_clock=sm_clock, mem_clock=mem_clock,
+            pids=pids, users=users,
             pid_mem={pid: pid_fb[pid] for pid in pids if pid in pid_fb},
             pid_jobid={pid: pid_jobid_all[pid] for pid in pids if pid in pid_jobid_all},
         ))

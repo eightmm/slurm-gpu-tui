@@ -466,7 +466,8 @@ def _gpu_to_dict(gpu: GpuInfo) -> dict:
         "name": gpu.name, "util": gpu.util,
         "mem_used": gpu.mem_used, "mem_total": gpu.mem_total,
         "temp": gpu.temp, "power": gpu.power, "power_cap": gpu.power_cap,
-        "ecc": gpu.ecc, "pids": gpu.pids, "users": gpu.users,
+        "ecc": gpu.ecc, "sm_clock": gpu.sm_clock, "mem_clock": gpu.mem_clock,
+        "pids": gpu.pids, "users": gpu.users,
     }
 
 
@@ -907,6 +908,12 @@ def _format_metrics(data: dict) -> str:
         "# TYPE sgpu_gpu_parked_seconds gauge",
         "# HELP sgpu_gpu_ecc_errors Uncorrectable ECC error count (aggregate)",
         "# TYPE sgpu_gpu_ecc_errors gauge",
+        "# HELP sgpu_gpu_sm_clock_mhz Current SM clock in MHz",
+        "# TYPE sgpu_gpu_sm_clock_mhz gauge",
+        "# HELP sgpu_gpu_mem_clock_mhz Current memory clock in MHz",
+        "# TYPE sgpu_gpu_mem_clock_mhz gauge",
+        "# HELP sgpu_pending_job_info Slurm job waiting in the queue",
+        "# TYPE sgpu_pending_job_info gauge",
         "# HELP sgpu_gpu_info Static GPU identity labels",
         "# TYPE sgpu_gpu_info gauge",
         "# HELP sgpu_node_info Static node identity labels",
@@ -954,6 +961,17 @@ def _format_metrics(data: dict) -> str:
     lines.append(f"sgpu_gpus_idle {idle_gpus}")
     lines.append(f"sgpu_gpus_parked {parked_gpus}")
     lines.append(f"sgpu_gpus_rogue {rogue_gpus}")
+    for pj in data.get("pending", []):
+        lines.append(
+            "sgpu_pending_job_info{"
+            f'jobid="{_prom_escape(str(pj.get("jobid", "")))}"'
+            f',user="{_prom_escape(pj.get("user", ""))}"'
+            f',partition="{_prom_escape(pj.get("partition", ""))}"'
+            f',jobname="{_prom_escape(pj.get("jobname", ""))}"'
+            f',reason="{_prom_escape(pj.get("reason", ""))}"'
+            f',gpus="{_prom_escape(str(pj.get("gpu_count", "")))}"'
+            "} 1"
+        )
     jobs_by_id = {str(j.get("jobid", "")): j for j in data.get("jobs", [])}
     for n in nodes:
         node = _prom_escape(n["name"])
@@ -993,6 +1011,8 @@ def _format_metrics(data: dict) -> str:
                 ("sgpu_gpu_temp_celsius", "temp"),
                 ("sgpu_gpu_power_watts", "power"),
                 ("sgpu_gpu_ecc_errors", "ecc"),
+                ("sgpu_gpu_sm_clock_mhz", "sm_clock"),
+                ("sgpu_gpu_mem_clock_mhz", "mem_clock"),
             ):
                 v = num(g.get(key))
                 if v is not None:

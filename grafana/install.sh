@@ -31,9 +31,10 @@ for arg in "$@"; do
     esac
 done
 
-echo "== [1/6] apt packages (prometheus, node_exporter) =="
+echo "== [1/6] apt packages (prometheus, node_exporter, alertmanager) =="
 export DEBIAN_FRONTEND=noninteractive
-apt-get install -y --no-install-recommends prometheus prometheus-node-exporter
+apt-get install -y --no-install-recommends prometheus prometheus-node-exporter \
+    prometheus-alertmanager
 
 if [ "$WITH_GRAFANA" = 1 ]; then
     echo "== [2/6] grafana apt repo + install =="
@@ -65,7 +66,9 @@ RestartSec=10
 EOF
 
 echo "== [4/6] prometheus: scrape config + sgpu rules, localhost only =="
-sed -i 's|^ARGS=.*|ARGS="--web.listen-address=127.0.0.1:9090"|' /etc/default/prometheus
+# 180d retention: the whole cluster is ~300 series, so long history is cheap
+# and power/usage trends stay queryable for months.
+sed -i 's|^ARGS=.*|ARGS="--web.listen-address=127.0.0.1:9090 --storage.tsdb.retention.time=180d"|' /etc/default/prometheus
 mkdir -p /etc/prometheus/rules
 install -m 644 "$REPO"/prometheus/*.yml /etc/prometheus/rules/
 if [ -f /etc/prometheus/prometheus.yml ] && [ ! -f /etc/prometheus/prometheus.yml.dist ]; then
@@ -79,6 +82,11 @@ global:
 rule_files:
   - /etc/prometheus/rules/*.yml
 
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['localhost:9093']
+
 scrape_configs:
   - job_name: prometheus
     static_configs:
@@ -90,6 +98,58 @@ EOF
 promtool check config /etc/prometheus/prometheus.yml
 mkdir -p /etc/systemd/system/prometheus.service.d
 cat > /etc/systemd/system/prometheus.service.d/sgpu.conf <<'EOF'
+[Service]
+Restart=always
+RestartSec=10
+EOF
+
+echo "== [4b/6] alertmanager: Slack route via the collector's bot token =="
+# Reuse the sgpu collector's Slack credentials (~root/.sgpu/webhook.json) so
+# the dead-man alerts land in the same channel the collector posts to.
+SLACK_TOKEN=""
+SLACK_CHANNEL=""
+if [ -f /root/.sgpu/webhook.json ]; then
+    SLACK_TOKEN=$(python3 -c "import json;print(json.load(open('/root/.sgpu/webhook.json')).get('bot_token',''))")
+    SLACK_CHANNEL=$(python3 -c "import json;print(json.load(open('/root/.sgpu/webhook.json')).get('channel',''))")
+fi
+sed -i 's|^ARGS=.*|ARGS="--web.listen-address=127.0.0.1:9093 --cluster.listen-address="|' \
+    /etc/default/prometheus-alertmanager
+if [ -n "$SLACK_TOKEN" ] && [ -n "$SLACK_CHANNEL" ]; then
+    cat > /etc/prometheus/alertmanager.yml <<EOF
+route:
+  receiver: slack
+  group_by: ['alertname']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+receivers:
+  - name: slack
+    slack_configs:
+      - api_url: https://slack.com/api/chat.postMessage
+        http_config:
+          authorization:
+            type: Bearer
+            credentials: '$SLACK_TOKEN'
+        channel: '$SLACK_CHANNEL'
+        send_resolved: true
+        title: '{{ .Status | toUpper }} {{ .CommonAnnotations.summary }}'
+        text: '{{ .CommonAnnotations.description }}'
+EOF
+    chmod 600 /etc/prometheus/alertmanager.yml
+else
+    echo "WARN: /root/.sgpu/webhook.json missing bot_token/channel —"
+    echo "      alertmanager installed but routes nowhere. Fill in"
+    echo "      /etc/prometheus/alertmanager.yml manually."
+    [ -f /etc/prometheus/alertmanager.yml ] || cat > /etc/prometheus/alertmanager.yml <<'EOF'
+route:
+  receiver: none
+receivers:
+  - name: none
+EOF
+fi
+command -v amtool >/dev/null && amtool check-config /etc/prometheus/alertmanager.yml
+mkdir -p /etc/systemd/system/prometheus-alertmanager.service.d
+cat > /etc/systemd/system/prometheus-alertmanager.service.d/sgpu.conf <<'EOF'
 [Service]
 Restart=always
 RestartSec=10
@@ -144,7 +204,7 @@ chmod 755 /var/lib/grafana/dashboards
 chmod 644 /var/lib/grafana/dashboards/*.json
 fi
 
-SERVICES=(prometheus-node-exporter prometheus)
+SERVICES=(prometheus-node-exporter prometheus prometheus-alertmanager)
 [ "$WITH_GRAFANA" = 1 ] && SERVICES+=(grafana-server)
 
 echo "== [6/6] start services =="

@@ -34,7 +34,7 @@ LOCK_FILE = Path("/tmp/sgpu-agent.lock")
 LOG_FILE = Path("/tmp/sgpu-agent.log")
 LOG_MAX_BYTES = 2 * 1024 * 1024
 
-AGENT_PAYLOAD_VERSION = 7  # v7: node power dict (RAPL cpu/ram + IPMI sys watts)
+AGENT_PAYLOAD_VERSION = 8  # v8: GPU sm/mem clocks (v7: node power dict)
 
 # Fingerprint of the agent source (shared FS ⇒ same value on all hosts).
 # The collector compares this against agent.py's current mtime and restarts

@@ -111,8 +111,8 @@ def test_parse_gpu_alloc_array_task_user():
 # ── SSH node payload (nvidia-smi + pmon + meminfo + ps) ───────────────────
 
 NODE_PAYLOAD = """\
-0, GPU-aaa, NVIDIA RTX 6000 Ada Generation, 97, 41370, 49140, 77, 289.51, 300.00
-1, GPU-bbb, NVIDIA RTX 6000 Ada Generation, 0, 3, 49140, 35, 21.05, 300.00
+0, GPU-aaa, NVIDIA RTX 6000 Ada Generation, 97, 41370, 49140, 77, 289.51, 300.00, 00000000:06:00.0, 0, 1234567, 2505, 10251
+1, GPU-bbb, NVIDIA RTX 6000 Ada Generation, 0, 3, 49140, 35, 21.05, 300.00, 00000000:07:00.0, 0, 1234568, 210, 405
 ---SEP---
 # gpu         pid   type     fb   ccpm  command
 # Idx           #    C/G     MB     MB  name
@@ -131,7 +131,9 @@ def test_parse_node_payload():
     g0, g1 = gpus
     assert g0.index == "0" and g0.util == "97" and g0.name == "RTX 6000 Ada"
     assert g0.pids == ["12345"] and g0.users == ["hlkim"]
+    assert g0.sm_clock == "2505" and g0.mem_clock == "10251"
     assert g1.users == [] and g1.pids == []
+    assert g1.sm_clock == "210" and g1.mem_clock == "405"
     assert mem.total == "244140" and mem.used == "114000" and mem.avail == "130140"
 
 
@@ -387,7 +389,9 @@ def test_prometheus_metrics_summary():
 
     text = _format_metrics({
         "jobs": [{"jobid": "10", "jobname": "train run"}],
-        "pending": [{"jobid": "2"}],
+        "pending": [{"jobid": "2", "user": "bob", "partition": "gpu",
+                     "jobname": "queued job", "reason": "Resources",
+                     "gpu_count": 4}],
         "nodes": [{
             "name": "gpu1",
             "partition": "gpu",
@@ -403,6 +407,7 @@ def test_prometheus_metrics_summary():
                     "index": "0", "name": "A100", "util": "75",
                     "mem_used": "20480", "mem_total": "40960",
                     "temp": "70", "power": "250",
+                    "sm_clock": "1410", "mem_clock": "1215",
                     "alloc_jobid": "10", "alloc_user": "alice",
                     "users": ["alice"], "idle_sec": 0, "parked_sec": 0,
                 },
@@ -453,6 +458,12 @@ def test_prometheus_metrics_summary():
     assert 'sgpu_node_cpu_power_watts{node="gpu1"} 142.5' in text
     assert 'sgpu_node_ram_power_watts{node="gpu1"} 18.2' in text
     assert 'sgpu_node_sys_power_watts{node="gpu1"} 612' in text
+    assert 'sgpu_gpu_sm_clock_mhz{node="gpu1",gpu="0"} 1410' in text
+    assert 'sgpu_gpu_mem_clock_mhz{node="gpu1",gpu="0"} 1215' in text
+    assert (
+        'sgpu_pending_job_info{jobid="2",user="bob",partition="gpu"'
+        ',jobname="queued job",reason="Resources",gpus="4"} 1'
+    ) in text
     assert "sgpu_gpus_idle 1" in text
     assert "sgpu_gpus_parked 1" in text
     assert 'sgpu_node_info{node="gpu1",partition="gpu",source="agent"} 1' in text
