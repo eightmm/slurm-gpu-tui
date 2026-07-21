@@ -104,13 +104,18 @@ RestartSec=10
 EOF
 
 echo "== [4b/6] alertmanager: Slack route via the collector's bot token =="
-# Reuse the sgpu collector's Slack credentials (~root/.sgpu/webhook.json) so
-# the dead-man alerts land in the same channel the collector posts to.
+# Reuse the sgpu collector's Slack credentials (~root/.sgpu/slack.json, or
+# the legacy webhook.json name) so the dead-man alerts land in the same
+# channel the collector posts to.
 SLACK_TOKEN=""
 SLACK_CHANNEL=""
-if [ -f /root/.sgpu/webhook.json ]; then
-    SLACK_TOKEN=$(python3 -c "import json;print(json.load(open('/root/.sgpu/webhook.json')).get('bot_token',''))")
-    SLACK_CHANNEL=$(python3 -c "import json;print(json.load(open('/root/.sgpu/webhook.json')).get('channel',''))")
+SLACK_CFG=""
+for f in /root/.sgpu/slack.json /root/.sgpu/webhook.json; do
+    [ -f "$f" ] && SLACK_CFG="$f" && break
+done
+if [ -n "$SLACK_CFG" ]; then
+    SLACK_TOKEN=$(python3 -c "import json;print(json.load(open('$SLACK_CFG')).get('bot_token',''))")
+    SLACK_CHANNEL=$(python3 -c "import json;print(json.load(open('$SLACK_CFG')).get('channel',''))")
 fi
 sed -i 's|^ARGS=.*|ARGS="--web.listen-address=127.0.0.1:9093 --cluster.listen-address="|' \
     /etc/default/prometheus-alertmanager
@@ -137,7 +142,7 @@ receivers:
 EOF
     chmod 600 /etc/prometheus/alertmanager.yml
 else
-    echo "WARN: /root/.sgpu/webhook.json missing bot_token/channel —"
+    echo "WARN: /root/.sgpu/slack.json missing bot_token/channel —"
     echo "      alertmanager installed but routes nowhere. Fill in"
     echo "      /etc/prometheus/alertmanager.yml manually."
     [ -f /etc/prometheus/alertmanager.yml ] || cat > /etc/prometheus/alertmanager.yml <<'EOF'

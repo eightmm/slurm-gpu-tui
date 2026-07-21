@@ -156,7 +156,7 @@ chkgpu               # one-shot user × node matrix with next-free ETA
 
 ## Slack Alerts
 
-Config is `~/.sgpu/webhook.json` (hot-reloaded); the installer sets it up and
+Config is `~/.sgpu/slack.json` (hot-reloaded); the installer sets it up and
 `sgpu doctor` shows the active mode. Full setup: **[docs/ALERTS.md](docs/ALERTS.md)**
 
 ## Operations
@@ -205,7 +205,7 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/uninstal
 | `SLURM_GPU_TUI_WASTE_MIN_SEC` | `600` | Threshold for waste view / `--waste` |
 | `SLURM_GPU_TUI_USAGE_KEEP_DAYS` | `30` | GPU-hour history retention |
 | `SLURM_GPU_TUI_SACCT_SEC` | `3600` | slurmdbd backfill interval; `0` disables |
-| `SLURM_GPU_TUI_SLACK_BOT_TOKEN` | (unset) | Slack bot token (channel remains in `~/.sgpu/webhook.json`) |
+| `SLURM_GPU_TUI_SLACK_BOT_TOKEN` | (unset) | Slack bot token (channel remains in `~/.sgpu/slack.json`) |
 | `SLURM_GPU_TUI_SLACK_DEBOUNCE_SEC` | `1800` | Min interval between repeated alerts |
 | `SLURM_GPU_TUI_SLACK_NAG_SEC` | `21600` | Re-alert interval for standing conditions |
 | `SLURM_GPU_TUI_ROGUE_IGNORE` | `root,gdm,xdm` | Users never flagged as rogue |

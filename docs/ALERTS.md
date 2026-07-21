@@ -1,7 +1,7 @@
 # Slack Alerts
 
 The collector can push cluster alerts to Slack. Config lives in
-`~/.sgpu/webhook.json` (root's `/root/.sgpu/webhook.json` for a system
+`~/.sgpu/slack.json` (root's `/root/.sgpu/slack.json` for a system
 service) and is **hot-reloaded** — edit and save, no restart needed. The
 historical filename is retained for existing installations; delivery uses the
 Slack Web API with a bot token, not an incoming webhook. The installer offers
@@ -37,10 +37,10 @@ Expected Slack line:
 - `slack: bot→#channel daily-thread, lang=ko|en, alerts: ...`
 
 If it says `not configured`, check the config path for the service user. System
-services read root's `~/.sgpu/webhook.json`; user services read that user's
+services read root's `~/.sgpu/slack.json`; user services read that user's
 home directory.
 
-## Config keys (`~/.sgpu/webhook.json`)
+## Config keys (`~/.sgpu/slack.json`)
 
 | Key | Default | Meaning |
 |-----|---------|---------|

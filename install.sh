@@ -122,11 +122,15 @@ if [ -n "$SHARE" ] && [ "$SHARE" != "0" ]; then
     fi
 fi
 
-# Slack bot alerts config. The legacy filename is retained so existing
-# installations keep their alert tuning, but incoming-webhook delivery is no
-# longer supported. Non-interactive runs can set SGPU_SLACK_BOT_TOKEN,
-# SGPU_SLACK_CHANNEL, SGPU_SLACK_SENDER, and SGPU_SLACK_LANG.
-SLACK_CFG="$HOME/.sgpu/webhook.json"
+# Slack bot alerts config. Migrates the legacy webhook.json name (from the
+# retired incoming-webhook era) to slack.json, keeping tuned alert keys.
+# Non-interactive runs can set SGPU_SLACK_BOT_TOKEN, SGPU_SLACK_CHANNEL,
+# SGPU_SLACK_SENDER, and SGPU_SLACK_LANG.
+SLACK_CFG="$HOME/.sgpu/slack.json"
+if [ -f "$HOME/.sgpu/webhook.json" ] && [ ! -f "$SLACK_CFG" ]; then
+    mv "$HOME/.sgpu/webhook.json" "$SLACK_CFG"
+    echo "migrated ~/.sgpu/webhook.json -> slack.json (bot-token config, not a webhook)"
+fi
 _tty() { [ -r /dev/tty ] && [ -w /dev/tty ]; }
 _cfg_get() {
     "$VENV_DIR/bin/python" - "$SLACK_CFG" "$1" << 'PYEOF'
@@ -233,7 +237,8 @@ defaults = {"sender_name": "AI-master", "lang": "en", "node_health": True,
             "down_grace_sec": 180, "collect_alert": True, "collect_grace_sec": 600,
             "waste_alert_hours": 2, "rogue_alert": True,
             "ecc_alert": True, "temp_alert_c": 0,
-            "job_done_users": [], "free_gpus_min": 0}
+            "job_done_users": [], "free_gpus_min": 0,
+            "mem_fair_factor": 0}
 for k, v in defaults.items():
     cfg.setdefault(k, v)
 json.dump(cfg, open(p, "w"), indent=2)

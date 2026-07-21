@@ -1,6 +1,7 @@
 """Slack bot notifications, driven by the collector's per-cycle snapshot.
 
-Config: ~/.sgpu/webhook.json
+Config: ~/.sgpu/slack.json (legacy name webhook.json still read when
+slack.json is absent — the file predates the switch to bot-token delivery)
 {
   "bot_token": "xoxb-...",        # Slack bot token; alerts become
   "channel": "#gpu-cluster",      #   replies under one parent message per day
@@ -164,10 +165,18 @@ def _fmt_dur(sec: float, lang: str = "en") -> str:
     return f"{sec / 86400:.1f}{d}"
 
 
+def _default_cfg_path() -> Path:
+    """~/.sgpu/slack.json, falling back to the legacy webhook.json name
+    (bot-token delivery replaced incoming webhooks long ago)."""
+    base = Path.home() / ".sgpu"
+    new, old = base / "slack.json", base / "webhook.json"
+    return old if (old.exists() and not new.exists()) else new
+
+
 class Notifier:
     def __init__(self, state_dir: Path, cfg_path: Optional[Path] = None) -> None:
         self._state_file = state_dir / "notify_state.json"
-        self._cfg_path = cfg_path or Path.home() / ".sgpu" / "webhook.json"
+        self._cfg_path = cfg_path or _default_cfg_path()
         self._cfg_mtime: Optional[float] = None
         self._load_config()
         # persisted: node down-state, last-seen jobs, last alert ts per key

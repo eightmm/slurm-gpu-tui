@@ -696,20 +696,30 @@ def _cli_doctor() -> int:
     # Slack notifier (optional) — same collector-home fallback as state
     from .notify import Notifier
     try:
-        cfg = Path.home() / ".sgpu" / "webhook.json"
-        if not cfg.exists() and collector_home:
-            alt = collector_home / ".sgpu" / "webhook.json"
-            if alt.exists():
-                cfg = alt
-        nf = Notifier(state_dir, cfg_path=cfg)
+        cfg = None
+        for home in (Path.home(), collector_home):
+            if home is None:
+                continue
+            for name in ("slack.json", "webhook.json"):  # webhook.json = legacy name
+                cand = home / ".sgpu" / name
+                try:
+                    if cand.exists():
+                        cfg = cand
+                        break
+                except OSError:
+                    continue
+            if cfg:
+                break
+        nf = Notifier(state_dir, cfg_path=cfg) if cfg else Notifier(state_dir)
         if nf.enabled:
             on = [k for k, v in (("node", nf.node_health), ("collect", nf.collect_alert),
                                  ("waste", nf.waste_alert_hours > 0), ("rogue", nf.rogue_alert),
-                                 ("ecc", nf.ecc_alert), ("temp", nf.temp_alert_c > 0)) if v]
+                                 ("ecc", nf.ecc_alert), ("temp", nf.temp_alert_c > 0),
+                                 ("mem-fair", nf.mem_fair_factor > 0)) if v]
             report(True, "slack", f"bot→{nf.channel} daily-thread, lang={nf.lang}, "
                    f"alerts: {'+'.join(on) or 'none'}")
         else:
-            report(None, "slack", "not configured (optional) — ~/.sgpu/webhook.json")
+            report(None, "slack", "not configured (optional) — ~/.sgpu/slack.json")
     except Exception as e:
         report(False, "slack", f"config error: {e}")
 
