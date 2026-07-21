@@ -18,7 +18,8 @@ Config: ~/.sgpu/webhook.json
   "ecc_alert": true,             # uncorrectable ECC errors (silent HW failure)
   "job_done_users": ["alice"],    # notify when these users' jobs finish
   "job_fail_users": ["*"],        # FAILED/OOM/TIMEOUT alerts; ["*"] = everyone
-                                  #   (alert carries the stderr tail when readable)
+                                  #   (owner's DM carries the stderr tail when
+                                  #   readable — never the shared channel)
   "pending_alert_hours": 0,       # job stuck PENDING >= N hours (0 = off;
                                   #   user holds/dependencies never alert)
   "dm_users": {"alice": "U012AB"},# per-user Slack DMs (member id) for alerts
@@ -340,11 +341,16 @@ class Notifier:
                     text = self._m("job_fail", jid=jid, name=j.get("jobname", "?"),
                                    user=user, state=state,
                                    elapsed=j.get("elapsed", "?"))
-                    tail = self._fail_log_tail(jid)
-                    if tail:
-                        text += f"\n```{tail}```"
                     self._post(text)
-                    self._post_dm(user, text)
+                    # stderr tail goes to the owner's DM only — the channel
+                    # is everyone, and stderr can leak paths/secrets (the
+                    # collector may read files the audience can't)
+                    dm_text = text
+                    if self.dm_users.get(user):
+                        tail = self._fail_log_tail(jid)
+                        if tail:
+                            dm_text += f"\n```{tail}```"
+                    self._post_dm(user, dm_text)
                 elif user in self.job_done_users:
                     text = self._m("job_done", jid=jid, name=j.get("jobname", "?"),
                                    user=user, elapsed=j.get("elapsed", "?"))

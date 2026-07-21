@@ -148,3 +148,57 @@ def test_fail_log_tail_nothing_readable(monkeypatch, tmp_path):
     import sgpu.notify as notify
     monkeypatch.setattr(notify, "run_cmd", lambda cmd, timeout=10: (False, "nope"))
     assert notify.Notifier._fail_log_tail(None, "8") == ""
+
+
+def test_fail_tail_dm_only(monkeypatch, tmp_path):
+    """stderr tail must reach the owner's DM, never the shared channel."""
+    import json as _json
+    import sgpu.notify as notify_mod
+
+    cfg = {"bot_token": "xoxb-test", "channel": "#gpu", "node_health": False,
+           "collect_alert": False, "rogue_alert": False, "ecc_alert": False,
+           "job_fail_users": ["*"], "dm_users": {"bob": "U01"}}
+    p = tmp_path / "webhook.json"
+    p.write_text(_json.dumps(cfg))
+    n = notify_mod.Notifier(tmp_path, cfg_path=p)
+    posts = []
+    n._post = lambda text, key="", channel="": posts.append((channel, text))
+    monkeypatch.setattr(notify_mod.Notifier, "_fail_log_tail",
+                        lambda self, jid: "RuntimeError: boom")
+    monkeypatch.setattr(notify_mod.Notifier, "_job_final_state",
+                        lambda self, jid: "FAILED")
+
+    base = {"nodes": [], "pending": [], "errors": ""}
+    n.process(dict(base, jobs=[{"jobid": "9", "user": "bob",
+                                "jobname": "t", "elapsed": "1:00"}]))
+    n.process(dict(base, jobs=[]))
+
+    channel_msgs = [t for c, t in posts if not c]
+    dm_msgs = [t for c, t in posts if c == "U01"]
+    assert channel_msgs and all("boom" not in t for t in channel_msgs)
+    assert dm_msgs and "```RuntimeError: boom```" in dm_msgs[0]
+
+
+def test_fail_tail_skipped_without_dm_target(monkeypatch, tmp_path):
+    """No DM mapping -> log file is never even read."""
+    import json as _json
+    import sgpu.notify as notify_mod
+
+    cfg = {"bot_token": "xoxb-test", "channel": "#gpu", "node_health": False,
+           "collect_alert": False, "rogue_alert": False, "ecc_alert": False,
+           "job_fail_users": ["*"]}
+    p = tmp_path / "webhook.json"
+    p.write_text(_json.dumps(cfg))
+    n = notify_mod.Notifier(tmp_path, cfg_path=p)
+    n._post = lambda text, key="", channel="": None
+
+    def boom(self, jid):
+        raise AssertionError("_fail_log_tail called without DM target")
+    monkeypatch.setattr(notify_mod.Notifier, "_fail_log_tail", boom)
+    monkeypatch.setattr(notify_mod.Notifier, "_job_final_state",
+                        lambda self, jid: "FAILED")
+
+    base = {"nodes": [], "pending": [], "errors": ""}
+    n.process(dict(base, jobs=[{"jobid": "9", "user": "bob",
+                                "jobname": "t", "elapsed": "1:00"}]))
+    n.process(dict(base, jobs=[]))
