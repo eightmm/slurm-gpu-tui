@@ -232,8 +232,13 @@ metric-name prefix:
   "No data") and only `<prefix>sgpu_bridge_up 0` remains. For remotes on
   an older sgpu without `sgpu_master_*`, it falls back to sampling the
   remote master's /proc over ssh.
-- `sgpu-master-bridge.service` / `.timer` — user units
-  (`systemctl --user`, host needs linger) running the bridge every 30 s.
+- `grafana/setup-bridge.sh install user@remote-master` — one-shot install
+  (script, user units, env file, timer). Also the on/off switch:
+  `pause` stops mirroring and drops the series so dashboards show honest
+  "No data"; `resume` restarts; `once` fetches a single snapshot;
+  `status` shows timer, file age, and `bridge_up`.
+- `sgpu-master-bridge.service` / `.timer` — the user units behind it
+  (`systemctl --user`, host needs linger), 30 s interval.
 - `grafana/gen-master-dashboards.py` — regenerates the bridged cluster's
   dashboard pair from the local sources (prefix rewrite, uids, titles,
   cross-links). Rerun after editing the local dashboards.
