@@ -437,7 +437,7 @@ def _gpu_count_from_gres(gres: str) -> int:
     first-match parser under-counted jobs requesting more than one GPU type.
     """
     return sum(int(n) for n in re.findall(
-        r"(?:^|,)gpu(?::[^:,()]+)?:(\d+)(?=\(|,|$)", gres,
+        r"(?:^|,)(?:gres/)?gpu(?::[^:,()]+)?:(\d+)(?=\(|,|$)", gres,
     ))
 
 

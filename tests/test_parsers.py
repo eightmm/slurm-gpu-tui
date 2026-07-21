@@ -529,3 +529,15 @@ def test_notify_rogue_ignores_system_users(tmp_path):
     n, sent = _mk_notifier(tmp_path)
     n.process(_rogue_data(users=("root", "gdm")))
     assert sent == [] and n._pending_rogue == {}
+
+
+def test_gpu_count_from_gres_prefix_variants():
+    from sgpu.common import _gpu_count_from_gres
+    # squeue %b prefixes typed values with "gres/" on newer Slurm
+    assert _gpu_count_from_gres("gres/gpu:1") == 1
+    assert _gpu_count_from_gres("gres/gpu:4090:2") == 2
+    assert _gpu_count_from_gres("gres/gpu:h100:1,gres/gpu:a6000:2") == 3
+    assert _gpu_count_from_gres("gpu:2") == 2
+    assert _gpu_count_from_gres("gpu:h100:1,gpu:a6000:2") == 3
+    assert _gpu_count_from_gres("gres/gpu:1(IDX:0)") == 1
+    assert _gpu_count_from_gres("N/A") == 0
