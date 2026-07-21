@@ -214,6 +214,7 @@ class JobInfo:
     cpu_count: int = 0
     gres_raw: str = ""
     time_limit: str = ""
+    mem: str = ""  # requested memory from squeue %m (e.g. "128G", "4000Mc")
     script: str = ""  # batch script when SHARE_SCRIPTS collector publishes it
 
 
@@ -301,7 +302,7 @@ def _classify_error(error_str: str, exc: Exception = None) -> NodeErrorKind:
 # ── Data collection ──────────────────────────────────────────────────────
 
 def collect_jobs() -> Tuple[List[JobInfo], str]:
-    cmd = 'squeue -h -t R -o "%i|%u|%P|%j|%M|%N|%b|%l|%C"'
+    cmd = 'squeue -h -t R -o "%i|%u|%P|%j|%M|%N|%b|%l|%C|%m"'
     ok, out = run_cmd(cmd)
     if not ok:
         return [], f"squeue failed: {out}"
@@ -317,8 +318,26 @@ def collect_jobs() -> Tuple[List[JobInfo], str]:
             cc = int(p[8].strip()) if len(p) > 8 else 0
         except ValueError:
             cc = 0
-        rows.append(JobInfo(p[0], p[1], p[2], p[3], p[4], p[5], gc, cc, gres, tlimit))
+        mem = p[9].strip() if len(p) > 9 else ""
+        rows.append(JobInfo(p[0], p[1], p[2], p[3], p[4], p[5], gc, cc, gres, tlimit,
+                            mem=mem))
     return rows, ""
+
+
+def mem_to_mib(s: str, cpus: int = 1) -> float:
+    """squeue %m value in MiB. Handles K/M/G/T suffixes and Slurm's trailing
+    n (per node) / c (per CPU — multiplied by the job's CPU count).
+    0.0 when empty or unparsable."""
+    s = (s or "").strip()
+    per_cpu = s.endswith(("c", "C"))
+    if s.endswith(("n", "N", "c", "C")):
+        s = s[:-1]
+    m = re.match(r"^([\d.]+)([KMGT]?)$", s, re.I)
+    if not m:
+        return 0.0
+    scale = {"K": 1 / 1024, "M": 1.0, "G": 1024.0, "T": 1024.0 * 1024, "": 1.0}
+    val = float(m.group(1)) * scale[m.group(2).upper()]
+    return val * (cpus if per_cpu and cpus > 0 else 1)
 
 
 def collect_pending_jobs() -> Tuple[List[PendingJob], str]:

@@ -70,7 +70,8 @@ def _parse_daemon_data(raw: dict) -> Tuple[List[NodeInfo], List[JobInfo], List[P
             partition=j.get("partition", ""), jobname=j.get("jobname", ""),
             elapsed=j.get("elapsed", ""), node=j.get("node", ""),
             gpu_count=j.get("gpu_count", 0), gres_raw=j.get("gres_raw", ""),
-            time_limit=j.get("time_limit", ""), script=j.get("script", ""),
+            time_limit=j.get("time_limit", ""), mem=j.get("mem", ""),
+            script=j.get("script", ""),
         ))
 
     pending: List[PendingJob] = []

@@ -22,3 +22,16 @@ groups:
           description: >-
             Prometheus cannot see the sgpu collector heartbeat. Check the
             node_exporter scrape target and its textfile collector path.
+
+      - alert: JobMemOverFairShare
+        expr: sgpu_job_mem_fair_ratio > 1.0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "job {{ $labels.jobid }} ({{ $labels.user }}) holds RAM beyond its GPU share"
+          description: >-
+            Job {{ $labels.jobid }} by {{ $labels.user }} on
+            {{ $labels.node }} requests {{ $value }}x the RAM its
+            {{ $labels.gpus }} GPU(s) entitle it to (node RAM divided by
+            node GPU count). Other GPU users on that node may be starved.

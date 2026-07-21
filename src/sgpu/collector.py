@@ -19,8 +19,8 @@ from typing import Dict, List
 
 from .common import (
     GpuInfo, JobInfo, NodeErrorKind, NodeMemInfo, PendingJob, ROGUE_IGNORE,
-    collect_basic, collect_node_data, parse_gres_models, reconcile_gpu_alloc,
-    resolve_user, run_cmd, ssh_cmd, _classify_error,
+    collect_basic, collect_node_data, mem_to_mib, parse_gres_models,
+    reconcile_gpu_alloc, resolve_user, run_cmd, ssh_cmd, _classify_error,
 )
 from .agent import AGENT_PAYLOAD_VERSION
 from . import agent as _agent_module
@@ -478,7 +478,7 @@ def _job_to_dict(job: JobInfo) -> dict:
         "jobname": job.jobname, "elapsed": job.elapsed, "node": job.node,
         "gpu_count": job.gpu_count, "cpu_count": job.cpu_count,
         "gres_raw": job.gres_raw,
-        "time_limit": job.time_limit,
+        "time_limit": job.time_limit, "mem": job.mem,
     }
 
 
@@ -915,6 +915,10 @@ def _format_metrics(data: dict) -> str:
         "# TYPE sgpu_gpu_mem_clock_mhz gauge",
         "# HELP sgpu_pending_job_info Slurm job waiting in the queue",
         "# TYPE sgpu_pending_job_info gauge",
+        "# HELP sgpu_job_mem_mib RAM requested by a running GPU job in MiB",
+        "# TYPE sgpu_job_mem_mib gauge",
+        "# HELP sgpu_job_mem_fair_ratio Job RAM over its GPU fair share (node RAM x job GPUs / node GPUs)",
+        "# TYPE sgpu_job_mem_fair_ratio gauge",
         "# HELP sgpu_gpu_info Static GPU identity labels",
         "# TYPE sgpu_gpu_info gauge",
         "# HELP sgpu_node_info Static node identity labels",
@@ -973,6 +977,23 @@ def _format_metrics(data: dict) -> str:
             f',gpus="{_prom_escape(str(pj.get("gpu_count", "")))}"'
             "} 1"
         )
+    # per-job RAM vs GPU fair share (node RAM × job GPUs / node GPUs) —
+    # ratio > 1 means the job holds more memory than its GPU count entitles
+    node_ram = {n["name"]: num(n.get("mem_total")) for n in nodes}
+    node_gpus = {n["name"]: len(n.get("gpus", [])) for n in nodes}
+    for j in data.get("jobs", []):
+        gpus = j.get("gpu_count", 0)
+        node = j.get("node", "")
+        mem_mib = mem_to_mib(j.get("mem", ""), int(j.get("cpu_count") or 1))
+        if not gpus or not mem_mib or not node_ram.get(node) or not node_gpus.get(node):
+            continue
+        share = node_ram[node] * gpus / node_gpus[node]
+        lbl = (f'jobid="{_prom_escape(str(j.get("jobid", "")))}"'
+               f',user="{_prom_escape(j.get("user", ""))}"'
+               f',node="{_prom_escape(node)}"'
+               f',gpus="{gpus}"')
+        lines.append(f"sgpu_job_mem_mib{{{lbl}}} {mem_mib:.0f}")
+        lines.append(f"sgpu_job_mem_fair_ratio{{{lbl}}} {mem_mib / share:.3f}")
     jobs_by_id = {str(j.get("jobid", "")): j for j in data.get("jobs", [])}
     for n in nodes:
         node = _prom_escape(n["name"])

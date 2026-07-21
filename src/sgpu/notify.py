@@ -24,7 +24,10 @@ Config: ~/.sgpu/webhook.json
                                   #   user holds/dependencies never alert)
   "dm_users": {"alice": "U012AB"},# per-user Slack DMs (member id) for alerts
                                   #   about their own jobs (bot mode only)
-  "free_gpus_min": 0              # alert when free-GPU count reaches N (0 = off)
+  "free_gpus_min": 0,             # alert when free-GPU count reaches N (0 = off)
+  "mem_fair_factor": 0            # RAM hog alerts: job RAM > factor × its GPU
+                                  #   fair share (node RAM × job GPUs / node
+                                  #   GPUs). 1.0 = strict, 0 = off
 }
 
 No bot token/channel -> notifier is inert. POSTs run in a daemon thread so a
@@ -45,7 +48,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from .common import ROGUE_IGNORE, job_log_paths, run_cmd, tail_file
+from .common import ROGUE_IGNORE, job_log_paths, mem_to_mib, run_cmd, tail_file
 
 DEBOUNCE_SEC = int(os.getenv(
     "SLURM_GPU_TUI_SLACK_DEBOUNCE_SEC",
@@ -77,6 +80,8 @@ MSG = {
         "collect_ok": ":arrows_counterclockwise: *{name}: sgpu collection restored* after {dur}",
         "job_fail": ":x: *job {jid} ({name}) by {user} {state}* after {elapsed}",
         "pend_stuck": ":hourglass_flowing_sand: *job {jid} ({name}) by {user} pending {dur}* — {reason}",
+        "mem_hog": ":pig: *job {jid} ({name}) by {user} holds {mem}G RAM on {node}* — "
+                   "fair share for {gpus} GPU(s) is {share}G",
         "idle": "idle", "parked": "parked",
     },
     "ko": {
@@ -94,6 +99,8 @@ MSG = {
         "collect_ok": ":arrows_counterclockwise: *{name}: sgpu 수집 복구* — {dur} 만에",
         "job_fail": ":x: *작업 {jid} ({name}, {user}) {state}* — {elapsed} 경과",
         "pend_stuck": ":hourglass_flowing_sand: *작업 {jid} ({name}, {user}) {dur}째 대기* — {reason}",
+        "mem_hog": ":pig: *작업 {jid} ({name}, {user}) — {node}에서 RAM {mem}G 점유* — "
+                   "GPU {gpus}장 공정 몫은 {share}G",
         "idle": "유휴", "parked": "점유",
     },
 }
@@ -215,6 +222,9 @@ class Notifier:
         # personal Slack DMs: {"login": "U0123ABC"} member ids
         self.dm_users: Dict[str, str] = dict(cfg.get("dm_users", {}))
         self.free_gpus_min: int = int(cfg.get("free_gpus_min", 0))
+        # RAM hogs: alert when a job's requested RAM exceeds factor × its GPU
+        # fair share (node RAM × job GPUs / node GPUs). 0 = off.
+        self.mem_fair_factor: float = float(cfg.get("mem_fair_factor", 0))
         self.waste_alert_hours: float = float(cfg.get("waste_alert_hours", 0))
         self.rogue_alert: bool = bool(cfg.get("rogue_alert", False))
         self.rogue_grace_sec: float = float(cfg.get("rogue_grace_sec", 300))
@@ -380,6 +390,30 @@ class Notifier:
                     self._post(text, key=f"pend:{jid}")
                     self._post_dm(p.get("user", ""), text)
             self._pend_seen = pend_now
+
+        # RAM hogs: requested memory beyond the job's GPU-count fair share.
+        # Allocation-based (squeue %m), so it flags greedy --mem requests even
+        # before the job actually touches that memory.
+        if self.mem_fair_factor > 0 and not data.get("errors"):
+            node_ram = {n["name"]: _to_int(n.get("mem_total")) for n in nodes}
+            node_gpus = {n["name"]: len(n.get("gpus", [])) for n in nodes}
+            for j in data.get("jobs", []):
+                gpus = j.get("gpu_count", 0)
+                node = j.get("node", "")
+                if not gpus or not node_ram.get(node) or not node_gpus.get(node):
+                    continue
+                mem_mib = mem_to_mib(j.get("mem", ""), int(j.get("cpu_count") or 1))
+                share = node_ram[node] * gpus / node_gpus[node]
+                if mem_mib and share > 0 and mem_mib > self.mem_fair_factor * share:
+                    key = f"memhog:{j.get('jobid', '')}"
+                    if self._ok_to_send(key, now, NAG_REALERT_SEC):
+                        text = self._m("mem_hog", jid=j.get("jobid", "?"),
+                                       name=j.get("jobname", "?"),
+                                       user=j.get("user", "?"), node=node,
+                                       mem=f"{mem_mib / 1024:.0f}",
+                                       share=f"{share / 1024:.0f}", gpus=gpus)
+                        self._post(text, key=key)
+                        self._post_dm(j.get("user", ""), text)
 
         if self.waste_alert_hours > 0 or self.rogue_alert:
             # Rogue needs trustworthy allocation data: a failed controller
