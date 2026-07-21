@@ -34,14 +34,14 @@ def targets(expr_fmt: str, legend_per_cluster: bool = True):
     return out
 
 
-def stat(title, expr, x, y, w, unit="none", h=5, color="blue", desc=""):
+def stat(title, expr, x, y, w, unit="none", h=5, color="blue", desc="", decimals=0):
     return {
         "id": nid(), "type": "stat", "title": title, "datasource": DS,
         "description": desc,
         "gridPos": {"x": x, "y": y, "w": w, "h": h},
         "fieldConfig": {"defaults": {
             "unit": unit, "color": {"mode": "fixed", "fixedColor": color},
-            "decimals": 0,
+            "decimals": decimals,
         }, "overrides": []},
         "options": {"reduceOptions": {"calcs": ["lastNotNull"]},
                     "graphMode": "area", "colorMode": "value"},
@@ -49,11 +49,11 @@ def stat(title, expr, x, y, w, unit="none", h=5, color="blue", desc=""):
     }
 
 
-def multistat(title, expr_fmt, x, y, w, unit="none", h=5):
+def multistat(title, expr_fmt, x, y, w, unit="none", h=5, decimals=0):
     return {
         "id": nid(), "type": "stat", "title": title, "datasource": DS,
         "gridPos": {"x": x, "y": y, "w": w, "h": h},
-        "fieldConfig": {"defaults": {"unit": unit, "decimals": 0}, "overrides": []},
+        "fieldConfig": {"defaults": {"unit": unit, "decimals": decimals}, "overrides": []},
         "options": {"reduceOptions": {"calcs": ["lastNotNull"]},
                     "graphMode": "none", "colorMode": "value",
                     "textMode": "value_and_name"},
@@ -88,7 +88,8 @@ def summed(metric: str) -> str:
 panels = [
     # ── combined totals ────────────────────────────────────────────────
     stat("Total Wall Power", summed("node_sys_power_watts"), 0, 0, 4, "watt", color="orange",
-         desc="Both clusters, BMC-reporting nodes only (sgpu doctor lists gaps)."),
+         desc="Both clusters, BMC-reporting nodes only (sgpu doctor lists gaps).",
+         decimals=2),
     stat("GPUs Total", summed("gpus_total"), 4, 0, 3),
     stat("GPUs Busy", summed("gpus_allocated"), 7, 0, 3, color="green"),
     stat("GPUs Free", summed("gpus_free"), 10, 0, 3, color="cyan"),
@@ -98,7 +99,8 @@ panels = [
          19, 0, 5, color="red",
          desc="Allocated GPUs doing no compute across both clusters."),
     # ── per-cluster comparison ─────────────────────────────────────────
-    multistat("Wall Power by Cluster", "sum({p}node_sys_power_watts)", 0, 5, 6, "watt"),
+    multistat("Wall Power by Cluster", "sum({p}node_sys_power_watts)", 0, 5, 6, "watt",
+              decimals=2),
     multistat("GPU Busy / Total", "sum({p}gpus_allocated)", 6, 5, 6),
     multistat("Avg GPU Util %", "avg({p}gpu_util)", 12, 5, 6, "percent"),
     multistat("Jobs Running", "{p}jobs_running", 18, 5, 6),

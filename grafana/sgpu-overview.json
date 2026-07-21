@@ -45,7 +45,7 @@
             "mode": "fixed",
             "fixedColor": "orange"
           },
-          "decimals": 0
+          "decimals": 2
         },
         "overrides": []
       },
@@ -362,7 +362,7 @@
       "fieldConfig": {
         "defaults": {
           "unit": "watt",
-          "decimals": 0
+          "decimals": 2
         },
         "overrides": []
       },

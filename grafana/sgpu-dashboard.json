@@ -1036,7 +1036,8 @@
                 "value": null
               }
             ]
-          }
+          },
+          "decimals": 2
         },
         "overrides": []
       },
@@ -1097,7 +1098,8 @@
                 "value": null
               }
             ]
-          }
+          },
+          "decimals": 2
         },
         "overrides": []
       },
@@ -2757,7 +2759,8 @@
                 "value": null
               }
             ]
-          }
+          },
+          "decimals": 2
         },
         "overrides": []
       },
