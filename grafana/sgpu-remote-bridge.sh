@@ -4,10 +4,11 @@
 # Grafana/Prometheus can watch several clusters without series collisions
 # (and without the local sgpu_* alert rules ever matching remote series).
 #
-# Also samples the remote master's own /proc//sys (CPU, RAM, load, disks,
-# network, coretemp) as <prefix>node_* — the remote host runs no
-# node_exporter, and the dashboard's "master (login/collector node)" row
-# needs first-party data, not this host's.
+# Newer sgpu collectors publish their own host's stats as sgpu_master_*
+# in metrics.prom, which the prefix rename above covers for free. For
+# remotes still on an older sgpu, fall back to sampling the master's
+# /proc//sys over ssh into the same <prefix>sgpu_master_* names, so the
+# dashboard's "master (login/collector node)" row works either way.
 #
 #   SGPU_BRIDGE_REMOTE       ssh target                (default sim@10.10.0.100)
 #   SGPU_BRIDGE_REMOTE_FILE  remote metrics path       (default /tmp/slurm-gpu-tui/metrics.prom)
@@ -39,9 +40,10 @@ else
     : >"$TMP"
 fi
 
-# remote master's own host stats, node_exporter-compatible names (only the
-# ones the dashboard's master row uses). Failure here only loses that row.
-ssh "${SSH_OPTS[@]}" "$REMOTE" /bin/sh 2>/dev/null <<'RSH' | sed "s/^node_/${PREFIX}node_/" >>"$TMP"
+# fallback master host stats for remotes on an sgpu without sgpu_master_*
+# (only the metrics the dashboard's master row uses)
+if ! grep -q "^${PREFIX}sgpu_master_" "$TMP"; then
+ssh "${SSH_OPTS[@]}" "$REMOTE" /bin/sh 2>/dev/null <<'RSH' | sed "s/^node_/${PREFIX}sgpu_master_/" >>"$TMP"
 awk '/^cpu[0-9]+ /{printf "node_cpu_seconds_total{cpu=\"%s\",mode=\"idle\"} %.2f\n", substr($1,4), $5/100}
      /^btime /{print "node_boot_time_seconds " $2}' /proc/stat
 awk '/^MemTotal:/{print "node_memory_MemTotal_bytes " $2*1024}
@@ -69,6 +71,7 @@ for h in /sys/class/hwmon/hwmon*; do
     done
 done
 RSH
+fi
 
 {
     printf '# HELP %ssgpu_bridge_up Remote sgpu fetch succeeded (1) or failed (0)\n' "$PREFIX"

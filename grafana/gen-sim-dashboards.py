@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Regenerate the SIM-cluster dashboard pair from the local sources.
 
-Rewrites: sgpu_* -> sim_sgpu_* everywhere, node_* -> sim_node_* inside
-panel exprs (the bridge republishes the remote master's /proc stats under
-that prefix), cross-dashboard links, uids, titles, tags. The master
+Rewrites: sgpu_* -> sim_sgpu_* everywhere, node_* -> sim_sgpu_master_*
+inside panel exprs (the remote collector publishes its own host stats as
+sgpu_master_* with node_exporter-compatible suffixes; the bridge adds the
+sim_ prefix), cross-dashboard links, uids, titles, tags. The master
 cluster has CPU-only nodes, so the "CPU ·" row ships expanded there.
 
 Run from the repo root, then deploy with grafana/install.sh (or copy to
@@ -28,7 +29,7 @@ _NODE_METRIC_RE = re.compile(r"\bnode_(?=[a-z])")
 def _rewrite_exprs(panel: dict) -> None:
     for t in panel.get("targets", []):
         if t.get("expr"):
-            t["expr"] = _NODE_METRIC_RE.sub("sim_node_", t["expr"])
+            t["expr"] = _NODE_METRIC_RE.sub("sim_sgpu_master_", t["expr"])
     for sub in panel.get("panels", []):
         _rewrite_exprs(sub)
 

@@ -1218,7 +1218,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "100 * (1 - avg(rate(sim_node_cpu_seconds_total{mode=\"idle\"}[2m])))",
+          "expr": "100 * (1 - avg(rate(sim_sgpu_master_cpu_seconds_total{mode=\"idle\"}[2m])))",
           "refId": "A"
         }
       ],
@@ -1293,7 +1293,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "100 * (1 - sim_node_memory_MemAvailable_bytes / sim_node_memory_MemTotal_bytes)",
+          "expr": "100 * (1 - sim_sgpu_master_memory_MemAvailable_bytes / sim_sgpu_master_memory_MemTotal_bytes)",
           "refId": "A"
         }
       ],
@@ -1353,7 +1353,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_node_load1",
+          "expr": "sim_sgpu_master_load1",
           "refId": "A"
         }
       ],
@@ -1421,7 +1421,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "max(sim_node_hwmon_temp_celsius{chip=~\"platform_coretemp.*\"})",
+          "expr": "max(sim_sgpu_master_hwmon_temp_celsius{chip=~\"platform_coretemp.*\"})",
           "refId": "A"
         }
       ],
@@ -1481,7 +1481,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "time() - sim_node_boot_time_seconds",
+          "expr": "time() - sim_sgpu_master_boot_time_seconds",
           "refId": "A"
         }
       ],
@@ -1570,7 +1570,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "100 * (1 - avg(rate(sim_node_cpu_seconds_total{mode=\"idle\"}[2m])))",
+          "expr": "100 * (1 - avg(rate(sim_sgpu_master_cpu_seconds_total{mode=\"idle\"}[2m])))",
           "legendFormat": "CPU %",
           "refId": "A"
         },
@@ -1579,7 +1579,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "100 * (1 - sim_node_memory_MemAvailable_bytes / sim_node_memory_MemTotal_bytes)",
+          "expr": "100 * (1 - sim_sgpu_master_memory_MemAvailable_bytes / sim_sgpu_master_memory_MemTotal_bytes)",
           "legendFormat": "RAM %",
           "refId": "B"
         }
@@ -1720,7 +1720,7 @@
           "refId": "A",
           "format": "table",
           "instant": true,
-          "expr": "sim_node_filesystem_size_bytes{mountpoint=~\"/|/home|/data1\"} - sim_node_filesystem_avail_bytes{mountpoint=~\"/|/home|/data1\"}"
+          "expr": "sim_sgpu_master_filesystem_size_bytes{mountpoint=~\"/|/home|/data1\"} - sim_sgpu_master_filesystem_avail_bytes{mountpoint=~\"/|/home|/data1\"}"
         },
         {
           "datasource": {
@@ -1730,7 +1730,7 @@
           "refId": "B",
           "format": "table",
           "instant": true,
-          "expr": "sim_node_filesystem_size_bytes{mountpoint=~\"/|/home|/data1\"}"
+          "expr": "sim_sgpu_master_filesystem_size_bytes{mountpoint=~\"/|/home|/data1\"}"
         },
         {
           "datasource": {
@@ -1740,7 +1740,7 @@
           "refId": "C",
           "format": "table",
           "instant": true,
-          "expr": "100 * (1 - sim_node_filesystem_avail_bytes{mountpoint=~\"/|/home|/data1\"} / sim_node_filesystem_size_bytes{mountpoint=~\"/|/home|/data1\"})"
+          "expr": "100 * (1 - sim_sgpu_master_filesystem_avail_bytes{mountpoint=~\"/|/home|/data1\"} / sim_sgpu_master_filesystem_size_bytes{mountpoint=~\"/|/home|/data1\"})"
         }
       ],
       "transformations": [
@@ -1852,7 +1852,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "expr": "sum(rate(sim_node_network_receive_bytes_total{device!=\"lo\"}[2m]))",
+          "expr": "sum(rate(sim_sgpu_master_network_receive_bytes_total{device!=\"lo\"}[2m]))",
           "legendFormat": "Inbound (RX)",
           "datasource": {
             "type": "prometheus",
@@ -1861,7 +1861,7 @@
           "refId": "A"
         },
         {
-          "expr": "sum(rate(sim_node_network_transmit_bytes_total{device!=\"lo\"}[2m]))",
+          "expr": "sum(rate(sim_sgpu_master_network_transmit_bytes_total{device!=\"lo\"}[2m]))",
           "legendFormat": "Outbound (TX)",
           "datasource": {
             "type": "prometheus",
@@ -1949,7 +1949,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "expr": "sum(rate(sim_node_disk_read_bytes_total[2m]))",
+          "expr": "sum(rate(sim_sgpu_master_disk_read_bytes_total[2m]))",
           "legendFormat": "read",
           "datasource": {
             "type": "prometheus",
@@ -1958,7 +1958,7 @@
           "refId": "A"
         },
         {
-          "expr": "sum(rate(sim_node_disk_written_bytes_total[2m]))",
+          "expr": "sum(rate(sim_sgpu_master_disk_written_bytes_total[2m]))",
           "legendFormat": "write",
           "datasource": {
             "type": "prometheus",

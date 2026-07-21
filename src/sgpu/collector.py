@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import fcntl
+import glob
 import json
 import os
 import re
@@ -1037,11 +1038,125 @@ def _format_metrics(data: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+# ── Master host stats (the collector's own machine) ──────────────────────
+# The dashboard's "master (login/collector node)" row needs first-party data
+# even on clusters that run no node_exporter — a remote Grafana can then read
+# everything from this one textfile. Metric suffixes mirror node_exporter's
+# so consumers translate mechanically (node_X -> sgpu_master_X).
+
+# local filesystems only: statvfs on a dead NFS mount would hang the loop
+_MASTER_FS_TYPES = {"ext2", "ext3", "ext4", "xfs", "btrfs", "zfs"}
+_MASTER_DISK_RE = re.compile(r"^(sd[a-z]+|vd[a-z]+|nvme\d+n\d+)$")
+
+
+def _master_host_lines(proc: str = "/proc", sys_dir: str = "/sys") -> List[str]:
+    """This host's CPU/RAM/load/fs/net/disk/temp as sgpu_master_* lines.
+    Every section is best-effort — a missing file just drops its metrics."""
+    lines: List[str] = []
+
+    def read(path: str) -> str:
+        with open(path) as f:
+            return f.read()
+
+    try:
+        for ln in read(f"{proc}/stat").splitlines():
+            if ln.startswith("cpu") and len(ln) > 3 and ln[3].isdigit():
+                f_ = ln.split()
+                lines.append(f'sgpu_master_cpu_seconds_total{{cpu="{f_[0][3:]}",mode="idle"}} '
+                             f"{int(f_[4]) / 100:.2f}")
+            elif ln.startswith("btime "):
+                lines.append(f"sgpu_master_boot_time_seconds {ln.split()[1]}")
+    except Exception:
+        pass
+    try:
+        for ln in read(f"{proc}/meminfo").splitlines():
+            k = ln.split(":")[0]
+            if k in ("MemTotal", "MemAvailable"):
+                lines.append(f"sgpu_master_memory_{k}_bytes {int(ln.split()[1]) * 1024}")
+    except Exception:
+        pass
+    try:
+        lines.append(f"sgpu_master_load1 {read(f'{proc}/loadavg').split()[0]}")
+    except Exception:
+        pass
+    try:
+        seen = set()
+        for ln in read(f"{proc}/mounts").splitlines():
+            parts = ln.split()
+            if len(parts) < 3 or parts[2] not in _MASTER_FS_TYPES or parts[1] in seen:
+                continue
+            seen.add(parts[1])
+            try:
+                st = os.statvfs(parts[1])
+            except OSError:
+                continue
+            mp = _prom_escape(parts[1])
+            lines.append(f'sgpu_master_filesystem_size_bytes{{mountpoint="{mp}"}} '
+                         f"{st.f_blocks * st.f_frsize}")
+            lines.append(f'sgpu_master_filesystem_avail_bytes{{mountpoint="{mp}"}} '
+                         f"{st.f_bavail * st.f_frsize}")
+    except Exception:
+        pass
+    try:
+        for ln in read(f"{proc}/net/dev").splitlines()[2:]:
+            if ":" not in ln:
+                continue
+            dev, rest = ln.split(":", 1)
+            dev = dev.strip()
+            if dev == "lo":
+                continue
+            f_ = rest.split()
+            lines.append(f'sgpu_master_network_receive_bytes_total{{device="{dev}"}} {f_[0]}')
+            lines.append(f'sgpu_master_network_transmit_bytes_total{{device="{dev}"}} {f_[8]}')
+    except Exception:
+        pass
+    try:
+        for ln in read(f"{proc}/diskstats").splitlines():
+            f_ = ln.split()
+            if len(f_) > 9 and _MASTER_DISK_RE.match(f_[2]):
+                lines.append(f'sgpu_master_disk_read_bytes_total{{device="{f_[2]}"}} '
+                             f"{int(f_[5]) * 512}")
+                lines.append(f'sgpu_master_disk_written_bytes_total{{device="{f_[2]}"}} '
+                             f"{int(f_[9]) * 512}")
+    except Exception:
+        pass
+    try:
+        for h in sorted(glob.glob(f"{sys_dir}/class/hwmon/hwmon*")):
+            try:
+                name = read(f"{h}/name").strip()
+            except OSError:
+                continue
+            if name == "coretemp":
+                for t in sorted(glob.glob(f"{h}/temp*_input")):
+                    sensor = os.path.basename(t)[:-len("_input")]
+                    try:
+                        val = int(read(t)) / 1000
+                    except (OSError, ValueError):
+                        continue
+                    lines.append(f'sgpu_master_hwmon_temp_celsius{{chip="platform_coretemp.0",'
+                                 f'sensor="{sensor}"}} {val:.1f}')
+            for pf in sorted(glob.glob(f"{h}/power*_average")):
+                sensor = os.path.basename(pf)[:-len("_average")]
+                try:
+                    val = int(read(pf)) / 1e6
+                except (OSError, ValueError):
+                    continue
+                lines.append(f'sgpu_master_hwmon_power_average_watt{{chip="{_prom_escape(name)}",'
+                             f'sensor="{sensor}"}} {val:.1f}')
+    except Exception:
+        pass
+    return lines
+
+
 def _write_metrics(data: dict) -> None:
     """Write a Prometheus textfile snapshot next to data.json."""
     try:
+        text = _format_metrics(data)
+        host = _master_host_lines()
+        if host:
+            text += "\n".join(host) + "\n"
         tmp = METRICS_FILE.with_suffix(".tmp")
-        tmp.write_text(_format_metrics(data))
+        tmp.write_text(text)
         tmp.rename(METRICS_FILE)
     except Exception as e:
         print(f"[collector] metrics write error: {e}", flush=True)
