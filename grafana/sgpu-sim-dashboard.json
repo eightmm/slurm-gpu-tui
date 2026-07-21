@@ -1218,7 +1218,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "100 * (1 - avg(rate(node_cpu_seconds_total{mode=\"idle\"}[2m])))",
+          "expr": "100 * (1 - avg(rate(sim_node_cpu_seconds_total{mode=\"idle\"}[2m])))",
           "refId": "A"
         }
       ],
@@ -1293,7 +1293,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)",
+          "expr": "100 * (1 - sim_node_memory_MemAvailable_bytes / sim_node_memory_MemTotal_bytes)",
           "refId": "A"
         }
       ],
@@ -1353,71 +1353,11 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "node_load1",
+          "expr": "sim_node_load1",
           "refId": "A"
         }
       ],
       "title": "Load (1m)",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "unit": "watt",
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "blue",
-                "value": null
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 5,
-        "w": 2,
-        "x": 10,
-        "y": 11
-      },
-      "id": 44,
-      "options": {
-        "colorMode": "background",
-        "graphMode": "none",
-        "justifyMode": "center",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto",
-        "wideLayout": true
-      },
-      "pluginVersion": "10.0.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "expr": "node_hwmon_power_average_watt",
-          "refId": "A"
-        }
-      ],
-      "title": "Wall Power",
       "type": "stat"
     },
     {
@@ -1481,7 +1421,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "max(node_hwmon_temp_celsius{chip=~\"platform_coretemp.*\"})",
+          "expr": "max(sim_node_hwmon_temp_celsius{chip=~\"platform_coretemp.*\"})",
           "refId": "A"
         }
       ],
@@ -1541,7 +1481,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "time() - node_boot_time_seconds",
+          "expr": "time() - sim_node_boot_time_seconds",
           "refId": "A"
         }
       ],
@@ -1630,7 +1570,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "100 * (1 - avg(rate(node_cpu_seconds_total{mode=\"idle\"}[2m])))",
+          "expr": "100 * (1 - avg(rate(sim_node_cpu_seconds_total{mode=\"idle\"}[2m])))",
           "legendFormat": "CPU %",
           "refId": "A"
         },
@@ -1639,7 +1579,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)",
+          "expr": "100 * (1 - sim_node_memory_MemAvailable_bytes / sim_node_memory_MemTotal_bytes)",
           "legendFormat": "RAM %",
           "refId": "B"
         }
@@ -1780,7 +1720,7 @@
           "refId": "A",
           "format": "table",
           "instant": true,
-          "expr": "node_filesystem_size_bytes{mountpoint=~\"/|/home|/data1\"} - node_filesystem_avail_bytes{mountpoint=~\"/|/home|/data1\"}"
+          "expr": "sim_node_filesystem_size_bytes{mountpoint=~\"/|/home|/data1\"} - sim_node_filesystem_avail_bytes{mountpoint=~\"/|/home|/data1\"}"
         },
         {
           "datasource": {
@@ -1790,7 +1730,7 @@
           "refId": "B",
           "format": "table",
           "instant": true,
-          "expr": "node_filesystem_size_bytes{mountpoint=~\"/|/home|/data1\"}"
+          "expr": "sim_node_filesystem_size_bytes{mountpoint=~\"/|/home|/data1\"}"
         },
         {
           "datasource": {
@@ -1800,7 +1740,7 @@
           "refId": "C",
           "format": "table",
           "instant": true,
-          "expr": "100 * (1 - node_filesystem_avail_bytes{mountpoint=~\"/|/home|/data1\"} / node_filesystem_size_bytes{mountpoint=~\"/|/home|/data1\"})"
+          "expr": "100 * (1 - sim_node_filesystem_avail_bytes{mountpoint=~\"/|/home|/data1\"} / sim_node_filesystem_size_bytes{mountpoint=~\"/|/home|/data1\"})"
         }
       ],
       "transformations": [
@@ -1912,7 +1852,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "expr": "sum(rate(node_network_receive_bytes_total{device!=\"lo\"}[2m]))",
+          "expr": "sum(rate(sim_node_network_receive_bytes_total{device!=\"lo\"}[2m]))",
           "legendFormat": "Inbound (RX)",
           "datasource": {
             "type": "prometheus",
@@ -1921,7 +1861,7 @@
           "refId": "A"
         },
         {
-          "expr": "sum(rate(node_network_transmit_bytes_total{device!=\"lo\"}[2m]))",
+          "expr": "sum(rate(sim_node_network_transmit_bytes_total{device!=\"lo\"}[2m]))",
           "legendFormat": "Outbound (TX)",
           "datasource": {
             "type": "prometheus",
@@ -2009,7 +1949,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "expr": "sum(rate(node_disk_read_bytes_total[2m]))",
+          "expr": "sum(rate(sim_node_disk_read_bytes_total[2m]))",
           "legendFormat": "read",
           "datasource": {
             "type": "prometheus",
@@ -2018,7 +1958,7 @@
           "refId": "A"
         },
         {
-          "expr": "sum(rate(node_disk_written_bytes_total[2m]))",
+          "expr": "sum(rate(sim_node_disk_written_bytes_total[2m]))",
           "legendFormat": "write",
           "datasource": {
             "type": "prometheus",
@@ -4352,7 +4292,6 @@
   "schemaVersion": 38,
   "style": "dark",
   "tags": [
-    "ai-master",
     "gpu",
     "master",
     "sgpu",
