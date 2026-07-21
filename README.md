@@ -111,8 +111,10 @@ sgpu        # launch the monitor
 | `d` | Detail columns (Temp / Power / JobID / JobName) |
 | `Space` / `j` `k` | Collapse node / move cursor |
 | `/` | Search node or username (`Esc` clears) |
-| `Enter` | Job / node details (`scontrol show`) |
+| `Enter` | Job / node details (`scontrol show`) — `Tab` cycles Info / Script / StdOut / StdErr |
 | `w` | Wasted GPUs popup |
+| `h` | My job history (7d, sacct) — `Enter`: state, exit code, logs |
+| `n` | Watch job under cursor — toast when it starts/ends |
 | `x` | Cancel job under cursor (own jobs, asks first) |
 | `e` | Export snapshot as JSON |
 | `?` / `q` | Help / quit |
@@ -128,6 +130,7 @@ sgpu --waste [-v]    # idle/parked/rogue GPUs; exit 1 if any
 sgpu doctor          # self-diagnosis: data, agents, slurm, sacct, Slack
 sgpu --usage [days] [--daily]          # per-user GPU-hours + efficiency + waste
 sgpu --jobs [days] [--user U]          # job history: outcomes, GPU-hours, waits
+sgpu logs JOBID [-f] [-e]              # tail a job's stdout (-e: stderr, -f: follow)
 sgpu --report [YYYY-MM]                # markdown monthly report
 sgpu --wait-free 2 --partition heavy   # block until 2 GPUs free
 sgpu fit 2 [--vram 40] [--partition P] # where 2 GPUs fit right now + sbatch line

@@ -19,8 +19,8 @@ from .cells import (
 )
 from .common import (
     GpuInfo, JobInfo, NodeInfo, apply_gpu_alloc, build_nodes, cleanup_ssh_pool,
-    collect_basic, collect_node_data_parallel, run_cmd,
-    ssh_cmd,
+    collect_basic, collect_node_data_parallel, job_log_paths, run_cmd,
+    ssh_cmd, tail_file,
 )
 from .tui import _DAEMON_DATA_FILE, _DAEMON_MAX_AGE, SlurmGpuTui
 from .usage import _read_usage_raw, load_usage_daily, load_usage_totals
@@ -385,6 +385,57 @@ def _cli_wait_free(want: int, partition: str, interval: int) -> int:
             print(f"{free} free GPU(s) available" + (f" in {partition}" if partition else ""))
             return 0
         time.sleep(interval)
+
+
+def _cli_logs(jobid: str, follow: bool = False, want_err: bool = False) -> int:
+    """Tail a job's stdout (or stderr with -e); -f keeps following like tail -f."""
+    ok, out = run_cmd(f"scontrol show job {jobid}")
+    if not ok or "JobId=" not in out:
+        print(f"scontrol: {out.strip() or 'job not found'} "
+              "(log paths only exist for queued/running jobs)", file=sys.stderr)
+        return 1
+    stdout_path, stderr_path = job_log_paths(out)
+    path = stderr_path if want_err else stdout_path
+    if want_err and not stderr_path and stdout_path:
+        print("(stderr is merged into stdout)", file=sys.stderr)
+        path = stdout_path
+    if not path:
+        print("job has no log file path", file=sys.stderr)
+        return 1
+    print(f"== {path}", file=sys.stderr)
+    if not follow:
+        text = tail_file(path)
+        sys.stdout.write(text if text.endswith("\n") else text + "\n")
+        return 0
+    try:
+        pos = max(0, os.path.getsize(path) - 4096)
+    except OSError:
+        pos = 0
+    last_job_check = time.time()
+    try:
+        while True:
+            try:
+                size = os.path.getsize(path)
+                if size < pos:
+                    pos = 0  # truncated — start over
+                if size > pos:
+                    with open(path, "rb") as f:
+                        f.seek(pos)
+                        data = f.read()
+                    pos += len(data)
+                    sys.stdout.write(data.decode(errors="replace"))
+                    sys.stdout.flush()
+            except FileNotFoundError:
+                pass  # not created yet; keep waiting
+            if time.time() - last_job_check > 30:
+                last_job_check = time.time()
+                ok2, out2 = run_cmd(f"scontrol show job {jobid}")
+                if not ok2 or "JobId=" not in out2:
+                    print("\n== job left the queue (finished)", file=sys.stderr)
+                    return 0
+            time.sleep(1)
+    except KeyboardInterrupt:
+        return 0
 
 
 def _cli_doctor() -> int:
@@ -753,6 +804,14 @@ def main():
                               partition=_arg_value(argv, "--partition", "")))
         if "--me" in argv or "me" in argv[:1]:
             sys.exit(_cli_me())
+        if argv[:1] == ["logs"] or "--logs" in argv:
+            jid = (_arg_value(argv, "--logs", "") if "--logs" in argv
+                   else (argv[1] if len(argv) > 1 and not argv[1].startswith("-") else ""))
+            if not jid:
+                print("usage: sgpu logs JOBID [-f] [-e]", file=sys.stderr)
+                sys.exit(2)
+            sys.exit(_cli_logs(jid, follow="-f" in argv or "--follow" in argv,
+                               want_err="-e" in argv or "--err" in argv))
         if "--wait-free" in argv:
             want = int(_arg_value(argv, "--wait-free", "1"))
             part = _arg_value(argv, "--partition", "")
@@ -761,7 +820,7 @@ def main():
         if argv and argv[0] in ("-h", "--help"):
             print("usage: sgpu [--version | --json | --once | --waste [-v] | --usage [days] [--daily] |\n"
                   "             --jobs [days] [--user U] | --report [YYYY-MM] | --wait-free N |\n"
-                  "             fit N [--vram G] [--partition P] | me | doctor]\n"
+                  "             fit N [--vram G] [--partition P] | logs JOBID [-f] [-e] | me | doctor]\n"
                   "  (no args)      interactive TUI\n"
                   "  --version      print installed release and exit\n"
                   "  --json         print snapshot as JSON and exit\n"
@@ -777,6 +836,8 @@ def main():
                   "                 [--partition P] [--interval sec]\n"
                   "  fit N          nodes that fit N free GPUs now + sbatch line\n"
                   "                 [--vram G] minimum VRAM per GPU, [--partition P]\n"
+                  "  logs JOBID     tail a job's stdout (last 64KB)\n"
+                  "                 -f follow like tail -f, -e stderr instead\n"
                   "  me             my jobs, my wasted GPUs, my week (exit 1 if wasting)\n"
                   "  doctor         self-diagnosis: data freshness, agents, slurm, sharing")
             return

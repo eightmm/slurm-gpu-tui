@@ -31,11 +31,11 @@ from .cells import (
 from .common import (
     GpuInfo, JobInfo, NodeInfo, NodeSSHResult, PendingJob,
     apply_gpu_alloc, build_nodes, cleanup_ssh_pool, collect_basic,
-    collect_node_data_parallel, run_cmd,
+    collect_node_data_parallel, job_log_paths, run_cmd, tail_file,
 )
 from .screens import (
-    _JAMO_ACTIONS, ConfirmScreen, DetailScreen, HelpScreen, UserSelectScreen,
-    WasteScreen,
+    _JAMO_ACTIONS, ConfirmScreen, DetailScreen, HelpScreen, HistoryScreen,
+    UserSelectScreen, WasteScreen,
 )
 from .usage import render_usage
 
@@ -180,6 +180,8 @@ class SlurmGpuTui(App):
         ("k", "cursor_up", "↑"),
         ("slash", "start_search", "Search"),
         ("w", "show_waste", "Waste"),
+        ("h", "show_history", "History"),
+        ("n", "watch_job", "Watch job"),
         ("x", "cancel_job", "Cancel job"),
         ("g", "show_usage", "Usage"),
         ("1", "tab_gpu", "GPU"),
@@ -274,6 +276,8 @@ class SlurmGpuTui(App):
         self._toast_jobs: Optional[Dict[str, JobInfo]] = None
         self._toast_pending: set = set()
         self._toast_down: Dict[str, bool] = {}
+        # jobs watched with `n`: jobid -> {user, jobname, state} (in-session)
+        self._watched: Dict[str, Dict[str, str]] = {}
         self._nodes_cache: List[NodeInfo] = []  # last applied nodes (waste view)
         self._jobs_by_id: Dict[str, JobInfo] = {}  # for detail popup scripts
         self._auto_collapsed = False  # big clusters start collapsed, once
@@ -405,6 +409,57 @@ class SlurmGpuTui(App):
                 return ""
             return self._row_job.get(key, "")
         return ""
+
+    def action_show_history(self) -> None:
+        self.status_w.update(Text(" loading job history… ", style="dim"))
+        self._open_history()
+
+    @work(thread=True)
+    def _open_history(self) -> None:
+        days = 7
+        ok, out = run_cmd(
+            f"sacct -u {self.current_user} -X --noheader --parsable2 "
+            "--format=JobID,JobName,State,ExitCode,Elapsed,End,Partition,AllocTRES "
+            f"-S now-{days}days", timeout=30)
+        rows: List[dict] = []
+        if ok:
+            for line in out.splitlines():
+                p = line.split("|")
+                if len(p) != 8:
+                    continue
+                mg = re.search(r"gres/gpu[^=]*=(\d+)", p[7])
+                rows.append({
+                    "jobid": p[0], "name": p[1], "state": p[2].split()[0],
+                    "exit": p[3], "elapsed": p[4],
+                    "end": p[5].replace("T", " "), "part": p[6],
+                    "gpus": int(mg.group(1)) if mg else 0,
+                })
+            rows.reverse()  # newest first
+        self.call_from_thread(self.push_screen,
+                              HistoryScreen(self.current_user, days, rows,
+                                            error="" if ok else out.strip()[:120]))
+        self.call_from_thread(self.status_w.update, Text(""))
+
+    def action_watch_job(self) -> None:
+        """Watch any job: toast when it starts / ends (n again unwatches)."""
+        jid = self._job_under_cursor()
+        if not jid:
+            self.status_w.update(Text(" Move cursor to a job row to watch ", style="dim"))
+            return
+        if jid in self._watched:
+            del self._watched[jid]
+            self.status_w.update(Text(f" stopped watching job {jid} ", style="dim"))
+            return
+        j = self._jobs_by_id.get(jid)
+        if j is not None:
+            user, name, state = j.user, j.jobname, "running"
+        else:
+            user, name, state = self._pending_user.get(jid, "?"), "", "pending"
+        self._watched[jid] = {"user": user, "jobname": name, "state": state}
+        label = f"{jid} ({name})" if name else jid
+        self.status_w.update(Text(
+            f" watching {state} job {label} of {user} — toast when it ends ",
+            style="bold cyan"))
 
     def action_cancel_job(self) -> None:
         jid = self._job_under_cursor()
@@ -578,9 +633,20 @@ class SlurmGpuTui(App):
                         src = m.group(1)
                     except OSError:
                         out += "\n\n(batch script not readable: not your job and file permissions deny it)"
+            # live step usage — sstat only answers for your own running jobs,
+            # so a silent skip is the common case for everything else
+            ok3, s3 = run_cmd(f"sstat -a -j {name} "
+                              "--format=JobID%16,AveCPU,MaxRSS,MaxVMSize,MaxDiskRead,MaxDiskWrite")
+            if ok3 and len(s3.strip().splitlines()) > 2:
+                out += "\n\nLive usage (sstat, per step):\n" + s3
+            stdout_path, stderr_path = job_log_paths(out)
+            stdout_text = tail_file(stdout_path) if stdout_path else ""
+            stderr_text = tail_file(stderr_path) if stderr_path else ""
             self.call_from_thread(
                 self.push_screen,
-                DetailScreen(f"{kind} {name}", out, script=script, script_src=src),
+                DetailScreen(f"{kind} {name}", out, script=script, script_src=src,
+                             stdout_text=stdout_text, stdout_path=stdout_path,
+                             stderr_text=stderr_text, stderr_path=stderr_path),
             )
             return
         self.call_from_thread(self.push_screen, DetailScreen(f"{kind} {name}", out))
@@ -727,6 +793,23 @@ class SlurmGpuTui(App):
                     else:
                         self.notify(f"{name} back in service",
                                     title="node recovered", severity="information", timeout=8)
+        if jobs_ok and self._watched:
+            run_ids = {j.jobid for j in jobs}
+            pend_ids = {pj.jobid for pj in pending}
+            for jid in list(self._watched):
+                w = self._watched[jid]
+                label = f"{jid} ({w['jobname']})" if w["jobname"] else jid
+                if jid in run_ids:
+                    if w["state"] == "pending":
+                        w["state"] = "running"
+                        self.notify(f"watched {label} of {w['user']} started",
+                                    title="watch", severity="information", timeout=10)
+                elif jid not in pend_ids:
+                    j = self._jobs_by_id.get(jid)
+                    gpus = f", {j.gpu_count} GPU freed" if j and j.gpu_count else ""
+                    self.notify(f"watched {label} of {w['user']} ended{gpus}",
+                                title="watch", severity="warning", timeout=15)
+                    del self._watched[jid]
         if jobs_ok:
             self._toast_jobs = mine_run
             self._toast_pending = mine_pend

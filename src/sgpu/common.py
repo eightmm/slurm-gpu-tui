@@ -828,3 +828,45 @@ def collect_node_data_parallel(
         errors.append(f"cached: {','.join(stale_nodes)}")
 
     return ssh_results, stale_nodes, errors
+
+
+# ── Job log files (stdout/stderr) ─────────────────────────────────────────
+
+def tail_file(path: str, limit: int = 65536) -> str:
+    """Last `limit` bytes of a job log, decoded leniently."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > limit:
+                f.seek(size - limit)
+            text = f.read(limit).decode(errors="replace")
+    except FileNotFoundError:
+        return "(no file yet — job may not have started writing)"
+    except OSError as e:
+        return f"(not readable: {e.strerror or e})"
+    if not text:
+        return "(empty)"
+    if size > limit:
+        text = f"… showing last {limit // 1024}KB of {size / 1048576:.1f}MB …\n" + text
+    return text
+
+
+def job_log_paths(scontrol_out: str) -> Tuple[str, str]:
+    """(stdout, stderr) paths from `scontrol show job` output.
+
+    scontrol reports resolved paths (%j etc. already expanded); relative
+    paths are relative to WorkDir. stderr is "" when merged into stdout."""
+    def one(field: str) -> str:
+        m = re.search(rf"{field}=(\S+)", scontrol_out)
+        p = m.group(1) if m else ""
+        if not p or p == "(null)":
+            return ""
+        if not os.path.isabs(p):
+            wd = re.search(r"WorkDir=(\S+)", scontrol_out)
+            p = os.path.join(wd.group(1), p) if wd else p
+        return p
+
+    stdout_path, stderr_path = one("StdOut"), one("StdErr")
+    if stderr_path == stdout_path:
+        stderr_path = ""
+    return stdout_path, stderr_path

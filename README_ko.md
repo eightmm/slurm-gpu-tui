@@ -111,8 +111,10 @@ sgpu        # 모니터 실행
 | `d` | 상세 컬럼(온도 / 전력 / JobID / JobName) |
 | `Space` / `j` `k` | 노드 접기 / 커서 이동 |
 | `/` | 노드명 또는 유저명 검색(`Esc` 초기화) |
-| `Enter` | Job / 노드 상세(`scontrol show`) |
+| `Enter` | Job / 노드 상세(`scontrol show`) — `Tab`으로 Info / Script / StdOut / StdErr 전환 |
 | `w` | 낭비 GPU 팝업 |
+| `h` | 내 잡 히스토리(7일, sacct) — `Enter`: 상태, 종료 코드, 로그 |
+| `n` | 커서 위치 잡 watch — 시작/종료 시 토스트 |
 | `x` | 커서 위치 잡 취소(본인 잡, 먼저 확인) |
 | `e` | 스냅샷 JSON 내보내기 |
 | `?` / `q` | 도움말 / 종료 |
@@ -127,6 +129,7 @@ sgpu --waste [-v]    # 유휴/parked/rogue GPU; 있으면 exit 1
 sgpu doctor          # 자가진단: 데이터, 에이전트, slurm, sacct, Slack
 sgpu --usage [일수] [--daily]          # 유저별 GPU-hours + 효율 + 낭비
 sgpu --jobs [일수] [--user U]          # 잡 히스토리: 결과, GPU-hours, 대기
+sgpu logs JOBID [-f] [-e]              # 잡 stdout 꼬리 보기 (-e: stderr, -f: 따라가기)
 sgpu --report [YYYY-MM]                # 월간 리포트(마크다운)
 sgpu --wait-free 2 --partition heavy   # 빈 GPU 2개 생길 때까지 대기
 sgpu fit 2 [--vram 40] [--partition P] # 지금 GPU 2장 들어갈 노드 + sbatch 예시
