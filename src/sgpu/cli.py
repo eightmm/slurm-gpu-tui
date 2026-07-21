@@ -741,7 +741,8 @@ def _cli_doctor() -> int:
                 report(None, "power (RAPL)",
                        f"no CPU power from {len(no_rapl)}/{len(live)}: {','.join(no_rapl[:8])}"
                        f"{'…' if len(no_rapl) > 8 else ''} — needs intel_rapl powercap "
-                       "readable by the agent (root)")
+                       "readable by the agent (root); AMD CPUs need kernel ≥5.11 "
+                       "(expected gap on older kernels — wall power still counts them)")
 
     print(f"\n{'all checks passed' if problems == 0 else f'{problems} problem(s) found'}")
     return 0 if problems == 0 else 1
