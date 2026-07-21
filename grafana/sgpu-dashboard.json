@@ -2042,7 +2042,7 @@
       "panels": [],
       "repeat": "node",
       "repeatDirection": "v",
-      "title": "$node",
+      "title": "GPU · $node",
       "type": "row"
     },
     {
@@ -3285,12 +3285,437 @@
       "type": "table"
     },
     {
+      "id": 53,
+      "type": "row",
+      "title": "CPU · $cpu_node",
+      "repeat": "cpu_node",
+      "collapsed": true,
+      "gridPos": {
+        "x": 0,
+        "y": 58,
+        "w": 24,
+        "h": 1
+      },
+      "panels": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "mappings": [
+                {
+                  "type": "value",
+                  "options": {
+                    "2": {
+                      "text": "UP",
+                      "color": "green",
+                      "index": 0
+                    },
+                    "1": {
+                      "text": "STALE",
+                      "color": "yellow",
+                      "index": 1
+                    },
+                    "0": {
+                      "text": "DOWN",
+                      "color": "red",
+                      "index": 2
+                    }
+                  }
+                }
+              ],
+              "unit": "none",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "blue",
+                    "value": null
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "x": 0,
+            "y": 59,
+            "w": 2,
+            "h": 5
+          },
+          "id": 53,
+          "options": {
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "center",
+            "orientation": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "auto",
+            "wideLayout": true
+          },
+          "pluginVersion": "10.0.0",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "expr": "sgpu_node_up{node=~\"$cpu_node\"} * (2 - sgpu_node_stale{node=~\"$cpu_node\"})",
+              "refId": "A"
+            }
+          ],
+          "title": "Status",
+          "type": "stat"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "mappings": [],
+              "min": 0,
+              "max": 100,
+              "unit": "percent",
+              "decimals": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "yellow",
+                    "value": 70
+                  },
+                  {
+                    "color": "orange",
+                    "value": 85
+                  },
+                  {
+                    "color": "red",
+                    "value": 95
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "x": 2,
+            "y": 59,
+            "w": 5,
+            "h": 5
+          },
+          "id": 54,
+          "options": {
+            "minVizHeight": 75,
+            "minVizWidth": 75,
+            "sizing": "auto",
+            "orientation": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "showThresholdLabels": false,
+            "showThresholdMarkers": true
+          },
+          "pluginVersion": "10.0.0",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "expr": "100 * sgpu_node_cpus_alloc{node=~\"$cpu_node\"} / clamp_min(sgpu_node_cpus_total{node=~\"$cpu_node\"}, 1)",
+              "refId": "A"
+            }
+          ],
+          "title": "CPU Alloc",
+          "type": "gauge"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "mappings": [],
+              "min": 0,
+              "max": 100,
+              "unit": "percent",
+              "decimals": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "yellow",
+                    "value": 70
+                  },
+                  {
+                    "color": "orange",
+                    "value": 85
+                  },
+                  {
+                    "color": "red",
+                    "value": 95
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "x": 7,
+            "y": 59,
+            "w": 5,
+            "h": 5
+          },
+          "id": 55,
+          "options": {
+            "minVizHeight": 75,
+            "minVizWidth": 75,
+            "sizing": "auto",
+            "orientation": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "showThresholdLabels": false,
+            "showThresholdMarkers": true
+          },
+          "pluginVersion": "10.0.0",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "expr": "100 * sgpu_node_mem_used_mib{node=~\"$cpu_node\"} / clamp_min(sgpu_node_mem_total_mib{node=~\"$cpu_node\"}, 1)",
+              "refId": "A"
+            }
+          ],
+          "title": "RAM Used",
+          "type": "gauge"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "mappings": [],
+              "unit": "percentunit",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "blue",
+                    "value": null
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "x": 12,
+            "y": 59,
+            "w": 3,
+            "h": 5
+          },
+          "id": 56,
+          "options": {
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "center",
+            "orientation": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "auto",
+            "wideLayout": true
+          },
+          "pluginVersion": "10.0.0",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "expr": "sgpu_node_cpu_load{node=~\"$cpu_node\"} / clamp_min(sgpu_node_cpus_total{node=~\"$cpu_node\"}, 1)",
+              "refId": "A"
+            }
+          ],
+          "title": "CPU Load / Cores",
+          "type": "stat"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "mappings": [],
+              "unit": "mbytes",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "blue",
+                    "value": null
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "x": 15,
+            "y": 59,
+            "w": 3,
+            "h": 5
+          },
+          "id": 57,
+          "options": {
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "center",
+            "orientation": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "auto",
+            "wideLayout": true
+          },
+          "pluginVersion": "10.0.0",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "expr": "sgpu_node_mem_avail_mib{node=~\"$cpu_node\"}",
+              "refId": "A"
+            }
+          ],
+          "title": "RAM Avail",
+          "type": "stat"
+        },
+        {
+          "id": 52,
+          "type": "timeseries",
+          "title": "Load vs Cores",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "gridPos": {
+            "x": 18,
+            "y": 59,
+            "w": 6,
+            "h": 5
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "fillOpacity": 5
+              },
+              "decimals": 1
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            }
+          },
+          "targets": [
+            {
+              "expr": "sgpu_node_cpu_load{node=~\"$cpu_node\"}",
+              "legendFormat": "load",
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              }
+            },
+            {
+              "expr": "sgpu_node_cpus_alloc{node=~\"$cpu_node\"}",
+              "legendFormat": "alloc cores",
+              "refId": "B",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              }
+            },
+            {
+              "expr": "sgpu_node_cpus_total{node=~\"$cpu_node\"}",
+              "legendFormat": "cores",
+              "refId": "C",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
       "collapsed": true,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 48
+        "y": 70
       },
       "id": 23,
       "panels": [
@@ -3944,7 +4369,7 @@
           "uid": "${DS_PROMETHEUS}"
         },
         "query": {
-          "query": "label_values(sgpu_node_up, node)",
+          "query": "label_values(sgpu_gpu_info, node)",
           "refId": "nodevar"
         },
         "refresh": 2,
@@ -3962,6 +4387,35 @@
         },
         "options": [],
         "hide": 0
+      },
+      {
+        "name": "cpu_node",
+        "label": "CPU node",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "query": {
+          "query": "query_result(sgpu_node_up unless on(node) sgpu_gpu_info)",
+          "refId": "cpunodevar"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "options": [],
+        "hide": 0,
+        "regex": "/node=\"([^\"]+)\"/"
       }
     ]
   },
