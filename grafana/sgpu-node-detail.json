@@ -1,5 +1,5 @@
 {
-  "title": "sgpu - Node Detail",
+  "title": "sgpu ai-master - Node Detail",
   "uid": "sgpu-node-detail",
   "schemaVersion": 38,
   "version": 1,
@@ -11,6 +11,7 @@
   },
   "timezone": "",
   "tags": [
+    "ai-master",
     "sgpu"
   ],
   "templating": {
@@ -71,7 +72,7 @@
   },
   "links": [
     {
-      "title": "\u2190 Overview",
+      "title": "← Overview",
       "type": "link",
       "icon": "dashboard",
       "url": "/d/sgpu-slurm-gpu-ops",
@@ -1214,10 +1215,10 @@
           },
           "expr": "sgpu_gpu_job_info{node=~\"$node\",gpu=~\"$gpu\"} == 1",
           "refId": "A",
-          "legendFormat": "{{user}} \u00b7 {{jobid}} {{jobname}}"
+          "legendFormat": "{{user}} · {{jobid}} {{jobname}}"
         }
       ],
-      "title": "User \u00b7 Job",
+      "title": "User · Job",
       "type": "stat"
     },
     {
@@ -1302,7 +1303,7 @@
       "targets": [
         {
           "expr": "sgpu_gpu_util{node=~\"$node\"} * on(node, gpu) group_left(name) sgpu_gpu_info",
-          "legendFormat": "{{gpu}} \u00b7 {{name}}",
+          "legendFormat": "{{gpu}} · {{name}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
@@ -1470,7 +1471,7 @@
       "targets": [
         {
           "expr": "sgpu_gpu_mem_used_percent{node=~\"$node\"} * on(node, gpu) group_left(name) sgpu_gpu_info",
-          "legendFormat": "{{gpu}} \u00b7 {{name}}",
+          "legendFormat": "{{gpu}} · {{name}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
@@ -1636,7 +1637,7 @@
       "targets": [
         {
           "expr": "sgpu_gpu_temp_celsius{node=~\"$node\"} * on(node, gpu) group_left(name) sgpu_gpu_info",
-          "legendFormat": "{{gpu}} \u00b7 {{name}}",
+          "legendFormat": "{{gpu}} · {{name}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
@@ -1798,7 +1799,7 @@
       "targets": [
         {
           "expr": "sgpu_gpu_power_watts{node=~\"$node\"} * on(node, gpu) group_left(name) sgpu_gpu_info",
-          "legendFormat": "{{gpu}} \u00b7 {{name}}",
+          "legendFormat": "{{gpu}} · {{name}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
@@ -2070,7 +2071,7 @@
       "targets": [
         {
           "expr": "sgpu_gpu_idle_seconds{node=~\"$node\"} * on(node, gpu) group_left(name) sgpu_gpu_info",
-          "legendFormat": "idle {{gpu}} \u00b7 {{name}}",
+          "legendFormat": "idle {{gpu}} · {{name}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
@@ -2079,7 +2080,7 @@
         },
         {
           "expr": "sgpu_gpu_parked_seconds{node=~\"$node\"} * on(node, gpu) group_left(name) sgpu_gpu_info",
-          "legendFormat": "parked {{gpu}} \u00b7 {{name}}",
+          "legendFormat": "parked {{gpu}} · {{name}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"

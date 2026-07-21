@@ -117,7 +117,7 @@
       "tooltip": ""
     },
     {
-      "title": "Node Detail \u2192",
+      "title": "Node Detail →",
       "type": "link",
       "icon": "doc",
       "url": "/d/sgpu-node-detail",
@@ -126,7 +126,7 @@
       "keepTime": true,
       "tags": [],
       "targetBlank": false,
-      "tooltip": "\ub178\ub4dc \uc0c1\uc138 (Nebius \uc2a4\ud0c0\uc77c)"
+      "tooltip": "노드 상세 (Nebius 스타일)"
     }
   ],
   "liveNow": false,
@@ -2115,7 +2115,7 @@
           },
           "expr": "sgpu_gpu_util{node=~\"$node\"} * on(node, gpu) group_left(name) sgpu_gpu_info",
           "refId": "A",
-          "legendFormat": "{{gpu}} \u00b7 {{name}}"
+          "legendFormat": "{{gpu}} · {{name}}"
         }
       ],
       "title": "Utilization",
@@ -2191,7 +2191,7 @@
           },
           "expr": "sgpu_gpu_mem_used_percent{node=~\"$node\"} * on(node, gpu) group_left(name) sgpu_gpu_info",
           "refId": "A",
-          "legendFormat": "{{gpu}} \u00b7 {{name}}"
+          "legendFormat": "{{gpu}} · {{name}}"
         }
       ],
       "title": "Memory",
@@ -3928,9 +3928,10 @@
   "schemaVersion": 38,
   "style": "dark",
   "tags": [
-    "slurm",
+    "ai-master",
     "gpu",
-    "sgpu"
+    "sgpu",
+    "slurm"
   ],
   "templating": {
     "list": [
@@ -3970,7 +3971,7 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "sgpu - SLURM GPU Operations",
+  "title": "sgpu ai-master - SLURM GPU Operations",
   "uid": "sgpu-slurm-gpu-ops",
   "version": 1,
   "weekStart": ""

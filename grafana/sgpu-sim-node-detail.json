@@ -1,5 +1,5 @@
 {
-  "title": "sgpu SIM (10.10.0.100) - Node Detail",
+  "title": "sgpu master (10.10.0.100) - Node Detail",
   "uid": "sgpu-sim-node-detail",
   "schemaVersion": 38,
   "version": 1,
@@ -11,6 +11,7 @@
   },
   "timezone": "",
   "tags": [
+    "master",
     "sgpu",
     "sim"
   ],

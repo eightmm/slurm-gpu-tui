@@ -3929,6 +3929,7 @@
   "style": "dark",
   "tags": [
     "gpu",
+    "master",
     "sgpu",
     "sim",
     "slurm"
@@ -3971,7 +3972,7 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "sgpu SIM (10.10.0.100) - SLURM GPU Operations",
+  "title": "sgpu master (10.10.0.100) - SLURM GPU Operations",
   "uid": "sgpu-sim-ops",
   "version": 1,
   "weekStart": ""
