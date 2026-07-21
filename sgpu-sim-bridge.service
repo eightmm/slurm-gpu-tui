@@ -1,0 +1,7 @@
+# User unit (systemctl --user): install to ~/.config/systemd/user/ on the Grafana host.
+[Unit]
+Description=sgpu bridge: mirror sim cluster (10.10.0.100) metrics into local textfile dir
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/sgpu-remote-bridge.sh
