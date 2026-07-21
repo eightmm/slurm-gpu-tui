@@ -175,6 +175,14 @@ journalctl -u sgpu-collector -f                  # logs (or /tmp/sgpu-collector.
 | Node `~smi_err` / `~no_smi` | `ssh <node> nvidia-smi` |
 | Anything else | `sgpu doctor` |
 
+One-shot extras (root, run once per cluster):
+
+```bash
+sudo ./setup-node-power.sh    # node wall-power/RAPL telemetry — pushes ipmitool
+                              # to internet-less nodes, persists kernel modules
+sudo grafana/install.sh       # Grafana + Prometheus + alertmanager + dashboards
+```
+
 Reinstall cleanly by re-running the one-line install. Deploying from a dev
 checkout? See `deploy.sh`. Uninstall (stops collector and agents, removes
 services, data, install dir):

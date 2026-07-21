@@ -631,6 +631,12 @@ fi
 
 echo ""
 
+if [ "$(id -u)" -eq 0 ]; then
+    echo "--- Optional one-shots ---"
+    echo "  sudo $INSTALL_DIR/setup-node-power.sh   # node wall-power/RAPL telemetry (ipmitool etc.)"
+    echo "  sudo $INSTALL_DIR/grafana/install.sh    # Grafana + Prometheus + alertmanager + dashboards"
+fi
+
 # Uninstall instructions
 echo "--- Uninstall (one line) ---"
 echo "  curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/uninstall.sh | bash"

@@ -174,6 +174,14 @@ journalctl -u sgpu-collector -f                  # 로그 (또는 /tmp/sgpu-coll
 | 노드 `~smi_err` / `~no_smi` | `ssh <node> nvidia-smi` |
 | 그 외 | `sgpu doctor` |
 
+원샷 부가 설정 (root, 클러스터당 1회):
+
+```bash
+sudo ./setup-node-power.sh    # 노드 전력(wall/RAPL) 텔레메트리 — 인터넷 없는
+                              # 노드에 ipmitool 배포 + 커널 모듈 영구 등록
+sudo grafana/install.sh       # Grafana + Prometheus + alertmanager + 대시보드
+```
+
 깨끗한 재설치는 한 줄 설치 명령 재실행. 개발 체크아웃을 별도 prod venv로
 배포하려면 `deploy.sh` 참고. 제거(collector·에이전트 중지, 서비스·데이터·설치
 디렉토리 삭제):
