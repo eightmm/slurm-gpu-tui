@@ -36,9 +36,14 @@
   순서가 `/dev/nvidiaN`과 달라도 GPU를 SLURM Job에 정확히 매칭
 - idle / parked / rogue GPU 탐지, 대기 큐(이유 코드 + 예상 시작 시각)
 - 유저별 GPU-hours, 효율, 낭비 시간 — slurmdbd에서 백필
-- Slack 알림(노드 다운/복구, GPU 헬스, 낭비/rogue)을 일별 스레드로 묶고,
-  문제가 없는 날에도 부모 메시지 하나를 게시
-- Prometheus 메트릭 + 포함된 Grafana 대시보드 — **[docs/GRAFANA.md](docs/GRAFANA.md)**
+- 잡 들여다보기: batch 스크립트 + stdout/stderr 탭(에러 줄 하이라이트,
+  라이브 tail), CLI `sgpu logs`, 종료 코드 포함 sacct 히스토리(`h`),
+  아무 잡이나 watch 걸어 시작/종료 토스트(`n`)
+- Slack 알림(노드 다운/복구, GPU 헬스, 낭비/rogue, 실패 잡 stderr DM,
+  RAM 공정몫 초과)을 일별 스레드로 묶고, 문제가 없는 날에도 부모 메시지
+  하나를 게시 — **[docs/ALERTS.md](docs/ALERTS.md)**
+- Prometheus 메트릭 + Grafana 대시보드 — 노드 전력(wall power), 멀티클러스터
+  브리지, 전체 클러스터 오버뷰 포함 — **[docs/GRAFANA.md](docs/GRAFANA.md)**
 
 ## 동작 방식
 

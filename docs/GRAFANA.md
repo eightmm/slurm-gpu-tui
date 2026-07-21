@@ -117,7 +117,7 @@ while the collector itself is alive.
 
 `grafana/install.sh` automates this: it installs `prometheus-alertmanager`
 (bound to `127.0.0.1:9093`), points Prometheus at it, and builds a Slack
-route from the collector's own credentials in `/root/.sgpu/webhook.json`
+route from the collector's own credentials in `/root/.sgpu/slack.json`
 (bot token + channel, posted via `chat.postMessage`). If that file is
 missing the alertmanager starts with a null route — fill in
 `/etc/prometheus/alertmanager.yml` by hand. The installer also sets
@@ -194,6 +194,54 @@ Per node/GPU:
 - `sgpu_gpu_sm_clock_mhz{node,gpu}` / `sgpu_gpu_mem_clock_mhz{node,gpu}`
 - `sgpu_pending_job_info{jobid,user,partition,jobname,reason,gpus}` (one
   series per queued job; disappears when the job starts)
+
+Per running GPU job (RAM fair share):
+
+- `sgpu_job_mem_mib{jobid,user,node,gpus}` — RAM the job *requested*
+  (`squeue %m`; allocation, not usage). Absent when the job requests no
+  memory or holds no GPUs.
+- `sgpu_job_mem_fair_ratio{jobid,user,node,gpus}` — requested RAM over the
+  job's GPU fair share (node RAM × job GPUs ÷ node GPUs). `> 1` = the job
+  reserves more memory than its GPU count entitles it to.
+  `prometheus/sgpu-alerts.yml` ships a 30-minute warning rule on it.
+
+Master host (the machine the collector runs on — lets a remote Grafana
+monitor this cluster without node_exporter here):
+
+- `sgpu_master_*` — CPU idle counters, memory, load1, boot time, local
+  filesystems, network/disk byte counters, coretemp, hwmon power. Metric
+  suffixes mirror node_exporter's (`sgpu_master_cpu_seconds_total`, …), so
+  consumers translate mechanically: `node_X` → `sgpu_master_X`.
+
+Node power coverage: `sudo ./setup-node-power.sh` (repo root) probes every
+SLURM node and installs/persists what BMC wall power and RAPL need;
+`sgpu doctor` reports remaining gaps.
+
+## Multi-cluster: bridge another sgpu install
+
+One Grafana can watch several sgpu clusters without label collisions or
+cross-firing alert rules — remote series are republished under a
+metric-name prefix:
+
+- `grafana/sgpu-remote-bridge.sh` — fetches the remote cluster's
+  `metrics.prom` over ssh every 30 s and rewrites `sgpu_*` →
+  `<prefix>sgpu_*` into the local textfile dir (defaults:
+  `sim@10.10.0.100`, prefix `master_`; override with `SGPU_BRIDGE_*` env).
+  On fetch failure the data series are dropped (panels go honest
+  "No data") and only `<prefix>sgpu_bridge_up 0` remains. For remotes on
+  an older sgpu without `sgpu_master_*`, it falls back to sampling the
+  remote master's /proc over ssh.
+- `sgpu-master-bridge.service` / `.timer` — user units
+  (`systemctl --user`, host needs linger) running the bridge every 30 s.
+- `grafana/gen-master-dashboards.py` — regenerates the bridged cluster's
+  dashboard pair from the local sources (prefix rewrite, uids, titles,
+  cross-links). Rerun after editing the local dashboards.
+- `grafana/gen-overview-dashboard.py` — the "All Clusters Overview"
+  dashboard: combined totals (wall power, GPUs, jobs, waste), per-cluster
+  comparison, trends. No per-node panels.
+- `prometheus/sgpu-master-cluster-alerts.yml` — bridge down / remote
+  collector stale / remote node down / remote RAM-over-share rules for the
+  prefixed series (stock rules only match local `sgpu_*`).
 
 ## Notes
 

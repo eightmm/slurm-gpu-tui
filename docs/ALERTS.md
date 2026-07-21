@@ -61,6 +61,7 @@ home directory.
 | `pending_alert_hours` | `0` | Job stuck `PENDING` on the scheduler ≥ N hours (`0` = off; user holds / dependencies never alert) |
 | `dm_users` | `{}` | `{"login": "U012AB..."}` Slack member ids — alerts about a user's own jobs are also DMed to them |
 | `free_gpus_min` | `0` | Notify when free-GPU count reaches N (`0` = off) |
+| `mem_fair_factor` | `0` | RAM-hog alerts: a job's **requested** RAM exceeds factor × its GPU fair share (node RAM × job GPUs ÷ node GPUs). `1.0` = strict, `0` = off. Allocation-based — catches greedy `--mem` before the memory is even touched; silent on clusters where jobs don't request memory |
 
 Repeated conditions are debounced (30 min for events, 6 h for standing
 conditions like waste/temp/ECC). Node-health and collection alerts are for
@@ -90,7 +91,12 @@ CPU/GPU-less nodes, and those collection failures never raise a false "down".
 - **Job failed:** when a tracked job (for `job_fail_users`) leaves the queue,
   slurmdbd is asked for its outcome; `FAILED`, `OUT_OF_MEMORY`, `TIMEOUT` and
   `NODE_FAIL` raise an alert. Clean finishes stay silent unless the user is
-  also in `job_done_users`.
+  also in `job_done_users`. The owner's DM (never the shared channel —
+  stderr can leak paths/secrets) carries the last ~15 lines of the job's
+  stderr when the file is readable.
+- **RAM over fair share** (`mem_fair_factor`): a running GPU job requests
+  more memory than factor × its share; posted to the channel and DMed to
+  the owner, re-alerted every 6 h while it persists.
 - **Pending stuck:** a job waiting on the *scheduler* (`Resources`,
   `Priority`, …) for `pending_alert_hours`. Holds, dependencies and
   begin-times are the user's own doing and never alert.
