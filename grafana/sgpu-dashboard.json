@@ -1074,7 +1074,8 @@
         }
       ],
       "title": "Total GPU Power",
-      "type": "stat"
+      "type": "stat",
+      "description": "Sum of nvidia-smi board power across all reporting GPUs."
     },
     {
       "datasource": {
@@ -1135,7 +1136,7 @@
       ],
       "title": "Total Wall Power",
       "type": "stat",
-      "description": "All Slurm nodes (BMC) + master (ACPI meter, bridged via recording rule)."
+      "description": "Sums only nodes whose BMC reports power — run `sgpu doctor` to list nodes missing power telemetry (undercounts otherwise)."
     },
     {
       "collapsed": false,

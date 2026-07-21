@@ -12,7 +12,7 @@
 #
 #   SGPU_BRIDGE_REMOTE       ssh target                (default sim@10.10.0.100)
 #   SGPU_BRIDGE_REMOTE_FILE  remote metrics path       (default /tmp/slurm-gpu-tui/metrics.prom)
-#   SGPU_BRIDGE_PREFIX       metric name prefix        (default sim_)
+#   SGPU_BRIDGE_PREFIX       metric name prefix        (default master_)
 #   SGPU_BRIDGE_OUT          output .prom              (default /tmp/slurm-gpu-tui/<prefix>sgpu.prom)
 #
 # On fetch failure the data series are dropped (Prometheus marks them stale)
@@ -22,7 +22,7 @@ set -uo pipefail
 
 REMOTE="${SGPU_BRIDGE_REMOTE:-sim@10.10.0.100}"
 REMOTE_FILE="${SGPU_BRIDGE_REMOTE_FILE:-/tmp/slurm-gpu-tui/metrics.prom}"
-PREFIX="${SGPU_BRIDGE_PREFIX:-sim_}"
+PREFIX="${SGPU_BRIDGE_PREFIX:-master_}"
 OUT="${SGPU_BRIDGE_OUT:-/tmp/slurm-gpu-tui/${PREFIX}sgpu.prom}"
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5)

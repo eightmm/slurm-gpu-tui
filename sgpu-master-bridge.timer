@@ -1,6 +1,6 @@
 # User unit (systemctl --user): install to ~/.config/systemd/user/ on the Grafana host.
 [Unit]
-Description=Run sgpu sim bridge every 30s
+Description=Run sgpu master-cluster bridge every 30s
 
 [Timer]
 OnBootSec=30

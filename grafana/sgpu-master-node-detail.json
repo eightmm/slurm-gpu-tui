@@ -1,6 +1,6 @@
 {
   "title": "sgpu master (10.10.0.100) - Node Detail",
-  "uid": "sgpu-sim-node-detail",
+  "uid": "sgpu-master-node-detail",
   "schemaVersion": 38,
   "version": 1,
   "editable": true,
@@ -12,8 +12,7 @@
   "timezone": "",
   "tags": [
     "master",
-    "sgpu",
-    "sim"
+    "sgpu"
   ],
   "templating": {
     "list": [
@@ -26,7 +25,7 @@
           "uid": "${DS_PROMETHEUS}"
         },
         "query": {
-          "query": "label_values(sim_sgpu_gpu_info, node)",
+          "query": "label_values(master_sgpu_gpu_info, node)",
           "refId": "nodevar"
         },
         "refresh": 2,
@@ -50,7 +49,7 @@
           "uid": "${DS_PROMETHEUS}"
         },
         "query": {
-          "query": "label_values(sim_sgpu_gpu_info{node=~\"$node\"}, gpu)",
+          "query": "label_values(master_sgpu_gpu_info{node=~\"$node\"}, gpu)",
           "refId": "gpuvar"
         },
         "refresh": 2,
@@ -76,7 +75,7 @@
       "title": "← Overview",
       "type": "link",
       "icon": "dashboard",
-      "url": "/d/sgpu-sim-ops",
+      "url": "/d/sgpu-master-ops",
       "asDropdown": false,
       "includeVars": false,
       "keepTime": true,
@@ -88,7 +87,7 @@
       "title": "gpu1",
       "type": "link",
       "icon": "dashboard",
-      "url": "/d/sgpu-sim-node-detail?var-node=gpu1",
+      "url": "/d/sgpu-master-node-detail?var-node=gpu1",
       "asDropdown": false,
       "includeVars": false,
       "keepTime": true,
@@ -100,7 +99,7 @@
       "title": "gpu2",
       "type": "link",
       "icon": "dashboard",
-      "url": "/d/sgpu-sim-node-detail?var-node=gpu2",
+      "url": "/d/sgpu-master-node-detail?var-node=gpu2",
       "asDropdown": false,
       "includeVars": false,
       "keepTime": true,
@@ -112,7 +111,7 @@
       "title": "gpu3",
       "type": "link",
       "icon": "dashboard",
-      "url": "/d/sgpu-sim-node-detail?var-node=gpu3",
+      "url": "/d/sgpu-master-node-detail?var-node=gpu3",
       "asDropdown": false,
       "includeVars": false,
       "keepTime": true,
@@ -124,7 +123,7 @@
       "title": "gpu4",
       "type": "link",
       "icon": "dashboard",
-      "url": "/d/sgpu-sim-node-detail?var-node=gpu4",
+      "url": "/d/sgpu-master-node-detail?var-node=gpu4",
       "asDropdown": false,
       "includeVars": false,
       "keepTime": true,
@@ -208,7 +207,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_node_up{node=~\"$node\"} * (2 - sim_sgpu_node_stale{node=~\"$node\"})",
+          "expr": "master_sgpu_node_up{node=~\"$node\"} * (2 - master_sgpu_node_stale{node=~\"$node\"})",
           "refId": "A"
         }
       ],
@@ -268,7 +267,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(sim_sgpu_gpu_allocated{node=~\"$node\"})",
+          "expr": "sum(master_sgpu_gpu_allocated{node=~\"$node\"})",
           "refId": "A"
         }
       ],
@@ -328,7 +327,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "count(count by (jobid) (sim_sgpu_gpu_job_info{node=~\"$node\"}))",
+          "expr": "count(count by (jobid) (master_sgpu_gpu_job_info{node=~\"$node\"}))",
           "refId": "A"
         }
       ],
@@ -396,7 +395,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "max(sim_sgpu_gpu_temp_celsius{node=~\"$node\"})",
+          "expr": "max(master_sgpu_gpu_temp_celsius{node=~\"$node\"})",
           "refId": "A"
         }
       ],
@@ -456,7 +455,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_node_sys_power_watts{node=~\"$node\"}",
+          "expr": "master_sgpu_node_sys_power_watts{node=~\"$node\"}",
           "refId": "A"
         }
       ],
@@ -516,7 +515,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_node_cpu_load{node=~\"$node\"}",
+          "expr": "master_sgpu_node_cpu_load{node=~\"$node\"}",
           "refId": "A"
         }
       ],
@@ -576,7 +575,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "100 * sim_sgpu_node_mem_used_mib{node=~\"$node\"} / clamp_min(sim_sgpu_node_mem_total_mib{node=~\"$node\"}, 1)",
+          "expr": "100 * master_sgpu_node_mem_used_mib{node=~\"$node\"} / clamp_min(master_sgpu_node_mem_total_mib{node=~\"$node\"}, 1)",
           "refId": "A"
         }
       ],
@@ -640,7 +639,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(sim_sgpu_gpu_ecc_errors{node=~\"$node\"})",
+          "expr": "sum(master_sgpu_gpu_ecc_errors{node=~\"$node\"})",
           "refId": "A"
         }
       ],
@@ -715,7 +714,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_gpu_info{node=~\"$node\",gpu=~\"$gpu\"}",
+          "expr": "master_sgpu_gpu_info{node=~\"$node\",gpu=~\"$gpu\"}",
           "refId": "A",
           "legendFormat": "{{name}}"
         }
@@ -805,7 +804,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_gpu_util{node=~\"$node\",gpu=~\"$gpu\"}",
+          "expr": "master_sgpu_gpu_util{node=~\"$node\",gpu=~\"$gpu\"}",
           "legendFormat": "util %",
           "refId": "A"
         },
@@ -814,7 +813,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_gpu_mem_used_percent{node=~\"$node\",gpu=~\"$gpu\"}",
+          "expr": "master_sgpu_gpu_mem_used_percent{node=~\"$node\",gpu=~\"$gpu\"}",
           "legendFormat": "mem %",
           "refId": "B"
         }
@@ -890,7 +889,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_gpu_util{node=~\"$node\",gpu=~\"$gpu\"}",
+          "expr": "master_sgpu_gpu_util{node=~\"$node\",gpu=~\"$gpu\"}",
           "refId": "A"
         }
       ],
@@ -965,7 +964,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_gpu_mem_used_percent{node=~\"$node\",gpu=~\"$gpu\"}",
+          "expr": "master_sgpu_gpu_mem_used_percent{node=~\"$node\",gpu=~\"$gpu\"}",
           "refId": "A"
         }
       ],
@@ -1033,7 +1032,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_gpu_temp_celsius{node=~\"$node\",gpu=~\"$gpu\"}",
+          "expr": "master_sgpu_gpu_temp_celsius{node=~\"$node\",gpu=~\"$gpu\"}",
           "refId": "A"
         }
       ],
@@ -1093,7 +1092,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_gpu_power_watts{node=~\"$node\",gpu=~\"$gpu\"}",
+          "expr": "master_sgpu_gpu_power_watts{node=~\"$node\",gpu=~\"$gpu\"}",
           "refId": "A"
         }
       ],
@@ -1153,7 +1152,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_gpu_sm_clock_mhz{node=~\"$node\",gpu=~\"$gpu\"}",
+          "expr": "master_sgpu_gpu_sm_clock_mhz{node=~\"$node\",gpu=~\"$gpu\"}",
           "refId": "A"
         }
       ],
@@ -1214,7 +1213,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_gpu_job_info{node=~\"$node\",gpu=~\"$gpu\"} == 1",
+          "expr": "master_sgpu_gpu_job_info{node=~\"$node\",gpu=~\"$gpu\"} == 1",
           "refId": "A",
           "legendFormat": "{{user}} · {{jobid}} {{jobname}}"
         }
@@ -1303,7 +1302,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "expr": "sim_sgpu_gpu_util{node=~\"$node\"} * on(node, gpu) group_left(name) sim_sgpu_gpu_info",
+          "expr": "master_sgpu_gpu_util{node=~\"$node\"} * on(node, gpu) group_left(name) master_sgpu_gpu_info",
           "legendFormat": "{{gpu}} · {{name}}",
           "datasource": {
             "type": "prometheus",
@@ -1383,7 +1382,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "avg(sim_sgpu_gpu_util{node=~\"$node\"})",
+          "expr": "avg(master_sgpu_gpu_util{node=~\"$node\"})",
           "refId": "A"
         }
       ],
@@ -1471,7 +1470,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "expr": "sim_sgpu_gpu_mem_used_percent{node=~\"$node\"} * on(node, gpu) group_left(name) sim_sgpu_gpu_info",
+          "expr": "master_sgpu_gpu_mem_used_percent{node=~\"$node\"} * on(node, gpu) group_left(name) master_sgpu_gpu_info",
           "legendFormat": "{{gpu}} · {{name}}",
           "datasource": {
             "type": "prometheus",
@@ -1551,7 +1550,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "avg(sim_sgpu_gpu_mem_used_percent{node=~\"$node\"})",
+          "expr": "avg(master_sgpu_gpu_mem_used_percent{node=~\"$node\"})",
           "refId": "A"
         }
       ],
@@ -1637,7 +1636,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "expr": "sim_sgpu_gpu_temp_celsius{node=~\"$node\"} * on(node, gpu) group_left(name) sim_sgpu_gpu_info",
+          "expr": "master_sgpu_gpu_temp_celsius{node=~\"$node\"} * on(node, gpu) group_left(name) master_sgpu_gpu_info",
           "legendFormat": "{{gpu}} · {{name}}",
           "datasource": {
             "type": "prometheus",
@@ -1713,7 +1712,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "max(sim_sgpu_gpu_temp_celsius{node=~\"$node\"})",
+          "expr": "max(master_sgpu_gpu_temp_celsius{node=~\"$node\"})",
           "refId": "A"
         }
       ],
@@ -1799,7 +1798,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "expr": "sim_sgpu_gpu_power_watts{node=~\"$node\"} * on(node, gpu) group_left(name) sim_sgpu_gpu_info",
+          "expr": "master_sgpu_gpu_power_watts{node=~\"$node\"} * on(node, gpu) group_left(name) master_sgpu_gpu_info",
           "legendFormat": "{{gpu}} · {{name}}",
           "datasource": {
             "type": "prometheus",
@@ -1867,7 +1866,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(sim_sgpu_gpu_power_watts{node=~\"$node\"})",
+          "expr": "sum(master_sgpu_gpu_power_watts{node=~\"$node\"})",
           "refId": "A"
         }
       ],
@@ -1953,7 +1952,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "expr": "sim_sgpu_node_sys_power_watts{node=~\"$node\"}",
+          "expr": "master_sgpu_node_sys_power_watts{node=~\"$node\"}",
           "legendFormat": "Wall (BMC)",
           "datasource": {
             "type": "prometheus",
@@ -1962,7 +1961,7 @@
           "refId": "A"
         },
         {
-          "expr": "sum(sim_sgpu_gpu_power_watts{node=~\"$node\"})",
+          "expr": "sum(master_sgpu_gpu_power_watts{node=~\"$node\"})",
           "legendFormat": "GPU total",
           "datasource": {
             "type": "prometheus",
@@ -1971,7 +1970,7 @@
           "refId": "B"
         },
         {
-          "expr": "sim_sgpu_node_cpu_power_watts{node=~\"$node\"}",
+          "expr": "master_sgpu_node_cpu_power_watts{node=~\"$node\"}",
           "legendFormat": "CPU (RAPL)",
           "datasource": {
             "type": "prometheus",
@@ -1980,7 +1979,7 @@
           "refId": "C"
         },
         {
-          "expr": "sim_sgpu_node_ram_power_watts{node=~\"$node\"}",
+          "expr": "master_sgpu_node_ram_power_watts{node=~\"$node\"}",
           "legendFormat": "RAM (RAPL)",
           "datasource": {
             "type": "prometheus",
@@ -2071,7 +2070,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "expr": "sim_sgpu_gpu_idle_seconds{node=~\"$node\"} * on(node, gpu) group_left(name) sim_sgpu_gpu_info",
+          "expr": "master_sgpu_gpu_idle_seconds{node=~\"$node\"} * on(node, gpu) group_left(name) master_sgpu_gpu_info",
           "legendFormat": "idle {{gpu}} · {{name}}",
           "datasource": {
             "type": "prometheus",
@@ -2080,7 +2079,7 @@
           "refId": "A"
         },
         {
-          "expr": "sim_sgpu_gpu_parked_seconds{node=~\"$node\"} * on(node, gpu) group_left(name) sim_sgpu_gpu_info",
+          "expr": "master_sgpu_gpu_parked_seconds{node=~\"$node\"} * on(node, gpu) group_left(name) master_sgpu_gpu_info",
           "legendFormat": "parked {{gpu}} · {{name}}",
           "datasource": {
             "type": "prometheus",
@@ -2171,7 +2170,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "expr": "sim_sgpu_node_cpu_load{node=~\"$node\"}",
+          "expr": "master_sgpu_node_cpu_load{node=~\"$node\"}",
           "legendFormat": "load1",
           "datasource": {
             "type": "prometheus",
@@ -2180,7 +2179,7 @@
           "refId": "A"
         },
         {
-          "expr": "sim_sgpu_node_cpus_total{node=~\"$node\"}",
+          "expr": "master_sgpu_node_cpus_total{node=~\"$node\"}",
           "legendFormat": "cores",
           "datasource": {
             "type": "prometheus",
@@ -2189,7 +2188,7 @@
           "refId": "B"
         },
         {
-          "expr": "sim_sgpu_node_cpus_alloc{node=~\"$node\"}",
+          "expr": "master_sgpu_node_cpus_alloc{node=~\"$node\"}",
           "legendFormat": "slurm alloc",
           "datasource": {
             "type": "prometheus",
@@ -2280,7 +2279,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "expr": "sim_sgpu_node_mem_used_mib{node=~\"$node\"}",
+          "expr": "master_sgpu_node_mem_used_mib{node=~\"$node\"}",
           "legendFormat": "used",
           "datasource": {
             "type": "prometheus",
@@ -2289,7 +2288,7 @@
           "refId": "A"
         },
         {
-          "expr": "sim_sgpu_node_mem_alloc_mib{node=~\"$node\"}",
+          "expr": "master_sgpu_node_mem_alloc_mib{node=~\"$node\"}",
           "legendFormat": "slurm alloc",
           "datasource": {
             "type": "prometheus",
@@ -2298,7 +2297,7 @@
           "refId": "B"
         },
         {
-          "expr": "sim_sgpu_node_mem_total_mib{node=~\"$node\"}",
+          "expr": "master_sgpu_node_mem_total_mib{node=~\"$node\"}",
           "legendFormat": "total",
           "datasource": {
             "type": "prometheus",
@@ -2366,7 +2365,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_gpu_job_info{node=~\"$node\"} == 1",
+          "expr": "master_sgpu_gpu_job_info{node=~\"$node\"} == 1",
           "format": "table",
           "instant": true,
           "refId": "A"

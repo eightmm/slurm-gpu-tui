@@ -626,10 +626,13 @@ def _cli_doctor() -> int:
     # persistent state — fall back to the collector user's home when ours
     # has no state (doctor as root, collector as a regular user)
     state_dir = Path(os.getenv("SLURM_GPU_TUI_STATE_DIR", str(Path.home() / ".sgpu" / "state")))
-    if (not (state_dir / "usage.json").exists()
-            and not os.getenv("SLURM_GPU_TUI_STATE_DIR") and collector_home
-            and (collector_home / ".sgpu" / "state" / "usage.json").exists()):
-        state_dir = collector_home / ".sgpu" / "state"
+    try:
+        if (not (state_dir / "usage.json").exists()
+                and not os.getenv("SLURM_GPU_TUI_STATE_DIR") and collector_home
+                and (collector_home / ".sgpu" / "state" / "usage.json").exists()):
+            state_dir = collector_home / ".sgpu" / "state"
+    except OSError:
+        pass  # collector home unreadable (doctor as regular user, collector root)
     usage = state_dir / "usage.json"
     if usage.exists():
         report(True, "usage history", f"{usage} age {(time.time() - usage.stat().st_mtime):.0f}s")
@@ -715,6 +718,30 @@ def _cli_doctor() -> int:
                           str(_DAEMON_DATA_FILE.parent / "metrics.prom")))
     report(True if prom.exists() else None, "prometheus",
            str(prom) if prom.exists() else "no metrics file yet")
+
+    # power telemetry coverage: silent gaps here undercount the cluster's
+    # wall-power totals on the dashboards
+    try:
+        nodes = json.loads(_DAEMON_DATA_FILE.read_text()).get("nodes", [])
+    except Exception:
+        nodes = []
+    if nodes:
+        live = [n for n in nodes if not n.get("error")]
+        no_bmc = sorted(n["name"] for n in live if not n.get("sys_power"))
+        no_rapl = sorted(n["name"] for n in live if not n.get("cpu_power"))
+        if not no_bmc and not no_rapl:
+            report(True, "power telemetry", f"all {len(live)} reporting nodes have BMC + RAPL")
+        else:
+            if no_bmc:
+                report(None, "power (BMC)",
+                       f"no wall power from {len(no_bmc)}/{len(live)}: {','.join(no_bmc[:8])}"
+                       f"{'…' if len(no_bmc) > 8 else ''} — needs ipmitool, ipmi_devintf "
+                       "module (/dev/ipmi0), agent as root")
+            if no_rapl:
+                report(None, "power (RAPL)",
+                       f"no CPU power from {len(no_rapl)}/{len(live)}: {','.join(no_rapl[:8])}"
+                       f"{'…' if len(no_rapl) > 8 else ''} — needs intel_rapl powercap "
+                       "readable by the agent (root)")
 
     print(f"\n{'all checks passed' if problems == 0 else f'{problems} problem(s) found'}")
     return 0 if problems == 0 else 1

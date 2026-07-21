@@ -48,7 +48,7 @@
       "title": "All",
       "type": "link",
       "icon": "dashboard",
-      "url": "/d/sgpu-sim-ops?var-node=$__all",
+      "url": "/d/sgpu-master-ops?var-node=$__all",
       "asDropdown": false,
       "includeVars": false,
       "keepTime": true,
@@ -60,7 +60,7 @@
       "title": "master",
       "type": "link",
       "icon": "dashboard",
-      "url": "/d/sgpu-sim-ops?var-node=master",
+      "url": "/d/sgpu-master-ops?var-node=master",
       "asDropdown": false,
       "includeVars": false,
       "keepTime": true,
@@ -72,7 +72,7 @@
       "title": "gpu1",
       "type": "link",
       "icon": "dashboard",
-      "url": "/d/sgpu-sim-ops?var-node=gpu1",
+      "url": "/d/sgpu-master-ops?var-node=gpu1",
       "asDropdown": false,
       "includeVars": false,
       "keepTime": true,
@@ -84,7 +84,7 @@
       "title": "gpu2",
       "type": "link",
       "icon": "dashboard",
-      "url": "/d/sgpu-sim-ops?var-node=gpu2",
+      "url": "/d/sgpu-master-ops?var-node=gpu2",
       "asDropdown": false,
       "includeVars": false,
       "keepTime": true,
@@ -96,7 +96,7 @@
       "title": "gpu3",
       "type": "link",
       "icon": "dashboard",
-      "url": "/d/sgpu-sim-ops?var-node=gpu3",
+      "url": "/d/sgpu-master-ops?var-node=gpu3",
       "asDropdown": false,
       "includeVars": false,
       "keepTime": true,
@@ -108,7 +108,7 @@
       "title": "gpu4",
       "type": "link",
       "icon": "dashboard",
-      "url": "/d/sgpu-sim-ops?var-node=gpu4",
+      "url": "/d/sgpu-master-ops?var-node=gpu4",
       "asDropdown": false,
       "includeVars": false,
       "keepTime": true,
@@ -120,7 +120,7 @@
       "title": "Node Detail →",
       "type": "link",
       "icon": "doc",
-      "url": "/d/sgpu-sim-node-detail",
+      "url": "/d/sgpu-master-node-detail",
       "asDropdown": false,
       "includeVars": false,
       "keepTime": true,
@@ -199,7 +199,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "100 * sim_sgpu_gpus_allocated / clamp_min(sim_sgpu_gpus_total, 1)",
+          "expr": "100 * master_sgpu_gpus_allocated / clamp_min(master_sgpu_gpus_total, 1)",
           "refId": "A"
         }
       ],
@@ -274,7 +274,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "avg(sim_sgpu_gpu_util)",
+          "expr": "avg(master_sgpu_gpu_util)",
           "refId": "A"
         }
       ],
@@ -349,7 +349,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "avg(sim_sgpu_gpu_mem_used_percent)",
+          "expr": "avg(master_sgpu_gpu_mem_used_percent)",
           "refId": "A"
         }
       ],
@@ -424,7 +424,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "100 * sum(sim_sgpu_node_cpus_alloc) / clamp_min(sum(sim_sgpu_node_cpus_total{node!=\"master\"}), 1)",
+          "expr": "100 * sum(master_sgpu_node_cpus_alloc) / clamp_min(sum(master_sgpu_node_cpus_total{node!=\"master\"}), 1)",
           "refId": "A"
         }
       ],
@@ -488,7 +488,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_gpus_free",
+          "expr": "master_sgpu_gpus_free",
           "refId": "A"
         }
       ],
@@ -548,7 +548,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_jobs_running",
+          "expr": "master_sgpu_jobs_running",
           "refId": "A"
         }
       ],
@@ -612,7 +612,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_jobs_pending",
+          "expr": "master_sgpu_jobs_pending",
           "refId": "A"
         }
       ],
@@ -676,7 +676,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_nodes_stale",
+          "expr": "master_sgpu_nodes_stale",
           "refId": "A"
         }
       ],
@@ -740,7 +740,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_gpus_rogue",
+          "expr": "master_sgpu_gpus_rogue",
           "refId": "A"
         }
       ],
@@ -808,7 +808,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_gpus_idle",
+          "expr": "master_sgpu_gpus_idle",
           "refId": "A"
         }
       ],
@@ -876,7 +876,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_gpus_parked",
+          "expr": "master_sgpu_gpus_parked",
           "refId": "A"
         }
       ],
@@ -940,7 +940,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(sim_sgpu_gpu_ecc_errors)",
+          "expr": "sum(master_sgpu_gpu_ecc_errors)",
           "refId": "A"
         }
       ],
@@ -1009,7 +1009,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "time() - sim_sgpu_collector_last_success_timestamp_seconds",
+          "expr": "time() - master_sgpu_collector_last_success_timestamp_seconds",
           "refId": "A"
         }
       ],
@@ -1069,12 +1069,13 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(sim_sgpu_gpu_power_watts)",
+          "expr": "sum(master_sgpu_gpu_power_watts)",
           "refId": "A"
         }
       ],
       "title": "Total GPU Power",
-      "type": "stat"
+      "type": "stat",
+      "description": "Sum of nvidia-smi board power across all reporting GPUs."
     },
     {
       "datasource": {
@@ -1129,13 +1130,13 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(sim_sgpu_node_sys_power_watts)",
+          "expr": "sum(master_sgpu_node_sys_power_watts)",
           "refId": "A"
         }
       ],
       "title": "Total Wall Power",
       "type": "stat",
-      "description": "All Slurm nodes (BMC) + master (ACPI meter, bridged via recording rule)."
+      "description": "Sums only nodes whose BMC reports power — run `sgpu doctor` to list nodes missing power telemetry (undercounts otherwise)."
     },
     {
       "collapsed": false,
@@ -1218,7 +1219,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "100 * (1 - avg(rate(sim_sgpu_master_cpu_seconds_total{mode=\"idle\"}[2m])))",
+          "expr": "100 * (1 - avg(rate(master_sgpu_master_cpu_seconds_total{mode=\"idle\"}[2m])))",
           "refId": "A"
         }
       ],
@@ -1293,7 +1294,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "100 * (1 - sim_sgpu_master_memory_MemAvailable_bytes / sim_sgpu_master_memory_MemTotal_bytes)",
+          "expr": "100 * (1 - master_sgpu_master_memory_MemAvailable_bytes / master_sgpu_master_memory_MemTotal_bytes)",
           "refId": "A"
         }
       ],
@@ -1353,7 +1354,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_master_load1",
+          "expr": "master_sgpu_master_load1",
           "refId": "A"
         }
       ],
@@ -1421,7 +1422,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "max(sim_sgpu_master_hwmon_temp_celsius{chip=~\"platform_coretemp.*\"})",
+          "expr": "max(master_sgpu_master_hwmon_temp_celsius{chip=~\"platform_coretemp.*\"})",
           "refId": "A"
         }
       ],
@@ -1481,7 +1482,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "time() - sim_sgpu_master_boot_time_seconds",
+          "expr": "time() - master_sgpu_master_boot_time_seconds",
           "refId": "A"
         }
       ],
@@ -1570,7 +1571,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "100 * (1 - avg(rate(sim_sgpu_master_cpu_seconds_total{mode=\"idle\"}[2m])))",
+          "expr": "100 * (1 - avg(rate(master_sgpu_master_cpu_seconds_total{mode=\"idle\"}[2m])))",
           "legendFormat": "CPU %",
           "refId": "A"
         },
@@ -1579,7 +1580,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "100 * (1 - sim_sgpu_master_memory_MemAvailable_bytes / sim_sgpu_master_memory_MemTotal_bytes)",
+          "expr": "100 * (1 - master_sgpu_master_memory_MemAvailable_bytes / master_sgpu_master_memory_MemTotal_bytes)",
           "legendFormat": "RAM %",
           "refId": "B"
         }
@@ -1720,7 +1721,7 @@
           "refId": "A",
           "format": "table",
           "instant": true,
-          "expr": "sim_sgpu_master_filesystem_size_bytes{mountpoint=~\"/|/home|/data1\"} - sim_sgpu_master_filesystem_avail_bytes{mountpoint=~\"/|/home|/data1\"}"
+          "expr": "master_sgpu_master_filesystem_size_bytes{mountpoint=~\"/|/home|/appl\"} - master_sgpu_master_filesystem_avail_bytes{mountpoint=~\"/|/home|/appl\"}"
         },
         {
           "datasource": {
@@ -1730,7 +1731,7 @@
           "refId": "B",
           "format": "table",
           "instant": true,
-          "expr": "sim_sgpu_master_filesystem_size_bytes{mountpoint=~\"/|/home|/data1\"}"
+          "expr": "master_sgpu_master_filesystem_size_bytes{mountpoint=~\"/|/home|/appl\"}"
         },
         {
           "datasource": {
@@ -1740,7 +1741,7 @@
           "refId": "C",
           "format": "table",
           "instant": true,
-          "expr": "100 * (1 - sim_sgpu_master_filesystem_avail_bytes{mountpoint=~\"/|/home|/data1\"} / sim_sgpu_master_filesystem_size_bytes{mountpoint=~\"/|/home|/data1\"})"
+          "expr": "100 * (1 - master_sgpu_master_filesystem_avail_bytes{mountpoint=~\"/|/home|/appl\"} / master_sgpu_master_filesystem_size_bytes{mountpoint=~\"/|/home|/appl\"})"
         }
       ],
       "transformations": [
@@ -1852,7 +1853,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "expr": "sum(rate(sim_sgpu_master_network_receive_bytes_total{device!=\"lo\"}[2m]))",
+          "expr": "sum(rate(master_sgpu_master_network_receive_bytes_total{device!=\"lo\"}[2m]))",
           "legendFormat": "Inbound (RX)",
           "datasource": {
             "type": "prometheus",
@@ -1861,7 +1862,7 @@
           "refId": "A"
         },
         {
-          "expr": "sum(rate(sim_sgpu_master_network_transmit_bytes_total{device!=\"lo\"}[2m]))",
+          "expr": "sum(rate(master_sgpu_master_network_transmit_bytes_total{device!=\"lo\"}[2m]))",
           "legendFormat": "Outbound (TX)",
           "datasource": {
             "type": "prometheus",
@@ -1949,7 +1950,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "expr": "sum(rate(sim_sgpu_master_disk_read_bytes_total[2m]))",
+          "expr": "sum(rate(master_sgpu_master_disk_read_bytes_total[2m]))",
           "legendFormat": "read",
           "datasource": {
             "type": "prometheus",
@@ -1958,7 +1959,7 @@
           "refId": "A"
         },
         {
-          "expr": "sum(rate(sim_sgpu_master_disk_written_bytes_total[2m]))",
+          "expr": "sum(rate(master_sgpu_master_disk_written_bytes_total[2m]))",
           "legendFormat": "write",
           "datasource": {
             "type": "prometheus",
@@ -2053,7 +2054,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_gpu_util{node=~\"$node\"} * on(node, gpu) group_left(name) sim_sgpu_gpu_info",
+          "expr": "master_sgpu_gpu_util{node=~\"$node\"} * on(node, gpu) group_left(name) master_sgpu_gpu_info",
           "refId": "A",
           "legendFormat": "{{gpu}} · {{name}}"
         }
@@ -2129,7 +2130,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_gpu_mem_used_percent{node=~\"$node\"} * on(node, gpu) group_left(name) sim_sgpu_gpu_info",
+          "expr": "master_sgpu_gpu_mem_used_percent{node=~\"$node\"} * on(node, gpu) group_left(name) master_sgpu_gpu_info",
           "refId": "A",
           "legendFormat": "{{gpu}} · {{name}}"
         }
@@ -2211,7 +2212,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_node_up{node=~\"$node\"} * (2 - sim_sgpu_node_stale{node=~\"$node\"})",
+          "expr": "master_sgpu_node_up{node=~\"$node\"} * (2 - master_sgpu_node_stale{node=~\"$node\"})",
           "refId": "A"
         }
       ],
@@ -2271,7 +2272,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(sim_sgpu_gpu_allocated{node=~\"$node\"})",
+          "expr": "sum(master_sgpu_gpu_allocated{node=~\"$node\"})",
           "refId": "A"
         }
       ],
@@ -2339,7 +2340,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "max(sim_sgpu_gpu_temp_celsius{node=~\"$node\"})",
+          "expr": "max(master_sgpu_gpu_temp_celsius{node=~\"$node\"})",
           "refId": "A"
         }
       ],
@@ -2399,7 +2400,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(sim_sgpu_gpu_power_watts{node=~\"$node\"})",
+          "expr": "sum(master_sgpu_gpu_power_watts{node=~\"$node\"})",
           "refId": "A"
         }
       ],
@@ -2474,7 +2475,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "100 * sim_sgpu_node_cpus_alloc{node=~\"$node\"} / clamp_min(sim_sgpu_node_cpus_total{node=~\"$node\"}, 1)",
+          "expr": "100 * master_sgpu_node_cpus_alloc{node=~\"$node\"} / clamp_min(master_sgpu_node_cpus_total{node=~\"$node\"}, 1)",
           "refId": "A"
         }
       ],
@@ -2549,7 +2550,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "100 * sim_sgpu_node_mem_used_mib{node=~\"$node\"} / clamp_min(sim_sgpu_node_mem_total_mib{node=~\"$node\"}, 1)",
+          "expr": "100 * master_sgpu_node_mem_used_mib{node=~\"$node\"} / clamp_min(master_sgpu_node_mem_total_mib{node=~\"$node\"}, 1)",
           "refId": "A"
         }
       ],
@@ -2609,7 +2610,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_node_cpu_load{node=~\"$node\"} / clamp_min(sim_sgpu_node_cpus_total{node=~\"$node\"}, 1)",
+          "expr": "master_sgpu_node_cpu_load{node=~\"$node\"} / clamp_min(master_sgpu_node_cpus_total{node=~\"$node\"}, 1)",
           "refId": "A"
         }
       ],
@@ -2669,7 +2670,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_node_mem_avail_mib{node=~\"$node\"}",
+          "expr": "master_sgpu_node_mem_avail_mib{node=~\"$node\"}",
           "refId": "A"
         }
       ],
@@ -2729,7 +2730,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_node_sys_power_watts{node=~\"$node\"}",
+          "expr": "master_sgpu_node_sys_power_watts{node=~\"$node\"}",
           "legendFormat": "Wall",
           "refId": "A"
         },
@@ -2738,7 +2739,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_node_cpu_power_watts{node=~\"$node\"}",
+          "expr": "master_sgpu_node_cpu_power_watts{node=~\"$node\"}",
           "legendFormat": "CPU",
           "refId": "B"
         },
@@ -2747,7 +2748,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_node_ram_power_watts{node=~\"$node\"}",
+          "expr": "master_sgpu_node_ram_power_watts{node=~\"$node\"}",
           "legendFormat": "RAM",
           "refId": "C"
         }
@@ -2837,7 +2838,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_gpu_util{node=~\"$node\"}",
+          "expr": "master_sgpu_gpu_util{node=~\"$node\"}",
           "legendFormat": "GPU {{gpu}}",
           "refId": "A"
         }
@@ -2927,7 +2928,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_gpu_mem_used_percent{node=~\"$node\"}",
+          "expr": "master_sgpu_gpu_mem_used_percent{node=~\"$node\"}",
           "legendFormat": "GPU {{gpu}}",
           "refId": "A"
         }
@@ -3015,7 +3016,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_gpu_temp_celsius{node=~\"$node\"}",
+          "expr": "master_sgpu_gpu_temp_celsius{node=~\"$node\"}",
           "legendFormat": "GPU {{gpu}}",
           "refId": "A"
         }
@@ -3103,7 +3104,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_gpu_power_watts{node=~\"$node\"}",
+          "expr": "master_sgpu_gpu_power_watts{node=~\"$node\"}",
           "legendFormat": "GPU {{gpu}}",
           "refId": "A"
         },
@@ -3112,7 +3113,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_node_cpu_power_watts{node=~\"$node\"}",
+          "expr": "master_sgpu_node_cpu_power_watts{node=~\"$node\"}",
           "legendFormat": "CPU (RAPL)",
           "refId": "B"
         },
@@ -3121,7 +3122,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_node_ram_power_watts{node=~\"$node\"}",
+          "expr": "master_sgpu_node_ram_power_watts{node=~\"$node\"}",
           "legendFormat": "RAM (RAPL)",
           "refId": "C"
         },
@@ -3130,7 +3131,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_node_sys_power_watts{node=~\"$node\"}",
+          "expr": "master_sgpu_node_sys_power_watts{node=~\"$node\"}",
           "legendFormat": "Wall (BMC)",
           "refId": "D"
         }
@@ -3194,7 +3195,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_gpu_job_info{node=~\"$node\"}",
+          "expr": "master_sgpu_gpu_job_info{node=~\"$node\"}",
           "format": "table",
           "instant": true,
           "refId": "A"
@@ -3229,422 +3230,423 @@
       "type": "row",
       "title": "CPU · $cpu_node",
       "repeat": "cpu_node",
-      "collapsed": false,
+      "collapsed": true,
       "gridPos": {
         "x": 0,
         "y": 58,
         "w": 24,
         "h": 1
       },
-      "panels": []
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
+      "panels": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
           },
-          "mappings": [
-            {
-              "type": "value",
-              "options": {
-                "2": {
-                  "text": "UP",
-                  "color": "green",
-                  "index": 0
-                },
-                "1": {
-                  "text": "STALE",
-                  "color": "yellow",
-                  "index": 1
-                },
-                "0": {
-                  "text": "DOWN",
-                  "color": "red",
-                  "index": 2
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "mappings": [
+                {
+                  "type": "value",
+                  "options": {
+                    "2": {
+                      "text": "UP",
+                      "color": "green",
+                      "index": 0
+                    },
+                    "1": {
+                      "text": "STALE",
+                      "color": "yellow",
+                      "index": 1
+                    },
+                    "0": {
+                      "text": "DOWN",
+                      "color": "red",
+                      "index": 2
+                    }
+                  }
                 }
+              ],
+              "unit": "none",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "blue",
+                    "value": null
+                  }
+                ]
               }
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "x": 0,
+            "y": 59,
+            "w": 2,
+            "h": 5
+          },
+          "id": 53,
+          "options": {
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "center",
+            "orientation": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "auto",
+            "wideLayout": true
+          },
+          "pluginVersion": "10.0.0",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "expr": "master_sgpu_node_up{node=~\"$cpu_node\"} * (2 - master_sgpu_node_stale{node=~\"$cpu_node\"})",
+              "refId": "A"
             }
           ],
-          "unit": "none",
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "blue",
-                "value": null
+          "title": "Status",
+          "type": "stat"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "mappings": [],
+              "min": 0,
+              "max": 100,
+              "unit": "percent",
+              "decimals": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "yellow",
+                    "value": 70
+                  },
+                  {
+                    "color": "orange",
+                    "value": 85
+                  },
+                  {
+                    "color": "red",
+                    "value": 95
+                  }
+                ]
               }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "x": 0,
-        "y": 59,
-        "w": 2,
-        "h": 5
-      },
-      "id": 53,
-      "options": {
-        "colorMode": "background",
-        "graphMode": "none",
-        "justifyMode": "center",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "x": 2,
+            "y": 59,
+            "w": 5,
+            "h": 5
+          },
+          "id": 54,
+          "options": {
+            "minVizHeight": 75,
+            "minVizWidth": 75,
+            "sizing": "auto",
+            "orientation": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "showThresholdLabels": false,
+            "showThresholdMarkers": true
+          },
+          "pluginVersion": "10.0.0",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "expr": "100 * master_sgpu_node_cpus_alloc{node=~\"$cpu_node\"} / clamp_min(master_sgpu_node_cpus_total{node=~\"$cpu_node\"}, 1)",
+              "refId": "A"
+            }
           ],
-          "fields": "",
-          "values": false
+          "title": "CPU Alloc",
+          "type": "gauge"
         },
-        "textMode": "auto",
-        "wideLayout": true
-      },
-      "pluginVersion": "10.0.0",
-      "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_node_up{node=~\"$cpu_node\"} * (2 - sim_sgpu_node_stale{node=~\"$cpu_node\"})",
-          "refId": "A"
-        }
-      ],
-      "title": "Status",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "min": 0,
-          "max": 100,
-          "unit": "percent",
-          "decimals": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
               },
-              {
-                "color": "yellow",
-                "value": 70
-              },
-              {
-                "color": "orange",
-                "value": 85
-              },
-              {
-                "color": "red",
-                "value": 95
+              "mappings": [],
+              "min": 0,
+              "max": 100,
+              "unit": "percent",
+              "decimals": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "yellow",
+                    "value": 70
+                  },
+                  {
+                    "color": "orange",
+                    "value": 85
+                  },
+                  {
+                    "color": "red",
+                    "value": 95
+                  }
+                ]
               }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "x": 2,
-        "y": 59,
-        "w": 5,
-        "h": 5
-      },
-      "id": 54,
-      "options": {
-        "minVizHeight": 75,
-        "minVizWidth": 75,
-        "sizing": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "showThresholdLabels": false,
-        "showThresholdMarkers": true
-      },
-      "pluginVersion": "10.0.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            },
+            "overrides": []
           },
-          "expr": "100 * sim_sgpu_node_cpus_alloc{node=~\"$cpu_node\"} / clamp_min(sim_sgpu_node_cpus_total{node=~\"$cpu_node\"}, 1)",
-          "refId": "A"
-        }
-      ],
-      "title": "CPU Alloc",
-      "type": "gauge"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
+          "gridPos": {
+            "x": 7,
+            "y": 59,
+            "w": 5,
+            "h": 5
           },
-          "mappings": [],
-          "min": 0,
-          "max": 100,
-          "unit": "percent",
-          "decimals": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
+          "id": 55,
+          "options": {
+            "minVizHeight": 75,
+            "minVizWidth": 75,
+            "sizing": "auto",
+            "orientation": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "showThresholdLabels": false,
+            "showThresholdMarkers": true
+          },
+          "pluginVersion": "10.0.0",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
               },
-              {
-                "color": "yellow",
-                "value": 70
+              "expr": "100 * master_sgpu_node_mem_used_mib{node=~\"$cpu_node\"} / clamp_min(master_sgpu_node_mem_total_mib{node=~\"$cpu_node\"}, 1)",
+              "refId": "A"
+            }
+          ],
+          "title": "RAM Used",
+          "type": "gauge"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
               },
-              {
-                "color": "orange",
-                "value": 85
+              "mappings": [],
+              "unit": "percentunit",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "blue",
+                    "value": null
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "x": 12,
+            "y": 59,
+            "w": 3,
+            "h": 5
+          },
+          "id": 56,
+          "options": {
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "center",
+            "orientation": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "auto",
+            "wideLayout": true
+          },
+          "pluginVersion": "10.0.0",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
               },
-              {
-                "color": "red",
-                "value": 95
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "x": 7,
-        "y": 59,
-        "w": 5,
-        "h": 5
-      },
-      "id": 55,
-      "options": {
-        "minVizHeight": 75,
-        "minVizWidth": 75,
-        "sizing": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
+              "expr": "master_sgpu_node_cpu_load{node=~\"$cpu_node\"} / clamp_min(master_sgpu_node_cpus_total{node=~\"$cpu_node\"}, 1)",
+              "refId": "A"
+            }
           ],
-          "fields": "",
-          "values": false
+          "title": "CPU Load / Cores",
+          "type": "stat"
         },
-        "showThresholdLabels": false,
-        "showThresholdMarkers": true
-      },
-      "pluginVersion": "10.0.0",
-      "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "100 * sim_sgpu_node_mem_used_mib{node=~\"$cpu_node\"} / clamp_min(sim_sgpu_node_mem_total_mib{node=~\"$cpu_node\"}, 1)",
-          "refId": "A"
-        }
-      ],
-      "title": "RAM Used",
-      "type": "gauge"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "unit": "percentunit",
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "blue",
-                "value": null
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "mappings": [],
+              "unit": "mbytes",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "blue",
+                    "value": null
+                  }
+                ]
               }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "x": 12,
-        "y": 59,
-        "w": 3,
-        "h": 5
-      },
-      "id": 56,
-      "options": {
-        "colorMode": "background",
-        "graphMode": "none",
-        "justifyMode": "center",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "x": 15,
+            "y": 59,
+            "w": 3,
+            "h": 5
+          },
+          "id": 57,
+          "options": {
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "center",
+            "orientation": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "auto",
+            "wideLayout": true
+          },
+          "pluginVersion": "10.0.0",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              },
+              "expr": "master_sgpu_node_mem_avail_mib{node=~\"$cpu_node\"}",
+              "refId": "A"
+            }
           ],
-          "fields": "",
-          "values": false
+          "title": "RAM Avail",
+          "type": "stat"
         },
-        "textMode": "auto",
-        "wideLayout": true
-      },
-      "pluginVersion": "10.0.0",
-      "targets": [
         {
+          "id": 52,
+          "type": "timeseries",
+          "title": "Load vs Cores",
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sim_sgpu_node_cpu_load{node=~\"$cpu_node\"} / clamp_min(sim_sgpu_node_cpus_total{node=~\"$cpu_node\"}, 1)",
-          "refId": "A"
-        }
-      ],
-      "title": "CPU Load / Cores",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
+          "gridPos": {
+            "x": 18,
+            "y": 59,
+            "w": 6,
+            "h": 5
           },
-          "mappings": [],
-          "unit": "mbytes",
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "blue",
-                "value": null
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "fillOpacity": 5
+              },
+              "decimals": 1
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            }
+          },
+          "targets": [
+            {
+              "expr": "master_sgpu_node_cpu_load{node=~\"$cpu_node\"}",
+              "legendFormat": "load",
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
               }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "x": 15,
-        "y": 59,
-        "w": 3,
-        "h": 5
-      },
-      "id": 57,
-      "options": {
-        "colorMode": "background",
-        "graphMode": "none",
-        "justifyMode": "center",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto",
-        "wideLayout": true
-      },
-      "pluginVersion": "10.0.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "expr": "sim_sgpu_node_mem_avail_mib{node=~\"$cpu_node\"}",
-          "refId": "A"
-        }
-      ],
-      "title": "RAM Avail",
-      "type": "stat"
-    },
-    {
-      "id": 52,
-      "type": "timeseries",
-      "title": "Load vs Cores",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "gridPos": {
-        "x": 18,
-        "y": 59,
-        "w": 6,
-        "h": 5
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "fillOpacity": 5
-          },
-          "decimals": 1
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        }
-      },
-      "targets": [
-        {
-          "expr": "sim_sgpu_node_cpu_load{node=~\"$cpu_node\"}",
-          "legendFormat": "load",
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          }
-        },
-        {
-          "expr": "sim_sgpu_node_cpus_alloc{node=~\"$cpu_node\"}",
-          "legendFormat": "alloc cores",
-          "refId": "B",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          }
-        },
-        {
-          "expr": "sim_sgpu_node_cpus_total{node=~\"$cpu_node\"}",
-          "legendFormat": "cores",
-          "refId": "C",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          }
+            },
+            {
+              "expr": "master_sgpu_node_cpus_alloc{node=~\"$cpu_node\"}",
+              "legendFormat": "alloc cores",
+              "refId": "B",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              }
+            },
+            {
+              "expr": "master_sgpu_node_cpus_total{node=~\"$cpu_node\"}",
+              "legendFormat": "cores",
+              "refId": "C",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+              }
+            }
+          ]
         }
       ]
     },
@@ -3741,7 +3743,7 @@
                 "type": "prometheus",
                 "uid": "${DS_PROMETHEUS}"
               },
-              "expr": "sim_sgpu_gpu_util",
+              "expr": "master_sgpu_gpu_util",
               "legendFormat": "{{node}} gpu{{gpu}}",
               "refId": "A"
             }
@@ -3832,7 +3834,7 @@
                 "type": "prometheus",
                 "uid": "${DS_PROMETHEUS}"
               },
-              "expr": "sim_sgpu_gpu_mem_used_percent",
+              "expr": "master_sgpu_gpu_mem_used_percent",
               "legendFormat": "{{node}} gpu{{gpu}}",
               "refId": "A"
             }
@@ -3931,7 +3933,7 @@
                 "type": "prometheus",
                 "uid": "${DS_PROMETHEUS}"
               },
-              "expr": "sim_sgpu_gpu_temp_celsius",
+              "expr": "master_sgpu_gpu_temp_celsius",
               "legendFormat": "{{node}} gpu{{gpu}}",
               "refId": "A"
             }
@@ -4022,7 +4024,7 @@
                 "type": "prometheus",
                 "uid": "${DS_PROMETHEUS}"
               },
-              "expr": "sim_sgpu_gpu_idle_seconds",
+              "expr": "master_sgpu_gpu_idle_seconds",
               "legendFormat": "idle {{node}} gpu{{gpu}}",
               "refId": "A"
             },
@@ -4031,7 +4033,7 @@
                 "type": "prometheus",
                 "uid": "${DS_PROMETHEUS}"
               },
-              "expr": "sim_sgpu_gpu_parked_seconds",
+              "expr": "master_sgpu_gpu_parked_seconds",
               "legendFormat": "parked {{node}} gpu{{gpu}}",
               "refId": "B"
             }
@@ -4122,7 +4124,7 @@
                 "type": "prometheus",
                 "uid": "${DS_PROMETHEUS}"
               },
-              "expr": "sim_sgpu_gpu_power_watts",
+              "expr": "master_sgpu_gpu_power_watts",
               "legendFormat": "{{node}} gpu{{gpu}}",
               "refId": "A"
             }
@@ -4186,7 +4188,7 @@
                 "type": "prometheus",
                 "uid": "${DS_PROMETHEUS}"
               },
-              "expr": "sim_sgpu_gpu_allocated",
+              "expr": "master_sgpu_gpu_allocated",
               "format": "table",
               "instant": true,
               "refId": "A"
@@ -4252,7 +4254,7 @@
                 "type": "prometheus",
                 "uid": "${DS_PROMETHEUS}"
               },
-              "expr": "sim_sgpu_pending_job_info",
+              "expr": "master_sgpu_pending_job_info",
               "format": "table",
               "instant": true,
               "refId": "A"
@@ -4295,7 +4297,6 @@
     "gpu",
     "master",
     "sgpu",
-    "sim",
     "slurm"
   ],
   "templating": {
@@ -4309,7 +4310,7 @@
           "uid": "${DS_PROMETHEUS}"
         },
         "query": {
-          "query": "label_values(sim_sgpu_gpu_info, node)",
+          "query": "label_values(master_sgpu_gpu_info, node)",
           "refId": "nodevar"
         },
         "refresh": 2,
@@ -4337,7 +4338,7 @@
           "uid": "${DS_PROMETHEUS}"
         },
         "query": {
-          "query": "query_result(sim_sgpu_node_up unless on(node) sim_sgpu_gpu_info)",
+          "query": "query_result(master_sgpu_node_up unless on(node) master_sgpu_gpu_info)",
           "refId": "cpunodevar"
         },
         "refresh": 2,
@@ -4366,7 +4367,7 @@
   "timepicker": {},
   "timezone": "",
   "title": "sgpu master (10.10.0.100) - SLURM GPU Operations",
-  "uid": "sgpu-sim-ops",
+  "uid": "sgpu-master-ops",
   "version": 1,
   "weekStart": ""
 }
