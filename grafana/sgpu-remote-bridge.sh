@@ -10,17 +10,20 @@
 # /proc//sys over ssh into the same <prefix>sgpu_master_* names, so the
 # dashboard's "master (login/collector node)" row works either way.
 #
-#   SGPU_BRIDGE_REMOTE       ssh target                (default sim@10.10.0.100)
+#   SGPU_BRIDGE_REMOTE       ssh target, e.g. user@remote-master  (REQUIRED)
 #   SGPU_BRIDGE_REMOTE_FILE  remote metrics path       (default /tmp/slurm-gpu-tui/metrics.prom)
 #   SGPU_BRIDGE_PREFIX       metric name prefix        (default master_)
 #   SGPU_BRIDGE_OUT          output .prom              (default /tmp/slurm-gpu-tui/<prefix>sgpu.prom)
+#
+# Site values live in an env file, not here — see bridge.env.example and
+# the EnvironmentFile= line in sgpu-master-bridge.service.
 #
 # On fetch failure the data series are dropped (Prometheus marks them stale)
 # and only <prefix>sgpu_bridge_up 0 remains — dashboards go "No data"
 # instead of silently freezing on the last good numbers.
 set -uo pipefail
 
-REMOTE="${SGPU_BRIDGE_REMOTE:-sim@10.10.0.100}"
+REMOTE="${SGPU_BRIDGE_REMOTE:?set SGPU_BRIDGE_REMOTE (user@remote-master), e.g. via ~/.config/sgpu/bridge.env}"
 REMOTE_FILE="${SGPU_BRIDGE_REMOTE_FILE:-/tmp/slurm-gpu-tui/metrics.prom}"
 PREFIX="${SGPU_BRIDGE_PREFIX:-master_}"
 OUT="${SGPU_BRIDGE_OUT:-/tmp/slurm-gpu-tui/${PREFIX}sgpu.prom}"

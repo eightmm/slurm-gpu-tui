@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerate the master-cluster (10.10.0.100) dashboard pair from the
+"""Regenerate the bridged-cluster dashboard pair from the
 local ai-master sources.
 
 Rewrites: sgpu_* -> master_sgpu_* everywhere, node_* -> master_sgpu_master_*
@@ -18,9 +18,9 @@ import re
 
 PAIRS = [
     ("grafana/sgpu-dashboard.json", "grafana/sgpu-master-dashboard.json",
-     "sgpu-master-ops", "sgpu master (10.10.0.100) - SLURM GPU Operations"),
+     "sgpu-master-ops", "sgpu master - SLURM GPU Operations"),
     ("grafana/sgpu-node-detail.json", "grafana/sgpu-master-node-detail.json",
-     "sgpu-master-node-detail", "sgpu master (10.10.0.100) - Node Detail"),
+     "sgpu-master-node-detail", "sgpu master - Node Detail"),
 ]
 
 # node_exporter metric names get the prefix only inside exprs — blanket

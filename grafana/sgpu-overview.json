@@ -393,7 +393,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "expr": "sum(master_sgpu_node_sys_power_watts)",
-          "legendFormat": "master (10.10.0.100)"
+          "legendFormat": "master"
         }
       ]
     },
@@ -445,7 +445,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "expr": "sum(master_sgpu_gpus_allocated)",
-          "legendFormat": "master (10.10.0.100)"
+          "legendFormat": "master"
         }
       ]
     },
@@ -497,7 +497,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "expr": "avg(master_sgpu_gpu_util)",
-          "legendFormat": "master (10.10.0.100)"
+          "legendFormat": "master"
         }
       ]
     },
@@ -549,7 +549,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "expr": "master_sgpu_jobs_running",
-          "legendFormat": "master (10.10.0.100)"
+          "legendFormat": "master"
         }
       ]
     },
@@ -607,7 +607,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "expr": "sum(master_sgpu_node_sys_power_watts)",
-          "legendFormat": "master (10.10.0.100)"
+          "legendFormat": "master"
         }
       ]
     },
@@ -662,7 +662,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "expr": "avg(master_sgpu_gpu_util)",
-          "legendFormat": "master (10.10.0.100)"
+          "legendFormat": "master"
         }
       ]
     },
@@ -717,7 +717,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "expr": "sum(master_sgpu_gpus_allocated)",
-          "legendFormat": "master (10.10.0.100)"
+          "legendFormat": "master"
         }
       ]
     },
@@ -772,7 +772,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "expr": "master_sgpu_jobs_running",
-          "legendFormat": "master (10.10.0.100)"
+          "legendFormat": "master"
         }
       ]
     },
@@ -827,7 +827,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "expr": "master_sgpu_jobs_pending",
-          "legendFormat": "master (10.10.0.100)"
+          "legendFormat": "master"
         }
       ]
     }

@@ -1,7 +1,10 @@
 # User unit (systemctl --user): install to ~/.config/systemd/user/ on the Grafana host.
+# Site values (remote host/account) go in ~/.config/sgpu/bridge.env — see
+# grafana/bridge.env.example.
 [Unit]
-Description=sgpu bridge: mirror master cluster (10.10.0.100) metrics into local textfile dir
+Description=sgpu bridge: mirror a remote sgpu cluster's metrics into local textfile dir
 
 [Service]
 Type=oneshot
+EnvironmentFile=%h/.config/sgpu/bridge.env
 ExecStart=%h/.local/bin/sgpu-remote-bridge.sh

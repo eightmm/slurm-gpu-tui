@@ -1,4 +1,4 @@
-# Alert rules for the bridged master cluster (10.10.0.100). The stock
+# Alert rules for the bridged master cluster. The stock
 # sgpu-alerts.yml only matches local sgpu_* series; the bridge republishes
 # that cluster under master_sgpu_*, which no other rule watches.
 # Install: sudo cp prometheus/sgpu-master-cluster-alerts.yml /etc/prometheus/rules/
@@ -14,10 +14,10 @@ groups:
         annotations:
           summary: master-cluster bridge is not delivering data
           description: >-
-            sgpu-remote-bridge has not fetched metrics from 10.10.0.100 for
+            sgpu-remote-bridge has not fetched metrics from the bridged cluster for
             5 minutes — the master dashboards are blind. Check the
             sgpu-master-bridge user timer and ssh connectivity to
-            sim@10.10.0.100.
+            the configured SGPU_BRIDGE_REMOTE.
 
       - alert: MasterClusterCollectorStale
         expr: time() - master_sgpu_collector_last_success_timestamp_seconds > 300
@@ -27,7 +27,7 @@ groups:
         annotations:
           summary: master cluster's sgpu collector is stale
           description: >-
-            The bridge is running but the collector on 10.10.0.100 has not
+            The bridge is running but the collector on the bridged cluster has not
             published a successful snapshot for 5 minutes. Check
             sgpu-collector on that host.
 
@@ -40,7 +40,7 @@ groups:
           summary: "master-cluster job {{ $labels.jobid }} ({{ $labels.user }}) holds RAM beyond its GPU share"
           description: >-
             Job {{ $labels.jobid }} by {{ $labels.user }} on
-            {{ $labels.node }} (10.10.0.100) requests {{ $value }}x the RAM
+            {{ $labels.node }} requests {{ $value }}x the RAM
             its {{ $labels.gpus }} GPU(s) entitle it to.
 
       - alert: MasterClusterNodeDown
@@ -51,5 +51,5 @@ groups:
         annotations:
           summary: "master cluster node {{ $labels.node }} is not reporting"
           description: >-
-            Node {{ $labels.node }} on 10.10.0.100 has had no sgpu data for
+            Node {{ $labels.node }} on the bridged cluster has had no sgpu data for
             10 minutes (down, drained, or agent dead).

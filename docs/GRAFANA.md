@@ -225,8 +225,9 @@ metric-name prefix:
 
 - `grafana/sgpu-remote-bridge.sh` — fetches the remote cluster's
   `metrics.prom` over ssh every 30 s and rewrites `sgpu_*` →
-  `<prefix>sgpu_*` into the local textfile dir (defaults:
-  `sim@10.10.0.100`, prefix `master_`; override with `SGPU_BRIDGE_*` env).
+  `<prefix>sgpu_*` into the local textfile dir. The ssh target and prefix
+  come from `~/.config/sgpu/bridge.env` (site file, not in git — copy
+  `grafana/bridge.env.example`).
   On fetch failure the data series are dropped (panels go honest
   "No data") and only `<prefix>sgpu_bridge_up 0` remains. For remotes on
   an older sgpu without `sgpu_master_*`, it falls back to sampling the

@@ -4369,7 +4369,7 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "sgpu master (10.10.0.100) - SLURM GPU Operations",
+  "title": "sgpu master - SLURM GPU Operations",
   "uid": "sgpu-master-ops",
   "version": 1,
   "weekStart": ""

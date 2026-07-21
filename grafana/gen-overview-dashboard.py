@@ -3,7 +3,7 @@
 
 One screen answering "how are both clusters doing": combined totals up
 top, per-cluster comparison stats, then trend lines. Local cluster is
-sgpu_* (ai-master), the bridged cluster is master_sgpu_* (10.10.0.100).
+sgpu_* (ai-master), the bridged cluster is master_sgpu_*.
 
 Writes grafana/sgpu-overview.json in repo export form (${DS_PROMETHEUS}
 placeholder); deploy via grafana/install.sh or its transformation.
@@ -11,7 +11,7 @@ placeholder); deploy via grafana/install.sh or its transformation.
 import json
 
 DS = {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}
-CLUSTERS = [("ai-master", "sgpu_"), ("master (10.10.0.100)", "master_sgpu_")]
+CLUSTERS = [("ai-master", "sgpu_"), ("master", "master_sgpu_")]
 
 _id = 0
 
@@ -76,9 +76,6 @@ def trend(title, expr_fmt, x, y, w, unit="none", h=8, stack=False):
     if stack:
         p["fieldConfig"]["defaults"]["custom"]["stacking"] = {"mode": "normal"}
     return p
-
-
-both = "({p0}{{m}} + {p1}{{m}})"  # unused helper text; kept simple below
 
 
 def summed(metric: str) -> str:
