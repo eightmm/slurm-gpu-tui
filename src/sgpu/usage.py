@@ -2,17 +2,14 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from rich.text import Text
 
 from .cells import _waste_thr
-
-_DATA_DIR = Path(os.getenv("SLURM_GPU_TUI_DATA_DIR", "/tmp/slurm-gpu-tui"))
+from .runtime import state_dir_candidates
 
 def render_usage(days: int = 7) -> Text:
     """Per-user GPU-hours table (Usage tab / former modal)."""
@@ -61,84 +58,108 @@ def render_usage(days: int = 7) -> Text:
     return body
 
 
-_usage_cache: Tuple[Optional[float], Optional[dict]] = (None, None)
+_usage_cache: Tuple[Optional[tuple], Optional[dict]] = (None, None)
 
 
 def _read_usage_raw() -> Optional[dict]:
-    """usage.json, cached by mtime — render_usage runs every refresh and
-    would otherwise re-read and re-parse the file each time."""
+    """Freshest usage.json across the published state locations.
+
+    Cached on (path, mtime): render_usage runs on every refresh and would
+    otherwise re-read and re-parse. Keying on mtime alone was wrong — two
+    candidate paths can share an mtime and return each other's cached content.
+
+    Newest wins rather than first-found: a root collector publishes to
+    /var/lib/sgpu, but an install that used to run as a user leaves a stale
+    copy behind in the data dir, and silently showing weeks-old GPU-hours is
+    worse than showing none.
+    """
     global _usage_cache
-    state_dir = Path(os.getenv("SLURM_GPU_TUI_STATE_DIR", str(Path.home() / ".sgpu" / "state")))
-    for p in (state_dir / "usage.json", _DATA_DIR / "usage.json"):
+    best: Optional[tuple] = None
+    for d in state_dir_candidates():
+        p = d / "usage.json"
         try:
             mtime = p.stat().st_mtime
-            if mtime == _usage_cache[0]:
-                return _usage_cache[1]
-            raw = json.loads(p.read_text())
-            _usage_cache = (mtime, raw)
-            return raw
-        except (OSError, ValueError):
+        except OSError:
             continue
-    return None
+        if best is None or mtime > best[1]:
+            best = (p, mtime)
+    if best is None:
+        return None
+    key = (str(best[0]), best[1])
+    if key == _usage_cache[0]:
+        return _usage_cache[1]
+    try:
+        raw = json.loads(best[0].read_text())
+    except (OSError, ValueError):
+        return None
+    _usage_cache = (key, raw)
+    return raw
+
+
+def merge_usage_window(raw: dict, keep) -> Tuple[Dict[str, List[float]], Dict[str, List[float]]]:
+    """Fold usage.json's two alloc sources over the days `keep(day)` accepts.
+
+    alloc per user-day = max(sampled, slurmdbd/sacct): sacct survives collector
+    downtime, sampling covers jobs slurmdbd has not flushed yet. busy and waste
+    exist only in sampling, so efficiency must be computed against
+    sampled_alloc — the same observation window as busy — not merged alloc.
+
+    Returns ({user: [alloc, busy, sampled_alloc, waste]}, {day: [alloc, busy]}).
+    This is the one implementation: the totals view, the daily view, and the
+    monthly report each used to carry their own copy of the merge rule.
+    """
+    sampled = raw.get("days") if isinstance(raw.get("days"), dict) else {}
+    sacct = raw.get("sacct_days") if isinstance(raw.get("sacct_days"), dict) else {}
+    users: Dict[str, List[float]] = {}
+    daily: Dict[str, List[float]] = {}
+    for day in set(sampled) | set(sacct):
+        if not keep(day):
+            continue
+        s_users = sampled.get(day, {})
+        a_users = sacct.get(day, {})
+        d = daily.setdefault(day, [0.0, 0.0])
+        for user in set(s_users) | set(a_users):
+            su = s_users.get(user, {})
+            alloc = max(su.get("alloc", 0), a_users.get(user, 0.0))
+            t = users.setdefault(user, [0.0, 0.0, 0.0, 0.0])
+            t[0] += alloc
+            t[1] += su.get("busy", 0)
+            t[2] += su.get("alloc", 0)
+            t[3] += su.get("waste", 0)
+            d[0] += alloc
+            d[1] += su.get("busy", 0)
+    return users, daily
+
+
+def _window_cutoff(days: int) -> str:
+    return (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
 
 
 def load_usage_daily(days: int) -> List[Tuple[str, float, float, float]]:
     """Cluster-wide per-day totals [(day, alloc_sec, busy_sec, covered_sec)],
-    oldest first. Same max(sampled, sacct) alloc merge as load_usage_totals.
-    covered_sec ~ 0 means the collector never sampled that day: busy is
-    unknown there, not zero."""
+    oldest first. covered_sec ~ 0 means the collector never sampled that day:
+    busy is unknown there, not zero."""
     raw = _read_usage_raw()
     if raw is None:
         return []
-    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    sampled = raw.get("days", {})
-    sacct = raw.get("sacct_days", {}) if isinstance(raw.get("sacct_days"), dict) else {}
+    cutoff = _window_cutoff(days)
+    _users, daily = merge_usage_window(raw, lambda d: d >= cutoff)
     meta = raw.get("meta", {})
-    out: List[Tuple[str, float, float, float]] = []
-    for day in sorted(set(sampled) | set(sacct)):
-        if day < cutoff:
-            continue
-        s_users = sampled.get(day, {})
-        a_users = sacct.get(day, {})
-        alloc = busy = 0.0
-        for user in set(s_users) | set(a_users):
-            su = s_users.get(user, {})
-            alloc += max(su.get("alloc", 0), a_users.get(user, 0.0))
-            busy += su.get("busy", 0)
-        out.append((day, alloc, busy, float(meta.get(day, 0))))
-    return out
+    return [(day, daily[day][0], daily[day][1], float(meta.get(day, 0)))
+            for day in sorted(daily)]
 
 
 def load_usage_totals(days: int) -> Optional[Tuple[List[Tuple[str, float, float, float]], float, Optional[float]]]:
     """Sum usage.json daily buckets over the window.
-
-    alloc per user-day = max(sampled, slurmdbd/sacct) — sacct survives
-    collector downtime, sampling covers jobs slurmdbd hasn't flushed yet.
-    busy exists only in sampling. eff should be computed against
-    sampled_alloc (same observation window as busy), not merged alloc.
 
     Returns ([(user, alloc, busy, sampled_alloc, waste)] alloc desc,
              covered_seconds, sacct_ts or None)."""
     raw = _read_usage_raw()
     if raw is None:
         return None
-    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    sampled = raw.get("days", {})
-    sacct = raw.get("sacct_days", {}) if isinstance(raw.get("sacct_days"), dict) else {}
-    totals: Dict[str, List[float]] = {}
-    for day in set(sampled) | set(sacct):
-        if day < cutoff:
-            continue
-        s_users = sampled.get(day, {})
-        a_users = sacct.get(day, {})
-        for user in set(s_users) | set(a_users):
-            su = s_users.get(user, {})
-            t = totals.setdefault(user, [0.0, 0.0, 0.0, 0.0])
-            t[0] += max(su.get("alloc", 0), a_users.get(user, 0.0))
-            t[1] += su.get("busy", 0)
-            t[2] += su.get("alloc", 0)
-            t[3] += su.get("waste", 0)
+    cutoff = _window_cutoff(days)
+    totals, _daily = merge_usage_window(raw, lambda d: d >= cutoff)
     covered = sum(v for d, v in raw.get("meta", {}).items() if d >= cutoff)
-    sacct_ts = raw.get("sacct_ts") if sacct else None
+    sacct_ts = raw.get("sacct_ts") if raw.get("sacct_days") else None
     return (sorted(((u, a, b, sa, w) for u, (a, b, sa, w) in totals.items()), key=lambda x: -x[1]),
             covered, sacct_ts)

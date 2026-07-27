@@ -63,6 +63,31 @@ sgpu doctor        # node delivery → "push mode (N nodes via agent)"
 - CPU-only nodes use the systemd push agent after a root/shared-FS install.
   Set `SGPU_ENABLE_CPU_PUSH=0` to keep them SSH-pull-only.
 
+## Who is allowed to publish a payload
+
+The agent dir is mode 1777, so any user on the shared FS can create a
+`<node>.json`. Shape validation cannot tell a real agent from a forgery, and a
+forged payload feeds Slack alerts, the waste view, and per-user GPU-hour
+accounting — so the collector also checks **who wrote the file** and ignores
+payloads from anyone else, falling back to SSH polling for that node.
+
+Trusted by default: `root`, the collector's own uid, the agent dir's owner, and
+`nobody` (the `root_squash` case above). If your agents run under some other
+account, list its uid:
+
+```bash
+SLURM_GPU_TUI_AGENT_TRUSTED_UIDS=1234,5678   # replaces the default set
+```
+
+Rejections are logged once per node and reported by `sgpu doctor` under
+`agent payload trust`.
+
+Sticky-bit side effect worth knowing: because nobody can replace a file they
+do not own, a user who creates `<node>.json` first *blocks* the real agent
+instead of impersonating it. The agent says so explicitly in its log
+(`cannot publish ... push mode is blocked for this node`) rather than
+degrading silently to SSH.
+
 ## Operational checks
 
 ```bash

@@ -12,6 +12,7 @@ import stat
 import sys
 import threading
 import time
+from dataclasses import asdict
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -25,14 +26,20 @@ from .common import (
 from .agent import AGENT_PAYLOAD_VERSION
 from . import agent as _agent_module
 from .notify import Notifier
+from .runtime import (
+    UnsafeRuntimeDir, atomic_write, default_data_dir, default_state_dir,
+    ensure_secure_dir, open_append, open_lock, state_dir_candidates,
+    trusted_payload_uids,
+)
 from . import __build__, __version__
 
 # ── Config ────────────────────────────────────────────────────────────────
 
-DATA_DIR = Path(os.getenv("SLURM_GPU_TUI_DATA_DIR", "/tmp/slurm-gpu-tui"))
+DATA_DIR = default_data_dir()
 # Persistent state (usage history, waste ages, inventory) must survive
-# reboots, so it lives under the home dir — NOT in /tmp like the live data
-STATE_DIR = Path(os.getenv("SLURM_GPU_TUI_STATE_DIR", str(Path.home() / ".sgpu" / "state")))
+# reboots, so it lives outside /tmp — see runtime.default_state_dir for why a
+# root collector cannot keep it under ~/.sgpu
+STATE_DIR = default_state_dir()
 DATA_FILE = DATA_DIR / "data.json"
 PID_FILE = DATA_DIR / "collector.pid"
 LOCK_FILE = DATA_DIR / "collector.lock"
@@ -90,8 +97,17 @@ _inventory: Dict[str, List[dict]] = {}
 
 
 def _read_state_json(path: Path):
-    """Load a state file, falling back to its pre-STATE_DIR /tmp location."""
-    for p in (path, DATA_DIR / path.name):
+    """Load a state file, falling back to every earlier STATE_DIR layout.
+
+    Covers the pre-STATE_DIR /tmp location and the pre-/var/lib ~/.sgpu/state
+    one, so switching the collector to root keeps the accumulated history.
+    """
+    seen = set()
+    for d in [path.parent] + state_dir_candidates():
+        p = d / path.name
+        if p in seen:
+            continue
+        seen.add(p)
         try:
             return json.loads(p.read_text())
         except Exception:
@@ -105,17 +121,16 @@ _state_write_lock = threading.Lock()
 
 def _write_state_json(path: Path, text: str) -> None:
     """Atomic + fsync'd write for files that must survive a reboot.
-    Failures (disk full, permissions) are logged once, not every cycle."""
+
+    World-readable on purpose: the published TUI runs as an ordinary user and
+    reads the usage history from here. Failures (disk full, permissions) are
+    logged once, not every cycle.
+    """
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        with open(tmp, "w") as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
-        tmp.rename(path)
+        ensure_secure_dir(path.parent)
+        atomic_write(path, text, mode=0o644, fsync=True)
         _state_write_warned.discard(str(path))
-    except OSError as e:
+    except (OSError, UnsafeRuntimeDir) as e:
         if str(path) not in _state_write_warned:
             _state_write_warned.add(str(path))
             print(f"[collector] state write failed for {path}: {e}", flush=True)
@@ -217,6 +232,11 @@ def _track_waste(node: str, gpu: dict, now: float) -> None:
 
 _script_cache: Dict[str, str] = {}  # jobid -> script text ("" = unreadable)
 _script_inflight: set = set()
+# Both are touched by the collect loop and by the fetch worker below. Without
+# this lock the loop's "drop finished jobs" pass could iterate the dict while
+# the worker inserts into it — RuntimeError, swallowed by run_collector's
+# handler, costing a whole collect cycle.
+_script_lock = threading.Lock()
 # one background worker: a burst of new jobs (array submit) would otherwise
 # serialize N scontrol calls inside the 3s collect cycle
 _script_executor = ThreadPoolExecutor(max_workers=1)
@@ -228,12 +248,14 @@ def _fetch_one_script(jid: str) -> None:
         if os.geteuid() != 0:
             # install.sh provisions a sudoers rule for exactly this command
             cmd = "sudo -n " + cmd
-        ok, out = run_cmd(cmd)
+        ok, out = run_cmd(cmd)  # outside the lock: this is a subprocess call
         out = out.strip()
         good = ok and out and not out.startswith("job script retrieval failed")
-        _script_cache[jid] = out[:SCRIPT_MAX_BYTES] if good else ""
+        with _script_lock:
+            _script_cache[jid] = out[:SCRIPT_MAX_BYTES] if good else ""
     finally:
-        _script_inflight.discard(jid)
+        with _script_lock:
+            _script_inflight.discard(jid)
 
 
 def _fetch_scripts(jobs: List[JobInfo]) -> Dict[str, str]:
@@ -242,14 +264,16 @@ def _fetch_scripts(jobs: List[JobInfo]) -> Dict[str, str]:
     if not SHARE_SCRIPTS:
         return {}
     live = {j.jobid for j in jobs}
-    for jid in [j for j in _script_cache if j not in live]:
-        del _script_cache[jid]
-    for j in jobs:
-        if j.jobid in _script_cache or j.jobid in _script_inflight:
-            continue
-        _script_inflight.add(j.jobid)
-        _script_executor.submit(_fetch_one_script, j.jobid)
-    return dict(_script_cache)
+    with _script_lock:
+        for jid in [j for j in _script_cache if j not in live]:
+            del _script_cache[jid]
+        todo = [j.jobid for j in jobs
+                if j.jobid not in _script_cache and j.jobid not in _script_inflight]
+        _script_inflight.update(todo)
+        snapshot = dict(_script_cache)
+    for jid in todo:
+        _script_executor.submit(_fetch_one_script, jid)
+    return snapshot
 
 
 # ── Per-user GPU-hour accounting ──────────────────────────────────────────
@@ -460,35 +484,20 @@ def _update_poll_state(name: str, success: bool, node_is_cold: bool, slurm_state
         state["interval"] = _INTERVAL_HOT
 
 
+# asdict, not a hand-listed subset. The old hand-written version omitted
+# pid_mem and pid_jobid, so SSH-polled nodes reached reconcile_gpu_alloc with
+# no cgroup jobids at all — the exact-attribution step silently never ran for
+# them, and `sgpu doctor`'s gpu-job binding check skipped them too.
 def _gpu_to_dict(gpu: GpuInfo) -> dict:
-    return {
-        "index": gpu.index, "minor": gpu.minor, "uuid": gpu.uuid,
-        "pci_bus": gpu.pci_bus, "slot": gpu.slot, "serial": gpu.serial,
-        "name": gpu.name, "util": gpu.util,
-        "mem_used": gpu.mem_used, "mem_total": gpu.mem_total,
-        "temp": gpu.temp, "power": gpu.power, "power_cap": gpu.power_cap,
-        "ecc": gpu.ecc, "sm_clock": gpu.sm_clock, "mem_clock": gpu.mem_clock,
-        "pids": gpu.pids, "users": gpu.users,
-    }
+    return asdict(gpu)
 
 
 def _job_to_dict(job: JobInfo) -> dict:
-    return {
-        "jobid": job.jobid, "user": job.user, "partition": job.partition,
-        "jobname": job.jobname, "elapsed": job.elapsed, "node": job.node,
-        "gpu_count": job.gpu_count, "cpu_count": job.cpu_count,
-        "gres_raw": job.gres_raw,
-        "time_limit": job.time_limit, "mem": job.mem,
-    }
+    return asdict(job)
 
 
 def _pending_to_dict(pj: PendingJob) -> dict:
-    return {
-        "jobid": pj.jobid, "user": pj.user, "partition": pj.partition,
-        "jobname": pj.jobname, "time_limit": pj.time_limit,
-        "gpu_count": pj.gpu_count, "reason": pj.reason, "priority": pj.priority,
-        "start_time": pj.start_time,
-    }
+    return asdict(pj)
 
 
 _agent_build_cache: tuple = (0.0, "0")  # (checked monotonic ts, value)
@@ -510,6 +519,28 @@ def _expected_agent_build() -> str:
 
 
 _agent_payload_cache: Dict[str, tuple] = {}  # name -> (mtime, expected kind, payload or None)
+# Nodes whose payload was rejected for authorship; also reported by `sgpu doctor`
+_untrusted_payloads: Dict[str, int] = {}  # node -> writing uid
+_untrusted_warned: set = set()
+
+
+def _payload_author_trusted(name: str, uid: int) -> bool:
+    """Is `uid` allowed to speak for node `name`?
+
+    AGENT_DIR is mode 1777, so any user can create <node>.json. Shape
+    validation cannot tell a real agent from a forgery, and a forged payload
+    drives Slack alerts, the waste view, and GPU-hour accounting.
+    """
+    if uid in trusted_payload_uids(AGENT_DIR):
+        return True
+    _untrusted_payloads[name] = uid
+    if name not in _untrusted_warned:
+        _untrusted_warned.add(name)
+        print(f"[collector] ignoring {name}.json: written by uid {uid}, not a "
+              f"trusted agent account — falling back to SSH poll. Set "
+              f"SLURM_GPU_TUI_AGENT_TRUSTED_UIDS if this uid is legitimate.",
+              flush=True)
+    return False
 
 
 def _valid_agent_payload(name: str, payload: object, expected_kind: str | None = None) -> bool:
@@ -554,9 +585,12 @@ def _read_agent_payload(name: str, expected_kind: str = "gpu") -> dict | None:
     try:
         file_stat = p.lstat()
         if not stat.S_ISREG(file_stat.st_mode):
-            return None
+            return None  # symlink or fifo planted in the 1777 agent dir
         if not 0 < file_stat.st_size <= AGENT_PAYLOAD_MAX_BYTES:
             return None
+        if not _payload_author_trusted(name, file_stat.st_uid):
+            return None
+        _untrusted_payloads.pop(name, None)
         mtime = file_stat.st_mtime
         # mtime is stamped by the NFS server (= this host), so no clock skew
         if time.time() - mtime > AGENT_MAX_AGE:
@@ -765,7 +799,9 @@ def collect_all() -> dict:
              g.get("minor") or g.get("index", ""),
              list(dict.fromkeys((g.get("pid_jobid") or {}).values())))
             for g in gpus])
-        for g, (jid, _user) in zip(gpus, alloc_pairs):
+        # strict: reconcile_gpu_alloc returns exactly one pair per GPU, and a
+        # length mismatch would silently leave trailing cards unattributed
+        for g, (jid, _user) in zip(gpus, alloc_pairs, strict=True):
             g["alloc_jobid"] = jid
             g["alloc_user"] = _user
             if skeleton_mode:
@@ -814,6 +850,8 @@ def collect_all() -> dict:
         "jobs": [dict(_job_to_dict(j), script=scripts.get(j.jobid, "")) for j in jobs],
         "pending": [_pending_to_dict(p) for p in pending],
         "stale_nodes": stale_nodes,
+        # node -> uid of a rejected <node>.json, so `sgpu doctor` can name it
+        "untrusted_payloads": dict(_untrusted_payloads),
         "errors": basic_err,
     }
 
@@ -1176,9 +1214,8 @@ def _write_metrics(data: dict) -> None:
         host = _master_host_lines()
         if host:
             text += "\n".join(host) + "\n"
-        tmp = METRICS_FILE.with_suffix(".tmp")
-        tmp.write_text(text)
-        tmp.rename(METRICS_FILE)
+        # 0644: node_exporter's textfile collector usually runs as its own user
+        atomic_write(METRICS_FILE, text, mode=0o644)
     except Exception as e:
         print(f"[collector] metrics write error: {e}", flush=True)
 
@@ -1207,7 +1244,7 @@ def _rotate_log_if_big() -> None:
             sys.stdout.close()
         _log_path.rename(_log_path.with_name("collector.log.1"))
         if reopen:
-            sys.stdout = open(_log_path, "a")
+            sys.stdout = os.fdopen(open_append(_log_path), "a")
             sys.stderr = sys.stdout
     except Exception:
         pass
@@ -1215,12 +1252,19 @@ def _rotate_log_if_big() -> None:
 
 def run_collector():
     """Main loop: collect and write data file every REFRESH_SEC."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # The snapshot is published world-readable, but the directory holding it
+    # must not be writable by the audience: this process is usually root, and
+    # a user-owned data dir turns every write into a root-write primitive.
+    try:
+        ensure_secure_dir(DATA_DIR)
+    except UnsafeRuntimeDir as e:
+        print(f"[collector] {e}", flush=True)
+        sys.exit(1)
 
     # Single-instance guard: two collectors would race on data.json.
     # Retry briefly so a restart can overlap the old instance's shutdown.
     global _lock_fd
-    _lock_fd = open(LOCK_FILE, "w")
+    _lock_fd = os.fdopen(open_lock(LOCK_FILE), "r+")
     lock_deadline = time.time() + 10
     while True:
         try:
@@ -1232,8 +1276,12 @@ def run_collector():
                 sys.exit(1)
             time.sleep(0.5)
 
-    PID_FILE.write_text(str(os.getpid()))
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_write(PID_FILE, str(os.getpid()), mode=0o644)
+    try:
+        ensure_secure_dir(STATE_DIR)
+    except UnsafeRuntimeDir as e:
+        print(f"[collector] {e}", flush=True)
+        sys.exit(1)
     _load_idle_state()
     _load_inventory()
     _load_usage()
@@ -1261,9 +1309,9 @@ def run_collector():
             data = collect_all()
             elapsed = time.time() - t0
 
-            tmp = DATA_FILE.with_suffix(".tmp")
-            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-            tmp.rename(DATA_FILE)
+            # 0644: the whole point of the daemon is that every user's TUI
+            # reads this instead of running its own SSH sweep
+            atomic_write(DATA_FILE, json.dumps(data, ensure_ascii=False), mode=0o644)
             _save_idle_state()
             _maybe_backfill_sacct(time.time())
             _save_usage()
@@ -1300,7 +1348,11 @@ def daemonize():
     if os.fork() > 0:
         sys.exit(0)
     log = DATA_DIR / "collector.log"
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        ensure_secure_dir(DATA_DIR)
+    except UnsafeRuntimeDir as e:
+        print(f"[collector] {e}", file=sys.stderr, flush=True)
+        sys.exit(1)
     global _log_path
     _log_path = log
     _rotate_log_if_big()
@@ -1308,7 +1360,7 @@ def daemonize():
     # inherited ssh/terminal pipe open (a remote `sgpu-collector --daemon`
     # launch would hang) and C-level writes to fd 2 would miss the log
     null_fd = os.open(os.devnull, os.O_RDONLY)
-    log_fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+    log_fd = open_append(log)
     os.dup2(null_fd, 0)
     os.dup2(log_fd, 1)
     os.dup2(log_fd, 2)

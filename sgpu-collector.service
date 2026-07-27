@@ -4,8 +4,11 @@ After=network.target
 
 [Service]
 Type=simple
-User=REPLACED_BY_INSTALLER
-ExecStart=/home/jaemin/mgt/slurm-gpu-tui/.venv/bin/sgpu-collector
+# install.sh rewrites both placeholders (see sgpu-cpu-agent.service for the
+# same @NAME@ convention). Never commit a real path here — it leaks the
+# maintainer's checkout and reads as if the unit should point at it.
+User=@SGPU_USER@
+ExecStart=@SGPU_VENV@/bin/sgpu-collector
 # "always" (not on-failure): site cron sweeps like pkill -f python send
 # SIGTERM, the collector exits 0, and on-failure would leave it dead.
 Restart=always

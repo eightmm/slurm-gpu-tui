@@ -29,10 +29,12 @@ from .cells import (
     vram_cell,
 )
 from .common import (
-    GpuInfo, JobInfo, NodeInfo, NodeSSHResult, PendingJob,
+    JobInfo, NodeInfo, NodeSSHResult, PendingJob,
     apply_gpu_alloc, build_nodes, cleanup_ssh_pool, collect_basic,
-    collect_node_data_parallel, job_log_paths, run_cmd, tail_file,
+    collect_node_data_parallel, from_dict, job_log_paths, node_from_dict,
+    run_cmd, tail_file,
 )
+from .runtime import default_data_dir
 from .screens import (
     _JAMO_ACTIONS, ConfirmScreen, DetailScreen, HelpScreen, HistoryScreen,
     UserSelectScreen, WasteScreen,
@@ -42,7 +44,7 @@ from .usage import render_usage
 
 # ── Daemon data reader ────────────────────────────────────────────────────
 
-_DAEMON_DATA_FILE = Path(os.getenv("SLURM_GPU_TUI_DATA_DIR", "/tmp/slurm-gpu-tui")) / "data.json"
+_DAEMON_DATA_FILE = default_data_dir() / "data.json"
 _DAEMON_MAX_AGE = 30
 
 
@@ -63,76 +65,14 @@ def read_daemon_data(max_age: float = _DAEMON_MAX_AGE) -> Optional[Tuple[List[No
 
 
 def _parse_daemon_data(raw: dict) -> Tuple[List[NodeInfo], List[JobInfo], List[PendingJob], str]:
-    jobs: List[JobInfo] = []
-    for j in raw.get("jobs", []):
-        jobs.append(JobInfo(
-            jobid=j.get("jobid", ""), user=j.get("user", ""),
-            partition=j.get("partition", ""), jobname=j.get("jobname", ""),
-            elapsed=j.get("elapsed", ""), node=j.get("node", ""),
-            gpu_count=j.get("gpu_count", 0), gres_raw=j.get("gres_raw", ""),
-            time_limit=j.get("time_limit", ""), mem=j.get("mem", ""),
-            script=j.get("script", ""),
-        ))
-
-    pending: List[PendingJob] = []
-    for p in raw.get("pending", []):
-        pending.append(PendingJob(
-            jobid=p.get("jobid", ""), user=p.get("user", ""),
-            partition=p.get("partition", ""), jobname=p.get("jobname", ""),
-            time_limit=p.get("time_limit", ""), gpu_count=p.get("gpu_count", 0),
-            reason=p.get("reason", ""), priority=p.get("priority", ""),
-            start_time=p.get("start_time", ""),
-        ))
-
-    stale_nodes = set(raw.get("stale_nodes", []))
-
-    nodes: List[NodeInfo] = []
-    for n in raw.get("nodes", []):
-        gpus = [
-            GpuInfo(
-                index=g.get("index", ""), minor=g.get("minor", ""),
-                uuid=g.get("uuid", ""), pci_bus=g.get("pci_bus", ""),
-                slot=g.get("slot", ""),
-                serial=g.get("serial", ""), name=g.get("name", ""),
-                util=g.get("util", ""), mem_used=g.get("mem_used", ""),
-                mem_total=g.get("mem_total", ""), temp=g.get("temp", ""),
-                power=g.get("power", ""), power_cap=g.get("power_cap", ""),
-                ecc=g.get("ecc", ""),
-                pids=g.get("pids", []), users=g.get("users", []),
-                pid_mem=g.get("pid_mem", {}) or {},
-                pid_jobid=g.get("pid_jobid", {}) or {},
-                alloc_jobid=g.get("alloc_jobid", ""), alloc_user=g.get("alloc_user", ""),
-                idle_sec=g.get("idle_sec", 0), parked_sec=g.get("parked_sec", 0),
-            )
-            for g in n.get("gpus", [])
-        ]
-        node_jobs = [
-            JobInfo(
-                jobid=j.get("jobid", ""), user=j.get("user", ""),
-                partition=j.get("partition", ""), jobname=j.get("jobname", ""),
-                elapsed=j.get("elapsed", ""), node=j.get("node", ""),
-                gpu_count=j.get("gpu_count", 0), cpu_count=j.get("cpu_count", 0),
-                gres_raw=j.get("gres_raw", ""),
-                time_limit=j.get("time_limit", ""),
-            )
-            for j in n.get("jobs", [])
-        ]
-        nodes.append(NodeInfo(
-            name=n.get("name", ""), state=n.get("state", ""),
-            partition=n.get("partition", ""), source=n.get("source", ""),
-            has_gpu=n.get("has_gpu", True),
-            cpus=n.get("cpus", ""), cpu_alloc=n.get("cpu_alloc", ""),
-            cpu_load=n.get("cpu_load", ""), mem_total=n.get("mem_total", ""),
-            mem_free=n.get("mem_free", ""), mem_alloc=n.get("mem_alloc", ""),
-            gres=n.get("gres", ""),
-            gpus=gpus, jobs=node_jobs, error=n.get("error", ""),
-            mem_used=n.get("mem_used", ""), mem_avail=n.get("mem_avail", ""),
-            stale=n.get("name", "") in stale_nodes,
-            error_kind=n.get("error_kind", ""),
-        ))
-
-    daemon_errors = raw.get("errors", "")
-    return nodes, jobs, pending, daemon_errors
+    jobs = [from_dict(JobInfo, j) for j in raw.get("jobs") or []]
+    pending = [from_dict(PendingJob, p) for p in raw.get("pending") or []]
+    stale_nodes = set(raw.get("stale_nodes") or [])
+    nodes = [node_from_dict(n) for n in raw.get("nodes") or []]
+    for n in nodes:
+        # stale is published both per-node and as a roster; keep honouring both
+        n.stale = n.stale or n.name in stale_nodes
+    return nodes, jobs, pending, raw.get("errors", "")
 
 
 def _node_source_counts(nodes: List[NodeInfo]) -> Tuple[int, int, int, int, int]:

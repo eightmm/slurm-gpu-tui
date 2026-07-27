@@ -42,7 +42,11 @@ if command -v sinfo >/dev/null 2>&1; then
                  as_root rm -f /etc/systemd/system/sgpu-cpu-agent.service
              fi
              pkill -f "bin/[s]gpu-agent" 2>/dev/null || true
-             rm -f /tmp/sgpu-agent.lock /tmp/sgpu-agent.log*
+             # /run/* is where a root agent keeps them now; the /tmp names are
+             # the pre-hardening layout (and the uid-scoped unprivileged one)
+             as_root rm -f /run/sgpu-agent.lock /run/sgpu-agent.log* 2>/dev/null || true
+             rm -f /tmp/sgpu-agent.lock /tmp/sgpu-agent.log* \
+                   /tmp/sgpu-agent-*.lock /tmp/sgpu-agent-*.log*
              if [ -f /etc/systemd/system/sgpu-gpu-persistence.service ]; then
                  as_root systemctl disable --now sgpu-gpu-persistence.service >/dev/null 2>&1 || true
                  as_root rm -f /etc/systemd/system/sgpu-gpu-persistence.service
@@ -91,6 +95,11 @@ _rm_data_dir() {
 }
 _rm_data_dir "${SLURM_GPU_TUI_DATA_DIR:-/tmp/slurm-gpu-tui}" data.json collector.lock
 _rm_data_dir "${SLURM_GPU_TUI_STATE_DIR:-$HOME/.sgpu/state}" usage.json idle_state.json inventory.json
+# a root collector publishes state here instead of ~/.sgpu/state, which /root's
+# mode 0700 would hide from the very users the TUI is published for
+if [ -z "${SLURM_GPU_TUI_STATE_DIR:-}" ]; then
+    _rm_data_dir /var/lib/sgpu usage.json idle_state.json inventory.json
+fi
 rm -rf "$HOME/.sgpu/nodes"
 
 if [ -n "$INSTALL_DIR" ] && [ -e "$INSTALL_DIR/bin/sgpu" ]; then

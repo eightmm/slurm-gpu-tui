@@ -195,6 +195,12 @@ class Notifier:
         self._thread_ts: str = st.get("thread_ts", "")
         self._post_lock = threading.Lock()
         self._state_lock = threading.Lock()
+        # Debounce slots to release because delivery failed. The delivery
+        # thread cannot touch the state dicts itself: _save() serializes them,
+        # and mutating one mid-serialization raises RuntimeError and kills
+        # whichever thread was iterating. So all state mutation stays on the
+        # collect thread and this queue carries the request across.
+        self._rollbacks: "queue.Queue[tuple[str, float]]" = queue.Queue()
         # single consumer thread: preserves alert order (down before recovered)
         # and stops a hung Slack call from stacking one thread per alert
         self._queue: "queue.Queue[tuple[str, str, float, str]]" = queue.Queue(maxsize=200)
@@ -269,6 +275,7 @@ class Notifier:
         self._maybe_reload()
         if not self.enabled:
             return
+        self._apply_rollbacks()
         self._maybe_start_daily_parent()
         now = time.time()
         nodes = data.get("nodes", [])
@@ -538,11 +545,17 @@ class Notifier:
     def _ok_to_send(self, key: str, now: float, min_gap: float = DEBOUNCE_SEC) -> bool:
         """Debounce check. Marks the slot immediately so the next collect
         cycle doesn't enqueue a duplicate, but the consumer rolls the mark
-        back if delivery ultimately fails, so the alert can re-fire."""
-        if now - self._last_sent.get(key, 0) < min_gap:
-            return False
-        self._last_sent[key] = now
-        return True
+        back if delivery ultimately fails, so the alert can re-fire.
+
+        Under _state_lock: this runs on the collect thread while the delivery
+        thread's _save() iterates the same dict. Adding a key mid-iteration
+        raised RuntimeError inside _drain and killed the consumer.
+        """
+        with self._state_lock:
+            if now - self._last_sent.get(key, 0) < min_gap:
+                return False
+            self._last_sent[key] = now
+            return True
 
     def _post(self, text: str, key: str = "", channel: str = "") -> None:
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -559,14 +572,27 @@ class Notifier:
     def _drain(self) -> None:
         while True:
             body, key, enq_ts, channel = self._queue.get()
-            ok = self._deliver(body, channel)
-            if not ok and key:
-                # free the debounce slot so the condition re-alerts next cycle
-                with self._state_lock:
-                    if self._last_sent.get(key, 0) <= enq_ts:
-                        self._last_sent.pop(key, None)
-                self._save()
-            self._queue.task_done()
+            try:
+                if not self._deliver(body, channel) and key:
+                    # hand the debounce release to the collect thread, which
+                    # owns the state dicts; it re-alerts on the next cycle
+                    self._rollbacks.put((key, enq_ts))
+            except Exception as e:
+                # never let one bad alert kill the consumer: the queue would
+                # then silently stop draining until the next _post revives it
+                print(f"[notify] delivery error: {e!r}", flush=True)
+            finally:
+                self._queue.task_done()
+
+    def _apply_rollbacks(self) -> None:
+        """Release debounce slots whose delivery failed (collect thread)."""
+        while True:
+            try:
+                key, enq_ts = self._rollbacks.get_nowait()
+            except queue.Empty:
+                return
+            if self._last_sent.get(key, 0) <= enq_ts:
+                self._last_sent.pop(key, None)
 
     def _deliver(self, body: str, channel: str = "") -> bool:
         return self._post_bot(body, channel)
@@ -600,8 +626,10 @@ class Notifier:
             })
             ts = (resp or {}).get("ts", "")
             if ts:
+                # scalar assignment only — persisting happens on the collect
+                # thread's next _save(), because serializing the state dicts
+                # from here would race that thread's mutations
                 self._thread_day, self._thread_ts = today, ts
-                self._save()
             else:
                 self._parent_fail_ts = time.time()
             return ts

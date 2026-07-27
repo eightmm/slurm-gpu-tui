@@ -216,7 +216,8 @@ def _fmt_sacct_detail(raw: str) -> str:
     hdr = lines[0].split("|")
     blocks = []
     for line in lines[1:]:
-        pairs = [(h, v) for h, v in zip(hdr, line.split("|")) if v]
+        # not strict: sacct rows legitimately run short of the header
+        pairs = [(h, v) for h, v in zip(hdr, line.split("|"), strict=False) if v]
         if not pairs:
             continue
         w = max(len(h) for h, _ in pairs)

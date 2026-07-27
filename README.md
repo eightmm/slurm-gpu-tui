@@ -171,7 +171,8 @@ Config is `~/.sgpu/slack.json` (hot-reloaded); the installer sets it up and
 ```bash
 systemctl status|restart sgpu-collector          # root install
 systemctl --user status|restart sgpu-collector   # user install
-journalctl -u sgpu-collector -f                  # logs (or /tmp/sgpu-collector.log)
+journalctl -u sgpu-collector -f                  # logs (nohup: <DATA_DIR>/collector.log)
+ssh <node> cat /run/sgpu-agent.log               # node agent (root; else /tmp/sgpu-agent-<uid>.log)
 ```
 
 | Symptom | Check |
@@ -180,6 +181,8 @@ journalctl -u sgpu-collector -f                  # logs (or /tmp/sgpu-collector.
 | Slow startup every launch | collector not running |
 | Node `~timeout` / `~unreachable` | `ssh <node>` from master fails |
 | Node `~smi_err` / `~no_smi` | `ssh <node> nvidia-smi` |
+| Usage tab stale / empty | `sgpu doctor` → `usage history` names the file it read |
+| Node stuck on SSH despite an agent | `sgpu doctor` → `agent payload trust` |
 | Anything else | `sgpu doctor` |
 
 One-shot extras (root, run once per cluster):

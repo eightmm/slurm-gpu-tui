@@ -21,6 +21,7 @@ from pathlib import Path
 
 from . import __build__, __version__
 from .common import NODE_PAYLOAD_CMD, parse_node_payload
+from .runtime import agent_runtime_path, atomic_write, open_append, open_lock
 
 AGENT_DIR = Path(os.getenv("SLURM_GPU_TUI_AGENT_DIR", str(Path.home() / ".sgpu" / "nodes")))
 GPU_INTERVAL = int(os.getenv("SLURM_GPU_TUI_AGENT_SEC", "3"))
@@ -29,9 +30,11 @@ CPU_INTERVAL = int(os.getenv("SLURM_GPU_TUI_CPU_AGENT_SEC", "20"))
 # (driver re-init), and the payload runs three of them
 CMD_TIMEOUT = int(os.getenv("SLURM_GPU_TUI_AGENT_CMD_TIMEOUT_SEC", "40"))
 
-# Node-local (NOT on NFS): one agent per node, log stays on the node
-LOCK_FILE = Path("/tmp/sgpu-agent.lock")
-LOG_FILE = Path("/tmp/sgpu-agent.log")
+# Node-local (NOT on NFS): one agent per node, log stays on the node.
+# /run when root — a fixed /tmp name is a root-append/truncate target on a
+# compute node, where every user has a shell (see runtime.agent_runtime_path).
+LOCK_FILE = agent_runtime_path("lock")
+LOG_FILE = agent_runtime_path("log")
 LOG_MAX_BYTES = 2 * 1024 * 1024
 
 AGENT_PAYLOAD_VERSION = 8  # v8: GPU sm/mem clocks (v7: node power dict)
@@ -204,7 +207,7 @@ def _rotate_log() -> None:
     try:
         if LOG_FILE.exists() and LOG_FILE.stat().st_size > LOG_MAX_BYTES:
             LOG_FILE.rename(LOG_FILE.with_suffix(".log.1"))
-            fd = os.open(LOG_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+            fd = open_append(LOG_FILE)
             os.dup2(fd, 1)
             os.dup2(fd, 2)
             os.close(fd)
@@ -218,7 +221,7 @@ def run_agent(mode: str = "gpu") -> None:
     interval = CPU_INTERVAL if mode == "cpu" else GPU_INTERVAL
 
     # Single instance per node; retry briefly so restarts can overlap shutdown
-    lock = open(LOCK_FILE, "w")
+    lock = os.fdopen(open_lock(LOCK_FILE), "r+")
     deadline = time.time() + 5
     while True:
         try:
@@ -252,13 +255,22 @@ def run_agent(mode: str = "gpu") -> None:
             took = time.time() - t0
             if took > interval * 3:
                 print(f"[agent] slow collect: {took:.1f}s")
-            # tmp file on the same NFS dir so rename stays atomic
-            tmp = out_path.with_name(f".{host}.json.tmp")
-            tmp.write_text(json.dumps(payload, ensure_ascii=False))
-            tmp.rename(out_path)
+            # tmp file on the same NFS dir so the rename stays atomic; 0644
+            # because the collector reads it as a different account
+            atomic_write(out_path, json.dumps(payload, ensure_ascii=False), mode=0o644)
             if consecutive_failures:
                 print(f"[agent] recovered after {consecutive_failures} failures")
             consecutive_failures = 0
+        except PermissionError as e:
+            # AGENT_DIR is mode 1777 (root_squash support). Sticky means we
+            # cannot replace a file somebody else created, so a user who
+            # pre-plants <host>.json permanently blocks push mode for this
+            # node. Name it — otherwise the only symptom is a silent, and
+            # much slower, fallback to SSH polling on the collector.
+            consecutive_failures += 1
+            print(f"[agent] cannot publish {out_path} ({e.strerror or e}) — "
+                  f"another account owns it or the tmp name; push mode is "
+                  f"blocked for this node until it is removed")
         except Exception as e:
             # No write on failure: the file goes stale and the collector
             # falls back to SSH / marks the node stale.
@@ -281,7 +293,7 @@ def daemonize(mode: str = "gpu") -> None:
     # dup2 over the real fds — merely rebinding sys.stdout would leave the
     # inherited ssh pipe open and the launching ssh session hanging
     null_fd = os.open(os.devnull, os.O_RDONLY)
-    log_fd = os.open(LOG_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+    log_fd = open_append(LOG_FILE)
     os.dup2(null_fd, 0)
     os.dup2(log_fd, 1)
     os.dup2(log_fd, 2)

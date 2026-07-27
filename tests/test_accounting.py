@@ -1,6 +1,5 @@
 """Collector accounting (_track_waste, _accumulate_usage, sacct backfill)
 and notify state-machine tests. All pure-logic with fake clocks/outputs."""
-import json
 import time
 from datetime import datetime, timedelta
 

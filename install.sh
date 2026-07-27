@@ -79,10 +79,11 @@ cat > "$INSTALL_DIR/bin/sgpu-collector" << EOF
 exec "$VENV_DIR/bin/sgpu-collector" "\$@"
 EOF
 
-# chkgpu: bundled one-shot user x node GPU/CPU matrix (stdlib only)
+# chkgpu: bundled one-shot user x node GPU/CPU matrix (stdlib only).
+# A console script from the package now, same as sgpu — no loose file to point at.
 cat > "$INSTALL_DIR/bin/chkgpu" << EOF
 #!/bin/bash
-exec "$VENV_DIR/bin/python" "$INSTALL_DIR/chkgpu" "\$@"
+exec "$VENV_DIR/bin/chkgpu" "\$@"
 EOF
 
 chmod +x "$INSTALL_DIR/bin/sgpu" "$INSTALL_DIR/bin/sgpu-collector" "$INSTALL_DIR/bin/chkgpu"
@@ -252,8 +253,13 @@ fi
 
 SERVICE_FILE="$INSTALL_DIR/sgpu-collector.service"
 GENERATED_SERVICE="$(mktemp)"
-sed -e "s|ExecStart=.*|ExecStart=$VENV_DIR/bin/sgpu-collector|" \
-    -e "s|User=.*|User=$(id -un)|" "$SERVICE_FILE" > "$GENERATED_SERVICE"
+sed -e "s|@SGPU_VENV@|$VENV_DIR|g" \
+    -e "s|@SGPU_USER@|$(id -un)|g" "$SERVICE_FILE" > "$GENERATED_SERVICE"
+if grep -q '@SGPU_[A-Z]*@' "$GENERATED_SERVICE"; then
+    echo "ERROR: unresolved placeholder in generated unit:" >&2
+    grep -n '@SGPU_[A-Z]*@' "$GENERATED_SERVICE" >&2
+    exit 1
+fi
 if [ -n "$SHARE" ] && [ "$SHARE" != "0" ]; then
     sed -i "/^User=/a Environment=SLURM_GPU_TUI_SHARE_SCRIPTS=1" "$GENERATED_SERVICE"
 fi

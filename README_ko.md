@@ -168,7 +168,8 @@ chkgpu               # 원샷 유저×노드 매트릭스 + next-free 예상시�
 ```bash
 systemctl status|restart sgpu-collector          # root 설치
 systemctl --user status|restart sgpu-collector   # 유저 설치
-journalctl -u sgpu-collector -f                  # 로그 (또는 /tmp/sgpu-collector.log)
+journalctl -u sgpu-collector -f                  # 로그 (nohup: <DATA_DIR>/collector.log)
+ssh <node> cat /run/sgpu-agent.log               # 노드 에이전트 (root; 그 외 /tmp/sgpu-agent-<uid>.log)
 ```
 
 | 증상 | 확인 |
@@ -177,6 +178,8 @@ journalctl -u sgpu-collector -f                  # 로그 (또는 /tmp/sgpu-coll
 | 매번 느린 시작 | collector 미실행 |
 | 노드 `~timeout` / `~unreachable` | 마스터→노드 SSH 실패 |
 | 노드 `~smi_err` / `~no_smi` | `ssh <node> nvidia-smi` |
+| Usage 탭이 낡거나 비어 있음 | `sgpu doctor` → `usage history`가 읽은 파일 표시 |
+| 에이전트가 있는데 SSH로만 수집 | `sgpu doctor` → `agent payload trust` |
 | 그 외 | `sgpu doctor` |
 
 원샷 부가 설정 (root, 클러스터당 1회):

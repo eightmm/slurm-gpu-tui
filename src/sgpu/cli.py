@@ -1,6 +1,7 @@
-"""One-shot CLI subcommands (--json/--once/--waste/--usage/... and doctor)."""
+"""One-shot CLI subcommands (json/once/waste/usage/... and doctor)."""
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -18,23 +19,38 @@ from .cells import (
     fmt_span, fmt_start_time, mb_to_gb,
 )
 from .common import (
-    GpuInfo, JobInfo, NodeInfo, apply_gpu_alloc, build_nodes, cleanup_ssh_pool,
-    collect_basic, collect_node_data_parallel, job_log_paths, run_cmd,
-    ssh_cmd, tail_file,
+    GpuInfo, NodeInfo, apply_gpu_alloc, build_nodes, cleanup_ssh_pool,
+    collect_basic, collect_node_data_parallel, job_log_paths, node_from_dict,
+    run_cmd, ssh_cmd, tail_file,
 )
+from .runtime import state_dir_candidates
 from .tui import _DAEMON_DATA_FILE, _DAEMON_MAX_AGE, SlurmGpuTui
-from .usage import _read_usage_raw, load_usage_daily, load_usage_totals
+from .usage import (
+    _read_usage_raw, load_usage_daily, load_usage_totals, merge_usage_window,
+)
 
 # ── One-shot CLI mode ─────────────────────────────────────────────────────
 
-def _oneshot_snapshot() -> dict:
-    """Fresh snapshot dict: daemon file if recent, else direct collection."""
+def _daemon_snapshot_fresh() -> bool:
+    """Is a collector publishing a recent snapshot we can just read?"""
     try:
-        age = time.time() - _DAEMON_DATA_FILE.stat().st_mtime
-        if age <= _DAEMON_MAX_AGE:
+        return (time.time() - _DAEMON_DATA_FILE.stat().st_mtime) <= _DAEMON_MAX_AGE
+    except OSError:
+        return False
+
+
+def _oneshot_snapshot() -> dict:
+    """Fresh snapshot dict: daemon file if recent, else direct collection.
+
+    The fallback is a parallel SSH sweep of every node — seconds of work and
+    real load on the cluster. Callers that need the snapshot more than once
+    must reuse the result rather than calling again.
+    """
+    if _daemon_snapshot_fresh():
+        try:
             return json.loads(_DAEMON_DATA_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        pass
+        except (OSError, ValueError):
+            pass
     nodes_raw, jobs, pending, node_jobs, gpu_alloc, alloc_user_map, err = collect_basic()
     node_names = [n["name"] for n in nodes_raw]
     ssh_results, stale_nodes, ssh_errors = collect_node_data_parallel(node_names)
@@ -49,6 +65,9 @@ def _oneshot_snapshot() -> dict:
         "jobs": [asdict(j) for j in jobs],
         "pending": [asdict(p) for p in pending],
         "stale_nodes": stale_nodes,
+        # no push agents on this path, but keep the key so consumers see one
+        # schema whether or not a collector was running
+        "untrusted_payloads": {},
         "errors": " | ".join(x for x in [err] + ssh_errors if x),
     }
 
@@ -81,32 +100,15 @@ def _print_once(data: dict) -> None:
                   f"{p.get('partition', '')}  {p.get('reason', '')}{start}")
 
 
-def _snapshot_nodes() -> List[NodeInfo]:
-    """Snapshot as NodeInfo list (daemon file or direct collection)."""
-    data = _oneshot_snapshot()
-    nodes: List[NodeInfo] = []
-    for n in data.get("nodes", []):
-        gpus = [
-            GpuInfo(**{k: g.get(k, d) for k, d in (
-                ("index", ""), ("minor", ""), ("uuid", ""), ("pci_bus", ""),
-                ("slot", ""), ("serial", ""),
-                ("name", ""), ("util", ""), ("mem_used", ""),
-                ("mem_total", ""), ("temp", ""), ("power", ""), ("power_cap", ""), ("ecc", ""),
-                ("pids", []), ("users", []), ("pid_mem", {}), ("pid_jobid", {}),
-                ("alloc_jobid", ""), ("alloc_user", ""), ("idle_sec", 0), ("parked_sec", 0),
-            )})
-            for g in n.get("gpus", [])
-        ]
-        node_jobs = [
-            JobInfo(jobid=j.get("jobid", ""), user=j.get("user", ""),
-                    gpu_count=j.get("gpu_count", 0))
-            for j in n.get("jobs", [])
-        ]
-        nodes.append(NodeInfo(
-            name=n.get("name", ""), state=n.get("state", ""),
-            partition=n.get("partition", ""), gpus=gpus, jobs=node_jobs,
-        ))
-    return nodes
+def _snapshot_nodes(data: Optional[dict] = None) -> List[NodeInfo]:
+    """Snapshot as NodeInfo list (daemon file or direct collection).
+
+    Pass an already-fetched `data` to avoid a second collection: on a cluster
+    with no running collector each call is a full parallel SSH sweep.
+    """
+    if data is None:
+        data = _oneshot_snapshot()
+    return [node_from_dict(n) for n in data.get("nodes") or []]
 
 
 def _cli_waste(verbose: bool = False) -> int:
@@ -181,8 +183,10 @@ def _cli_me() -> int:
         start = fmt_start_time(p.get("start_time", ""))
         print(f"  {p['jobid']}  {p.get('jobname', '')[:24]:<24} PENDING "
               f"({p.get('reason', '')})" + (f"  est.start {start}" if start else ""))
-    # my waste: GPUs I hold that do nothing (idle) or merely park VRAM
-    mine_waste = [r for r in collect_waste(_snapshot_nodes(), WASTE_MIN_SEC)
+    # my waste: GPUs I hold that do nothing (idle) or merely park VRAM.
+    # Reuses the snapshot above — taking a second one meant two full SSH
+    # sweeps of the cluster for one `sgpu me` when no collector is running.
+    mine_waste = [r for r in collect_waste(_snapshot_nodes(data), WASTE_MIN_SEC)
                   if r["user"] == me or me in r["user"].split(",")]
     if mine_waste:
         print("\nwasting:")
@@ -315,27 +319,7 @@ def _cli_report(month: str) -> int:
     print(f"# GPU usage report — {month}\n")
 
     raw = _read_usage_raw() or {}
-    sampled = raw.get("days", {})
-    sacct_days = raw.get("sacct_days", {}) if isinstance(raw.get("sacct_days"), dict) else {}
-    in_month = lambda d: start_day <= d <= end_day
-    users: Dict[str, List[float]] = {}  # alloc, busy, sampled_alloc, waste
-    daily: Dict[str, List[float]] = {}  # alloc, busy
-    for day in set(sampled) | set(sacct_days):
-        if not in_month(day):
-            continue
-        s_users = sampled.get(day, {})
-        a_users = sacct_days.get(day, {})
-        for user in set(s_users) | set(a_users):
-            su = s_users.get(user, {})
-            alloc = max(su.get("alloc", 0), a_users.get(user, 0.0))
-            t = users.setdefault(user, [0.0, 0.0, 0.0, 0.0])
-            t[0] += alloc
-            t[1] += su.get("busy", 0)
-            t[2] += su.get("alloc", 0)
-            t[3] += su.get("waste", 0)
-            d = daily.setdefault(day, [0.0, 0.0])
-            d[0] += alloc
-            d[1] += su.get("busy", 0)
+    users, daily = merge_usage_window(raw, lambda d: start_day <= d <= end_day)
 
     print("## Per-user GPU-hours\n")
     print("| user | alloc | busy | eff* | waste |")
@@ -374,8 +358,16 @@ def _cli_report(month: str) -> int:
     return 0
 
 
+# Floor for the no-collector path: each poll there is a full parallel SSH
+# sweep of every node, so honouring a 10s interval would hammer the cluster
+# for as long as the user leaves the command running.
+_WAIT_FREE_MIN_SWEEP_SEC = 60
+
+
 def _cli_wait_free(want: int, partition: str, interval: int) -> int:
+    warned = False
     while True:
+        by_daemon = _daemon_snapshot_fresh()
         free = 0
         for n in _snapshot_nodes():
             if partition and partition not in n.partition.split(","):
@@ -384,7 +376,14 @@ def _cli_wait_free(want: int, partition: str, interval: int) -> int:
         if free >= want:
             print(f"{free} free GPU(s) available" + (f" in {partition}" if partition else ""))
             return 0
-        time.sleep(interval)
+        delay = interval
+        if not by_daemon:
+            delay = max(interval, _WAIT_FREE_MIN_SWEEP_SEC)
+            if not warned:
+                warned = True
+                print(f"(no collector running — polling by direct SSH sweep "
+                      f"every {delay}s instead of {interval}s)", file=sys.stderr)
+        time.sleep(delay)
 
 
 def _cli_logs(jobid: str, follow: bool = False, want_err: bool = False) -> int:
@@ -501,6 +500,20 @@ def _cli_doctor() -> int:
                    f"cli={__version__} collector=unknown — restart/deploy collector")
     except (OSError, ValueError):
         report(False, "collector data", f"{_DAEMON_DATA_FILE} missing — collector not running (TUI falls back to slow SSH)")
+
+    # Forged push payloads. AGENT_DIR is mode 1777, so anyone can drop a
+    # <node>.json; the collector rejects ones written by an untrusted uid and
+    # records them here. A hit means either an attempt to spoof telemetry or a
+    # site whose agents run under an account we don't know about.
+    untrusted = raw.get("untrusted_payloads") or {}
+    if untrusted:
+        who = ", ".join(f"{n} (uid {u})" for n, u in sorted(untrusted.items())[:6])
+        report(False, "agent payload trust",
+               f"{len(untrusted)} node payload(s) rejected: {who} — those nodes "
+               "fall back to SSH. Set SLURM_GPU_TUI_AGENT_TRUSTED_UIDS if the "
+               "uid is a legitimate agent account.")
+    elif raw:
+        report(True, "agent payload trust", "no forged/untrusted node payloads")
 
     # GPU→job attribution sanity: a process's cgroup names its own job. If a
     # card runs job X's process but the snapshot binds job Y (or nothing),
@@ -623,21 +636,34 @@ def _cli_doctor() -> int:
         report(True if not persistence_bad and not inactive_units else None,
                "GPU persistence", detail)
 
-    # persistent state — fall back to the collector user's home when ours
-    # has no state (doctor as root, collector as a regular user)
-    state_dir = Path(os.getenv("SLURM_GPU_TUI_STATE_DIR", str(Path.home() / ".sgpu" / "state")))
-    try:
-        if (not (state_dir / "usage.json").exists()
-                and not os.getenv("SLURM_GPU_TUI_STATE_DIR") and collector_home
-                and (collector_home / ".sgpu" / "state" / "usage.json").exists()):
-            state_dir = collector_home / ".sgpu" / "state"
-    except OSError:
-        pass  # collector home unreadable (doctor as regular user, collector root)
-    usage = state_dir / "usage.json"
-    if usage.exists():
-        report(True, "usage history", f"{usage} age {(time.time() - usage.stat().st_mtime):.0f}s")
+    # Persistent state. Doctor may run as a different account than the
+    # collector, so search the same published locations the TUI does, plus the
+    # collector user's home for pre-/var/lib installs. Newest wins — an old
+    # copy left behind by a previous layout is exactly the trap here.
+    candidates = list(state_dir_candidates())
+    if collector_home:
+        candidates.append(collector_home / ".sgpu" / "state")
+    state_dir = candidates[0]
+    usage = None
+    for cand in candidates:
+        p = cand / "usage.json"
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            continue
+        if usage is None or mtime > usage[1]:
+            usage, state_dir = (p, mtime), cand
+    if usage is not None:
+        age = time.time() - usage[1]
+        stale = age > 6 * 3600
+        report(None if stale else True, "usage history",
+               f"{usage[0]} age {age:.0f}s"
+               + (" — stale, is the collector writing somewhere else?" if stale else ""))
+        usage = usage[0]
     else:
-        report(None, "usage history", "not started yet (collector writes it)")
+        searched = ", ".join(str(c) for c in candidates)
+        report(None, "usage history", f"not started yet (looked in {searched})")
+        usage = state_dir / "usage.json"
 
     # slurmdbd backfill (alloc GPU-hours survive collector downtime).
     # Absolute -S time: Slurm < 20.11 rejects relative forms like "now-1hour".
@@ -758,14 +784,6 @@ def _cli_doctor() -> int:
     return 0 if problems == 0 else 1
 
 
-def _arg_value(argv: List[str], flag: str, default: str) -> str:
-    if flag in argv:
-        i = argv.index(flag)
-        if i + 1 < len(argv):
-            return argv[i + 1]
-    return default
-
-
 def _unit_env_enabled(unit_text: str, name: str) -> bool:
     return any(
         line.strip() == f"Environment={name}=1"
@@ -807,79 +825,117 @@ def _parse_persistence_status(out: str) -> Tuple[List[str], str]:
     return modes, fields.get("unit", "")
 
 
+# Every subcommand also answers to a --flag spelling, because that is how the
+# READMEs, docs, and people's cron jobs have always invoked it.
+_LEGACY_FLAGS = {
+    "--version": "version", "--json": "json", "--once": "once",
+    "--doctor": "doctor", "--waste": "waste", "--usage": "usage",
+    "--report": "report", "--jobs": "jobs", "--fit": "fit", "--me": "me",
+    "--logs": "logs", "--wait-free": "wait-free",
+}
+
+
+def _normalize_argv(argv: List[str]) -> List[str]:
+    """Rewrite legacy `--verb` spellings to subcommands, verb first.
+
+    The old parser scanned argv for flags in a fixed source order, so
+    `sgpu --partition gpu --wait-free 2` worked and `sgpu --waste --json`
+    silently ran whichever check came first in the code. Hoisting the verb
+    keeps the first form working under a real parser, and the second now
+    fails loudly instead of guessing.
+    """
+    out = [_LEGACY_FLAGS.get(a, a) for a in argv]
+    verbs = [i for i, a in enumerate(out) if a in _LEGACY_FLAGS.values()]
+    if verbs and verbs[0] != 0:
+        i = verbs[0]
+        out.insert(0, out.pop(i))
+    return out
+
+
+def _build_parser() -> "argparse.ArgumentParser":
+    p = argparse.ArgumentParser(
+        prog="sgpu", description="SLURM GPU operations monitor. No arguments: interactive TUI.",
+        epilog="every subcommand also accepts its legacy --flag spelling "
+               "(sgpu --waste == sgpu waste)",
+    )
+    sub = p.add_subparsers(dest="cmd")
+
+    def add(name, help_):
+        return sub.add_parser(name, help=help_)
+
+    add("version", "print installed release and exit")
+    add("json", "print snapshot as JSON and exit")
+    add("once", "print snapshot as plain text and exit")
+    add("doctor", "self-diagnosis: data freshness, agents, slurm, sharing")
+    add("me", "my jobs, my wasted GPUs, my week (exit 1 if wasting)")
+
+    s = add("waste", "list idle/parked/rogue GPUs; exit 1 if any (cron-friendly)")
+    s.add_argument("-v", "--verbose", action="store_true",
+                   help="add JobName/Command/WorkDir per offender")
+
+    s = add("usage", "per-user GPU-hours over the last N days")
+    s.add_argument("days", nargs="?", type=int, default=7)
+    s.add_argument("--daily", action="store_true", help="add a per-day cluster trend")
+
+    s = add("jobs", "job history from slurmdbd: outcomes, queue waits")
+    s.add_argument("days", nargs="?", type=int, default=7)
+    s.add_argument("--user", default="", help="filter to one user")
+
+    s = add("report", "markdown monthly report")
+    s.add_argument("month", nargs="?", default=datetime.now().strftime("%Y-%m"),
+                   help="YYYY-MM (default: current month)")
+
+    s = add("wait-free", "block until N GPUs are free")
+    s.add_argument("count", nargs="?", type=int, default=1)
+    s.add_argument("--partition", default="")
+    s.add_argument("--interval", type=int, default=10, help="seconds between polls")
+
+    s = add("fit", "nodes that fit N free GPUs now, plus an sbatch line")
+    s.add_argument("count", nargs="?", type=int, default=1)
+    s.add_argument("--vram", type=float, default=0, help="minimum VRAM per GPU, in GB")
+    s.add_argument("--partition", default="")
+
+    s = add("logs", "tail a job's stdout (last 64KB)")
+    s.add_argument("jobid")
+    s.add_argument("-f", "--follow", action="store_true", help="follow like tail -f")
+    s.add_argument("-e", "--err", action="store_true", help="stderr instead of stdout")
+    return p
+
+
 def main():
     argv = sys.argv[1:]
+    if not argv:
+        SlurmGpuTui().run()
+        return
+    args = _build_parser().parse_args(_normalize_argv(argv))
+    if args.cmd is None:  # e.g. bare `sgpu --help` already exited above
+        SlurmGpuTui().run()
+        return
     try:
-        if "--version" in argv or (argv and argv[0] == "version"):
+        if args.cmd == "version":
             print(f"sgpu {__version__} (build {__build__})")
             return
-        if "--json" in argv or "--once" in argv:
+        if args.cmd in ("json", "once"):
             data = _oneshot_snapshot()
-            if "--json" in argv:
+            if args.cmd == "json":
                 print(json.dumps(data, ensure_ascii=False, indent=2))
             else:
                 _print_once(data)
             return
-        if "--doctor" in argv or "doctor" in argv:
-            sys.exit(_cli_doctor())
-        if "--waste" in argv:
-            sys.exit(_cli_waste(verbose="-v" in argv or "--verbose" in argv))
-        if "--usage" in argv:
-            v = _arg_value(argv, "--usage", "7")
-            sys.exit(_cli_usage(int(v) if v.isdigit() else 7, daily="--daily" in argv))
-        if "--report" in argv:
-            sys.exit(_cli_report(_arg_value(argv, "--report", datetime.now().strftime("%Y-%m"))))
-        if "--jobs" in argv:
-            v = _arg_value(argv, "--jobs", "7")
-            sys.exit(_cli_jobs(int(v) if v.isdigit() else 7,
-                               user=_arg_value(argv, "--user", "")))
-        if "--fit" in argv or "fit" in argv[:1]:
-            flag = "--fit" if "--fit" in argv else "fit"
-            v = _arg_value(argv, flag, "1")
-            vram = _arg_value(argv, "--vram", "0")
-            sys.exit(_cli_fit(int(v) if v.isdigit() else 1,
-                              vram_gb=float(vram) if vram.replace(".", "").isdigit() else 0,
-                              partition=_arg_value(argv, "--partition", "")))
-        if "--me" in argv or "me" in argv[:1]:
-            sys.exit(_cli_me())
-        if argv[:1] == ["logs"] or "--logs" in argv:
-            jid = (_arg_value(argv, "--logs", "") if "--logs" in argv
-                   else (argv[1] if len(argv) > 1 and not argv[1].startswith("-") else ""))
-            if not jid:
-                print("usage: sgpu logs JOBID [-f] [-e]", file=sys.stderr)
-                sys.exit(2)
-            sys.exit(_cli_logs(jid, follow="-f" in argv or "--follow" in argv,
-                               want_err="-e" in argv or "--err" in argv))
-        if "--wait-free" in argv:
-            want = int(_arg_value(argv, "--wait-free", "1"))
-            part = _arg_value(argv, "--partition", "")
-            interval = int(_arg_value(argv, "--interval", "10"))
-            sys.exit(_cli_wait_free(want, part, interval))
-        if argv and argv[0] in ("-h", "--help"):
-            print("usage: sgpu [--version | --json | --once | --waste [-v] | --usage [days] [--daily] |\n"
-                  "             --jobs [days] [--user U] | --report [YYYY-MM] | --wait-free N |\n"
-                  "             fit N [--vram G] [--partition P] | logs JOBID [-f] [-e] | me | doctor]\n"
-                  "  (no args)      interactive TUI\n"
-                  "  --version      print installed release and exit\n"
-                  "  --json         print snapshot as JSON and exit\n"
-                  "  --once         print snapshot as plain text and exit\n"
-                  "  --waste [-v]   list idle/parked/rogue GPUs; exit 1 if any (cron-friendly)\n"
-                  "                 -v adds JobName/Command/WorkDir per offender\n"
-                  "  --usage [N]    per-user GPU-hours over last N days (default 7)\n"
-                  "                 --daily adds a per-day cluster trend\n"
-                  "  --jobs [N]     job history from slurmdbd: outcomes, queue waits\n"
-                  "                 [--user U] filters to one user\n"
-                  "  --report [M]   markdown monthly report (default: current month)\n"
-                  "  --wait-free N  block until N GPUs are free\n"
-                  "                 [--partition P] [--interval sec]\n"
-                  "  fit N          nodes that fit N free GPUs now + sbatch line\n"
-                  "                 [--vram G] minimum VRAM per GPU, [--partition P]\n"
-                  "  logs JOBID     tail a job's stdout (last 64KB)\n"
-                  "                 -f follow like tail -f, -e stderr instead\n"
-                  "  me             my jobs, my wasted GPUs, my week (exit 1 if wasting)\n"
-                  "  doctor         self-diagnosis: data freshness, agents, slurm, sharing")
-            return
+        code = {
+            "doctor": lambda: _cli_doctor(),
+            "me": lambda: _cli_me(),
+            "waste": lambda: _cli_waste(verbose=args.verbose),
+            "usage": lambda: _cli_usage(args.days, daily=args.daily),
+            "jobs": lambda: _cli_jobs(args.days, user=args.user),
+            "report": lambda: _cli_report(args.month),
+            "fit": lambda: _cli_fit(args.count, vram_gb=args.vram,
+                                    partition=args.partition),
+            "logs": lambda: _cli_logs(args.jobid, follow=args.follow,
+                                      want_err=args.err),
+            "wait-free": lambda: _cli_wait_free(args.count, args.partition,
+                                                args.interval),
+        }[args.cmd]()
+        sys.exit(code)
     finally:
-        if argv:
-            cleanup_ssh_pool()
-    SlurmGpuTui().run()
+        cleanup_ssh_pool()

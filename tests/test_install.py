@@ -21,6 +21,37 @@ def test_cpu_agent_unit_renders_without_placeholder_collisions():
     assert "StartLimitBurst=6" in rendered
 
 
+def test_collector_unit_ships_placeholders_not_a_real_path():
+    # A committed absolute ExecStart leaked the maintainer's checkout into the
+    # public repo and read as if the unit should point at a dev tree.
+    unit = (ROOT / "sgpu-collector.service").read_text()
+
+    assert "ExecStart=@SGPU_VENV@/bin/sgpu-collector" in unit
+    assert "User=@SGPU_USER@" in unit
+    assert "/home/" not in unit
+    assert "Restart=always" in unit
+
+
+def test_collector_unit_renders_without_leftover_placeholders():
+    rendered = (
+        (ROOT / "sgpu-collector.service").read_text()
+        .replace("@SGPU_VENV@", "/shared/sgpu/.venv")
+        .replace("@SGPU_USER@", "root")
+    )
+
+    assert "@SGPU" not in rendered
+    assert "ExecStart=/shared/sgpu/.venv/bin/sgpu-collector" in rendered
+
+
+def test_installer_substitutes_the_collector_unit_placeholders():
+    installer = (ROOT / "install.sh").read_text()
+
+    assert 's|@SGPU_VENV@|$VENV_DIR|g' in installer
+    assert 's|@SGPU_USER@|$(id -un)|g' in installer
+    # and refuses to install a half-rendered unit
+    assert "unresolved placeholder in generated unit" in installer
+
+
 def test_installer_has_cpu_push_opt_out():
     installer = (ROOT / "install.sh").read_text()
 

@@ -11,8 +11,9 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field, replace
+from dataclasses import MISSING, dataclass, field, fields, replace
 from enum import Enum
+from itertools import product
 from typing import Dict, List, Tuple
 
 
@@ -251,6 +252,9 @@ class NodeInfo:
     mem_total: str = ""
     mem_free: str = ""
     mem_alloc: str = ""  # slurm AllocMem (MB) — works without node access
+    cpu_power: str = ""  # W, CPU package via RAPL (agent payload only)
+    ram_power: str = ""  # W, DRAM via RAPL (Intel only)
+    sys_power: str = ""  # W, whole-node wall power from the BMC
     gres: str = ""
     gpus: List[GpuInfo] = field(default_factory=list)
     jobs: List[JobInfo] = field(default_factory=list)
@@ -267,6 +271,49 @@ class NodeSSHResult:
     mem: NodeMemInfo = field(default_factory=NodeMemInfo)
     error: str = ""
     error_kind: NodeErrorKind = NodeErrorKind.OK
+
+
+# ── data.json codec ───────────────────────────────────────────────────────
+# One decoder for the snapshot, shared by the TUI and the CLI. Hand-written
+# per-reader parsers drifted: both silently dropped fields the collector had
+# been publishing for releases (GPU clocks), and the two `sgpu --json` code
+# paths emitted different shapes for the same command.
+
+def from_dict(cls, raw: object):
+    """Rebuild a flat dataclass from its JSON form, defensively.
+
+    Unknown keys are ignored — a newer collector may publish fields this
+    reader has never heard of. Missing keys keep the dataclass default — an
+    older collector may not publish them yet. A value whose JSON type does not
+    match the field's default is dropped rather than propagated, so one
+    malformed entry degrades a single field instead of killing the refresh.
+    """
+    if not isinstance(raw, dict):
+        return cls()
+    kwargs = {}
+    for f in fields(cls):
+        if f.name not in raw:
+            continue
+        value = raw[f.name]
+        if f.default is not MISSING:
+            default = f.default
+        elif f.default_factory is not MISSING:  # type: ignore[misc]
+            default = f.default_factory()       # type: ignore[misc]
+        else:
+            default = None
+        if default is not None and not isinstance(value, type(default)):
+            continue
+        kwargs[f.name] = value
+    return cls(**kwargs)
+
+
+def node_from_dict(raw: object) -> "NodeInfo":
+    """NodeInfo plus its nested GPU and job lists."""
+    node = from_dict(NodeInfo, raw)
+    if isinstance(raw, dict):
+        node.gpus = [from_dict(GpuInfo, g) for g in raw.get("gpus") or []]
+        node.jobs = [from_dict(JobInfo, j) for j in raw.get("jobs") or []]
+    return node
 
 
 # ── GPU name shortening ──────────────────────────────────────────────────
@@ -394,24 +441,71 @@ def collect_nodes_basic() -> Tuple[List[dict], str]:
     return rows, ""
 
 
-def expand_nodelist(expr: str) -> List[str]:
-    """Expand a SLURM nodelist like 'gpu[1-3,5],node7' into hostnames."""
-    hosts: List[str] = []
-    for part in re.findall(r"[^,\[\]]+(?:\[[^\]]*\])?", expr):
-        m = re.match(r"^(.*?)\[([^\]]+)\]$", part)
-        if not m:
-            if part:
-                hosts.append(part)
+# Guard against a malformed or hostile nodelist turning into a memory bomb
+# ('gpu[1-99999999]'): far above any real cluster, far below trouble.
+_MAX_EXPANSION = 100_000
+_NODE_TOKEN_RE = re.compile(r"\[([^\]]*)\]|([^\[\]]+)")
+
+
+def _split_top_level(expr: str) -> List[str]:
+    """Split on commas that are not inside a bracket group."""
+    out: List[str] = []
+    depth = 0
+    cur: List[str] = []
+    for ch in expr:
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth = max(0, depth - 1)
+        if ch == "," and depth == 0:
+            out.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    out.append("".join(cur))
+    return [s for s in (p.strip() for p in out) if s]
+
+
+def _expand_range_spec(spec: str) -> List[str]:
+    """'1-3,5' -> ['1','2','3','5'], preserving zero padding ('01-03')."""
+    out: List[str] = []
+    for r in (p.strip() for p in spec.split(",")):
+        if not r:
             continue
-        prefix, ranges = m.group(1), m.group(2)
-        for r in ranges.split(","):
-            if "-" in r:
-                a, b = r.split("-", 1)
-                width = len(a)
-                for i in range(int(a), int(b) + 1):
-                    hosts.append(f"{prefix}{str(i).zfill(width)}")
-            else:
-                hosts.append(f"{prefix}{r}")
+        a, sep, b = r.partition("-")
+        if sep and a.isdigit() and b.isdigit():
+            lo, hi = int(a), int(b)
+            if lo <= hi and hi - lo < _MAX_EXPANSION:
+                out.extend(str(i).zfill(len(a)) for i in range(lo, hi + 1))
+                continue
+        out.append(r)  # not a numeric range — keep verbatim rather than raise
+    return out
+
+
+def expand_nodelist(expr: str) -> List[str]:
+    """Expand a SLURM nodelist like 'gpu[1-3,5],node7' into hostnames.
+
+    Handles several bracket groups in one name ('rack[1-2]node[3-4]') and a
+    literal tail after a group ('gpu[1-2]-ib'). The previous version restarted
+    parsing at every bracket, so both of those silently became extra bogus
+    hostnames — and a non-numeric range ('gpu[a-b]') raised ValueError out of
+    the collect loop instead of degrading.
+    """
+    hosts: List[str] = []
+    for name in _split_top_level(expr):
+        groups: List[List[str]] = []
+        for m in _NODE_TOKEN_RE.finditer(name):
+            spec, literal = m.group(1), m.group(2)
+            groups.append([literal] if spec is None else _expand_range_spec(spec))
+        if not groups:
+            continue
+        total = 1
+        for g in groups:
+            total *= max(1, len(g))
+        if total > _MAX_EXPANSION:
+            hosts.append(name)  # implausible; pass through rather than expand
+            continue
+        hosts.extend("".join(combo) for combo in product(*groups))
     return hosts
 
 
@@ -422,8 +516,8 @@ def _expand_idx(spec: str) -> List[str]:
         r = r.strip()
         if not r or r.upper() == "N/A":
             continue
-        if "-" in r:
-            a, b = r.split("-", 1)
+        a, sep, b = r.partition("-")
+        if sep and a.isdigit() and b.isdigit() and int(a) <= int(b):
             out.extend(str(i) for i in range(int(a), int(b) + 1))
         else:
             out.append(r)
@@ -778,7 +872,7 @@ def apply_gpu_alloc(
             [([u for u in g.users if u not in ROGUE_IGNORE], g.minor or g.index,
               list(dict.fromkeys(g.pid_jobid.values())))
              for g in node.gpus])
-        for g, (jid, user) in zip(node.gpus, pairs):
+        for g, (jid, user) in zip(node.gpus, pairs, strict=True):
             g.alloc_jobid = jid
             g.alloc_user = user
 
@@ -796,14 +890,20 @@ def build_nodes(
         gpus = r.gpus if r else []
         gerr = r.error if r else ""
         mem = r.mem if r else NodeMemInfo()
+        stale = name in stale_nodes
         result.append(NodeInfo(
-            name=name, state=n["state"], partition=n.get("partition", ""), cpus=n["cpus"],
+            name=name, state=n["state"], partition=n.get("partition", ""),
+            # keep the direct-collection path's shape identical to the
+            # collector's, so `sgpu --json` emits one schema either way
+            source="stale" if stale else "ssh",
+            has_gpu=n.get("has_gpu", True),
+            cpus=n["cpus"],
             cpu_alloc=n.get("cpu_alloc", ""), cpu_load=n["cpu_load"],
             mem_total=n["mem_total"], mem_free=n["mem_free"],
             mem_alloc=n.get("mem_alloc", ""), gres=n["gres"],
             gpus=gpus, jobs=node_jobs.get(name, []), error=gerr,
             mem_used=mem.used, mem_avail=mem.avail,
-            stale=(name in stale_nodes),
+            stale=stale,
             error_kind=r.error_kind.value if r and hasattr(r, 'error_kind') else "",
         ))
     return result

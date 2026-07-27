@@ -20,3 +20,16 @@ jobs:
           uv pip install -e . pytest
       - name: Test
         run: uv run --no-sync pytest tests/ -v
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Ruff
+        run: uvx ruff check src/ tests/ grafana/
+      - name: Shellcheck
+        # notes only flag intentional patterns here (single-quoted remote
+        # command bodies, deliberate client-side expansion in ssh), so the
+        # gate starts at warning — which is where actual shell bugs land
+        run: uvx --from shellcheck-py shellcheck --severity=warning *.sh grafana/*.sh chkgpu
