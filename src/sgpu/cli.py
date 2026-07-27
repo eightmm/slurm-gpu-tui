@@ -743,11 +743,19 @@ def _cli_doctor() -> int:
                                  ("mem-fair", nf.mem_fair_factor > 0)) if v]
             report(True, "slack", f"bot→{nf.channel} daily-thread, lang={nf.lang}, "
                    f"alerts: {'+'.join(on) or 'none'} ({cfg})")
+        elif cfg is not None and not os.access(cfg, os.R_OK):
+            # The config holds a bot token, so it is mode 0600 and owned by the
+            # collector. Reporting "not configured" here would send an admin
+            # off to create a second config the collector never reads.
+            report(None, "slack", f"{cfg} exists but is not readable as "
+                   f"{os.environ.get('USER') or os.geteuid()} (mode 0600 by "
+                   "design) — re-run `sudo sgpu doctor` to check it")
         else:
-            # name the path the COLLECTOR reads, not a generic ~ — under a root
-            # collector those are different files
-            report(None, "slack",
-                   f"not configured (optional) — create {cands[0]}")
+            # Name the path the COLLECTOR reads, not this user's ~ — under a
+            # root collector those are different files.
+            want = (Path("/etc/sgpu/slack.json") if collector_user == "root"
+                    else cands[0])
+            report(None, "slack", f"not configured (optional) — create {want}")
     except Exception as e:
         report(False, "slack", f"config error: {e}")
 
