@@ -1,6 +1,7 @@
 """Notifier state-machine tests: node down/recovered, collect-blind,
 job-done diffing, debounce, persistence. No network — _post is stubbed."""
 import json
+import threading
 import time
 from datetime import datetime
 
@@ -119,14 +120,55 @@ def test_ok_to_send_debounces(tmp_path):
 
 
 def test_failed_delivery_rolls_back_debounce(tmp_path):
+    # The delivery thread cannot touch the state dicts (it would race _save's
+    # serialization), so it queues the release and the collect thread applies
+    # it on the next cycle.
     n, _ = _mk(tmp_path)
     now = time.time()
     assert n._ok_to_send("k", now)
-    # simulate the consumer's failure path
-    with n._state_lock:
-        if n._last_sent.get("k", 0) <= time.time():
-            n._last_sent.pop("k", None)
-    assert n._ok_to_send("k", time.time())
+    assert not n._ok_to_send("k", now)      # debounced
+    n._rollbacks.put(("k", time.time()))    # what _drain does on failure
+    n._apply_rollbacks()
+    assert n._ok_to_send("k", time.time())  # slot freed, condition re-alerts
+
+
+def test_delivery_failure_enqueues_a_rollback(tmp_path):
+    n, _ = _mk(tmp_path)
+    n._deliver = lambda body, channel="": False
+    n._queue.put(("body", "k", time.time(), ""))
+    consumer = threading.Thread(target=n._drain, daemon=True)
+    consumer.start()
+    n._queue.join()
+    assert n._rollbacks.get(timeout=1)[0] == "k"
+
+
+def test_successful_delivery_enqueues_nothing(tmp_path):
+    n, _ = _mk(tmp_path)
+    n._deliver = lambda body, channel="": True
+    n._queue.put(("body", "k", time.time(), ""))
+    threading.Thread(target=n._drain, daemon=True).start()
+    n._queue.join()
+    assert n._rollbacks.empty()
+
+
+def test_a_raising_delivery_does_not_kill_the_consumer(tmp_path):
+    # A dead consumer means the queue silently stops draining until the next
+    # _post happens to revive it.
+    n, _ = _mk(tmp_path)
+    calls = []
+
+    def flaky(body, channel=""):
+        calls.append(body)
+        if len(calls) == 1:
+            raise RuntimeError("boom")
+        return True
+
+    n._deliver = flaky
+    threading.Thread(target=n._drain, daemon=True).start()
+    n._queue.put(("first", "", time.time(), ""))
+    n._queue.put(("second", "", time.time(), ""))
+    n._queue.join()
+    assert calls == ["first", "second"]
 
 
 # ── persistence ───────────────────────────────────────────────────────────

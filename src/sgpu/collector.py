@@ -1257,6 +1257,11 @@ def run_collector():
     # a user-owned data dir turns every write into a root-write primitive.
     try:
         ensure_secure_dir(DATA_DIR)
+        # docs/GRAFANA.md tells sites with a PrivateTmp node_exporter to point
+        # METRICS_FILE outside DATA_DIR; that parent needs the same treatment,
+        # and creating it here beats failing every cycle in _write_metrics
+        if METRICS_FILE.parent != DATA_DIR:
+            ensure_secure_dir(METRICS_FILE.parent)
     except UnsafeRuntimeDir as e:
         print(f"[collector] {e}", flush=True)
         sys.exit(1)

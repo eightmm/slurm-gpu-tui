@@ -100,7 +100,17 @@ if [ -z "$SHARE" ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
     case "$ans" in n|N|no) SHARE="" ;; *) SHARE=1 ;; esac
 fi
 
-if [ -n "$SHARE" ] && [ "$SHARE" != "0" ]; then
+if [ -n "$SHARE" ] && [ "$SHARE" != "0" ] && [ "$(id -u)" = "0" ]; then
+    # A root collector calls `scontrol write batch_script` directly (see
+    # collector.py), so a sudoers rule granting root what root already has is
+    # dead weight — and one more file to reason about in /etc/sudoers.d.
+    # Drop one left behind by an earlier non-root install of this same tree.
+    if [ -f /etc/sudoers.d/sgpu ]; then
+        rm -f /etc/sudoers.d/sgpu
+        echo "[3a] removed stale /etc/sudoers.d/sgpu (root collector needs no grant)"
+    fi
+    echo "[3a] Script sharing enabled (root collector — no sudoers rule needed)"
+elif [ -n "$SHARE" ] && [ "$SHARE" != "0" ]; then
     if $HAS_SUDO; then
         # Narrow sudoers grant: the collector user may run exactly
         # 'scontrol write batch_script' as root — nothing else. This keeps
@@ -127,11 +137,22 @@ fi
 # retired incoming-webhook era) to slack.json, keeping tuned alert keys.
 # Non-interactive runs can set SGPU_SLACK_BOT_TOKEN, SGPU_SLACK_CHANNEL,
 # SGPU_SLACK_SENDER, and SGPU_SLACK_LANG.
-SLACK_CFG="$HOME/.sgpu/slack.json"
-if [ -f "$HOME/.sgpu/webhook.json" ] && [ ! -f "$SLACK_CFG" ]; then
-    mv "$HOME/.sgpu/webhook.json" "$SLACK_CFG"
-    echo "migrated ~/.sgpu/webhook.json -> slack.json (bot-token config, not a webhook)"
+# Root collectors read /etc/sgpu/slack.json: ~/.sgpu would be /root/.sgpu,
+# mode 0700, so an admin editing "their" ~/.sgpu/slack.json later would be
+# editing a file the collector never opens (see notify.cfg_search_paths).
+if [ "$(id -u)" = "0" ]; then
+    SLACK_CFG="/etc/sgpu/slack.json"
+else
+    SLACK_CFG="$HOME/.sgpu/slack.json"
 fi
+for legacy in "$HOME/.sgpu/webhook.json" "$HOME/.sgpu/slack.json"; do
+    if [ -f "$legacy" ] && [ ! -f "$SLACK_CFG" ]; then
+        mkdir -p "$(dirname "$SLACK_CFG")"
+        cp "$legacy" "$SLACK_CFG"
+        echo "migrated $legacy -> $SLACK_CFG"
+        break
+    fi
+done
 _tty() { [ -r /dev/tty ] && [ -w /dev/tty ]; }
 _cfg_get() {
     "$VENV_DIR/bin/python" - "$SLACK_CFG" "$1" << 'PYEOF'
@@ -213,7 +234,7 @@ if [ -n "$BOT_TOKEN" ] && [ -z "$CHANNEL" ]; then
 fi
 
 if [ -f "$SLACK_CFG" ] || [ -n "$BOT_TOKEN" ] || [ -n "$CHANNEL" ]; then
-    mkdir -p "$HOME/.sgpu"
+    mkdir -p "$(dirname "$SLACK_CFG")"
     touch "$SLACK_CFG"
     chmod 600 "$SLACK_CFG"
     # Preserve tuned alert keys, replace delivery credentials explicitly, and

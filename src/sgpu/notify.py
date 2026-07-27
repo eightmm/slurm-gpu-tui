@@ -165,12 +165,43 @@ def _fmt_dur(sec: float, lang: str = "en") -> str:
     return f"{sec / 86400:.1f}{d}"
 
 
+SYSTEM_CFG_PATH = Path("/etc/sgpu/slack.json")
+
+
+def cfg_search_paths() -> List[Path]:
+    """Where the notifier looks for its Slack config, best first.
+
+    A root collector must not depend on ``~/.sgpu``: /root is mode 0700, so an
+    admin who edits "~/.sgpu/slack.json" as themselves writes a file the
+    collector never reads, and the alerts then silently never fire. /etc/sgpu
+    is the path both can see, so it wins for root.
+
+    ``webhook.json`` is the legacy name — bot-token delivery replaced incoming
+    webhooks long ago, but installed sites still have the old file.
+    """
+    out: List[Path] = []
+    if os.geteuid() == 0:
+        out.append(SYSTEM_CFG_PATH)
+    try:
+        base = Path.home() / ".sgpu"
+        out += [base / "slack.json", base / "webhook.json"]
+    except (OSError, RuntimeError):  # no resolvable home
+        pass
+    if SYSTEM_CFG_PATH not in out:
+        out.append(SYSTEM_CFG_PATH)
+    return out
+
+
 def _default_cfg_path() -> Path:
-    """~/.sgpu/slack.json, falling back to the legacy webhook.json name
-    (bot-token delivery replaced incoming webhooks long ago)."""
-    base = Path.home() / ".sgpu"
-    new, old = base / "slack.json", base / "webhook.json"
-    return old if (old.exists() and not new.exists()) else new
+    """First existing config, else the path we would prefer to find one at."""
+    candidates = cfg_search_paths()
+    for p in candidates:
+        try:
+            if p.exists():
+                return p
+        except OSError:
+            continue
+    return candidates[0]
 
 
 class Notifier:

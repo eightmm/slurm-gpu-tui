@@ -52,6 +52,23 @@ def test_installer_substitutes_the_collector_unit_placeholders():
     assert "unresolved placeholder in generated unit" in installer
 
 
+def test_root_install_skips_the_pointless_sudoers_rule():
+    # A root collector runs `scontrol write batch_script` directly, so the
+    # grant would give root what root already has.
+    installer = (ROOT / "install.sh").read_text()
+
+    assert "root collector — no sudoers rule needed" in installer
+
+
+def test_root_install_puts_slack_config_where_root_reads_it():
+    # /root/.sgpu is mode 0700, so a config there is invisible to the admin
+    # who has to maintain it — and to `sgpu doctor` run as a normal user.
+    installer = (ROOT / "install.sh").read_text()
+
+    assert 'SLACK_CFG="/etc/sgpu/slack.json"' in installer
+    assert 'mkdir -p "$(dirname "$SLACK_CFG")"' in installer
+
+
 def test_installer_has_cpu_push_opt_out():
     installer = (ROOT / "install.sh").read_text()
 

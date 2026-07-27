@@ -719,23 +719,22 @@ def _cli_doctor() -> int:
         else:
             report(None, "script sharing", "not configured (own jobs only) — rerun installer to enable")
 
-    # Slack notifier (optional) — same collector-home fallback as state
-    from .notify import Notifier
+    # Slack notifier (optional). Search the collector's own locations plus the
+    # collector user's home, since doctor may run as a different account.
+    from .notify import Notifier, cfg_search_paths
     try:
+        cands = list(cfg_search_paths())
+        if collector_home:
+            cands += [collector_home / ".sgpu" / n
+                      for n in ("slack.json", "webhook.json")]
         cfg = None
-        for home in (Path.home(), collector_home):
-            if home is None:
+        for cand in cands:
+            try:
+                if cand.exists():
+                    cfg = cand
+                    break
+            except OSError:
                 continue
-            for name in ("slack.json", "webhook.json"):  # webhook.json = legacy name
-                cand = home / ".sgpu" / name
-                try:
-                    if cand.exists():
-                        cfg = cand
-                        break
-                except OSError:
-                    continue
-            if cfg:
-                break
         nf = Notifier(state_dir, cfg_path=cfg) if cfg else Notifier(state_dir)
         if nf.enabled:
             on = [k for k, v in (("node", nf.node_health), ("collect", nf.collect_alert),
@@ -743,9 +742,12 @@ def _cli_doctor() -> int:
                                  ("ecc", nf.ecc_alert), ("temp", nf.temp_alert_c > 0),
                                  ("mem-fair", nf.mem_fair_factor > 0)) if v]
             report(True, "slack", f"bot→{nf.channel} daily-thread, lang={nf.lang}, "
-                   f"alerts: {'+'.join(on) or 'none'}")
+                   f"alerts: {'+'.join(on) or 'none'} ({cfg})")
         else:
-            report(None, "slack", "not configured (optional) — ~/.sgpu/slack.json")
+            # name the path the COLLECTOR reads, not a generic ~ — under a root
+            # collector those are different files
+            report(None, "slack",
+                   f"not configured (optional) — create {cands[0]}")
     except Exception as e:
         report(False, "slack", f"config error: {e}")
 
