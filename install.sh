@@ -100,6 +100,22 @@ if [ -z "$SHARE" ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
     case "$ans" in n|N|no) SHARE="" ;; *) SHARE=1 ;; esac
 fi
 
+# Job stdout/stderr sharing: a root collector mirrors a tail of every job's
+# logs somewhere world-readable, so the TUI's log tabs work for jobs you do
+# not own. Defaults to NO even interactively — a log is runtime output and can
+# carry tokens a framework echoed, connection strings, or an env dump inside a
+# traceback. SGPU_SHARE_LOGS=1/0 skips the question.
+SHARE_LOGS="${SGPU_SHARE_LOGS:-}"
+if [ -z "$SHARE_LOGS" ] && [ "$(id -u)" = "0" ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    printf "Also mirror every job's stdout/stderr so all users can read them? [y/N] " > /dev/tty
+    read -r ans_logs < /dev/tty || ans_logs=""
+    case "$ans_logs" in y|Y|yes) SHARE_LOGS=1 ;; *) SHARE_LOGS="" ;; esac
+fi
+if [ -n "$SHARE_LOGS" ] && [ "$SHARE_LOGS" != "0" ] && [ "$(id -u)" != "0" ]; then
+    echo "NOTE: job log sharing needs a root collector to read other users' logs — skipping."
+    SHARE_LOGS=""
+fi
+
 if [ -n "$SHARE" ] && [ "$SHARE" != "0" ] && [ "$(id -u)" = "0" ]; then
     # A root collector calls `scontrol write batch_script` directly (see
     # collector.py), so a sudoers rule granting root what root already has is
@@ -283,6 +299,9 @@ if grep -q '@SGPU_[A-Z]*@' "$GENERATED_SERVICE"; then
 fi
 if [ -n "$SHARE" ] && [ "$SHARE" != "0" ]; then
     sed -i "/^User=/a Environment=SLURM_GPU_TUI_SHARE_SCRIPTS=1" "$GENERATED_SERVICE"
+fi
+if [ -n "$SHARE_LOGS" ] && [ "$SHARE_LOGS" != "0" ]; then
+    sed -i "/^User=/a Environment=SLURM_GPU_TUI_SHARE_LOGS=1" "$GENERATED_SERVICE"
 fi
 # Root install: default the agent dir to a sibling of the install dir
 # (/home/shared/sgpu -> /home/shared/sgpu-nodes) so a shared-FS install gets

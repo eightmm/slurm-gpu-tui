@@ -180,6 +180,22 @@ ssh <node> cat /run/sgpu-agent.log               # 노드 에이전트 (root; �
 | 노드 `~smi_err` / `~no_smi` | `ssh <node> nvidia-smi` |
 | Usage 탭이 낡거나 비어 있음 | `sgpu doctor` → `usage history`가 읽은 파일 표시 |
 | 에이전트가 있는데 SSH로만 수집 | `sgpu doctor` → `agent payload trust` |
+| 남의 작업 로그 탭이 비어 있음 | `sgpu doctor` → `job log sharing` (기본 꺼짐) |
+
+### 다른 사용자 작업 공개
+
+둘 다 root collector가 필요하고, 설치 시 명시적으로 동의해야 켜진다:
+
+| unit 환경변수 | 모든 사용자가 볼 수 있게 되는 것 |
+|---|---|
+| `SLURM_GPU_TUI_SHARE_SCRIPTS=1` | 모든 작업의 배치 스크립트 (상세 팝업) |
+| `SLURM_GPU_TUI_SHARE_LOGS=1` | 모든 작업의 stdout/stderr (마지막 64KB, `<state>/logs`로 미러링) |
+
+> **로그 공개는 런타임 산출물을 공개하는 것이다.** 배치 스크립트는 작성자가 쓴
+> 텍스트지만, 로그는 작업이 출력한 전부다 — 프레임워크가 찍은 토큰, 접속 문자열,
+> traceback 안의 환경변수 덤프. 클러스터 사용자 전원이 서로의 작업 출력을 볼
+> 권한이 있는 곳에서만 켜라. 스트림당 미러링 양은
+> `SLURM_GPU_TUI_LOG_TAIL_BYTES`로 제한한다.
 | 그 외 | `sgpu doctor` |
 
 원샷 부가 설정 (root, 클러스터당 1회):

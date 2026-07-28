@@ -69,6 +69,17 @@ def test_root_install_puts_slack_config_where_root_reads_it():
     assert 'mkdir -p "$(dirname "$SLACK_CFG")"' in installer
 
 
+def test_log_sharing_is_opt_in_and_defaults_to_no():
+    # Unlike a batch script, a log is runtime output — tokens, connection
+    # strings, env dumps in tracebacks. The prompt must not default to yes.
+    installer = (ROOT / "install.sh").read_text()
+
+    assert "Also mirror every job's stdout/stderr" in installer
+    assert "[y/N]" in installer
+    assert "Environment=SLURM_GPU_TUI_SHARE_LOGS=1" in installer
+    assert "job log sharing needs a root collector" in installer
+
+
 def test_installer_has_cpu_push_opt_out():
     installer = (ROOT / "install.sh").read_text()
 

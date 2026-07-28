@@ -21,7 +21,7 @@ from .cells import (
 from .common import (
     GpuInfo, NodeInfo, apply_gpu_alloc, build_nodes, cleanup_ssh_pool,
     collect_basic, collect_node_data_parallel, job_log_paths, node_from_dict,
-    run_cmd, ssh_cmd, tail_file,
+    read_job_log, run_cmd, ssh_cmd,
 )
 from .runtime import state_dir_candidates
 from .tui import _DAEMON_DATA_FILE, _DAEMON_MAX_AGE, SlurmGpuTui
@@ -401,9 +401,21 @@ def _cli_logs(jobid: str, follow: bool = False, want_err: bool = False) -> int:
     if not path:
         print("job has no log file path", file=sys.stderr)
         return 1
-    print(f"== {path}", file=sys.stderr)
+    # Someone else's job: their log is normally unreadable to us, so fall back
+    # to the collector's shared mirror when the site publishes one.
+    shared = ""
+    if not os.access(path, os.R_OK):
+        job = next((j for j in _oneshot_snapshot().get("jobs", [])
+                    if str(j.get("jobid")) == str(jobid)), {})
+        shared = job.get("log_err" if want_err else "log_out", "") or ""
+    text, path = read_job_log(path, shared)
+    if shared and path == shared:
+        print(f"== {path} (shared by the collector; last "
+              f"{len(text) // 1024}KB, refreshed each collect cycle)",
+              file=sys.stderr)
+    else:
+        print(f"== {path}", file=sys.stderr)
     if not follow:
-        text = tail_file(path)
         sys.stdout.write(text if text.endswith("\n") else text + "\n")
         return 0
     try:
@@ -718,6 +730,27 @@ def _cli_doctor() -> int:
             report(True, "script sharing", "sudoers rule active (all-user script view)")
         else:
             report(None, "script sharing", "not configured (own jobs only) — rerun installer to enable")
+
+    # Job log sharing: without it another user's stdout/stderr tabs are empty,
+    # because the log lives under their home. Count what actually got mirrored
+    # rather than trusting the unit — a job whose log is not written yet, or
+    # whose path the collector cannot stat, silently produces nothing.
+    if raw:
+        jobs_raw = raw.get("jobs", [])
+        shared_logs = sum(1 for j in jobs_raw if j.get("log_out") or j.get("log_err"))
+        logs_on = _unit_env_enabled(unit_text, "SLURM_GPU_TUI_SHARE_LOGS")
+        if logs_on and jobs_raw:
+            report(True if shared_logs else None, "job log sharing",
+                   f"{shared_logs}/{len(jobs_raw)} running job(s) mirrored "
+                   "world-readable"
+                   + ("" if shared_logs else " — nothing yet; logs may not be "
+                      "written, or the collector cannot read them"))
+        elif logs_on:
+            report(True, "job log sharing", "enabled in unit; no running jobs")
+        else:
+            report(None, "job log sharing",
+                   "off — other users' stdout/stderr tabs stay empty "
+                   "(SLURM_GPU_TUI_SHARE_LOGS=1 to publish them)")
 
     # Slack notifier (optional). Search the collector's own locations plus the
     # collector user's home, since doctor may run as a different account.

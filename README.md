@@ -183,6 +183,23 @@ ssh <node> cat /run/sgpu-agent.log               # node agent (root; else /tmp/s
 | Node `~smi_err` / `~no_smi` | `ssh <node> nvidia-smi` |
 | Usage tab stale / empty | `sgpu doctor` → `usage history` names the file it read |
 | Node stuck on SSH despite an agent | `sgpu doctor` → `agent payload trust` |
+| Other users' log tabs empty | `sgpu doctor` → `job log sharing` (off by default) |
+
+### Sharing other users' jobs
+
+Two independent opt-ins, both needing a root collector, both off unless you
+say yes at install time:
+
+| Env in the unit | What every user can then see |
+|---|---|
+| `SLURM_GPU_TUI_SHARE_SCRIPTS=1` | every job's batch script in the detail popup |
+| `SLURM_GPU_TUI_SHARE_LOGS=1` | every job's stdout/stderr (last 64KB, mirrored to `<state>/logs`) |
+
+> **Log sharing publishes runtime output.** A batch script is text its author
+> wrote; a log is whatever the job printed — tokens a framework echoed,
+> connection strings, environment dumps inside tracebacks. Turn it on only
+> where every cluster user is entitled to see every other user's job output.
+> `SLURM_GPU_TUI_LOG_TAIL_BYTES` caps how much is mirrored per stream.
 | Anything else | `sgpu doctor` |
 
 One-shot extras (root, run once per cluster):

@@ -217,6 +217,10 @@ class JobInfo:
     time_limit: str = ""
     mem: str = ""  # requested memory from squeue %m (e.g. "128G", "4000Mc")
     script: str = ""  # batch script when SHARE_SCRIPTS collector publishes it
+    # world-readable mirrors of the job's stdout/stderr tail, published by a
+    # SHARE_LOGS collector; "" when sharing is off or nothing was readable
+    log_out: str = ""
+    log_err: str = ""
 
 
 @dataclass
@@ -968,6 +972,24 @@ def tail_file(path: str, limit: int = 65536) -> str:
     if size > limit:
         text = f"… showing last {limit // 1024}KB of {size / 1048576:.1f}MB …\n" + text
     return text
+
+
+def read_job_log(path: str, shared: str = "", limit: int = 65536) -> Tuple[str, str]:
+    """Tail a job log, preferring the real file. Returns (text, path read).
+
+    The owner reads their own file directly, so they always get the live,
+    complete thing. Everyone else usually cannot — job logs land in the
+    submitter's home, behind a private directory or mode 0600 — and falls back
+    to the collector's world-readable mirror, which only exists when the site
+    turned SHARE_LOGS on.
+    """
+    if path and os.access(path, os.R_OK):
+        return tail_file(path, limit), path
+    if shared and os.access(shared, os.R_OK):
+        return tail_file(shared, limit), shared
+    if path:
+        return tail_file(path, limit), path  # surface the real error
+    return "", ""
 
 
 def job_log_paths(scontrol_out: str) -> Tuple[str, str]:

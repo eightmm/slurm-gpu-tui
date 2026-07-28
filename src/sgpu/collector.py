@@ -20,8 +20,9 @@ from typing import Dict, List
 
 from .common import (
     GpuInfo, JobInfo, NodeErrorKind, NodeMemInfo, PendingJob, ROGUE_IGNORE,
-    collect_basic, collect_node_data, mem_to_mib, parse_gres_models,
-    reconcile_gpu_alloc, resolve_user, run_cmd, ssh_cmd, _classify_error,
+    collect_basic, collect_node_data, job_log_paths, mem_to_mib,
+    parse_gres_models, reconcile_gpu_alloc, resolve_user, run_cmd, ssh_cmd,
+    _classify_error,
 )
 from .agent import AGENT_PAYLOAD_VERSION
 from . import agent as _agent_module
@@ -274,6 +275,113 @@ def _fetch_scripts(jobs: List[JobInfo]) -> Dict[str, str]:
     for jid in todo:
         _script_executor.submit(_fetch_one_script, jid)
     return snapshot
+
+
+# ── Job stdout/stderr sharing (opt-in) ────────────────────────────────────
+# A job's logs live wherever the submitter pointed --output, normally under
+# their home: another user cannot read them, so the TUI's log tabs are empty
+# for everyone but the owner. A root collector can read them, so it mirrors a
+# bounded tail into a world-readable spool and readers fall back to that.
+#
+# OFF by default, and more sensitive than SHARE_SCRIPTS: a batch script is
+# static text the author wrote, whereas a log is runtime output. Tokens echoed
+# by a framework, connection strings, and environment dumps inside tracebacks
+# all end up here, and this publishes them to everyone who can read the state
+# directory.
+
+SHARE_LOGS = bool(os.getenv("SLURM_GPU_TUI_SHARE_LOGS", ""))
+LOG_SPOOL_DIR = Path(
+    os.getenv("SLURM_GPU_TUI_LOG_SPOOL_DIR", str(STATE_DIR / "logs"))
+)
+# Matches tail_file's default, so a shared log shows exactly what the owner
+# would see in the same pane.
+LOG_TAIL_BYTES = int(os.getenv("SLURM_GPU_TUI_LOG_TAIL_BYTES", str(64 * 1024)))
+
+_log_paths: Dict[str, tuple] = {}      # jobid -> (stdout src, stderr src)
+_log_fingerprint: Dict[str, tuple] = {}  # spool path -> (size, mtime) mirrored
+_log_inflight: set = set()
+_log_lock = threading.Lock()
+# two workers: a mirror pass is file I/O over NFS, and one slow home directory
+# should not hold up every other job's logs
+_log_executor = ThreadPoolExecutor(max_workers=2)
+
+
+def _mirror_one_job_log(jid: str) -> None:
+    """Copy the tail of one job's stdout/stderr into the shared spool."""
+    try:
+        with _log_lock:
+            paths = _log_paths.get(jid)
+        if paths is None:
+            # scontrol resolves %j/%A patterns for us; the answer cannot change
+            # while the job runs, so this costs one call per job, not per cycle
+            ok, out = run_cmd(f"scontrol show job {jid}", timeout=10)
+            paths = job_log_paths(out) if ok and "JobId=" in out else ("", "")
+            with _log_lock:
+                _log_paths[jid] = paths
+        for src, suffix in ((paths[0], "out"), (paths[1], "err")):
+            if not src:
+                continue
+            dst = LOG_SPOOL_DIR / f"{jid}.{suffix}"
+            try:
+                st = os.stat(src)
+            except OSError:
+                continue  # not created yet, or gone with the job
+            fp = (st.st_size, st.st_mtime)
+            if _log_fingerprint.get(str(dst)) == fp:
+                continue  # unchanged since the last pass — most jobs, most cycles
+            try:
+                with open(src, "rb") as f:
+                    if st.st_size > LOG_TAIL_BYTES:
+                        f.seek(st.st_size - LOG_TAIL_BYTES)
+                    data = f.read(LOG_TAIL_BYTES)
+            except OSError:
+                continue
+            # raw bytes, not tail_file's decorated text: readers run their own
+            # tail_file over this and `sgpu logs -f` tracks byte offsets
+            atomic_write(dst, data, mode=0o644)
+            _log_fingerprint[str(dst)] = fp
+    except Exception as e:
+        print(f"[collector] log mirror {jid} failed: {e}", flush=True)
+    finally:
+        with _log_lock:
+            _log_inflight.discard(jid)
+
+
+def _drop_log_spool(jid: str) -> None:
+    for suffix in ("out", "err"):
+        p = LOG_SPOOL_DIR / f"{jid}.{suffix}"
+        _log_fingerprint.pop(str(p), None)
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
+def _share_logs(jobs: List[JobInfo]) -> Dict[str, dict]:
+    """Refresh the shared log spool; return jobid -> {"out"/"err": path}."""
+    if not SHARE_LOGS:
+        return {}
+    live = {j.jobid for j in jobs}
+    with _log_lock:
+        gone = [j for j in _log_paths if j not in live]
+        todo = [j.jobid for j in jobs if j.jobid not in _log_inflight]
+        _log_inflight.update(todo)
+    for jid in gone:
+        with _log_lock:
+            _log_paths.pop(jid, None)
+        _drop_log_spool(jid)
+    for jid in todo:
+        _log_executor.submit(_mirror_one_job_log, jid)
+    published: Dict[str, dict] = {}
+    for j in jobs:
+        entry = {}
+        for suffix in ("out", "err"):
+            p = LOG_SPOOL_DIR / f"{j.jobid}.{suffix}"
+            if p.exists():
+                entry[suffix] = str(p)
+        if entry:
+            published[j.jobid] = entry
+    return published
 
 
 # ── Per-user GPU-hour accounting ──────────────────────────────────────────
@@ -841,13 +949,19 @@ def collect_all() -> dict:
     _accumulate_usage(result_nodes, time.time())
 
     scripts = _fetch_scripts(jobs)
+    logs = _share_logs(jobs)
     return {
         "version": 1,
         "release": __version__,
         "build": __build__,
         "ts": datetime.now().isoformat(),
         "nodes": result_nodes,
-        "jobs": [dict(_job_to_dict(j), script=scripts.get(j.jobid, "")) for j in jobs],
+        "jobs": [
+            dict(_job_to_dict(j), script=scripts.get(j.jobid, ""),
+                 log_out=logs.get(j.jobid, {}).get("out", ""),
+                 log_err=logs.get(j.jobid, {}).get("err", ""))
+            for j in jobs
+        ],
         "pending": [_pending_to_dict(p) for p in pending],
         "stale_nodes": stale_nodes,
         # node -> uid of a rejected <node>.json, so `sgpu doctor` can name it
@@ -1287,6 +1401,17 @@ def run_collector():
     except UnsafeRuntimeDir as e:
         print(f"[collector] {e}", flush=True)
         sys.exit(1)
+    if SHARE_LOGS:
+        # 0755: the whole point is that users other than the job owner can
+        # read what lands in here
+        try:
+            ensure_secure_dir(LOG_SPOOL_DIR)
+        except UnsafeRuntimeDir as e:
+            print(f"[collector] {e}", flush=True)
+            sys.exit(1)
+        print(f"[collector] job log sharing on (spool={LOG_SPOOL_DIR}, "
+              f"tail={LOG_TAIL_BYTES // 1024}KB) — every user can read every "
+              "job's stdout/stderr", flush=True)
     _load_idle_state()
     _load_inventory()
     _load_usage()

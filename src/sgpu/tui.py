@@ -32,7 +32,7 @@ from .common import (
     JobInfo, NodeInfo, NodeSSHResult, PendingJob,
     apply_gpu_alloc, build_nodes, cleanup_ssh_pool, collect_basic,
     collect_node_data_parallel, from_dict, job_log_paths, node_from_dict,
-    run_cmd, tail_file,
+    read_job_log, run_cmd,
 )
 from .runtime import default_data_dir
 from .screens import (
@@ -580,9 +580,14 @@ class SlurmGpuTui(App):
                               "--format=JobID%16,AveCPU,MaxRSS,MaxVMSize,MaxDiskRead,MaxDiskWrite")
             if ok3 and len(s3.strip().splitlines()) > 2:
                 out += "\n\nLive usage (sstat, per step):\n" + s3
+            # Fall back to the collector's shared mirror for jobs whose logs
+            # our account cannot read — without it these tabs are blank for
+            # everyone but the owner.
             stdout_path, stderr_path = job_log_paths(out)
-            stdout_text = tail_file(stdout_path) if stdout_path else ""
-            stderr_text = tail_file(stderr_path) if stderr_path else ""
+            stdout_text, stdout_path = read_job_log(
+                stdout_path, j.log_out if j else "")
+            stderr_text, stderr_path = read_job_log(
+                stderr_path, j.log_err if j else "")
             self.call_from_thread(
                 self.push_screen,
                 DetailScreen(f"{kind} {name}", out, script=script, script_src=src,
