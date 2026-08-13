@@ -29,6 +29,18 @@ _LOG_ERR_RE = re.compile(
     r"|\w*(?:Error|Exception)\b|ERROR|error:"
     r"|\bFAILED\b|[Oo]ut of memory"
 )
+_LOG_UNSEEN = object()
+
+
+def _log_signature(path: str):
+    try:
+        st = os.stat(path)
+        return (
+            st.st_mode, st.st_dev, st.st_ino, st.st_size,
+            st.st_mtime_ns, st.st_ctime_ns,
+        )
+    except OSError:
+        return None
 
 
 def _log_text(text: str) -> Text:
@@ -72,6 +84,9 @@ class DetailScreen(ModalScreen):
         self._stdout_path = stdout_path
         self._stderr_path = stderr_path
         self._log_scrolled: set = set()  # log tabs already auto-scrolled to end
+        self._log_fingerprints: dict[
+            str, tuple[int, int, int, int, int, int]
+        ] = {}
         # (tab id, tab title, renderable) — Text() so shell scripts and logs
         # with [brackets] aren't parsed as markup
         self._tabs: List[Tuple[str, str, object]] = [("tab-info", "Job Info", Text(body))]
@@ -119,13 +134,29 @@ class DetailScreen(ModalScreen):
     @work(thread=True, exclusive=True)
     def _poll_logs(self) -> None:
         """Re-read log tails so open modals behave like tail -f."""
+        updates = self._collect_log_updates()
+        if updates:
+            self.app.call_from_thread(self._apply_log_updates, updates)
+
+    def _collect_log_updates(self) -> List[Tuple[str, Text]]:
         updates = []
         for path, tab_id in ((self._stdout_path, "tab-stdout"),
                              (self._stderr_path, "tab-stderr")):
             if path:
-                updates.append((tab_id, self._log_render(path, tail_file(path))))
-        if updates:
-            self.app.call_from_thread(self._apply_log_updates, updates)
+                signature = _log_signature(path)
+                if self._log_fingerprints.get(tab_id, _LOG_UNSEEN) == signature:
+                    continue
+                text = tail_file(path)
+                # Missing/transiently unreadable files must be retried even
+                # when their stat metadata remains unchanged.
+                if signature is not None and not text.startswith(
+                    ("(no file yet", "(not readable:"),
+                ):
+                    self._log_fingerprints[tab_id] = signature
+                else:
+                    self._log_fingerprints.pop(tab_id, None)
+                updates.append((tab_id, self._log_render(path, text)))
+        return updates
 
     def _apply_log_updates(self, updates: List[Tuple[str, Text]]) -> None:
         for tab_id, content in updates:

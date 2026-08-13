@@ -228,6 +228,7 @@ class SlurmGpuTui(App):
         self._refresh_lock = threading.Lock()
 
         self._timer: Timer | None = None
+        self._search_timer: Timer | None = None
         self._reset_timer(self.refresh_sec)
         self.refresh_all()
 
@@ -241,12 +242,16 @@ class SlurmGpuTui(App):
         self.exit()
 
     def _rerender(self) -> None:
-        """Force a re-render even if daemon data is unchanged (UI state changed)."""
+        """Repaint cached data after a UI-only state change."""
+        if self._last_applied is not None:
+            self._apply(*self._last_applied)
+            return
         self._force_render = True
         self.refresh_all()
 
     def action_refresh(self) -> None:
-        self._rerender()
+        self._force_render = True
+        self.refresh_all()
 
     def action_export_json(self) -> None:
         if self._last_applied is None:
@@ -627,13 +632,30 @@ class SlurmGpuTui(App):
         w.display = True
         w.focus()
 
+    def _cancel_search_rerender(self) -> None:
+        if self._search_timer is not None:
+            self._search_timer.stop()
+            self._search_timer = None
+
+    def _finish_search_rerender(self) -> None:
+        self._search_timer = None
+        self._rerender()
+
+    def _schedule_search_rerender(self) -> None:
+        # A full DataTable rebuild is still substantial on large clusters.
+        # Coalesce rapid keystrokes while keeping the filter responsive.
+        self._cancel_search_rerender()
+        self._search_timer = self.set_timer(0.12, self._finish_search_rerender)
+
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "search-input":
             self.search_text = event.value.strip().lower()
-            self._rerender()
+            self._schedule_search_rerender()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "search-input":
+            self._cancel_search_rerender()
+            self._rerender()
             self.tbl.focus()
 
     def on_key(self, event) -> None:
@@ -644,6 +666,7 @@ class SlurmGpuTui(App):
                 w.display = False
                 self.search_text = ""
                 self.tbl.focus()
+                self._cancel_search_rerender()
                 self._rerender()
             return
         ch = getattr(event, "character", None)
@@ -962,6 +985,11 @@ class SlurmGpuTui(App):
             if is_collapsed:
                 pass
             elif node.gpus:
+                jobs_by_id: Dict[str, JobInfo] = {}
+                jobs_by_user: Dict[str, Tuple[int, JobInfo]] = {}
+                for rank, job in enumerate(node.jobs):
+                    jobs_by_id.setdefault(job.jobid, job)
+                    jobs_by_user.setdefault(job.user, (rank, job))
                 for gpu_i, gpu in enumerate(node.gpus):
                     user = ""
                     jobid = ""
@@ -982,15 +1010,12 @@ class SlurmGpuTui(App):
                         is_me = gpu.alloc_user == self.current_user
                     # Exact job match via SLURM allocation, fallback to user match
                     if gpu.alloc_jobid:
-                        for j in node.jobs:
-                            if j.jobid == gpu.alloc_jobid:
-                                matched_job = j
-                                break
+                        matched_job = jobs_by_id.get(gpu.alloc_jobid)
                     if matched_job is None and gpu.users:
-                        for j in node.jobs:
-                            if j.user in gpu.users:
-                                matched_job = j
-                                break
+                        candidates = [jobs_by_user[u] for u in gpu.users
+                                      if u in jobs_by_user]
+                        if candidates:
+                            matched_job = min(candidates, key=lambda item: item[0])[1]
                     if matched_job:
                         jobid, jobname, elapsed = matched_job.jobid, matched_job.jobname, matched_job.elapsed
 

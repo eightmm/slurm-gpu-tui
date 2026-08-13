@@ -144,6 +144,29 @@ def test_load_usage_daily_is_oldest_first_with_coverage(tmp_path, monkeypatch):
     assert rows[0][3] == 0     # collector wasn't sampling: unknown, not zero
 
 
+def test_render_usage_merges_the_window_once(monkeypatch):
+    raw = {
+        "days": {
+            day(1): {"alice": {"alloc": 10, "busy": 5}},
+            day(): {"alice": {"alloc": 20, "busy": 10}},
+        },
+        "meta": {day(1): 60, day(): 60},
+    }
+    real_merge = usage_mod.merge_usage_window
+    calls = []
+
+    def counted_merge(payload, keep):
+        calls.append(payload)
+        return real_merge(payload, keep)
+
+    monkeypatch.setattr(usage_mod, "_read_usage_raw", lambda: raw)
+    monkeypatch.setattr(usage_mod, "merge_usage_window", counted_merge)
+
+    usage_mod.render_usage(7)
+
+    assert calls == [raw]
+
+
 # ── discovery ─────────────────────────────────────────────────────────────
 
 def test_freshest_state_file_wins_over_a_stale_leftover(tmp_path, monkeypatch):

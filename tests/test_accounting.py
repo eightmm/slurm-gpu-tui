@@ -1,5 +1,7 @@
 """Collector accounting (_track_waste, _accumulate_usage, sacct backfill)
 and notify state-machine tests. All pure-logic with fake clocks/outputs."""
+import os
+import stat
 import time
 from datetime import datetime, timedelta
 
@@ -14,8 +16,145 @@ def _reset_collector_state():
     collector._parked_since.clear()
     collector._usage.clear()
     collector._usage["days"] = {}
+    collector._state_write_cache.clear()
+    collector._state_path_locks.clear()
+    collector._node_absent_cycles.clear()
     collector._last_usage_ts = None
     yield
+
+
+def test_state_write_skips_identical_payload_but_repairs_replacement(
+        tmp_path, monkeypatch):
+    path = tmp_path / "idle_state.json"
+    writes = []
+    real_atomic_write = collector.atomic_write_with_signature
+
+    def counted_write(*args, **kwargs):
+        writes.append(args[1])
+        return real_atomic_write(*args, **kwargs)
+
+    monkeypatch.setattr(collector, "atomic_write_with_signature", counted_write)
+
+    payload = "expected"
+    assert collector._write_state_json(path, payload) is True
+    first_inode = path.stat().st_ino
+    assert collector._write_state_json(path, payload) is False
+    assert path.stat().st_ino == first_inode
+    assert len(writes) == 1
+
+    # Same-inode/same-size edits with a restored mtime are still detected from
+    # the on-disk digest; external changes cannot hide behind metadata.
+    before = path.stat()
+    time.sleep(0.01)  # ensure ctime advances on coarse timestamp filesystems
+    path.write_text("tampered")
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert collector._write_state_json(path, payload) is True
+    assert path.read_text() == payload
+    assert len(writes) == 2
+
+
+def test_state_write_repairs_a_replacement_racing_after_rename(
+        tmp_path, monkeypatch):
+    path = tmp_path / "idle_state.json"
+    real_atomic_write = collector.atomic_write_with_signature
+    calls = 0
+
+    def replaced_after_write(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        signature = real_atomic_write(*args, **kwargs)
+        if calls == 1:
+            path.write_text("external race")
+        return signature
+
+    monkeypatch.setattr(
+        collector, "atomic_write_with_signature", replaced_after_write,
+    )
+
+    assert collector._write_state_json(path, "expected") is True
+    assert path.read_text() == "external race"
+    assert collector._write_state_json(path, "expected") is True
+    assert path.read_text() == "expected"
+
+
+def test_state_write_retries_after_failure(tmp_path, monkeypatch):
+    path = tmp_path / "usage.json"
+    real_atomic_write = collector.atomic_write_with_signature
+    calls = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("disk full")
+        return real_atomic_write(*args, **kwargs)
+
+    monkeypatch.setattr(collector, "atomic_write_with_signature", fail_once)
+
+    assert collector._write_state_json(path, "expected") is False
+    assert collector._write_state_json(path, "expected") is True
+    assert path.read_text() == "expected"
+
+
+def test_state_write_skips_when_live_file_identity_is_unstable(
+        tmp_path, monkeypatch):
+    path = tmp_path / "usage.json"
+    real_signature = collector._state_file_signature
+    sequence = iter(range(1, 10))
+
+    def unstable_signature(target):
+        mode, dev, ino, size, mtime_ns, ctime_ns = real_signature(target)
+        return mode, dev, ino + next(sequence), size, mtime_ns, ctime_ns
+
+    monkeypatch.setattr(collector, "_state_file_signature", unstable_signature)
+
+    results = [collector._write_state_json(path, "same") for _ in range(3)]
+    assert results == [True, False, False]
+
+
+def test_state_write_repairs_mode_and_symlink(tmp_path):
+    path = tmp_path / "usage.json"
+    victim = tmp_path / "victim"
+    victim.write_text("same")
+
+    assert collector._write_state_json(path, "same") is True
+    path.chmod(0o600)
+    assert collector._write_state_json(path, "same") is True
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+
+    path.unlink()
+    path.symlink_to(victim)
+    assert collector._write_state_json(path, "same") is True
+    assert not path.is_symlink()
+    assert path.read_text() == "same"
+    assert victim.read_text() == "same"
+
+
+def test_prune_node_caches_uses_grace_and_keeps_repair_rate_limit(monkeypatch):
+    monkeypatch.setattr(collector, "_node_results", {"live": {}, "old": {}})
+    monkeypatch.setattr(collector, "_node_poll_state", {"live": {}, "old": {}})
+    monkeypatch.setattr(collector, "_agent_payload_cache", {"live": (), "old": ()})
+    monkeypatch.setattr(
+        collector, "_agent_repair_ts",
+        {"live": 1.0, "old": 2.0},
+    )
+    monkeypatch.setattr(collector, "_untrusted_payloads", {"live": 1, "old": 2})
+    monkeypatch.setattr(collector, "_untrusted_warned", {"live", "old"})
+    monkeypatch.setattr(collector, "_node_absent_cycles", {})
+
+    collector._prune_node_caches({"live"})
+    assert "old" in collector._node_results  # one partial roster is tolerated
+    collector._prune_node_caches({"live"})
+
+    for cache in (
+        collector._node_results, collector._node_poll_state,
+        collector._agent_payload_cache,
+        collector._untrusted_payloads, collector._untrusted_warned,
+    ):
+        assert set(cache) == {"live"}
+    # Deleting this while a repair worker is still active can schedule a
+    # second repair that kills the first one's freshly launched agent.
+    assert collector._agent_repair_ts == {"live": 1.0, "old": 2.0}
 
 
 # ── _track_waste ──────────────────────────────────────────────────────────

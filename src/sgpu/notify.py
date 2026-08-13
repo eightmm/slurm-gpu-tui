@@ -37,6 +37,7 @@ so restarts don't re-fire old alerts.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -50,6 +51,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from .common import ROGUE_IGNORE, job_log_paths, mem_to_mib, run_cmd, tail_file
+from .runtime import atomic_write_with_signature, read_regular_file_with_signature
 
 DEBOUNCE_SEC = int(os.getenv(
     "SLURM_GPU_TUI_SLACK_DEBOUNCE_SEC",
@@ -62,6 +64,14 @@ NAG_REALERT_SEC = int(os.getenv(
 ))
 # override for tests; real Slack Web API otherwise
 SLACK_API_BASE = os.getenv("SLURM_GPU_TUI_SLACK_API_BASE", "https://slack.com/api")
+
+
+def _state_file_signature(path: Path) -> tuple[int, int, int, int, int, int]:
+    st = path.lstat()
+    return (
+        st.st_mode, st.st_dev, st.st_ino, st.st_size,
+        st.st_mtime_ns, st.st_ctime_ns,
+    )
 
 # Alert message templates per language. These are user-facing Slack strings
 # (intentionally localizable); all code/logs stay English.
@@ -239,6 +249,10 @@ class Notifier:
         self._parent_worker: Optional[threading.Thread] = None
         self._parent_fail_ts = 0.0
         self._save_failed = False
+        self._last_state_digest: Optional[bytes] = None
+        self._last_state_signature: Optional[
+            tuple[int, int, int, int, int, int]
+        ] = None
         self._blind: Dict[str, float] = st.get("blind", {})
         # first-seen ts of an unconfirmed down/blind; deliberately NOT persisted
         # so a collector restart re-starts the grace clock (cold start looks
@@ -741,13 +755,31 @@ class Notifier:
                 "free_was_below": self._free_was_below,
                 "thread_day": self._thread_day, "thread_ts": self._thread_ts,
             })
+            digest = hashlib.blake2b(payload.encode(), digest_size=16).digest()
+            if digest == self._last_state_digest:
+                try:
+                    signature = _state_file_signature(self._state_file)
+                    if signature == self._last_state_signature:
+                        return
+                    current = read_regular_file_with_signature(
+                        self._state_file, mode=0o644,
+                    )
+                    if current is None:
+                        raise OSError("state file type or mode changed")
+                    content, signature = current
+                    disk_digest = hashlib.blake2b(content, digest_size=16).digest()
+                    if disk_digest == digest:
+                        self._last_state_signature = signature
+                        return
+                except OSError:
+                    pass
             # Parent creation and alert delivery run in separate workers. Keep
             # their shared temp-file write inside the lock as well as snapshot
             # construction so concurrent saves cannot rename each other's file.
             try:
-                tmp = self._state_file.with_suffix(".tmp")
-                tmp.write_text(payload)
-                tmp.rename(self._state_file)
+                signature = atomic_write_with_signature(self._state_file, payload)
+                self._last_state_digest = digest
+                self._last_state_signature = signature
                 self._save_failed = False
             except OSError as e:
                 if not self._save_failed:  # log once, not every 3s cycle

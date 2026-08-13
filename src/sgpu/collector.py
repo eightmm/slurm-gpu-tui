@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import fcntl
 import glob
+import hashlib
 import json
 import os
 import re
@@ -28,8 +29,9 @@ from .agent import AGENT_PAYLOAD_VERSION
 from . import agent as _agent_module
 from .notify import Notifier
 from .runtime import (
-    UnsafeRuntimeDir, atomic_write, default_data_dir, default_state_dir,
-    ensure_secure_dir, open_append, open_lock, state_dir_candidates,
+    UnsafeRuntimeDir, atomic_write, atomic_write_with_signature,
+    default_data_dir, default_state_dir, ensure_secure_dir, open_append,
+    open_lock, read_regular_file_with_signature, state_dir_candidates,
     trusted_payload_uids,
 )
 from . import __build__, __version__
@@ -77,6 +79,8 @@ _repair_executor = ThreadPoolExecutor(max_workers=2)
 _results_lock = threading.Lock()
 _node_results: Dict[str, dict] = {}
 _inflight: set = set()
+_node_absent_cycles: Dict[str, int] = {}
+_NODE_CACHE_PRUNE_AFTER = 2
 
 # ── Waste-age tracking (idle / parked) ────────────────────────────────────
 # "node:gpu_index" -> {"jobid"/"owner": str, "since": float}.
@@ -117,10 +121,31 @@ def _read_state_json(path: Path):
 
 
 _state_write_warned: set = set()
+# path -> (last successful digest, file identity). Keeping the identity means
+# an external replacement/deletion is repaired instead of being mistaken for
+# an unchanged state file.
+_state_write_cache: Dict[
+    Path, tuple[bytes, tuple[int, int, int, int, int, int]]
+] = {}
 _state_write_lock = threading.Lock()
+_state_path_locks: Dict[Path, threading.Lock] = {}
+_inventory_lock = threading.Lock()
 
 
-def _write_state_json(path: Path, text: str) -> None:
+def _state_path_lock(path: Path) -> threading.Lock:
+    with _state_write_lock:
+        return _state_path_locks.setdefault(path, threading.Lock())
+
+
+def _state_file_signature(path: Path) -> tuple[int, int, int, int, int, int]:
+    st = path.lstat()
+    return (
+        st.st_mode, st.st_dev, st.st_ino, st.st_size,
+        st.st_mtime_ns, st.st_ctime_ns,
+    )
+
+
+def _write_state_json(path: Path, text: str) -> bool:
     """Atomic + fsync'd write for files that must survive a reboot.
 
     World-readable on purpose: the published TUI runs as an ordinary user and
@@ -129,12 +154,44 @@ def _write_state_json(path: Path, text: str) -> None:
     """
     try:
         ensure_secure_dir(path.parent)
-        atomic_write(path, text, mode=0o644, fsync=True)
-        _state_write_warned.discard(str(path))
+        with _state_path_lock(path):
+            digest = hashlib.blake2b(text.encode(), digest_size=16).digest()
+            with _state_write_lock:
+                cached = _state_write_cache.get(path)
+            if cached is not None and cached[0] == digest:
+                try:
+                    signature = _state_file_signature(path)
+                    if signature == cached[1]:
+                        return False
+                    # Some filesystems expose a different identity for the
+                    # temp fd and its post-rename path. Verify content through
+                    # a no-follow fd, then refresh metadata instead of writing
+                    # forever. Wrong modes and non-regular files are repaired.
+                    current = read_regular_file_with_signature(path, mode=0o644)
+                    if current is None:
+                        raise OSError("state file type or mode changed")
+                    content, signature = current
+                    disk_digest = hashlib.blake2b(content, digest_size=16).digest()
+                    if disk_digest == digest:
+                        with _state_write_lock:
+                            _state_write_cache[path] = (digest, signature)
+                        return False
+                except OSError:
+                    pass
+            signature = atomic_write_with_signature(
+                path, text, mode=0o644, fsync=True,
+            )
+            with _state_write_lock:
+                _state_write_cache[path] = (digest, signature)
+                _state_write_warned.discard(str(path))
+            return True
     except (OSError, UnsafeRuntimeDir) as e:
-        if str(path) not in _state_write_warned:
+        with _state_write_lock:
+            first_failure = str(path) not in _state_write_warned
             _state_write_warned.add(str(path))
+        if first_failure:
             print(f"[collector] state write failed for {path}: {e}", flush=True)
+        return False
 
 
 def _load_inventory() -> None:
@@ -154,7 +211,7 @@ def _update_inventory(name: str, gpu_dicts: List[dict]) -> None:
         return
     # called from poller threads and the main loop — serialize the check-
     # mutate-write sequence so two threads can't interleave on the tmp file
-    with _state_write_lock:
+    with _inventory_lock:
         if _inventory.get(name) == static and INVENTORY_FILE.exists():
             return
         _inventory[name] = static
@@ -825,6 +882,45 @@ def _effective_mem_total(mem: object, slurm_total: str) -> str:
     return slurm_total
 
 
+def _prune_node_caches(live_names: set[str]) -> None:
+    """Drop transient data after a node misses consecutive Slurm rosters.
+
+    Inventory is intentionally retained so a temporarily missing node keeps
+    its learned GPU layout. A one-cycle grace also prevents a partial sinfo
+    result from immediately discarding last-good telemetry.
+    """
+    with _results_lock:
+        tracked = set(_node_results) | set(_node_poll_state) | set(_inflight)
+    tracked.update(_agent_payload_cache)
+    tracked.update(_untrusted_payloads)
+    tracked.update(_untrusted_warned)
+    tracked.update(_node_absent_cycles)
+
+    for name in live_names:
+        _node_absent_cycles.pop(name, None)
+    for name in tracked - live_names:
+        _node_absent_cycles[name] = _node_absent_cycles.get(name, 0) + 1
+    retired = {
+        name for name, count in _node_absent_cycles.items()
+        if count >= _NODE_CACHE_PRUNE_AFTER
+    }
+    if not retired:
+        return
+
+    with _results_lock:
+        for name in retired:
+            _node_results.pop(name, None)
+        for name in retired:
+            _node_poll_state.pop(name, None)
+    for cache in (_agent_payload_cache, _untrusted_payloads):
+        for name in retired:
+            cache.pop(name, None)
+    for name in retired:
+        _untrusted_warned.discard(name)
+    for name in retired:
+        _node_absent_cycles.pop(name, None)
+
+
 def collect_all() -> dict:
     """One collection cycle: fast local data + latest async node results.
 
@@ -832,6 +928,11 @@ def collect_all() -> dict:
     node only goes stale, it cannot stall data for healthy nodes.
     """
     nodes_raw, jobs, pending, node_jobs_from_basic, gpu_alloc, alloc_user_map, basic_err = collect_basic()
+    # An empty roster can mean sinfo failed, so retain caches in that case.
+    # Repeated non-empty snapshots retire renamed or decommissioned nodes;
+    # one partial snapshot keeps the last-good telemetry.
+    if nodes_raw:
+        _prune_node_caches({n["name"] for n in nodes_raw})
 
     node_jobs: Dict[str, List[dict]] = {
         k: [_job_to_dict(j) for j in v] for k, v in node_jobs_from_basic.items()

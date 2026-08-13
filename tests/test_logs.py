@@ -2,7 +2,7 @@
 import os
 
 from sgpu.common import job_log_paths, tail_file
-from sgpu.screens import _LOG_ERR_RE, _fmt_sacct_detail
+from sgpu.screens import DetailScreen, _LOG_ERR_RE, _fmt_sacct_detail
 
 
 # ── job_log_paths ─────────────────────────────────────────────────────────
@@ -67,6 +67,41 @@ def test_tail_missing_empty_unreadable(tmp_path):
         secret.write_text("hidden")
         secret.chmod(0)
         assert "not readable" in tail_file(str(secret))
+
+
+def test_detail_log_poll_skips_unchanged_files(tmp_path, monkeypatch):
+    import sgpu.screens as screens
+
+    log = tmp_path / "job.log"
+    log.write_text("step 1\n")
+    reads = []
+    real_tail = screens.tail_file
+
+    def counted_tail(path):
+        reads.append(path)
+        return real_tail(path)
+
+    monkeypatch.setattr(screens, "tail_file", counted_tail)
+    detail = DetailScreen("job 1", "body", stdout_path=str(log))
+
+    assert len(detail._collect_log_updates()) == 1
+    assert detail._collect_log_updates() == []
+    before = log.stat()
+    log.write_text("step 2\n")  # same size
+    os.utime(log, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert len(detail._collect_log_updates()) == 1
+    assert reads == [str(log), str(log)]
+
+
+def test_detail_log_poll_retries_a_missing_file(tmp_path):
+    log = tmp_path / "later.log"
+    detail = DetailScreen("job 1", "body", stdout_path=str(log))
+
+    assert len(detail._collect_log_updates()) == 1
+    assert len(detail._collect_log_updates()) == 1
+    log.write_text("started\n")
+    updates = detail._collect_log_updates()
+    assert len(updates) == 1 and "started" in updates[0][1].plain
 
 
 # ── error highlighting ────────────────────────────────────────────────────

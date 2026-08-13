@@ -10,9 +10,9 @@ import stat
 import pytest
 
 from sgpu.runtime import (
-    UnsafeRuntimeDir, agent_runtime_path, atomic_write, default_state_dir,
-    dir_trust_problem, ensure_secure_dir, open_append, open_lock,
-    trusted_payload_uids,
+    UnsafeRuntimeDir, agent_runtime_path, atomic_write,
+    atomic_write_with_signature, default_state_dir, dir_trust_problem,
+    ensure_secure_dir, open_append, open_lock, trusted_payload_uids,
 )
 
 
@@ -89,6 +89,16 @@ def test_atomic_write_creates_and_replaces(tmp_path):
     assert p.read_text() == "one"
     atomic_write(p, "two")
     assert p.read_text() == "two"
+
+
+def test_atomic_write_signature_identifies_installed_file(tmp_path):
+    p = tmp_path / "data.json"
+    signature = atomic_write_with_signature(p, "one")
+    st = p.stat()
+    assert signature == (
+        st.st_mode, st.st_dev, st.st_ino, st.st_size,
+        st.st_mtime_ns, st.st_ctime_ns,
+    )
 
 
 def test_atomic_write_applies_mode_despite_umask(tmp_path):

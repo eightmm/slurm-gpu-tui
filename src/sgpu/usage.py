@@ -11,15 +11,16 @@ from rich.text import Text
 from .cells import _waste_thr
 from .runtime import state_dir_candidates
 
+
 def render_usage(days: int = 7) -> Text:
     """Per-user GPU-hours table (Usage tab / former modal)."""
     body = Text()
     body.append(f"GPU-hours by user — last {days} days\n\n", style="bold")
-    loaded = load_usage_totals(days)
+    loaded = _load_usage_window(days)
     if loaded is None:
         body.append("No usage data (collector not running or too new).", style="dim")
         return body
-    totals, covered, sacct_ts = loaded
+    totals, daily, covered, sacct_ts = loaded
     if not totals:
         body.append("No GPU usage recorded in this window.", style="dim")
         return body
@@ -31,7 +32,6 @@ def render_usage(days: int = 7) -> Text:
         body.append(f"{alloc / 3600:>8.1f}h{busy / 3600:>8.1f}h", style="bold")
         body.append(f"{eff:>6.0%}", style=eff_style)
         body.append(f"{waste / 3600:>8.1f}h\n", style="red" if waste >= 3600 else "dim")
-    daily = load_usage_daily(days)
     if len(daily) > 1:
         body.append(f"\n {'day':<7}{'alloc':>7}{'busy':>7}  cluster GPU-hours/day\n",
                     style="bold underline")
@@ -135,31 +135,50 @@ def _window_cutoff(days: int) -> str:
     return (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
 
 
-def load_usage_daily(days: int) -> List[Tuple[str, float, float, float]]:
-    """Cluster-wide per-day totals [(day, alloc_sec, busy_sec, covered_sec)],
-    oldest first. covered_sec ~ 0 means the collector never sampled that day:
-    busy is unknown there, not zero."""
-    raw = _read_usage_raw()
-    if raw is None:
-        return []
-    cutoff = _window_cutoff(days)
-    _users, daily = merge_usage_window(raw, lambda d: d >= cutoff)
-    meta = raw.get("meta", {})
-    return [(day, daily[day][0], daily[day][1], float(meta.get(day, 0)))
-            for day in sorted(daily)]
+UsageTotals = List[Tuple[str, float, float, float, float]]
+UsageDaily = List[Tuple[str, float, float, float]]
 
 
-def load_usage_totals(days: int) -> Optional[Tuple[List[Tuple[str, float, float, float]], float, Optional[float]]]:
-    """Sum usage.json daily buckets over the window.
-
-    Returns ([(user, alloc, busy, sampled_alloc, waste)] alloc desc,
-             covered_seconds, sacct_ts or None)."""
+def _load_usage_window(
+    days: int,
+) -> Optional[Tuple[UsageTotals, UsageDaily, float, Optional[float]]]:
+    """Load and merge one window for both Usage-tab views."""
     raw = _read_usage_raw()
     if raw is None:
         return None
     cutoff = _window_cutoff(days)
-    totals, _daily = merge_usage_window(raw, lambda d: d >= cutoff)
-    covered = sum(v for d, v in raw.get("meta", {}).items() if d >= cutoff)
+    totals, daily = merge_usage_window(raw, lambda d: d >= cutoff)
+    meta = raw.get("meta", {})
+    total_rows = sorted(
+        ((u, a, b, sa, w) for u, (a, b, sa, w) in totals.items()),
+        key=lambda x: -x[1],
+    )
+    daily_rows = [
+        (day, daily[day][0], daily[day][1], float(meta.get(day, 0)))
+        for day in sorted(daily)
+    ]
+    covered = sum(v for d, v in meta.items() if d >= cutoff)
     sacct_ts = raw.get("sacct_ts") if raw.get("sacct_days") else None
-    return (sorted(((u, a, b, sa, w) for u, (a, b, sa, w) in totals.items()), key=lambda x: -x[1]),
-            covered, sacct_ts)
+    return total_rows, daily_rows, covered, sacct_ts
+
+
+def load_usage_daily(days: int) -> List[Tuple[str, float, float, float]]:
+    """Cluster-wide per-day totals [(day, alloc_sec, busy_sec, covered_sec)],
+    oldest first. covered_sec ~ 0 means the collector never sampled that day:
+    busy is unknown there, not zero."""
+    loaded = _load_usage_window(days)
+    return loaded[1] if loaded is not None else []
+
+
+def load_usage_totals(
+    days: int,
+) -> Optional[Tuple[UsageTotals, float, Optional[float]]]:
+    """Sum usage.json daily buckets over the window.
+
+    Returns ([(user, alloc, busy, sampled_alloc, waste)] alloc desc,
+             covered_seconds, sacct_ts or None)."""
+    loaded = _load_usage_window(days)
+    if loaded is None:
+        return None
+    totals, _daily, covered, sacct_ts = loaded
+    return totals, covered, sacct_ts

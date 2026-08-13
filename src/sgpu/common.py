@@ -613,12 +613,15 @@ NODE_PAYLOAD_CMD = (
     "ecc.errors.uncorrected.aggregate.total,serial,clocks.sm,clocks.mem "
     "--format=csv,noheader,nounits 2>/dev/null; "
     "echo '---SEP---'; "
-    "nvidia-smi pmon -c 1 -s m 2>/dev/null; "
+    # One pmon sample supplies both the payload section and the PID list.
+    # Running pmon again doubled its process/driver-query cost on every node.
+    "PMON=$(nvidia-smi pmon -c 1 -s m 2>/dev/null); "
+    "printf '%s\n' \"$PMON\"; "
     "echo '---SEP---'; "
     "awk '/^MemTotal:/{ t=$2 } /^MemAvailable:/{ a=$2 } "
     "END{ printf \"%d %d %d\", t/1024, (t-a)/1024, a/1024 }' /proc/meminfo; "
     "echo '---SEP---'; "
-    "PIDS=$(nvidia-smi pmon -c 1 -s u 2>/dev/null | awk 'NR>2 && $2!= \"-\" {print $2}' | tr '\\n' ','); "
+    "PIDS=$(printf '%s\n' \"$PMON\" | awk 'NR>2 && $2!= \"-\" {print $2}' | tr '\\n' ','); "
     "if [ -n \"$PIDS\" ]; then ps -p ${PIDS%,} -o pid=,user= 2>/dev/null; fi; "
     "echo '---SEP---'; "
     # PCI bus -> /dev/nvidiaN minor. SLURM's GRES IDX means the minor, and

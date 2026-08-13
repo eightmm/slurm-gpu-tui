@@ -26,6 +26,16 @@ from pathlib import Path
 from typing import Union
 
 
+FileSignature = tuple[int, int, int, int, int, int]
+
+
+def _file_signature(st: os.stat_result) -> FileSignature:
+    return (
+        st.st_mode, st.st_dev, st.st_ino, st.st_size,
+        st.st_mtime_ns, st.st_ctime_ns,
+    )
+
+
 class UnsafeRuntimeDir(RuntimeError):
     """A runtime directory an unprivileged user could use to redirect writes."""
 
@@ -111,12 +121,12 @@ def _tmp_sibling(path: Path) -> Path:
     return path.with_name(f".{path.name}.{os.getpid()}.tmp")
 
 
-def atomic_write(
+def _atomic_write(
     path: Union[str, Path],
     data: Union[str, bytes],
     mode: int = 0o644,
     fsync: bool = False,
-) -> None:
+) -> FileSignature:
     """Replace `path` with `data`, never following a symlink.
 
     ``O_NOFOLLOW|O_EXCL`` on the temp name means a planted symlink makes us
@@ -137,6 +147,7 @@ def atomic_write(
         if e.errno != errno.ENOENT:
             raise
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    signature: FileSignature
     try:
         with os.fdopen(fd, "wb", closefd=False) as f:
             f.write(payload)
@@ -144,6 +155,7 @@ def atomic_write(
             if fsync:
                 os.fsync(fd)
         os.fchmod(fd, mode)  # defeat a restrictive umask; readers need this
+        signature = _file_signature(os.fstat(fd))
     except BaseException:
         os.close(fd)
         try:
@@ -153,6 +165,44 @@ def atomic_write(
         raise
     os.close(fd)
     os.replace(tmp, p)
+    return signature
+
+
+def atomic_write(
+    path: Union[str, Path],
+    data: Union[str, bytes],
+    mode: int = 0o644,
+    fsync: bool = False,
+) -> None:
+    """Atomically replace ``path`` without following symlinks."""
+    _atomic_write(path, data, mode=mode, fsync=fsync)
+
+
+def atomic_write_with_signature(
+    path: Union[str, Path],
+    data: Union[str, bytes],
+    mode: int = 0o644,
+    fsync: bool = False,
+) -> FileSignature:
+    """Atomic write plus the identity of the file that was installed."""
+    return _atomic_write(path, data, mode=mode, fsync=fsync)
+
+
+def read_regular_file_with_signature(
+    path: Union[str, Path], mode: int = 0o644,
+) -> tuple[bytes, FileSignature] | None:
+    """Read a regular file of the expected mode without following symlinks."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or stat.S_IMODE(st.st_mode) != mode:
+            return None
+        chunks = []
+        while chunk := os.read(fd, 64 * 1024):
+            chunks.append(chunk)
+        return b"".join(chunks), _file_signature(st)
+    finally:
+        os.close(fd)
 
 
 def open_append(path: Union[str, Path], mode: int = 0o644) -> int:

@@ -1,10 +1,13 @@
 """Push-agent payload validation and delivery-mode tests."""
 import json
+import os
+import subprocess
 import time
 
 from sgpu import collector
 from sgpu import agent
 from sgpu.agent import AGENT_PAYLOAD_VERSION
+from sgpu.common import NODE_PAYLOAD_CMD, parse_node_payload
 
 
 def _payload(hostname="gpu1", kind="gpu"):
@@ -21,6 +24,46 @@ def _payload(hostname="gpu1", kind="gpu"):
         }] if kind == "gpu" else [],
         "mem": {"total": "250000", "used": "1000", "avail": "249000"},
     }
+
+
+def test_node_payload_reuses_one_pmon_sample(tmp_path):
+    """PID attribution and pmon metrics must come from one driver query."""
+    calls = tmp_path / "nvidia-calls"
+    ps_args = tmp_path / "ps-args"
+    nvidia_smi = tmp_path / "nvidia-smi"
+    nvidia_smi.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >> \"$SGPU_TEST_NVIDIA_CALLS\"\n"
+        "case \"$1\" in\n"
+        "  --query-gpu=*) printf '%s\\n' "
+        "'0, GPU-test, NVIDIA H100, 10, 20, 100, 30, 40, 50, "
+        "00000000:01:00.0, 0, S, 1000, 2000' ;;\n"
+        "  pmon) printf '%s\\n' '# gpu pid type fb ccpm command' "
+        "'# Idx # C/G MB MB name' '0 4242 C 20 0 python' ;;\n"
+        "esac\n"
+    )
+    nvidia_smi.chmod(0o755)
+    ps = tmp_path / "ps"
+    ps.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >> \"$SGPU_TEST_PS_ARGS\"\n"
+        "printf '%s\\n' '4242 alice'\n"
+    )
+    ps.chmod(0o755)
+    env = dict(os.environ, PATH=f"{tmp_path}:{os.environ['PATH']}",
+               SGPU_TEST_NVIDIA_CALLS=str(calls), SGPU_TEST_PS_ARGS=str(ps_args))
+
+    proc = subprocess.run(
+        ["bash", "-c", NODE_PAYLOAD_CMD], env=env, text=True,
+        capture_output=True, timeout=10, check=True,
+    )
+
+    invocations = calls.read_text().splitlines()
+    assert len(invocations) == 2
+    assert sum(line.startswith("pmon ") for line in invocations) == 1
+    assert "-p 4242 -o pid=,user=" in ps_args.read_text()
+    gpus, _mem = parse_node_payload(proc.stdout)
+    assert gpus[0].pids == ["4242"] and gpus[0].users == ["alice"]
 
 
 def test_valid_agent_payload_accepts_expected_shape():

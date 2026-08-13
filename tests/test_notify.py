@@ -1,6 +1,7 @@
 """Notifier state-machine tests: node down/recovered, collect-blind,
 job-done diffing, debounce, persistence. No network — _post is stubbed."""
 import json
+import stat
 import threading
 import time
 from datetime import datetime
@@ -193,6 +194,91 @@ def test_save_prunes_expired_debounce_keys(tmp_path):
     n._save()
     assert "ancient" not in n._last_sent
     assert "fresh" in n._last_sent
+
+
+def test_save_skips_identical_state_but_repairs_external_change(tmp_path):
+    n, _ = _mk(tmp_path)
+    n._save()
+    first_inode = n._state_file.stat().st_ino
+
+    n._save()
+    assert n._state_file.stat().st_ino == first_inode
+
+    n._state_file.write_text("externally replaced")
+    n._save()
+    restored = json.loads(n._state_file.read_text())
+    assert restored["thread_ts"] == "parent-ts"
+
+
+def test_save_repairs_a_replacement_racing_after_rename(tmp_path, monkeypatch):
+    import sgpu.notify as notify
+
+    n, _ = _mk(tmp_path)
+    real_atomic_write = notify.atomic_write_with_signature
+    calls = 0
+
+    def replaced_after_write(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        signature = real_atomic_write(*args, **kwargs)
+        if calls == 1:
+            n._state_file.write_text("external race")
+        return signature
+
+    monkeypatch.setattr(
+        notify, "atomic_write_with_signature", replaced_after_write,
+    )
+
+    n._save()
+    assert n._state_file.read_text() == "external race"
+    n._save()
+    assert json.loads(n._state_file.read_text())["thread_ts"] == "parent-ts"
+
+
+def test_save_skips_when_live_file_identity_is_unstable(tmp_path, monkeypatch):
+    import sgpu.notify as notify
+
+    n, _ = _mk(tmp_path)
+    real_signature = notify._state_file_signature
+    real_atomic_write = notify.atomic_write_with_signature
+    sequence = iter(range(1, 10))
+    writes = 0
+
+    def unstable_signature(path):
+        mode, dev, ino, size, mtime_ns, ctime_ns = real_signature(path)
+        return mode, dev, ino + next(sequence), size, mtime_ns, ctime_ns
+
+    def counted_write(*args, **kwargs):
+        nonlocal writes
+        writes += 1
+        return real_atomic_write(*args, **kwargs)
+
+    monkeypatch.setattr(notify, "_state_file_signature", unstable_signature)
+    monkeypatch.setattr(notify, "atomic_write_with_signature", counted_write)
+
+    n._save()
+    n._save()
+    n._save()
+    assert writes == 1
+
+
+def test_save_repairs_mode_and_symlink(tmp_path):
+    n, _ = _mk(tmp_path)
+    victim = tmp_path / "victim"
+
+    n._save()
+    n._state_file.chmod(0o600)
+    n._save()
+    assert stat.S_IMODE(n._state_file.stat().st_mode) == 0o644
+
+    payload = n._state_file.read_text()
+    victim.write_text(payload)
+    n._state_file.unlink()
+    n._state_file.symlink_to(victim)
+    n._save()
+    assert not n._state_file.is_symlink()
+    assert n._state_file.read_text() == payload
+    assert victim.read_text() == payload
 
 
 # ── job-fail ──────────────────────────────────────────────────────────────
