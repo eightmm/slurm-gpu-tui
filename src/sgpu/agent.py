@@ -20,15 +20,16 @@ from dataclasses import asdict
 from pathlib import Path
 
 from . import __build__, __version__
-from .common import NODE_PAYLOAD_CMD, parse_node_payload
+from .common import NODE_DYNAMIC_PAYLOAD_CMD, NODE_PAYLOAD_CMD, parse_node_payload
 from .runtime import agent_runtime_path, atomic_write, open_append, open_lock
 
 AGENT_DIR = Path(os.getenv("SLURM_GPU_TUI_AGENT_DIR", str(Path.home() / ".sgpu" / "nodes")))
 GPU_INTERVAL = int(os.getenv("SLURM_GPU_TUI_AGENT_SEC", "3"))
 CPU_INTERVAL = int(os.getenv("SLURM_GPU_TUI_CPU_AGENT_SEC", "20"))
 # Generous: without GPU persistence mode each nvidia-smi call can take ~5s
-# (driver re-init), and the payload runs three of them
+# (driver re-init), and the payload runs the query plus one pmon sample.
 CMD_TIMEOUT = int(os.getenv("SLURM_GPU_TUI_AGENT_CMD_TIMEOUT_SEC", "40"))
+GPU_TOPOLOGY_TTL = int(os.getenv("SLURM_GPU_TUI_GPU_TOPOLOGY_TTL_SEC", "300"))
 
 # Node-local (NOT on NFS): one agent per node, log stays on the node.
 # /run when root — a fixed /tmp name is a root-append/truncate target on a
@@ -48,6 +49,11 @@ except OSError:
     AGENT_BUILD = "0"
 
 _running = True
+_gpu_topology_cache = {
+    "expires": 0.0,
+    "gpu_set": (),
+    "values": {},
+}
 
 
 def _handle_signal(signum, frame):
@@ -166,17 +172,65 @@ def _read_ipmi_power() -> str:
     return val
 
 
+def _run_gpu_payload(command: str):
+    out = subprocess.run(
+        ["bash", "-c", command],
+        capture_output=True, text=True, timeout=CMD_TIMEOUT,
+    ).stdout
+    return parse_node_payload(out)
+
+
+def _gpu_set(gpus) -> tuple[tuple[str, str, str], ...]:
+    return tuple((g.index, g.uuid, g.pci_bus) for g in gpus)
+
+
+def _remember_gpu_topology(gpus, now: float) -> None:
+    # ``minor`` is required for exact Slurm GRES placement. /proc can be
+    # transiently incomplete during driver init/reset; never turn that one
+    # partial probe into a five-minute cache entry. Slots are optional because
+    # not every chassis exposes /sys/bus/pci/slots metadata.
+    complete = bool(gpus) and all(g.minor for g in gpus)
+    _gpu_topology_cache["expires"] = (
+        now + max(0, GPU_TOPOLOGY_TTL) if complete else 0.0
+    )
+    _gpu_topology_cache["gpu_set"] = _gpu_set(gpus) if complete else ()
+    _gpu_topology_cache["values"] = (
+        {g.index: (g.minor, g.slot) for g in gpus} if complete else {}
+    )
+
+
+def _collect_gpu_payload(now: float | None = None):
+    """Collect live GPU data, refreshing static PCI topology when needed."""
+    now = time.monotonic() if now is None else now
+    cache_valid = (
+        bool(_gpu_topology_cache["gpu_set"])
+        and now < float(_gpu_topology_cache["expires"])
+    )
+    command = NODE_DYNAMIC_PAYLOAD_CMD if cache_valid else NODE_PAYLOAD_CMD
+    gpus, mem = _run_gpu_payload(command)
+
+    if cache_valid and _gpu_set(gpus) != _gpu_topology_cache["gpu_set"]:
+        # Hotplug, driver reset, or enumeration change: discard the dynamic
+        # sample and immediately rebuild topology from a full payload.
+        gpus, mem = _run_gpu_payload(NODE_PAYLOAD_CMD)
+        cache_valid = False
+
+    if not cache_valid:
+        _remember_gpu_topology(gpus, now)
+    else:
+        topology = _gpu_topology_cache["values"]
+        for gpu in gpus:
+            gpu.minor, gpu.slot = topology.get(gpu.index, ("", ""))
+    return gpus, mem
+
+
 def collect_local(mode: str = "gpu") -> dict:
     """Collect a GPU or CPU-only payload locally."""
     if mode == "cpu":
         gpu_dicts = []
         mem_dict = _read_meminfo()
     elif mode == "gpu":
-        out = subprocess.run(
-            ["bash", "-c", NODE_PAYLOAD_CMD],
-            capture_output=True, text=True, timeout=CMD_TIMEOUT,
-        ).stdout
-        gpus, mem = parse_node_payload(out)
+        gpus, mem = _collect_gpu_payload()
         gpu_dicts = [asdict(g) for g in gpus]
         mem_dict = {"total": mem.total, "used": mem.used, "avail": mem.avail}
     else:

@@ -45,7 +45,9 @@ ls -l /tmp/slurm-gpu-tui/metrics.prom
 sed -n '1,80p' /tmp/slurm-gpu-tui/metrics.prom
 ```
 
-The file is rewritten every collector cycle.
+By default the file is rewritten every 15 seconds (and never faster than the
+collector cycle). Set `SLURM_GPU_TUI_METRICS_SEC` on the collector service to
+change that cadence.
 
 ## 2. Expose with node_exporter
 

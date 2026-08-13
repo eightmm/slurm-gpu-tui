@@ -285,7 +285,7 @@ def test_save_repairs_mode_and_symlink(tmp_path):
 
 def test_job_fail_alerts_on_bad_outcome(tmp_path):
     n, sent = _mk(tmp_path, job_fail_users=["*"])
-    n._job_final_state = lambda jid: "OUT_OF_MEMORY"
+    n._job_final_states = lambda jids: dict.fromkeys(jids, "OUT_OF_MEMORY")
     n.process({"nodes": [], "jobs": [_job()], "errors": ""})
     n.process({"nodes": [], "jobs": [], "errors": ""})
     assert len(sent) == 1 and "OUT_OF_MEMORY" in sent[0]
@@ -294,10 +294,86 @@ def test_job_fail_alerts_on_bad_outcome(tmp_path):
 def test_job_fail_quiet_on_clean_finish(tmp_path):
     # COMPLETED job of a non-job_done user: no alert at all
     n, sent = _mk(tmp_path, job_fail_users=["*"])
-    n._job_final_state = lambda jid: "COMPLETED"
+    n._job_final_states = lambda jids: dict.fromkeys(jids, "COMPLETED")
     n.process({"nodes": [], "jobs": [_job()], "errors": ""})
     n.process({"nodes": [], "jobs": [], "errors": ""})
     assert sent == []
+
+
+def test_job_fail_batches_finished_state_lookup_once(tmp_path, monkeypatch):
+    import sgpu.notify as notify
+
+    n, sent = _mk(tmp_path, job_fail_users=["*"])
+    calls = []
+
+    def fake_run(cmd, timeout=10):
+        calls.append(cmd)
+        return True, "7|FAILED|\n8|COMPLETED|\n9_3|TIMEOUT|"
+
+    monkeypatch.setattr(notify, "run_cmd", fake_run)
+    jobs = [_job("7"), _job("8"), _job("9_3")]
+    n.process({"nodes": [], "jobs": jobs, "errors": ""})
+    n.process({"nodes": [], "jobs": [], "errors": ""})
+
+    assert len(calls) == 1
+    assert "-j 7,8,9_3" in calls[0]
+    assert len(sent) == 2
+    assert "7" in sent[0] and "9_3" in sent[1]
+
+
+def test_job_final_states_exact_jobidraw_ignores_steps_and_duplicates(
+        tmp_path, monkeypatch):
+    import sgpu.notify as notify
+
+    n, _ = _mk(tmp_path)
+    calls = []
+
+    def fake_run(cmd, timeout=10):
+        calls.append(cmd)
+        return True, (
+            "101|COMPLETED|\n"
+            "102_7.batch|FAILED|\n"
+            "102_7|OUT_OF_MEMORY|\n"
+            "102_7|TIMEOUT|\n"
+            "103.extern|FAILED|\n"
+            "junk\n"
+        )
+
+    monkeypatch.setattr(notify, "run_cmd", fake_run)
+
+    states = n._job_final_states(["101", "102_7", "103", "102_7"])
+
+    assert states == {"101": "COMPLETED", "102_7": "OUT_OF_MEMORY"}
+    assert len(calls) == 1
+    assert "-o JobIDRaw,State" in calls[0]
+    assert n._job_final_state("101") == "COMPLETED"
+    assert len(calls) == 2  # compatibility helper remains one standalone query
+    assert n._job_final_state("bad id") == ""
+    assert len(calls) == 2  # unsafe/malformed IDs never become sacct arguments
+
+
+def test_job_final_states_shell_quotes_federated_ids(tmp_path, monkeypatch):
+    import sgpu.notify as notify
+
+    n, _ = _mk(tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        notify, "run_cmd",
+        lambda cmd, **kwargs: (calls.append(cmd) or True, "7;west|FAILED|"),
+    )
+
+    assert n._job_final_states(["7;west"]) == {"7;west": "FAILED"}
+    assert "-j '7;west'" in calls[0]
+
+
+@pytest.mark.parametrize("result", [(False, "sacct failed"), (True, "")])
+def test_job_final_states_empty_on_command_failure_or_no_rows(
+        tmp_path, monkeypatch, result):
+    import sgpu.notify as notify
+
+    n, _ = _mk(tmp_path)
+    monkeypatch.setattr(notify, "run_cmd", lambda *args, **kwargs: result)
+    assert n._job_final_states(["7", "8_2"]) == {}
 
 
 # ── pending-stuck ─────────────────────────────────────────────────────────

@@ -23,6 +23,14 @@ def test_from_dict_keeps_defaults_for_missing_keys():
     assert g.name == "" and g.pids == [] and g.idle_sec == 0
 
 
+def test_from_dict_cached_schema_does_not_share_mutable_defaults():
+    first = from_dict(GpuInfo, {"index": "0"})
+    second = from_dict(GpuInfo, {"index": "1"})
+    first.pids.append("123")
+    first.pid_mem["123"] = "10"
+    assert second.pids == [] and second.pid_mem == {}
+
+
 def test_from_dict_drops_type_mismatches_instead_of_propagating():
     # A malformed entry should cost one field, not kill the refresh worker.
     g = from_dict(GpuInfo, {"index": "0", "pids": "not-a-list", "idle_sec": "x"})

@@ -1,6 +1,7 @@
 """Parser tests against captured real-cluster output."""
 from datetime import datetime
 
+from sgpu import common
 from sgpu.common import (
     NodeErrorKind, _classify_error, _expand_idx, _gpu_count_from_gres,
     assign_node_jobs, expand_nodelist, parse_gpu_alloc, parse_gres_models,
@@ -33,6 +34,65 @@ def test_assign_node_jobs_multinode():
     assert [j.jobid for j in m["gpu3"]] == ["1"] and m["gpu3"][0].cpu_count == 8
     assert all(m[f"cpu{i}"][0].cpu_count == 64 for i in range(5, 9))
     assert m["cpu1"][0].cpu_count == 3 and m["cpu2"][0].cpu_count == 2
+
+
+def test_combined_squeue_splits_running_and_pending(monkeypatch):
+    output = (
+        "RUNNING|10|alice|gpu|train|01:02|gpu1|gpu:h100:2|2:00:00|8|64G|None|9|N/A\n"
+        "PENDING|11|bob|gpu|wait|0:00|(Priority)|gpu:a100:1|1:00:00|4|32G|Priority|7|2030-01-02T03:04:05"
+    )
+    calls = []
+    monkeypatch.setattr(
+        common, "run_cmd",
+        lambda cmd: (calls.append(cmd) or True, output),
+    )
+
+    jobs, pending, error = common._collect_queue()
+
+    assert error == "" and len(calls) == 1
+    assert [(j.jobid, j.gpu_count, j.cpu_count, j.mem) for j in jobs] == [
+        ("10", 2, 8, "64G")
+    ]
+    assert [(p.jobid, p.gpu_count, p.reason, p.start_time) for p in pending] == [
+        ("11", 1, "Priority", "2030-01-02T03:04:05")
+    ]
+
+
+def test_collect_basic_uses_one_squeue_and_preserves_errors(monkeypatch):
+    calls = []
+    monkeypatch.setattr(common, "collect_nodes_basic", lambda: ([], ""))
+    monkeypatch.setattr(common, "collect_gpu_alloc", lambda: ({}, {}, ""))
+    monkeypatch.setattr(common, "collect_mem_alloc", lambda: ({}, ""))
+    monkeypatch.setattr(
+        common, "run_cmd",
+        lambda cmd: (calls.append(cmd) or False, "controller unavailable"),
+    )
+
+    *_, error = common.collect_basic()
+
+    assert len(calls) == 1
+    assert error == (
+        "squeue failed: controller unavailable | "
+        "squeue PD failed: controller unavailable"
+    )
+
+
+def test_public_queue_error_prefixes_are_unchanged(monkeypatch):
+    monkeypatch.setattr(common, "run_cmd", lambda _cmd: (False, "down"))
+    assert common.collect_jobs() == ([], "squeue failed: down")
+    assert common.collect_pending_jobs() == ([], "squeue PD failed: down")
+
+
+def test_basic_executor_cleanup_waits_and_cancels(monkeypatch):
+    calls = []
+
+    class FakeExecutor:
+        def shutdown(self, **kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setattr(common, "_basic_executor", FakeExecutor())
+    common.cleanup_basic_executor()
+    assert calls == [{"wait": True, "cancel_futures": True}]
 
 
 def test_expand_idx():

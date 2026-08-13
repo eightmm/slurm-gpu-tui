@@ -7,7 +7,10 @@ import time
 from sgpu import collector
 from sgpu import agent
 from sgpu.agent import AGENT_PAYLOAD_VERSION
-from sgpu.common import NODE_PAYLOAD_CMD, parse_node_payload
+from sgpu.common import (
+    GpuInfo, NODE_DYNAMIC_PAYLOAD_CMD, NODE_PAYLOAD_CMD, NodeMemInfo,
+    parse_node_payload,
+)
 
 
 def _payload(hostname="gpu1", kind="gpu"):
@@ -30,6 +33,7 @@ def test_node_payload_reuses_one_pmon_sample(tmp_path):
     """PID attribution and pmon metrics must come from one driver query."""
     calls = tmp_path / "nvidia-calls"
     ps_args = tmp_path / "ps-args"
+    grep_args = tmp_path / "grep-args"
     nvidia_smi = tmp_path / "nvidia-smi"
     nvidia_smi.write_text(
         "#!/bin/sh\n"
@@ -39,7 +43,8 @@ def test_node_payload_reuses_one_pmon_sample(tmp_path):
         "'0, GPU-test, NVIDIA H100, 10, 20, 100, 30, 40, 50, "
         "00000000:01:00.0, 0, S, 1000, 2000' ;;\n"
         "  pmon) printf '%s\\n' '# gpu pid type fb ccpm command' "
-        "'# Idx # C/G MB MB name' '0 4242 C 20 0 python' ;;\n"
+        "'# Idx # C/G MB MB name' '0 4242 C 20 0 python' "
+        "'0 4343 C 10 0 python' ;;\n"
         "esac\n"
     )
     nvidia_smi.chmod(0o755)
@@ -47,11 +52,19 @@ def test_node_payload_reuses_one_pmon_sample(tmp_path):
     ps.write_text(
         "#!/bin/sh\n"
         "printf '%s\\n' \"$*\" >> \"$SGPU_TEST_PS_ARGS\"\n"
-        "printf '%s\\n' '4242 alice'\n"
+        "printf '%s\\n' '4242 alice' '4343 bob'\n"
     )
     ps.chmod(0o755)
+    grep = tmp_path / "grep"
+    grep.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >> \"$SGPU_TEST_GREP_ARGS\"\n"
+        "printf '%s\\n' '/proc/4242/cgroup:job_77' '/proc/4343/cgroup:job_88'\n"
+    )
+    grep.chmod(0o755)
     env = dict(os.environ, PATH=f"{tmp_path}:{os.environ['PATH']}",
-               SGPU_TEST_NVIDIA_CALLS=str(calls), SGPU_TEST_PS_ARGS=str(ps_args))
+               SGPU_TEST_NVIDIA_CALLS=str(calls), SGPU_TEST_PS_ARGS=str(ps_args),
+               SGPU_TEST_GREP_ARGS=str(grep_args))
 
     proc = subprocess.run(
         ["bash", "-c", NODE_PAYLOAD_CMD], env=env, text=True,
@@ -61,9 +74,85 @@ def test_node_payload_reuses_one_pmon_sample(tmp_path):
     invocations = calls.read_text().splitlines()
     assert len(invocations) == 2
     assert sum(line.startswith("pmon ") for line in invocations) == 1
-    assert "-p 4242 -o pid=,user=" in ps_args.read_text()
+    assert "-p 4242,4343 -o pid=,user=" in ps_args.read_text()
+    grep_call = grep_args.read_text()
+    assert grep_call.count("/proc/4242/cgroup") == 1
+    assert grep_call.count("/proc/4343/cgroup") == 1
     gpus, _mem = parse_node_payload(proc.stdout)
-    assert gpus[0].pids == ["4242"] and gpus[0].users == ["alice"]
+    assert gpus[0].pids == ["4242", "4343"]
+    assert gpus[0].users == ["alice", "bob"]
+    assert gpus[0].pid_jobid == {"4242": "77", "4343": "88"}
+
+
+def test_cgroup_probe_uses_one_grep_for_all_pids():
+    assert NODE_PAYLOAD_CMD.count("grep -H -m1") == 1
+    assert "for p in" in NODE_PAYLOAD_CMD
+    assert NODE_DYNAMIC_PAYLOAD_CMD.count("echo '---SEP---'") == 6
+
+
+def test_agent_caches_static_gpu_topology_until_ttl(monkeypatch):
+    agent._gpu_topology_cache.update(expires=0.0, gpu_set=(), values={})
+    calls = []
+
+    def run(command):
+        calls.append(command)
+        if command == NODE_PAYLOAD_CMD:
+            return ([GpuInfo(index="0", uuid="u0", pci_bus="b0",
+                             minor="3", slot="9")], NodeMemInfo(total="1"))
+        return ([GpuInfo(index="0", uuid="u0", pci_bus="b0")],
+                NodeMemInfo(total="1"))
+
+    monkeypatch.setattr(agent, "_run_gpu_payload", run)
+    monkeypatch.setattr(agent, "GPU_TOPOLOGY_TTL", 300)
+
+    first, _ = agent._collect_gpu_payload(now=10.0)
+    second, _ = agent._collect_gpu_payload(now=11.0)
+    third, _ = agent._collect_gpu_payload(now=311.0)
+
+    assert calls == [NODE_PAYLOAD_CMD, NODE_DYNAMIC_PAYLOAD_CMD, NODE_PAYLOAD_CMD]
+    assert (first[0].minor, second[0].minor, third[0].minor) == ("3", "3", "3")
+    assert second[0].slot == "9"
+
+
+def test_agent_refreshes_topology_when_gpu_set_changes(monkeypatch):
+    agent._gpu_topology_cache.update(
+        expires=999.0, gpu_set=(("0", "old", "b0"),),
+        values={"0": ("0", "1")},
+    )
+    calls = []
+
+    def run(command):
+        calls.append(command)
+        if len(calls) == 1:
+            return ([GpuInfo(index="0", uuid="new", pci_bus="b1")], NodeMemInfo())
+        return ([GpuInfo(index="0", uuid="new", pci_bus="b1",
+                         minor="4", slot="8")], NodeMemInfo())
+
+    monkeypatch.setattr(agent, "_run_gpu_payload", run)
+    gpus, _ = agent._collect_gpu_payload(now=10.0)
+
+    assert calls == [NODE_DYNAMIC_PAYLOAD_CMD, NODE_PAYLOAD_CMD]
+    assert (gpus[0].minor, gpus[0].slot) == ("4", "8")
+    assert agent._gpu_topology_cache["gpu_set"] == (("0", "new", "b1"),)
+
+
+def test_agent_retries_incomplete_static_topology_next_cycle(monkeypatch):
+    agent._gpu_topology_cache.update(expires=0.0, gpu_set=(), values={})
+    calls = []
+
+    def run(command):
+        calls.append(command)
+        minor = "" if len(calls) == 1 else "3"
+        return ([GpuInfo(index="0", uuid="u0", pci_bus="b0", minor=minor)],
+                NodeMemInfo())
+
+    monkeypatch.setattr(agent, "_run_gpu_payload", run)
+    first, _ = agent._collect_gpu_payload(now=10.0)
+    second, _ = agent._collect_gpu_payload(now=11.0)
+
+    assert calls == [NODE_PAYLOAD_CMD, NODE_PAYLOAD_CMD]
+    assert first[0].minor == "" and second[0].minor == "3"
+    assert agent._gpu_topology_cache["gpu_set"] == (("0", "u0", "b0"),)
 
 
 def test_valid_agent_payload_accepts_expected_shape():

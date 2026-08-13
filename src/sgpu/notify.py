@@ -41,6 +41,8 @@ import hashlib
 import json
 import os
 import queue
+import re
+import shlex
 import socket
 import threading
 import time
@@ -120,6 +122,10 @@ MSG = {
 _FAIL_STATES = ("FAILED", "OUT_OF_MEMORY", "TIMEOUT", "NODE_FAIL")
 # pending reasons that are the user's own doing — waiting is expected
 _PEND_QUIET = ("held", "dependency", "begintime", "jobarraytasklimit")
+# ``squeue %i`` produces scheduler-owned IDs, but keep the batch argument a
+# single, option-safe token even if a malformed snapshot reaches the notifier.
+# This covers ordinary, array-task, heterogeneous, and federated-looking IDs.
+_JOB_ID_SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+;:-]*$")
 
 
 def _gpu_is_free(g: dict) -> bool:
@@ -401,13 +407,15 @@ class Notifier:
                 return fail_all or u in self.job_done_users or u in self.job_fail_users
             current = {j["jobid"]: j for j in data.get("jobs", [])
                        if _watched(j.get("user", ""))}
-            for jid, j in self._jobs.items():
-                if jid in current:
-                    continue
+            gone = [(jid, j) for jid, j in self._jobs.items() if jid not in current]
+            state_jids = [
+                jid for jid, j in gone
+                if fail_all or j.get("user", "?") in self.job_fail_users
+            ]
+            final_states = self._query_job_final_states(state_jids)
+            for jid, j in gone:
                 user = j.get("user", "?")
-                state = ""
-                if fail_all or user in self.job_fail_users:
-                    state = self._job_final_state(jid)
+                state = final_states.get(jid, "")
                 if state.startswith(_FAIL_STATES):
                     text = self._m("job_fail", jid=jid, name=j.get("jobname", "?"),
                                    user=user, state=state,
@@ -573,12 +581,58 @@ class Notifier:
             lines = lines[1:]
         return "\n".join(lines[-max_lines:]).strip()
 
-    def _job_final_state(self, jid: str) -> str:
-        """Outcome of a finished job from slurmdbd ('' when sacct is absent)."""
-        ok, out = run_cmd(f"sacct -j {jid} -X -n -o State --parsable2", timeout=10)
+    def _job_final_states(self, jids: List[str]) -> Dict[str, str]:
+        """Outcomes for finished jobs from one slurmdbd query.
+
+        ``-X`` asks sacct for allocation rows only. Still require an exact
+        JobIDRaw match: older/custom sacct builds and test fixtures may return
+        ``.batch``/``.extern`` rows, and a step must never overwrite its job's
+        terminal state. Duplicate exact rows keep the first result, matching
+        the old single-job helper's first-line behavior.
+        """
+        requested = list(dict.fromkeys(
+            str(jid) for jid in jids if _JOB_ID_SAFE.fullmatch(str(jid))
+        ))
+        if not requested:
+            return {}
+        joined = ",".join(requested)
+        ok, out = run_cmd(
+            f"sacct -j {shlex.quote(joined)} -X -n -o JobIDRaw,State --parsable2",
+            timeout=10,
+        )
         if not ok or not out.strip():
-            return ""
-        return out.strip().splitlines()[0].split()[0]  # "CANCELLED by 1234" -> CANCELLED
+            return {}
+        wanted = set(requested)
+        states: Dict[str, str] = {}
+        for line in out.splitlines():
+            fields = line.split("|")
+            if len(fields) < 2:
+                continue
+            raw_jid = fields[0].strip()
+            if raw_jid not in wanted or raw_jid in states:
+                continue
+            raw_state = fields[1].strip()
+            if raw_state:
+                states[raw_jid] = raw_state.split()[0]
+        return states
+
+    def _query_job_final_states(self, jids: List[str]) -> Dict[str, str]:
+        """Batch in production, while honoring legacy single-helper overrides.
+
+        Some integrations replace ``_job_final_state`` to supply an alternate
+        accounting backend. Keep that compatibility without putting the normal
+        sacct path back on the one-subprocess-per-job behavior.
+        """
+        single = self._job_final_state
+        if not getattr(single, "_sgpu_batch_wrapper", False):
+            return {jid: single(jid) for jid in jids}
+        return self._job_final_states(jids)
+
+    def _job_final_state(self, jid: str) -> str:
+        """Single-job compatibility wrapper around the batch sacct query."""
+        return self._job_final_states([jid]).get(jid, "")
+
+    _job_final_state._sgpu_batch_wrapper = True
 
     def _post_dm(self, user: str, text: str) -> None:
         """Also deliver an alert as a Slack DM to the user it concerns.

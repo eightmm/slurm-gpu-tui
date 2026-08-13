@@ -221,6 +221,15 @@ class SlurmGpuTui(App):
         self._watched: Dict[str, Dict[str, str]] = {}
         self._nodes_cache: List[NodeInfo] = []  # last applied nodes (waste view)
         self._jobs_by_id: Dict[str, JobInfo] = {}  # for detail popup scripts
+        # DataTable.clear()+add_row() is substantially more expensive than the
+        # parsing and summary work on large clusters.  Keep a value-only model
+        # of the last rendered pane so the common case (a fresh collector file
+        # whose visible values did not change) can leave the table untouched.
+        # Any structural, ordering, filter, or displayed-cell change falls back
+        # to the existing full rebuild, preserving compatibility with old
+        # Textual versions whose row-mutation APIs differ from current ones.
+        self._last_gpu_view_signature: tuple | None = None
+        self._last_cpu_view_signature: tuple | None = None
         self._auto_collapsed = False  # big clusters start collapsed, once
         self._last_applied: Optional[Tuple[List[NodeInfo], List[JobInfo], List[PendingJob], str]] = None
         # one collection at a time: exclusive=True only cancels cooperatively,
@@ -890,6 +899,10 @@ class SlurmGpuTui(App):
 
     def _apply_gpu_tab(self, visible: List[NodeInfo], node_classes: Dict[str, List[str]],
                        pending: List[PendingJob]) -> None:
+        view_signature = self._gpu_view_signature(visible, node_classes, pending)
+        if view_signature == self._last_gpu_view_signature:
+            return
+
         saved_row = self.tbl.cursor_row
         saved_col = self.tbl.cursor_column
         saved_scroll_x = self.tbl.scroll_x
@@ -1124,8 +1137,69 @@ class SlurmGpuTui(App):
                 row = min(saved_row, self.tbl.row_count - 1)
             self.tbl.move_cursor(row=row, column=saved_col, animate=False)
         self.tbl.scroll_to(x=saved_scroll_x, y=saved_scroll_y, animate=False)
+        self._last_gpu_view_signature = view_signature
+
+    def _gpu_view_signature(
+        self,
+        visible: List[NodeInfo],
+        node_classes: Dict[str, List[str]],
+        pending: List[PendingJob],
+    ) -> tuple:
+        """Hashable model of every value that can affect the GPU tables."""
+        node_rows = []
+        for node in visible:
+            collapsed = node.name in self._collapsed
+            node_partition = node.partition or (
+                node.jobs[0].partition if node.jobs else ""
+            )
+            # Collapsed rows show aggregate GPU classes, not live utilization,
+            # VRAM, or job details.  Excluding hidden values is important: those
+            # metrics normally fluctuate every collector cycle even though the
+            # one-line collapsed view remains byte-for-byte identical.
+            detail_rows = ()
+            if not collapsed:
+                jobs = tuple(
+                    (
+                        job.jobid, job.user, job.jobname, job.elapsed,
+                        job.gpu_count, job.time_limit,
+                    )
+                    for job in node.jobs
+                )
+                gpus = tuple(
+                    (
+                        gpu.index, gpu.name, gpu.util, gpu.mem_used,
+                        gpu.mem_total, gpu.temp, gpu.power, gpu.power_cap,
+                        tuple(gpu.users), gpu.alloc_jobid, gpu.alloc_user,
+                        gpu.idle_sec, gpu.parked_sec,
+                    )
+                    for gpu in node.gpus
+                )
+                detail_rows = (jobs, gpus)
+            node_rows.append((
+                node.name, node.state, node_partition, node.stale,
+                node.error_kind, node.cpus, node.cpu_alloc, node.mem_total,
+                node.mem_free, node.mem_alloc, node.mem_avail,
+                collapsed, tuple(node_classes[node.name]), detail_rows,
+            ))
+        pending_rows = tuple(
+            (
+                job.jobid, job.user, job.partition, job.jobname,
+                job.gpu_count, job.reason, job.priority, job.start_time,
+            )
+            for job in pending
+        )
+        return (
+            self.show_details, self.filter_user, self.current_user,
+            # Estimated start times switch from HH:MM to MM-DD HH:MM at
+            # midnight even when the collector values themselves are unchanged.
+            datetime.now().date(), tuple(node_rows), pending_rows,
+        )
 
     def _apply_cpu_tab(self, nodes: List[NodeInfo]) -> None:
+        view_signature = self._cpu_view_signature(nodes)
+        if view_signature == self._last_cpu_view_signature:
+            return
+
         # ── CPU tab (all nodes, CPU-only included) ──
         self.cpu_tbl.clear()
         cpu_rows = []
@@ -1184,6 +1258,34 @@ class SlurmGpuTui(App):
             cpu_sum.append(f" {u}", style="bold yellow underline" if u == self.current_user else "bold magenta")
             cpu_sum.append(f":{c}", style="bold")
         self.cpu_summary.update(cpu_sum)
+        self._last_cpu_view_signature = view_signature
+
+    def _cpu_view_signature(self, nodes: List[NodeInfo]) -> tuple:
+        """Hashable model of every value that can affect the CPU table."""
+        node_rows = []
+        for node in nodes:
+            try:
+                total_c = float(node.cpus)
+                alloc_c = float(node.cpu_alloc or 0)
+                cpct = alloc_c / total_c if total_c > 0 else 0.0
+            except (ValueError, TypeError):
+                cpct = 0.0
+            user_cores: Dict[str, int] = {}
+            for job in node.jobs:
+                if job.cpu_count:
+                    user_cores[job.user] = (
+                        user_cores.get(job.user, 0) + job.cpu_count
+                    )
+            node_rows.append((
+                cpct, node.name, node.state, node.partition, node.has_gpu,
+                node.cpus, node.cpu_alloc, node.cpu_load, node.mem_total,
+                node.mem_free, node.mem_alloc, node.mem_avail,
+                tuple(sorted(user_cores.items())),
+            ))
+        return (
+            self.current_user,
+            tuple(sorted(node_rows, key=lambda row: (-row[0], row[1]))),
+        )
 
     def _apply_summary(self, nodes: List[NodeInfo], jobs: List[JobInfo],
                        pending: List[PendingJob], err: str,

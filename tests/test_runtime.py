@@ -9,6 +9,7 @@ import stat
 
 import pytest
 
+from sgpu import runtime
 from sgpu.runtime import (
     UnsafeRuntimeDir, agent_runtime_path, atomic_write,
     atomic_write_with_signature, default_state_dir, dir_trust_problem,
@@ -189,6 +190,55 @@ def test_trusted_payload_uids_env_override(monkeypatch):
 
 def test_trusted_payload_uids_includes_agent_dir_owner(tmp_path):
     assert tmp_path.stat().st_uid in trusted_payload_uids(tmp_path)
+
+
+def test_trusted_payload_uids_cache_avoids_repeated_nss_and_stat(
+        tmp_path, monkeypatch):
+    runtime._trusted_uid_cache.clear()
+    calls = {"pwd": 0, "stat": 0}
+    real_stat = runtime.os.stat
+
+    def counted_pwd(_name):
+        calls["pwd"] += 1
+        return type("Pw", (), {"pw_uid": 65534})()
+
+    def counted_stat(path):
+        calls["stat"] += 1
+        return real_stat(path)
+
+    monkeypatch.delenv("SLURM_GPU_TUI_AGENT_TRUSTED_UIDS", raising=False)
+    monkeypatch.setattr(runtime.pwd, "getpwnam", counted_pwd)
+    monkeypatch.setattr(runtime.os, "stat", counted_stat)
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: 10.0)
+
+    first = trusted_payload_uids(tmp_path)
+    second = trusted_payload_uids(tmp_path)
+    assert first == second
+    assert calls == {"pwd": 1, "stat": 1}
+
+
+def test_trusted_payload_uids_cache_refreshes_after_ttl_and_env_change(
+        tmp_path, monkeypatch):
+    runtime._trusted_uid_cache.clear()
+    clock = [10.0]
+    calls = 0
+    real_stat = runtime.os.stat
+
+    def counted_stat(path):
+        nonlocal calls
+        calls += 1
+        return real_stat(path)
+
+    monkeypatch.delenv("SLURM_GPU_TUI_AGENT_TRUSTED_UIDS", raising=False)
+    monkeypatch.setattr(runtime.os, "stat", counted_stat)
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: clock[0])
+    trusted_payload_uids(tmp_path)
+    clock[0] += runtime._TRUSTED_UID_CACHE_TTL + 0.1
+    trusted_payload_uids(tmp_path)
+    assert calls == 2
+
+    monkeypatch.setenv("SLURM_GPU_TUI_AGENT_TRUSTED_UIDS", "42")
+    assert trusted_payload_uids(tmp_path) == frozenset({42})
 
 
 def test_default_state_dir_env_override(monkeypatch):

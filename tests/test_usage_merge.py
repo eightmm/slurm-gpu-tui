@@ -24,8 +24,12 @@ ALL = lambda _d: True  # noqa: E731
 @pytest.fixture(autouse=True)
 def _clear_cache():
     usage_mod._usage_cache = (None, None)
+    usage_mod._usage_window_cache = (None, None)
+    usage_mod._usage_render_cache = (None, None)
     yield
     usage_mod._usage_cache = (None, None)
+    usage_mod._usage_window_cache = (None, None)
+    usage_mod._usage_render_cache = (None, None)
 
 
 def write_usage(dir_, payload):
@@ -163,8 +167,25 @@ def test_render_usage_merges_the_window_once(monkeypatch):
     monkeypatch.setattr(usage_mod, "merge_usage_window", counted_merge)
 
     usage_mod.render_usage(7)
+    usage_mod.render_usage(7)
 
     assert calls == [raw]
+
+
+def test_render_usage_cache_returns_independent_text(monkeypatch):
+    raw = {
+        "days": {day(): {"alice": {"alloc": 20, "busy": 10}}},
+        "meta": {day(): 60},
+    }
+    monkeypatch.setattr(usage_mod, "_read_usage_raw", lambda: raw)
+    monkeypatch.setattr(usage_mod.time, "time", lambda: 6000.0)
+
+    first = usage_mod.render_usage(7)
+    second = usage_mod.render_usage(7)
+    first.append("mutated")
+
+    assert first is not second
+    assert "mutated" not in second.plain
 
 
 # ── discovery ─────────────────────────────────────────────────────────────

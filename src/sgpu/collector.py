@@ -353,9 +353,16 @@ LOG_SPOOL_DIR = Path(
 # Matches tail_file's default, so a shared log shows exactly what the owner
 # would see in the same pane.
 LOG_TAIL_BYTES = int(os.getenv("SLURM_GPU_TUI_LOG_TAIL_BYTES", str(64 * 1024)))
+LOG_MIRROR_SEC = max(
+    1.0, float(os.getenv("SLURM_GPU_TUI_LOG_MIRROR_SEC", "10")),
+)
 
 _log_paths: Dict[str, tuple] = {}      # jobid -> (stdout src, stderr src)
+_log_owner_uids: Dict[str, int] = {}   # jobid -> scheduler-reported owner uid
 _log_fingerprint: Dict[str, tuple] = {}  # spool path -> (size, mtime) mirrored
+_log_published: Dict[str, Dict[str, str]] = {}
+_log_next_check: Dict[str, float] = {}
+_log_live: set[str] = set()
 _log_inflight: set = set()
 _log_lock = threading.Lock()
 # two workers: a mirror pass is file I/O over NFS, and one slow home directory
@@ -368,26 +375,59 @@ def _mirror_one_job_log(jid: str) -> None:
     try:
         with _log_lock:
             paths = _log_paths.get(jid)
-        if paths is None:
+            owner_uid = _log_owner_uids.get(jid)
+        if paths is None or owner_uid is None:
             # scontrol resolves %j/%A patterns for us; the answer cannot change
             # while the job runs, so this costs one call per job, not per cycle
             ok, out = run_cmd(f"scontrol show job {jid}", timeout=10)
-            paths = job_log_paths(out) if ok and "JobId=" in out else ("", "")
+            owner = re.search(r"\bUserId=[^(\s]+\((\d+)\)", out) if ok else None
+            if not ok or "JobId=" not in out or owner is None:
+                return  # transient lookup failures are retried on the next scan
+            paths = job_log_paths(out)
+            owner_uid = int(owner.group(1))
             with _log_lock:
+                if jid not in _log_live:
+                    return
                 _log_paths[jid] = paths
+                _log_owner_uids[jid] = owner_uid
         for src, suffix in ((paths[0], "out"), (paths[1], "err")):
             if not src:
                 continue
             dst = LOG_SPOOL_DIR / f"{jid}.{suffix}"
             try:
-                st = os.stat(src)
+                # The output path is controlled by the submitting user while
+                # this collector commonly runs as root.  Mirror only a regular
+                # file owned by the scheduler-reported job uid and keep that
+                # check on the opened fd, closing symlink/TOCTOU exfiltration
+                # paths into arbitrary root-readable files.
+                before = os.lstat(src)
+                if not stat.S_ISREG(before.st_mode) or before.st_uid != owner_uid:
+                    continue
+                flags = os.O_RDONLY | os.O_NONBLOCK
+                flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+                fd = os.open(src, flags)
             except OSError:
                 continue  # not created yet, or gone with the job
-            fp = (st.st_size, st.st_mtime)
-            if _log_fingerprint.get(str(dst)) == fp:
-                continue  # unchanged since the last pass — most jobs, most cycles
             try:
-                with open(src, "rb") as f:
+                with os.fdopen(fd, "rb") as f:
+                    st = os.fstat(f.fileno())
+                    if (
+                        not stat.S_ISREG(st.st_mode)
+                        or st.st_uid != owner_uid
+                        or (st.st_dev, st.st_ino) != (before.st_dev, before.st_ino)
+                    ):
+                        continue
+                    fp = (
+                        st.st_dev, st.st_ino, st.st_size,
+                        st.st_mtime_ns, st.st_ctime_ns,
+                    )
+                    with _log_lock:
+                        unchanged = _log_fingerprint.get(str(dst)) == fp
+                    if unchanged and dst.is_file():
+                        with _log_lock:
+                            if jid in _log_live:
+                                _log_published.setdefault(jid, {})[suffix] = str(dst)
+                        continue
                     if st.st_size > LOG_TAIL_BYTES:
                         f.seek(st.st_size - LOG_TAIL_BYTES)
                     data = f.read(LOG_TAIL_BYTES)
@@ -395,8 +435,15 @@ def _mirror_one_job_log(jid: str) -> None:
                 continue
             # raw bytes, not tail_file's decorated text: readers run their own
             # tail_file over this and `sgpu logs -f` tracks byte offsets
-            atomic_write(dst, data, mode=0o644)
-            _log_fingerprint[str(dst)] = fp
+            with _log_lock:
+                if jid not in _log_live:
+                    continue
+                # Serialize the publish with live-set removal. If a job exits
+                # during a mirror, either this finishes before cleanup (which
+                # then unlinks it) or cleanup wins and this write is skipped.
+                atomic_write(dst, data, mode=0o644)
+                _log_fingerprint[str(dst)] = fp
+                _log_published.setdefault(jid, {})[suffix] = str(dst)
     except Exception as e:
         print(f"[collector] log mirror {jid} failed: {e}", flush=True)
     finally:
@@ -405,13 +452,29 @@ def _mirror_one_job_log(jid: str) -> None:
 
 
 def _drop_log_spool(jid: str) -> None:
+    with _log_lock:
+        _log_published.pop(jid, None)
+        _log_next_check.pop(jid, None)
+        _log_owner_uids.pop(jid, None)
+        _log_live.discard(jid)
     for suffix in ("out", "err"):
         p = LOG_SPOOL_DIR / f"{jid}.{suffix}"
-        _log_fingerprint.pop(str(p), None)
+        with _log_lock:
+            _log_fingerprint.pop(str(p), None)
         try:
             p.unlink()
         except OSError:
             pass
+
+
+def _clear_stale_log_spool() -> None:
+    """Remove bounded-tail files left by a crashed/aborted collector."""
+    for pattern in ("*.out", "*.err"):
+        for path in LOG_SPOOL_DIR.glob(pattern):
+            try:
+                path.unlink()  # unlinks a planted symlink; never follows it
+            except OSError:
+                pass
 
 
 def _share_logs(jobs: List[JobInfo]) -> Dict[str, dict]:
@@ -419,32 +482,38 @@ def _share_logs(jobs: List[JobInfo]) -> Dict[str, dict]:
     if not SHARE_LOGS:
         return {}
     live = {j.jobid for j in jobs}
+    now = time.monotonic()
     with _log_lock:
-        gone = [j for j in _log_paths if j not in live]
-        todo = [j.jobid for j in jobs if j.jobid not in _log_inflight]
+        known = set(_log_paths) | set(_log_owner_uids) | set(_log_published) \
+            | set(_log_next_check) | set(_log_live)
+        gone = [jid for jid in known if jid not in live]
+        _log_live.clear()
+        _log_live.update(live)
+        todo = [
+            j.jobid for j in jobs
+            if j.jobid not in _log_inflight
+            and now >= _log_next_check.get(j.jobid, 0.0)
+        ]
         _log_inflight.update(todo)
+        for jid in todo:
+            _log_next_check[jid] = now + LOG_MIRROR_SEC
     for jid in gone:
         with _log_lock:
             _log_paths.pop(jid, None)
         _drop_log_spool(jid)
     for jid in todo:
         _log_executor.submit(_mirror_one_job_log, jid)
-    published: Dict[str, dict] = {}
-    for j in jobs:
-        entry = {}
-        for suffix in ("out", "err"):
-            p = LOG_SPOOL_DIR / f"{j.jobid}.{suffix}"
-            if p.exists():
-                entry[suffix] = str(p)
-        if entry:
-            published[j.jobid] = entry
-    return published
+    with _log_lock:
+        return {
+            j.jobid: dict(_log_published[j.jobid])
+            for j in jobs if _log_published.get(j.jobid)
+        }
 
 
 # ── Per-user GPU-hour accounting ──────────────────────────────────────────
 # Daily buckets: {"days": {"YYYY-MM-DD": {user: {"alloc": sec, "busy": sec}}}}
 # alloc = GPU allocated to the user's job; busy = that GPU actually computing.
-# Rolling window, persisted each cycle.
+# Rolling window, sampled each cycle and checkpointed on a bounded cadence.
 #
 # Two alloc sources:
 #   days       — 3s sampling (loses time whenever the collector is down)
@@ -456,10 +525,16 @@ def _share_logs(jobs: List[JobInfo]) -> Dict[str, dict]:
 USAGE_FILE = STATE_DIR / "usage.json"
 USAGE_KEEP_DAYS = int(os.getenv("SLURM_GPU_TUI_USAGE_KEEP_DAYS", "30"))
 WASTE_MIN_SEC = int(os.getenv("SLURM_GPU_TUI_WASTE_MIN_SEC", "600"))
+# Sampling remains per collector cycle, but a durable full-history checkpoint
+# every cycle needlessly fsyncs the same growing file thousands of times/day.
+USAGE_SAVE_SEC = max(1.0, float(os.getenv("SLURM_GPU_TUI_USAGE_SAVE_SEC", "30")))
 # 0 disables slurmdbd backfill
 SACCT_BACKFILL_SEC = int(os.getenv("SLURM_GPU_TUI_SACCT_SEC", "3600"))
 _usage: Dict[str, dict] = {"days": {}}
 _last_usage_ts: float | None = None
+_usage_lock = threading.Lock()
+_usage_dirty = False
+_usage_last_save = 0.0
 _sacct_inflight = False
 _sacct_last_attempt = 0.0
 _sacct_failures = 0  # consecutive; disables backfill on clusters without slurmdbd
@@ -479,45 +554,62 @@ def _load_usage() -> None:
         _usage["sacct_ts"] = raw.get("sacct_ts")
 
 
-def _save_usage() -> None:
-    _write_state_json(USAGE_FILE, json.dumps(_usage))
+def _save_usage(force: bool = False, monotonic_now: float | None = None) -> bool:
+    """Checkpoint sampled usage, normally at a lower cadence than sampling."""
+    global _usage_dirty, _usage_last_save
+    now = time.monotonic() if monotonic_now is None else monotonic_now
+    with _usage_lock:
+        if not _usage_dirty:
+            return False
+        if not force and _usage_last_save and now - _usage_last_save < USAGE_SAVE_SEC:
+            return False
+        # Serialize while holding the lock: the hourly sacct worker replaces
+        # nested history concurrently, and a torn snapshot is not acceptable.
+        payload = json.dumps(_usage)
+        if not _write_state_json(USAGE_FILE, payload):
+            return False  # retry next collector cycle
+        _usage_dirty = False
+        _usage_last_save = now
+        return True
 
 
 def _accumulate_usage(result_nodes: List[dict], now: float) -> None:
-    global _last_usage_ts
-    prev, _last_usage_ts = _last_usage_ts, now
-    if prev is None:
-        return
-    dt = now - prev
-    if not (0 < dt <= 60):
-        return  # collector was paused; don't credit the gap
-    day = datetime.now().strftime("%Y-%m-%d")
-    # coverage meta: how many seconds this sampling accounting actually saw
-    meta = _usage.setdefault("meta", {})
-    meta[day] = meta.get(day, 0) + dt
-    bucket = _usage["days"].setdefault(day, {})
-    for n in result_nodes:
-        for g in n.get("gpus", []):
-            user = g.get("alloc_user") or (g.get("users") or [""])[0]
-            if not user:
-                continue
-            u = bucket.setdefault(user, {"alloc": 0, "busy": 0})
-            u["alloc"] += dt
-            try:
-                if float(g.get("util") or 0) > 5:
-                    u["busy"] += dt
-            except (ValueError, TypeError):
-                pass
-            # waste = allocated but idle (no process) or parked (VRAM held,
-            # no compute). Same threshold as the TUI waste view, so short
-            # startup/data-loading lulls don't count.
-            if max(g.get("idle_sec", 0), g.get("parked_sec", 0)) >= WASTE_MIN_SEC:
-                u["waste"] = u.get("waste", 0) + dt
-    cutoff = (datetime.now() - timedelta(days=USAGE_KEEP_DAYS)).strftime("%Y-%m-%d")
-    for d in [d for d in _usage["days"] if d < cutoff]:
-        del _usage["days"][d]
-    for d in [d for d in _usage.get("meta", {}) if d < cutoff]:
-        del _usage["meta"][d]
+    global _last_usage_ts, _usage_dirty
+    with _usage_lock:
+        prev, _last_usage_ts = _last_usage_ts, now
+        if prev is None:
+            return
+        dt = now - prev
+        if not (0 < dt <= 60):
+            return  # collector was paused; don't credit the gap
+        day = datetime.now().strftime("%Y-%m-%d")
+        # coverage meta: how many seconds this sampling accounting actually saw
+        meta = _usage.setdefault("meta", {})
+        meta[day] = meta.get(day, 0) + dt
+        bucket = _usage["days"].setdefault(day, {})
+        for n in result_nodes:
+            for g in n.get("gpus", []):
+                user = g.get("alloc_user") or (g.get("users") or [""])[0]
+                if not user:
+                    continue
+                u = bucket.setdefault(user, {"alloc": 0, "busy": 0})
+                u["alloc"] += dt
+                try:
+                    if float(g.get("util") or 0) > 5:
+                        u["busy"] += dt
+                except (ValueError, TypeError):
+                    pass
+                # waste = allocated but idle (no process) or parked (VRAM held,
+                # no compute). Same threshold as the TUI waste view, so short
+                # startup/data-loading lulls don't count.
+                if max(g.get("idle_sec", 0), g.get("parked_sec", 0)) >= WASTE_MIN_SEC:
+                    u["waste"] = u.get("waste", 0) + dt
+        cutoff = (datetime.now() - timedelta(days=USAGE_KEEP_DAYS)).strftime("%Y-%m-%d")
+        for d in [d for d in _usage["days"] if d < cutoff]:
+            del _usage["days"][d]
+        for d in [d for d in _usage.get("meta", {}) if d < cutoff]:
+            del _usage["meta"][d]
+        _usage_dirty = True
 
 
 def _parse_sacct_time(s: str) -> float | None:
@@ -537,7 +629,7 @@ def _gpu_count_from_tres(tres: str) -> int:
     return sum(int(n) for n in re.findall(r"(?:^|,)gres/gpu:[^=,]+=(\d+)", tres))
 
 
-def _sacct_backfill(now: float) -> None:
+def _sacct_backfill(now: float) -> bool:
     """Rebuild per-day alloc GPU-seconds from slurmdbd (authoritative)."""
     global _sacct_failures
     start_dt = datetime.now() - timedelta(days=USAGE_KEEP_DAYS)
@@ -552,7 +644,7 @@ def _sacct_backfill(now: float) -> None:
         if _sacct_failures >= _SACCT_MAX_FAILURES:
             print("[collector] disabling sacct backfill (no slurmdbd/accounting?) — "
                   "alloc stays sampling-based", flush=True)
-        return
+        return False
     _sacct_failures = 0
     days: Dict[str, Dict[str, float]] = {}
     for line in out.splitlines():
@@ -579,10 +671,14 @@ def _sacct_backfill(now: float) -> None:
                 bucket = days.setdefault(day_key, {})
                 bucket[user] = bucket.get(user, 0.0) + ngpu * seg
             cur = day_end
-    _usage["sacct_days"] = days
-    _usage["sacct_ts"] = now
+    global _usage_dirty
+    with _usage_lock:
+        _usage["sacct_days"] = days
+        _usage["sacct_ts"] = now
+        _usage_dirty = True
     print(f"[collector] sacct backfill: {len(days)} day(s), "
           f"{sum(len(u) for u in days.values())} user-day rows", flush=True)
+    return True
 
 
 def _maybe_backfill_sacct(now: float) -> None:
@@ -603,7 +699,8 @@ def _maybe_backfill_sacct(now: float) -> None:
     def worker() -> None:
         global _sacct_inflight
         try:
-            _sacct_backfill(time.time())
+            if _sacct_backfill(time.time()):
+                _save_usage(force=True)
         except Exception as e:
             print(f"[collector] sacct backfill error: {e}", flush=True)
         finally:
@@ -1079,6 +1176,11 @@ def collect_all() -> dict:
 METRICS_FILE = Path(
     os.getenv("SLURM_GPU_TUI_METRICS_FILE", str(DATA_DIR / "metrics.prom"))
 )
+METRICS_REFRESH_SEC = max(
+    float(REFRESH_SEC),
+    float(os.getenv("SLURM_GPU_TUI_METRICS_SEC", "15")),
+)
+_metrics_last_write = 0.0
 
 
 def _prom_escape(s: str) -> str:
@@ -1422,8 +1524,15 @@ def _master_host_lines(proc: str = "/proc", sys_dir: str = "/sys") -> List[str]:
     return lines
 
 
-def _write_metrics(data: dict) -> None:
-    """Write a Prometheus textfile snapshot next to data.json."""
+def _write_metrics(
+    data: dict, *, force: bool = False, monotonic_now: float | None = None,
+) -> bool:
+    """Write a rate-limited Prometheus textfile snapshot."""
+    global _metrics_last_write
+    now = time.monotonic() if monotonic_now is None else monotonic_now
+    if not force and _metrics_last_write \
+            and now - _metrics_last_write < METRICS_REFRESH_SEC:
+        return False
     try:
         text = _format_metrics(data)
         host = _master_host_lines()
@@ -1431,8 +1540,11 @@ def _write_metrics(data: dict) -> None:
             text += "\n".join(host) + "\n"
         # 0644: node_exporter's textfile collector usually runs as its own user
         atomic_write(METRICS_FILE, text, mode=0o644)
+        _metrics_last_write = now
+        return True
     except Exception as e:
         print(f"[collector] metrics write error: {e}", flush=True)
+        return False
 
 
 # ── Daemon ────────────────────────────────────────────────────────────────
@@ -1510,6 +1622,7 @@ def run_collector():
         except UnsafeRuntimeDir as e:
             print(f"[collector] {e}", flush=True)
             sys.exit(1)
+        _clear_stale_log_spool()
         print(f"[collector] job log sharing on (spool={LOG_SPOOL_DIR}, "
               f"tail={LOG_TAIL_BYTES // 1024}KB) — every user can read every "
               "job's stdout/stderr", flush=True)
@@ -1565,6 +1678,7 @@ def run_collector():
             time.sleep(0.5)
 
     try:
+        _save_usage(force=True)
         PID_FILE.unlink(missing_ok=True)
     except Exception:
         pass

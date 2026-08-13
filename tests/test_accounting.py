@@ -20,6 +20,8 @@ def _reset_collector_state():
     collector._state_path_locks.clear()
     collector._node_absent_cycles.clear()
     collector._last_usage_ts = None
+    collector._usage_dirty = False
+    collector._usage_last_save = 0.0
     yield
 
 

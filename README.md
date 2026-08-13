@@ -199,7 +199,9 @@ say yes at install time:
 > wrote; a log is whatever the job printed — tokens a framework echoed,
 > connection strings, environment dumps inside tracebacks. Turn it on only
 > where every cluster user is entitled to see every other user's job output.
-> `SLURM_GPU_TUI_LOG_TAIL_BYTES` caps how much is mirrored per stream.
+> `SLURM_GPU_TUI_LOG_TAIL_BYTES` caps how much is mirrored per stream. The
+> collector mirrors only regular, non-symlink files owned by the job's
+> scheduler-reported UID.
 | Anything else | `sgpu doctor` |
 
 One-shot extras (root, run once per cluster):
@@ -234,17 +236,23 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/uninstal
 | `SLURM_GPU_TUI_AGENT_DIR` | `~/.sgpu/nodes` | Push-agent payload dir (shared FS for push) |
 | `SLURM_GPU_TUI_AGENT_SEC` | `3` | GPU agent interval |
 | `SLURM_GPU_TUI_CPU_AGENT_SEC` | `20` | CPU-only agent interval |
+| `SLURM_GPU_TUI_GPU_TOPOLOGY_TTL_SEC` | `300` | Static GPU PCI/minor/slot refresh interval |
 | `SLURM_GPU_TUI_AGENT_MAX_AGE_SEC` | `45` | Agent payload freshness limit |
 | `SLURM_GPU_TUI_AGENT_REPAIR_SEC` | `180` | Min interval between agent repairs per node |
 | `SLURM_GPU_TUI_AGENT_DISABLE` | (unset) | Disable push agents entirely |
 | `SLURM_GPU_TUI_WASTE_MIN_SEC` | `600` | Threshold for waste view / `--waste` |
 | `SLURM_GPU_TUI_USAGE_KEEP_DAYS` | `30` | GPU-hour history retention |
+| `SLURM_GPU_TUI_USAGE_SAVE_SEC` | `30` | Durable usage-history checkpoint interval |
 | `SLURM_GPU_TUI_SACCT_SEC` | `3600` | slurmdbd backfill interval; `0` disables |
+| `SLURM_GPU_TUI_METRICS_SEC` | `15` | Prometheus textfile refresh interval |
+| `SLURM_GPU_TUI_METRICS_FILE` | `<data>/metrics.prom` | Prometheus textfile output path |
 | `SLURM_GPU_TUI_SLACK_BOT_TOKEN` | (unset) | Slack bot token (channel remains in `~/.sgpu/slack.json`) |
 | `SLURM_GPU_TUI_SLACK_DEBOUNCE_SEC` | `1800` | Min interval between repeated alerts |
 | `SLURM_GPU_TUI_SLACK_NAG_SEC` | `21600` | Re-alert interval for standing conditions |
 | `SLURM_GPU_TUI_ROGUE_IGNORE` | `root,gdm,xdm` | Users never flagged as rogue |
 | `SLURM_GPU_TUI_SHARE_SCRIPTS` | (unset) | Show every job's batch script to all users — **shares script contents (and secrets)** |
+| `SLURM_GPU_TUI_SHARE_LOGS` | (unset) | Mirror every job's log tail for all users — **shares runtime output (and secrets)** |
+| `SLURM_GPU_TUI_LOG_MIRROR_SEC` | `10` | Shared-log scan interval |
 
 Install-time only: `SGPU_INSTALL_DIR`, `SGPU_ENABLE_PERSISTENCE` (`0` skips
 GPU-node persistence), `SGPU_ENABLE_CPU_PUSH` (`0` keeps CPU telemetry on SSH

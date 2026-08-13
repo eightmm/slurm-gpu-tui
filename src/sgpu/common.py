@@ -13,6 +13,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import MISSING, dataclass, field, fields, replace
 from enum import Enum
+from functools import lru_cache
 from itertools import product
 from typing import Dict, List, Tuple
 
@@ -283,6 +284,26 @@ class NodeSSHResult:
 # been publishing for releases (GPU clocks), and the two `sgpu --json` code
 # paths emitted different shapes for the same command.
 
+@lru_cache(maxsize=32)
+def _dataclass_field_types(cls) -> tuple[tuple[str, type | None], ...]:
+    """Precompute the defensive decoder schema for a dataclass.
+
+    Only the expected *type* is retained.  In particular, values produced by
+    mutable default factories are discarded here; every decoded instance is
+    still constructed by the dataclass and receives fresh list/dict defaults.
+    """
+    schema = []
+    for f in fields(cls):
+        if f.default is not MISSING:
+            default = f.default
+        elif f.default_factory is not MISSING:  # type: ignore[misc]
+            default = f.default_factory()       # type: ignore[misc]
+        else:
+            default = None
+        schema.append((f.name, type(default) if default is not None else None))
+    return tuple(schema)
+
+
 def from_dict(cls, raw: object):
     """Rebuild a flat dataclass from its JSON form, defensively.
 
@@ -295,19 +316,13 @@ def from_dict(cls, raw: object):
     if not isinstance(raw, dict):
         return cls()
     kwargs = {}
-    for f in fields(cls):
-        if f.name not in raw:
+    for name, expected_type in _dataclass_field_types(cls):
+        if name not in raw:
             continue
-        value = raw[f.name]
-        if f.default is not MISSING:
-            default = f.default
-        elif f.default_factory is not MISSING:  # type: ignore[misc]
-            default = f.default_factory()       # type: ignore[misc]
-        else:
-            default = None
-        if default is not None and not isinstance(value, type(default)):
+        value = raw[name]
+        if expected_type is not None and not isinstance(value, expected_type):
             continue
-        kwargs[f.name] = value
+        kwargs[name] = value
     return cls(**kwargs)
 
 
@@ -352,27 +367,50 @@ def _classify_error(error_str: str, exc: Exception = None) -> NodeErrorKind:
 
 # ── Data collection ──────────────────────────────────────────────────────
 
-def collect_jobs() -> Tuple[List[JobInfo], str]:
-    cmd = 'squeue -h -t R -o "%i|%u|%P|%j|%M|%N|%b|%l|%C|%m"'
-    ok, out = run_cmd(cmd)
+_SQUEUE_COMBINED_CMD = (
+    'squeue -h -t R,PD -o '
+    '"%T|%i|%u|%P|%j|%M|%N|%b|%l|%C|%m|%r|%Q|%S"'
+)
+
+
+def _collect_queue() -> Tuple[List[JobInfo], List[PendingJob], str]:
+    """Fetch running and pending jobs with one scheduler RPC."""
+    ok, out = run_cmd(_SQUEUE_COMBINED_CMD)
     if not ok:
-        return [], f"squeue failed: {out}"
-    rows: List[JobInfo] = []
+        return [], [], out
+    jobs: List[JobInfo] = []
+    pending: List[PendingJob] = []
     for line in out.splitlines():
         p = line.split("|")
-        if len(p) < 7:
+        if len(p) < 14:
             continue
-        gres = p[6].strip()
-        gc = _gpu_count_from_gres(gres)
-        tlimit = p[7].strip() if len(p) > 7 else ""
-        try:
-            cc = int(p[8].strip()) if len(p) > 8 else 0
-        except ValueError:
-            cc = 0
-        mem = p[9].strip() if len(p) > 9 else ""
-        rows.append(JobInfo(p[0], p[1], p[2], p[3], p[4], p[5], gc, cc, gres, tlimit,
-                            mem=mem))
-    return rows, ""
+        state = p[0].strip().upper()
+        if state == "RUNNING":
+            gres = p[7].strip()
+            try:
+                cpu_count = int(p[9].strip())
+            except ValueError:
+                cpu_count = 0
+            jobs.append(JobInfo(
+                p[1], p[2], p[3], p[4], p[5], p[6],
+                _gpu_count_from_gres(gres), cpu_count, gres, p[8].strip(),
+                mem=p[10].strip(),
+            ))
+        elif state == "PENDING":
+            gres = p[7].strip()
+            pending.append(PendingJob(
+                p[1], p[2], p[3], p[4], p[8].strip(),
+                _gpu_count_from_gres(gres), p[11].strip(), p[12].strip(),
+                p[13].strip(),
+            ))
+    return jobs, pending, ""
+
+
+def collect_jobs() -> Tuple[List[JobInfo], str]:
+    jobs, _pending, error = _collect_queue()
+    if error:
+        return [], f"squeue failed: {error}"
+    return jobs, ""
 
 
 def mem_to_mib(s: str, cpus: int = 1) -> float:
@@ -392,20 +430,10 @@ def mem_to_mib(s: str, cpus: int = 1) -> float:
 
 
 def collect_pending_jobs() -> Tuple[List[PendingJob], str]:
-    cmd = 'squeue -h -t PD -o "%i|%u|%P|%j|%l|%b|%r|%Q|%S"'
-    ok, out = run_cmd(cmd)
-    if not ok:
-        return [], f"squeue PD failed: {out}"
-    rows: List[PendingJob] = []
-    for line in out.splitlines():
-        p = line.split("|")
-        if len(p) < 8:
-            continue
-        gres = p[5].strip()
-        gc = _gpu_count_from_gres(gres)
-        start = p[8].strip() if len(p) > 8 else ""
-        rows.append(PendingJob(p[0], p[1], p[2], p[3], p[4], gc, p[6].strip(), p[7].strip(), start))
-    return rows, ""
+    _jobs, pending, error = _collect_queue()
+    if error:
+        return [], f"squeue PD failed: {error}"
+    return pending, ""
 
 
 def collect_nodes_basic() -> Tuple[List[dict], str]:
@@ -602,10 +630,11 @@ def collect_gpu_alloc() -> Tuple[Dict[str, Dict[str, str]], Dict[str, str], str]
     return alloc, jobid_user, ""
 
 
-# Combined node-side payload command: nvidia-smi metrics + pmon (PID→GPU)
-# + meminfo + ps (PID→user). Run remotely via SSH (pull) or locally by the
-# resident agent (push).
-NODE_PAYLOAD_CMD = (
+# Combined node-side payload commands: nvidia-smi metrics + pmon (PID→GPU)
+# + meminfo + ps (PID→user). SSH pull uses the full command. The resident
+# agent normally uses the dynamic form and periodically refreshes the static
+# PCI minor/slot sections.
+_NODE_PAYLOAD_PREFIX = (
     # NOTE: pci.bus_id must stay at index 9 (minor mapping reads p[9]); new
     # columns append after. Consumer GPUs report ecc/serial as [N/A].
     "nvidia-smi --query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total,"
@@ -624,20 +653,36 @@ NODE_PAYLOAD_CMD = (
     "PIDS=$(printf '%s\n' \"$PMON\" | awk 'NR>2 && $2!= \"-\" {print $2}' | tr '\\n' ','); "
     "if [ -n \"$PIDS\" ]; then ps -p ${PIDS%,} -o pid=,user= 2>/dev/null; fi; "
     "echo '---SEP---'; "
+)
+
+_NODE_CGROUP_CMD = (
+    # PID -> SLURM jobid from the process's cgroup path (job_<id> under the
+    # slurmstepd scope). One grep handles all PIDs instead of one fork per PID.
+    "if [ -n \"$PIDS\" ]; then set --; "
+    "for p in $(printf '%s\\n' \"${PIDS%,}\" | tr ',' ' '); do "
+    "set -- \"$@\" \"/proc/$p/cgroup\"; done; "
+    "grep -H -m1 -oE 'job_[0-9]+' \"$@\" 2>/dev/null | "
+    "sed -E 's#^/proc/([0-9]+)/cgroup:job_#\\1 #'; fi; "
+)
+
+NODE_DYNAMIC_PAYLOAD_CMD = (
+    _NODE_PAYLOAD_PREFIX
+    # Empty minor section; the agent merges its cached topology after parse.
+    + "echo '---SEP---'; "
+    + _NODE_CGROUP_CMD
+    # Empty slot section.
+    + "echo '---SEP---'; true"
+)
+
+_NODE_MINOR_CMD = (
     # PCI bus -> /dev/nvidiaN minor. SLURM's GRES IDX means the minor, and
     # minor order can differ from nvidia-smi (PCI) order on some boards.
     "for d in /proc/driver/nvidia/gpus/*/information; do "
     "awk '/Bus Location/{b=$NF} /Device Minor/{m=$NF} END{print b, m}' \"$d\" 2>/dev/null; "
     "done; "
-    "echo '---SEP---'; "
-    # PID -> SLURM jobid from the process's cgroup path (job_<id> under the
-    # slurmstepd scope). World-readable, so this works for any user's PID —
-    # gives exact GPU->job attribution with no user-name heuristics.
-    "if [ -n \"$PIDS\" ]; then for p in $(echo ${PIDS%,} | tr ',' ' '); do "
-    "j=$(grep -m1 -oE 'job_[0-9]+' /proc/$p/cgroup 2>/dev/null); "
-    "[ -n \"$j\" ] && echo \"$p ${j#job_}\"; "
-    "done; fi; "
-    "echo '---SEP---'; "
+)
+
+_NODE_SLOT_CMD = (
     # PCI bus -> physical slot number (SMBIOS, via /sys/bus/pci/slots — no
     # root needed). A GPU behind a riser/PLX bridge has no slot entry of its
     # own, so walk the sysfs ancestor chain and take the deepest ancestor
@@ -652,6 +697,15 @@ NODE_PAYLOAD_CMD = (
     "m=$(printf '%s\\n' \"$SLOTS\" | awk -v a=\"${c%.*}\" '$2==a{print $1; exit}'); "
     "[ -n \"$m\" ] && slot=$m;; esac; done; "
     "if [ -n \"$slot\" ]; then echo \"$b $slot\"; fi; fi; done; true"
+)
+
+NODE_PAYLOAD_CMD = (
+    _NODE_PAYLOAD_PREFIX
+    + _NODE_MINOR_CMD
+    + "echo '---SEP---'; "
+    + _NODE_CGROUP_CMD
+    + "echo '---SEP---'; "
+    + _NODE_SLOT_CMD
 )
 
 
@@ -769,19 +823,29 @@ def collect_mem_alloc() -> Tuple[Dict[str, str], str]:
     return res, ""
 
 
+_basic_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="sgpu-basic")
+
+
+def cleanup_basic_executor() -> None:
+    """Release the long-lived local Slurm command pool at process exit."""
+    _basic_executor.shutdown(wait=True, cancel_futures=True)
+
+
+atexit.register(cleanup_basic_executor)
+
+
 def collect_basic() -> Tuple[List[dict], List[JobInfo], List[PendingJob], Dict[str, List[JobInfo]], Dict[str, Dict[str, str]], Dict[str, str], str]:
     """Phase 1: fast local commands only (sinfo + squeue + scontrol)."""
-    with ThreadPoolExecutor(max_workers=5) as ex:
-        f_nodes = ex.submit(collect_nodes_basic)
-        f_jobs = ex.submit(collect_jobs)
-        f_pending = ex.submit(collect_pending_jobs)
-        f_alloc = ex.submit(collect_gpu_alloc)
-        f_mem = ex.submit(collect_mem_alloc)
-        nodes_raw, e1 = f_nodes.result()
-        jobs, e2 = f_jobs.result()
-        pending, e3 = f_pending.result()
-        gpu_alloc, alloc_user_map, e4 = f_alloc.result()
-        mem_alloc, e5 = f_mem.result()
+    f_nodes = _basic_executor.submit(collect_nodes_basic)
+    f_queue = _basic_executor.submit(_collect_queue)
+    f_alloc = _basic_executor.submit(collect_gpu_alloc)
+    f_mem = _basic_executor.submit(collect_mem_alloc)
+    nodes_raw, e1 = f_nodes.result()
+    jobs, pending, queue_error = f_queue.result()
+    gpu_alloc, alloc_user_map, e4 = f_alloc.result()
+    mem_alloc, e5 = f_mem.result()
+    e2 = f"squeue failed: {queue_error}" if queue_error else ""
+    e3 = f"squeue PD failed: {queue_error}" if queue_error else ""
     for n in nodes_raw:
         n["mem_alloc"] = mem_alloc.get(n["name"], "")
     err = " | ".join(x for x in [e1, e2, e3, e4, e5] if x)

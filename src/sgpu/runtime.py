@@ -20,8 +20,11 @@ from __future__ import annotations
 
 import errno
 import os
+import pwd
 import stat
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Union
 
@@ -276,6 +279,12 @@ def agent_runtime_path(name: str) -> Path:
     return Path(tempfile.gettempdir()) / f"sgpu-agent-{os.geteuid()}.{name}"
 
 
+_TRUSTED_UID_CACHE_TTL = 5.0
+_TRUSTED_UID_CACHE_MAX = 16
+_trusted_uid_cache: dict[tuple[str, int, str], tuple[float, frozenset[int]]] = {}
+_trusted_uid_cache_lock = threading.Lock()
+
+
 def trusted_payload_uids(agent_dir: Union[str, Path, None] = None) -> frozenset:
     """UIDs whose push-agent payloads the collector will believe.
 
@@ -290,20 +299,35 @@ def trusted_payload_uids(agent_dir: Union[str, Path, None] = None) -> frozenset:
     set for sites that map agent writes to some other account.
     """
     override = os.getenv("SLURM_GPU_TUI_AGENT_TRUSTED_UIDS", "").strip()
+    euid = os.geteuid()
+    directory = os.fspath(agent_dir) if agent_dir is not None else ""
+    key = (override, euid, directory)
+    now = time.monotonic()
+    with _trusted_uid_cache_lock:
+        cached = _trusted_uid_cache.get(key)
+        if cached is not None and now < cached[0]:
+            return cached[1]
+
     if override:
-        return frozenset(
+        result = frozenset(
             int(x) for x in override.replace(",", " ").split() if x.lstrip("-").isdigit()
         )
-    uids = {0, os.geteuid()}
-    try:  # nobody: what root_squash rewrites the agents' writes to
-        import pwd
+    else:
+        uids = {0, euid}
+        try:  # nobody: what root_squash rewrites the agents' writes to
+            uids.add(pwd.getpwnam("nobody").pw_uid)
+        except KeyError:
+            uids.add(65534)
+        if agent_dir is not None:
+            try:
+                uids.add(os.stat(agent_dir).st_uid)
+            except OSError:
+                pass
+        result = frozenset(uids)
 
-        uids.add(pwd.getpwnam("nobody").pw_uid)
-    except (KeyError, ImportError):
-        uids.add(65534)
-    if agent_dir is not None:
-        try:
-            uids.add(os.stat(agent_dir).st_uid)
-        except OSError:
-            pass
-    return frozenset(uids)
+    with _trusted_uid_cache_lock:
+        if len(_trusted_uid_cache) >= _TRUSTED_UID_CACHE_MAX and key not in _trusted_uid_cache:
+            oldest = min(_trusted_uid_cache, key=lambda k: _trusted_uid_cache[k][0])
+            _trusted_uid_cache.pop(oldest, None)
+        _trusted_uid_cache[key] = (now + _TRUSTED_UID_CACHE_TTL, result)
+    return result
