@@ -77,10 +77,11 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstra
 ```
 
 **root/sudo**로 실행 시 시스템 서비스 + 모든 유저용 `/usr/local/bin/sgpu`;
-일반 유저 설치는 본인 계정만 설정. root 설치는 추가로 GPU 노드에 NVIDIA
-persistence mode를 활성화하고(`SGPU_ENABLE_PERSISTENCE=0`으로 생략), 공유 FS
-환경이면 CPU 전용 노드에 push 에이전트를 배치한다(`SGPU_ENABLE_CPU_PUSH=0`
-으로 생략).
+일반 유저 설치는 본인 계정만 설정. root 설치는 추가로 매 설치 때 GPU 노드의
+NVIDIA persistence mode를 활성화·재적용하고(`SGPU_ENABLE_PERSISTENCE=0`으로
+생략), 다른 사용자 작업의 로그 tail을 기본 공개하며(`SGPU_SHARE_LOGS=0`으로
+해제), 공유 FS 환경이면 CPU 전용 노드에 push 에이전트를 배치한다
+(`SGPU_ENABLE_CPU_PUSH=0`으로 생략).
 
 **설치 위치** (`SGPU_INSTALL_DIR`): 유저 설치는 `~/.sgpu/app`; root는
 `/home/shared`가 있으면 `/home/shared/sgpu`(공유 FS → push 모드 기본 동작),
@@ -180,11 +181,12 @@ ssh <node> cat /run/sgpu-agent.log               # 노드 에이전트 (root; �
 | 노드 `~smi_err` / `~no_smi` | `ssh <node> nvidia-smi` |
 | Usage 탭이 낡거나 비어 있음 | `sgpu doctor` → `usage history`가 읽은 파일 표시 |
 | 에이전트가 있는데 SSH로만 수집 | `sgpu doctor` → `agent payload trust` |
-| 남의 작업 로그 탭이 비어 있음 | `sgpu doctor` → `job log sharing` (기본 꺼짐) |
+| 남의 작업 로그 탭이 비어 있음 | `sgpu doctor` → `job log sharing`; root 설치 프로그램 재실행 |
 
 ### 다른 사용자 작업 공개
 
-둘 다 root collector가 필요하고, 설치 시 명시적으로 동의해야 켜진다:
+둘 다 root collector가 필요하다. 스크립트 공유는 설치 시 선택하고, 로그 공유는
+root 설치에서 기본으로 켜진다(`SGPU_SHARE_LOGS=0`으로 해제):
 
 | unit 환경변수 | 모든 사용자가 볼 수 있게 되는 것 |
 |---|---|
@@ -244,6 +246,7 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/uninstal
 
 설치 시에만: `SGPU_INSTALL_DIR`, `SGPU_ENABLE_PERSISTENCE`(`0`이면 GPU 노드
 persistence 생략), `SGPU_ENABLE_CPU_PUSH`(`0`이면 CPU telemetry를 SSH polling
-으로 유지), `SGPU_SHARE_SCRIPTS`.
+으로 유지), `SGPU_SHARE_SCRIPTS`, `SGPU_SHARE_LOGS`(root 설치 기본값을 `0`으로
+해제).
 
 </details>

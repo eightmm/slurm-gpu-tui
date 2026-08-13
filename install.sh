@@ -100,16 +100,22 @@ if [ -z "$SHARE" ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
     case "$ans" in n|N|no) SHARE="" ;; *) SHARE=1 ;; esac
 fi
 
-# Job stdout/stderr sharing: a root collector mirrors a tail of every job's
-# logs somewhere world-readable, so the TUI's log tabs work for jobs you do
-# not own. Defaults to NO even interactively — a log is runtime output and can
-# carry tokens a framework echoed, connection strings, or an env dump inside a
-# traceback. SGPU_SHARE_LOGS=1/0 skips the question.
-SHARE_LOGS="${SGPU_SHARE_LOGS:-}"
-if [ -z "$SHARE_LOGS" ] && [ "$(id -u)" = "0" ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
-    printf "Also mirror every job's stdout/stderr so all users can read them? [y/N] " > /dev/tty
-    read -r ans_logs < /dev/tty || ans_logs=""
-    case "$ans_logs" in y|Y|yes) SHARE_LOGS=1 ;; *) SHARE_LOGS="" ;; esac
+# Job stdout/stderr sharing: a root collector mirrors a bounded tail of every
+# job's logs somewhere world-readable, so the TUI's log tabs work for jobs you
+# do not own. Root installs default to ON as a cluster-wide operational policy;
+# the prompt still names the exposure and SGPU_SHARE_LOGS=0 is the explicit
+# opt-out. Headless root installs use the same default.
+if [ "${SGPU_SHARE_LOGS+x}" = "x" ]; then
+    SHARE_LOGS="$SGPU_SHARE_LOGS"
+elif [ "$(id -u)" = "0" ]; then
+    SHARE_LOGS=1
+    if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+        printf "Mirror every job's stdout/stderr for all users? Logs may contain secrets. [Y/n] " > /dev/tty
+        read -r ans_logs < /dev/tty || ans_logs=""
+        case "$ans_logs" in n|N|no|NO|No) SHARE_LOGS=0 ;; *) SHARE_LOGS=1 ;; esac
+    fi
+else
+    SHARE_LOGS=""
 fi
 if [ -n "$SHARE_LOGS" ] && [ "$SHARE_LOGS" != "0" ] && [ "$(id -u)" != "0" ]; then
     echo "NOTE: job log sharing needs a root collector to read other users' logs — skipping."
@@ -302,6 +308,9 @@ if [ -n "$SHARE" ] && [ "$SHARE" != "0" ]; then
 fi
 if [ -n "$SHARE_LOGS" ] && [ "$SHARE_LOGS" != "0" ]; then
     sed -i "/^User=/a Environment=SLURM_GPU_TUI_SHARE_LOGS=1" "$GENERATED_SERVICE"
+    echo "[3a] Job log sharing enabled — every user can read the last ${SLURM_GPU_TUI_LOG_TAIL_BYTES:-65536} bytes of every job stream"
+else
+    echo "[3a] Job log sharing disabled (SGPU_SHARE_LOGS=0)"
 fi
 # Root install: default the agent dir to a sibling of the install dir
 # (/home/shared/sgpu -> /home/shared/sgpu-nodes) so a shared-FS install gets
@@ -355,15 +364,34 @@ _install_persistence_local() {
         echo "root or passwordless sudo required"
         return 77
     fi
-    $SUDO install -m 0644 "$PERSISTENCE_SERVICE" \
-        /etc/systemd/system/sgpu-gpu-persistence.service
-    $SUDO systemctl daemon-reload
+    if ! $SUDO install -m 0644 "$PERSISTENCE_SERVICE" \
+            /etc/systemd/system/sgpu-gpu-persistence.service; then
+        echo "failed to install persistence unit"
+        return 1
+    fi
+    if ! $SUDO systemctl daemon-reload; then
+        echo "failed to reload systemd"
+        return 1
+    fi
     if $SUDO systemctl cat nvidia-persistenced.service >/dev/null 2>&1; then
         $SUDO systemctl start nvidia-persistenced.service >/dev/null 2>&1 || true
         $SUDO systemctl enable nvidia-persistenced.service >/dev/null 2>&1 || true
     fi
-    $SUDO systemctl enable --now sgpu-gpu-persistence.service >/dev/null
-    modes="$(nvidia-smi --query-gpu=persistence_mode --format=csv,noheader 2>/dev/null)" || return
+    # `enable --now` does not rerun an already-active RemainAfterExit oneshot.
+    # Reinstallation must actively reapply -pm 1 after a driver reset or a
+    # distro service has disabled it again.
+    if ! $SUDO systemctl enable sgpu-gpu-persistence.service >/dev/null; then
+        echo "failed to enable persistence unit"
+        return 1
+    fi
+    if ! $SUDO systemctl restart sgpu-gpu-persistence.service >/dev/null; then
+        echo "failed to reapply GPU persistence mode"
+        return 1
+    fi
+    if ! modes="$(nvidia-smi --query-gpu=persistence_mode --format=csv,noheader 2>/dev/null)"; then
+        echo "failed to verify GPU persistence mode"
+        return 1
+    fi
     printf '%s\n' "$modes" | awk '
         BEGIN { count=0; bad=0 }
         { gsub(/^[[:space:]]+|[[:space:]]+$/, ""); count++; if ($0 != "Enabled") bad=1 }
@@ -401,14 +429,30 @@ if [ "$(id -u)" != "0" ] && ! sudo -n true 2>/dev/null; then
     echo "root or passwordless sudo required"
     exit 77
 fi
-as_root install -m 0644 /dev/stdin /etc/systemd/system/sgpu-gpu-persistence.service
-as_root systemctl daemon-reload
+if ! as_root install -m 0644 /dev/stdin /etc/systemd/system/sgpu-gpu-persistence.service; then
+    echo "failed to install persistence unit"
+    exit 1
+fi
+if ! as_root systemctl daemon-reload; then
+    echo "failed to reload systemd"
+    exit 1
+fi
 if as_root systemctl cat nvidia-persistenced.service >/dev/null 2>&1; then
     as_root systemctl start nvidia-persistenced.service >/dev/null 2>&1 || true
     as_root systemctl enable nvidia-persistenced.service >/dev/null 2>&1 || true
 fi
-as_root systemctl enable --now sgpu-gpu-persistence.service >/dev/null
-modes="$(nvidia-smi --query-gpu=persistence_mode --format=csv,noheader 2>/dev/null)"
+if ! as_root systemctl enable sgpu-gpu-persistence.service >/dev/null; then
+    echo "failed to enable persistence unit"
+    exit 1
+fi
+if ! as_root systemctl restart sgpu-gpu-persistence.service >/dev/null; then
+    echo "failed to reapply GPU persistence mode"
+    exit 1
+fi
+if ! modes="$(nvidia-smi --query-gpu=persistence_mode --format=csv,noheader 2>/dev/null)"; then
+    echo "failed to verify GPU persistence mode"
+    exit 1
+fi
 printf "%s\n" "$modes" | awk '\''
     BEGIN { count=0; bad=0 }
     { gsub(/^[[:space:]]+|[[:space:]]+$/, ""); count++; if ($0 != "Enabled") bad=1 }
@@ -442,6 +486,9 @@ printf "%s\n" "$modes" | awk '\''
                 fi
             done
             echo "     persistence summary: $PERSIST_OK enabled, $PERSIST_FAIL skipped/failed"
+            if [ "$PERSIST_FAIL" -gt 0 ]; then
+                echo "[3c] WARNING: GPU persistence could not be enabled on $PERSIST_FAIL node(s); run sgpu doctor after fixing node access"
+            fi
         fi
     fi
 elif [ "${PERSISTENCE_REQUEST,,}" = "auto" ]; then

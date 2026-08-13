@@ -80,9 +80,10 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstra
 
 Run as **root/sudo** for a system service and `/usr/local/bin/sgpu` for every
 user; a non-root install sets up only your own user. Root installs also enable
-NVIDIA persistence mode on GPU nodes (`SGPU_ENABLE_PERSISTENCE=0` to skip) and
-provision CPU-only push agents on shared-FS setups (`SGPU_ENABLE_CPU_PUSH=0`
-to skip).
+and actively reapply NVIDIA persistence mode on GPU nodes on every install
+(`SGPU_ENABLE_PERSISTENCE=0` to skip), enable cross-user job-log tails
+(`SGPU_SHARE_LOGS=0` to opt out), and provision CPU-only push agents on
+shared-FS setups (`SGPU_ENABLE_CPU_PUSH=0` to skip).
 
 **Install location** (`SGPU_INSTALL_DIR`): `~/.sgpu/app` for user installs; as
 root, `/home/shared/sgpu` when `/home/shared` exists (shared FS → push mode
@@ -183,12 +184,12 @@ ssh <node> cat /run/sgpu-agent.log               # node agent (root; else /tmp/s
 | Node `~smi_err` / `~no_smi` | `ssh <node> nvidia-smi` |
 | Usage tab stale / empty | `sgpu doctor` → `usage history` names the file it read |
 | Node stuck on SSH despite an agent | `sgpu doctor` → `agent payload trust` |
-| Other users' log tabs empty | `sgpu doctor` → `job log sharing` (off by default) |
+| Other users' log tabs empty | `sgpu doctor` → `job log sharing`; rerun the root installer |
 
 ### Sharing other users' jobs
 
-Two independent opt-ins, both needing a root collector, both off unless you
-say yes at install time:
+Both features need a root collector. Script sharing is chosen at install time;
+log sharing defaults to **on** for root installs (`SGPU_SHARE_LOGS=0` opts out):
 
 | Env in the unit | What every user can then see |
 |---|---|
@@ -256,6 +257,7 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/uninstal
 
 Install-time only: `SGPU_INSTALL_DIR`, `SGPU_ENABLE_PERSISTENCE` (`0` skips
 GPU-node persistence), `SGPU_ENABLE_CPU_PUSH` (`0` keeps CPU telemetry on SSH
-polling), `SGPU_SHARE_SCRIPTS`.
+polling), `SGPU_SHARE_SCRIPTS`, `SGPU_SHARE_LOGS` (`0` disables the root-install
+default).
 
 </details>

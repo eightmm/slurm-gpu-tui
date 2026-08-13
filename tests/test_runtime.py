@@ -102,6 +102,44 @@ def test_atomic_write_signature_identifies_installed_file(tmp_path):
     )
 
 
+def test_atomic_write_reads_signature_after_install(tmp_path, monkeypatch):
+    p = tmp_path / "data.json"
+    installed = False
+    real_replace = runtime.os.replace
+    real_file_signature = runtime._file_signature
+
+    def tracked_replace(src, dst):
+        nonlocal installed
+        real_replace(src, dst)
+        installed = True
+
+    def signature_after_install(st):
+        assert installed
+        return real_file_signature(st)
+
+    monkeypatch.setattr(runtime.os, "replace", tracked_replace)
+    monkeypatch.setattr(runtime, "_file_signature", signature_after_install)
+
+    atomic_write_with_signature(p, "one")
+
+
+def test_post_install_failure_does_not_unlink_a_new_temp(tmp_path, monkeypatch):
+    p = tmp_path / "data.json"
+    tmp = runtime._tmp_sibling(p)
+
+    def fail_after_reuse(_st):
+        tmp.write_text("next writer")
+        raise OSError("signature failed")
+
+    monkeypatch.setattr(runtime, "_file_signature", fail_after_reuse)
+
+    with pytest.raises(OSError, match="signature failed"):
+        atomic_write_with_signature(p, "installed")
+
+    assert p.read_text() == "installed"
+    assert tmp.read_text() == "next writer"
+
+
 def test_atomic_write_applies_mode_despite_umask(tmp_path):
     old = os.umask(0o077)
     try:

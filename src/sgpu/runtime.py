@@ -150,7 +150,7 @@ def _atomic_write(
         if e.errno != errno.ENOENT:
             raise
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
-    signature: FileSignature
+    installed = False
     try:
         with os.fdopen(fd, "wb", closefd=False) as f:
             f.write(payload)
@@ -158,17 +158,23 @@ def _atomic_write(
             if fsync:
                 os.fsync(fd)
         os.fchmod(fd, mode)  # defeat a restrictive umask; readers need this
-        signature = _file_signature(os.fstat(fd))
+        os.replace(tmp, p)
+        installed = True
+        # Renaming can update ctime on some filesystems.  Read the installed
+        # signature only after the rename, through the still-open fd: unlike a
+        # path stat, this cannot be redirected to a racing replacement file.
+        return _file_signature(os.fstat(fd))
     except BaseException:
-        os.close(fd)
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        # After replace, the deterministic temp name is free for another
+        # writer. Never let a later fstat failure unlink that writer's file.
+        if not installed:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         raise
-    os.close(fd)
-    os.replace(tmp, p)
-    return signature
+    finally:
+        os.close(fd)
 
 
 def atomic_write(

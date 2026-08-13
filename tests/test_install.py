@@ -69,15 +69,38 @@ def test_root_install_puts_slack_config_where_root_reads_it():
     assert 'mkdir -p "$(dirname "$SLACK_CFG")"' in installer
 
 
-def test_log_sharing_is_opt_in_and_defaults_to_no():
-    # Unlike a batch script, a log is runtime output — tokens, connection
-    # strings, env dumps in tracebacks. The prompt must not default to yes.
+def test_root_log_sharing_defaults_on_with_explicit_opt_out():
+    # The chosen cluster policy defaults root installs on, while the installer
+    # must still disclose the exposure and preserve a deterministic opt-out.
     installer = (ROOT / "install.sh").read_text()
 
-    assert "Also mirror every job's stdout/stderr" in installer
-    assert "[y/N]" in installer
+    assert 'elif [ "$(id -u)" = "0" ]; then\n    SHARE_LOGS=1' in installer
+    assert "Logs may contain secrets. [Y/n]" in installer
+    assert 'SGPU_SHARE_LOGS=0' in installer
     assert "Environment=SLURM_GPU_TUI_SHARE_LOGS=1" in installer
     assert "job log sharing needs a root collector" in installer
+
+
+def test_installer_restarts_persistence_oneshot_on_every_install():
+    installer = (ROOT / "install.sh").read_text()
+    local = installer.split("_install_persistence_local() {", 1)[1].split(
+        "\n}\n\nif $_persistence_requested", 1
+    )[0]
+    remote = installer.split("REMOTE_INSTALL_SCRIPT='", 1)[1].split(
+        "'\n            for node", 1
+    )[0]
+
+    for path in (local, remote):
+        enable = path.index("systemctl enable sgpu-gpu-persistence.service")
+        restart = path.index("systemctl restart sgpu-gpu-persistence.service")
+        verify = path.index("nvidia-smi --query-gpu=persistence_mode")
+        assert enable < restart < verify
+        assert "failed to enable persistence unit" in path
+        assert "failed to reapply GPU persistence mode" in path
+        assert "failed to verify GPU persistence mode" in path
+        assert "systemctl enable --now sgpu-gpu-persistence.service" not in path
+
+    assert "GPU persistence could not be enabled" in installer
 
 
 def test_installer_has_cpu_push_opt_out():

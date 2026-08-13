@@ -334,17 +334,17 @@ def _fetch_scripts(jobs: List[JobInfo]) -> Dict[str, str]:
     return snapshot
 
 
-# ── Job stdout/stderr sharing (opt-in) ────────────────────────────────────
+# ── Job stdout/stderr sharing ─────────────────────────────────────────────
 # A job's logs live wherever the submitter pointed --output, normally under
 # their home: another user cannot read them, so the TUI's log tabs are empty
 # for everyone but the owner. A root collector can read them, so it mirrors a
 # bounded tail into a world-readable spool and readers fall back to that.
 #
-# OFF by default, and more sensitive than SHARE_SCRIPTS: a batch script is
-# static text the author wrote, whereas a log is runtime output. Tokens echoed
-# by a framework, connection strings, and environment dumps inside tracebacks
-# all end up here, and this publishes them to everyone who can read the state
-# directory.
+# Gated by the unit environment; root installs enable it by default and offer
+# SGPU_SHARE_LOGS=0 as an install-time opt-out. It is more sensitive than
+# SHARE_SCRIPTS: tokens echoed by a framework, connection strings, and
+# environment dumps inside tracebacks can all end up here, and this publishes
+# them to everyone who can read the state directory.
 
 SHARE_LOGS = bool(os.getenv("SLURM_GPU_TUI_SHARE_LOGS", ""))
 LOG_SPOOL_DIR = Path(

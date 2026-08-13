@@ -750,7 +750,7 @@ def _cli_doctor() -> int:
         else:
             report(None, "job log sharing",
                    "off — other users' stdout/stderr tabs stay empty "
-                   "(SLURM_GPU_TUI_SHARE_LOGS=1 to publish them)")
+                   "(root installs enable this by default; SGPU_SHARE_LOGS=0 opts out)")
 
     # Slack notifier (optional). Search the collector's own locations plus the
     # collector user's home, since doctor may run as a different account.
