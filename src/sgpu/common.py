@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import atexit
+import json
 import os
 import pwd
 import re
@@ -222,6 +223,11 @@ class JobInfo:
     # SHARE_LOGS collector; "" when sharing is off or nothing was readable
     log_out: str = ""
     log_err: str = ""
+    # Bounded scheduler detail published by a privileged collector. Readers
+    # use it when their own Slurm account cannot inspect another user's job.
+    detail: str = ""
+    log_status: Dict[str, str] = field(default_factory=dict)
+    uid: int = -1  # structured scheduler owner; authorizes log mirroring
 
 
 @dataclass
@@ -235,6 +241,7 @@ class PendingJob:
     reason: str = ""
     priority: str = ""
     start_time: str = ""  # scheduler's estimated start (squeue %S)
+    detail: str = ""  # collector-published scontrol detail for cross-user UI
 
 
 @dataclass
@@ -368,9 +375,22 @@ def _classify_error(error_str: str, exc: Exception = None) -> NodeErrorKind:
 # ── Data collection ──────────────────────────────────────────────────────
 
 _SQUEUE_COMBINED_CMD = (
-    'squeue -h -t R,PD -o '
-    '"%T|%i|%u|%P|%j|%M|%N|%b|%l|%C|%m|%r|%Q|%S"'
+    'env SLURM_BITSTR_LEN=0 squeue -h -t R,PD -o '
+    # JobName is intentionally absent. Slurm prints it verbatim, including
+    # embedded newlines, so it cannot safely share this line-oriented protocol.
+    # Names and the authoritative numeric UID are joined later from scontrol's
+    # structured JSON response.
+    '"%T|%i|%u|%P|%M|%N|%b|%l|%C|%m|%r|%Q|%S"'
 )
+
+_SLURM_JOB_ID_RE = re.compile(
+    r"[0-9]+(?:_[0-9]+|_\[[0-9,:%-]+\]|\+[0-9]+)?"
+)
+
+
+def valid_slurm_job_id(value: object) -> bool:
+    """Whether ``value`` is a safe canonical squeue job/array/het ID."""
+    return isinstance(value, str) and bool(_SLURM_JOB_ID_RE.fullmatch(value))
 
 
 def _collect_queue() -> Tuple[List[JobInfo], List[PendingJob], str]:
@@ -382,26 +402,29 @@ def _collect_queue() -> Tuple[List[JobInfo], List[PendingJob], str]:
     pending: List[PendingJob] = []
     for line in out.splitlines():
         p = line.split("|")
-        if len(p) < 14:
+        if len(p) != 13:
             continue
         state = p[0].strip().upper()
+        jobid = p[1].strip()
+        if not valid_slurm_job_id(jobid):
+            continue
         if state == "RUNNING":
-            gres = p[7].strip()
+            gres = p[6].strip()
             try:
-                cpu_count = int(p[9].strip())
+                cpu_count = int(p[8].strip())
             except ValueError:
                 cpu_count = 0
             jobs.append(JobInfo(
-                p[1], p[2], p[3], p[4], p[5], p[6],
-                _gpu_count_from_gres(gres), cpu_count, gres, p[8].strip(),
-                mem=p[10].strip(),
+                jobid, p[2], p[3], "", p[4], p[5],
+                _gpu_count_from_gres(gres), cpu_count, gres, p[7].strip(),
+                mem=p[9].strip(),
             ))
         elif state == "PENDING":
-            gres = p[7].strip()
+            gres = p[6].strip()
             pending.append(PendingJob(
-                p[1], p[2], p[3], p[4], p[8].strip(),
-                _gpu_count_from_gres(gres), p[11].strip(), p[12].strip(),
-                p[13].strip(),
+                jobid, p[2], p[3], "", p[7].strip(),
+                _gpu_count_from_gres(gres), p[10].strip(), p[11].strip(),
+                p[12].strip(),
             ))
     return jobs, pending, ""
 
@@ -597,14 +620,17 @@ def parse_gpu_alloc(out: str) -> Tuple[Dict[str, Dict[str, str]], Dict[str, str]
         # dropping it made every job's final seconds look like rogue GPU use
         if "JobState=RUNNING" not in line and "JobState=COMPLETING" not in line:
             continue
-        m_id = re.search(r"JobId=(\d+)", line)
+        m_id = re.match(r"JobId=(\d+)\b", line)
         if not m_id:
             continue
         jobid = m_id.group(1)
-        m_u = re.search(r"UserId=([^(\s]+)\(", line)
+        m_u = re.search(r"(?:^|\s)UserId=([^(\s]+)\(", line)
         if m_u:
             jobid_user[jobid] = m_u.group(1)
-        for m in re.finditer(r"Nodes=(\S+)\s+CPU_IDs=\S+\s+Mem=\S+\s+GRES=(\S+)", line):
+        for m in re.finditer(
+            r"(?:^|\s)Nodes=(\S+)\s+CPU_IDs=\S+\s+Mem=\S+\s+GRES=(\S+)",
+            line,
+        ):
             nodes_expr, gres = m.group(1), m.group(2)
             idx_groups = re.findall(
                 r"(?:^|,)gpu(?::[^,()]*)?\(IDX:([^)]+)\)", gres,
@@ -619,15 +645,382 @@ def parse_gpu_alloc(out: str) -> Tuple[Dict[str, Dict[str, str]], Dict[str, str]
     return alloc, jobid_user
 
 
-def collect_gpu_alloc() -> Tuple[Dict[str, Dict[str, str]], Dict[str, str], str]:
-    """Exact GPU allocation from scontrol: (node->idx->jobid, jobid->user, err)."""
-    ok, out = run_cmd("scontrol -o show job -d")
-    if not ok:
-        if "no jobs" in out.lower():
-            return {}, {}, ""
-        return {}, {}, f"scontrol failed: {out}"
-    alloc, jobid_user = parse_gpu_alloc(out)
-    return alloc, jobid_user, ""
+JOB_DETAIL_MAX_CHARS = 16 * 1024
+
+# The collector snapshot is mode 0644. Keep root-only/free-form/path-bearing
+# fields (AdminComment, Comment, Extra, MailUser, Command, WorkDir, Std*) out
+# of it and expose only operational scheduler state already useful in the UI.
+_PUBLIC_JOB_DETAIL_FIELDS = frozenset({
+    "JobId", "ArrayJobId", "ArrayTaskId", "JobName", "UserId",
+    "Priority", "Nice", "Account", "QOS", "JobState", "Reason",
+    "Dependency", "Requeue", "Restarts", "BatchFlag", "ExitCode",
+    "RunTime", "TimeLimit", "TimeMin", "SubmitTime", "EligibleTime",
+    "AccrueTime", "StartTime", "EndTime", "Deadline", "SuspendTime",
+    "SecsPreSuspend", "LastSchedEval", "Scheduler", "Partition",
+    "ReqNodeList", "ExcNodeList", "NodeList", "BatchHost", "NumNodes",
+    "NumCPUs", "NumTasks", "CPUs/Task", "ReqB:S:C:T", "ReqTRES",
+    "AllocTRES", "Socks/Node", "NtasksPerN:B:S:C", "CoreSpec",
+    "MinCPUsNode", "MinMemoryNode", "MinTmpDiskNode", "Features",
+    "DelayBoot", "OverSubscribe", "Contiguous", "Licenses", "Network",
+    "Power", "TresPerNode", "TresPerTask", "TresPerSocket", "TresPerJob",
+})
+
+JobLogMetadata = Tuple[str, str, bool]
+
+
+def _json_number(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, dict):
+        number = value.get("number")
+        if isinstance(number, int) and not isinstance(number, bool):
+            return number
+    return None
+
+
+def _json_job_ids(record: dict) -> List[str]:
+    job_id = _json_number(record.get("job_id"))
+    if job_id is None or job_id <= 0:
+        return []
+    ids = [str(job_id)]
+    array_id = _json_number(record.get("array_job_id")) or 0
+    task_id = record.get("array_task_id")
+    task_number = _json_number(task_id)
+    task_is_set = isinstance(task_id, dict) and task_id.get("set") is True
+    task_string = record.get("array_task_string")
+    if array_id > 0 and task_is_set and task_number is not None:
+        ids.append(f"{array_id}_{task_number}")
+    elif array_id > 0 and isinstance(task_string, str) and task_string:
+        candidate = f"{array_id}_[{task_string}]"
+        if valid_slurm_job_id(candidate):
+            ids.append(candidate)
+    het_id = _json_number(record.get("het_job_id")) or 0
+    het_offset = _json_number(record.get("het_job_offset"))
+    if het_id > 0 and het_offset is not None:
+        ids.append(f"{het_id}+{het_offset}")
+    return list(dict.fromkeys(ids))
+
+
+def _public_json_scalar(value: object, limit: int = 4096) -> str:
+    """One display-safe line from a structured Slurm JSON scalar."""
+    if isinstance(value, bool):
+        text = "Yes" if value else "No"
+    elif isinstance(value, (str, int, float)) and not isinstance(value, bool):
+        text = str(value)
+    elif isinstance(value, list):
+        text = ",".join(
+            part for item in value
+            if (part := _public_json_scalar(item, limit))
+        )
+    else:
+        return ""
+    # JobName and several other strings are submitter-controlled. Keep each
+    # value on one line so it cannot impersonate a neighboring detail field.
+    return " ".join(text.split())[:limit]
+
+
+def _json_wrapped_scalar(value: object) -> str:
+    if not isinstance(value, dict):
+        return _public_json_scalar(value)
+    if value.get("infinite") is True:
+        return "UNLIMITED"
+    if value.get("set") is False:
+        return ""
+    return _public_json_scalar(value.get("number"))
+
+
+def _json_timestamp(value: object) -> str:
+    number = _json_number(value)
+    if not isinstance(value, dict) or value.get("set") is False \
+            or number is None or number <= 0:
+        return ""
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(number))
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+
+def _json_duration_minutes(value: object) -> str:
+    if isinstance(value, dict) and value.get("infinite") is True:
+        return "UNLIMITED"
+    minutes = _json_number(value)
+    if minutes is None or minutes < 0:
+        return ""
+    seconds = minutes * 60
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    mins, seconds = divmod(seconds, 60)
+    prefix = f"{days}-" if days else ""
+    return f"{prefix}{hours:02d}:{mins:02d}:{seconds:02d}"
+
+
+def _public_json_job_detail(record: dict, ids: List[str]) -> str:
+    """Render an allowlisted scheduler detail from structured JSON."""
+    if not ids:
+        return ""
+    uid = _json_number(record.get("user_id"))
+    user = _public_json_scalar(record.get("user_name"))
+    user_id = f"{user}({uid})" if user and uid is not None else user
+    state = _public_json_scalar(record.get("job_state"))
+    array_id = _json_number(record.get("array_job_id")) or 0
+    array_task = ""
+    if array_id > 0:
+        array_task = _json_wrapped_scalar(record.get("array_task_id")) \
+            or _public_json_scalar(record.get("array_task_string"))
+    fields_out = [
+        ("JobId", ids[0]),
+        ("ArrayJobId", str(array_id) if array_id > 0 else ""),
+        ("ArrayTaskId", array_task),
+        ("JobName", _public_json_scalar(record.get("name"))),
+        ("UserId", user_id),
+        ("Priority", _json_wrapped_scalar(record.get("priority"))),
+        ("Nice", _public_json_scalar(record.get("nice"))),
+        ("Account", _public_json_scalar(record.get("account"))),
+        ("QOS", _public_json_scalar(record.get("qos"))),
+        ("JobState", state),
+        ("Reason", _public_json_scalar(record.get("state_reason"))),
+        ("Dependency", _public_json_scalar(record.get("dependency"))),
+        ("Requeue", _public_json_scalar(record.get("requeue"))),
+        ("Restarts", _public_json_scalar(record.get("restart_cnt"))),
+        ("BatchFlag", _public_json_scalar(record.get("batch_flag"))),
+        ("TimeLimit", _json_duration_minutes(record.get("time_limit"))),
+        ("SubmitTime", _json_timestamp(record.get("submit_time"))),
+        ("EligibleTime", _json_timestamp(record.get("eligible_time"))),
+        ("StartTime", _json_timestamp(record.get("start_time"))),
+        ("EndTime", _json_timestamp(record.get("end_time"))),
+        ("Deadline", _json_timestamp(record.get("deadline"))),
+        ("SuspendTime", _json_timestamp(record.get("suspend_time"))),
+        ("LastSchedEval", _json_timestamp(record.get("last_sched_evaluation"))),
+        ("Partition", _public_json_scalar(record.get("partition"))),
+        ("ReqNodeList", _public_json_scalar(record.get("required_nodes"))),
+        ("ExcNodeList", _public_json_scalar(record.get("excluded_nodes"))),
+        ("NodeList", _public_json_scalar(record.get("nodes"))),
+        ("BatchHost", _public_json_scalar(record.get("batch_host"))),
+        ("NumNodes", _json_wrapped_scalar(record.get("node_count"))),
+        ("NumCPUs", _json_wrapped_scalar(record.get("cpus"))),
+        ("NumTasks", _json_wrapped_scalar(record.get("tasks"))),
+        ("CPUs/Task", _json_wrapped_scalar(record.get("cpus_per_task"))),
+        ("ReqTRES", _public_json_scalar(record.get("tres_req_str"))),
+        ("AllocTRES", _public_json_scalar(record.get("tres_alloc_str"))),
+        ("MinCPUsNode", _json_wrapped_scalar(
+            record.get("minimum_cpus_per_node"))),
+        ("MinMemoryNode", _json_wrapped_scalar(record.get("memory_per_node"))),
+        ("MinTmpDiskNode", _json_wrapped_scalar(
+            record.get("minimum_tmp_disk_per_node"))),
+        ("Features", _public_json_scalar(record.get("features"))),
+        ("OverSubscribe", _public_json_scalar(record.get("oversubscribe"))),
+        ("Contiguous", _public_json_scalar(record.get("contiguous"))),
+        ("Licenses", _public_json_scalar(record.get("licenses"))),
+        ("Network", _public_json_scalar(record.get("network"))),
+        ("TresPerNode", _public_json_scalar(record.get("tres_per_node"))),
+        ("TresPerTask", _public_json_scalar(record.get("tres_per_task"))),
+        ("TresPerSocket", _public_json_scalar(record.get("tres_per_socket"))),
+        ("TresPerJob", _public_json_scalar(record.get("tres_per_job"))),
+    ]
+    return "\n".join(f"{key}={value}" for key, value in fields_out if value)[
+        :JOB_DETAIL_MAX_CHARS
+    ]
+
+
+def _json_job_log_spec(record: dict) -> JobLogMetadata:
+    workdir = record.get("current_working_directory")
+    workdir = workdir if isinstance(workdir, str) else ""
+
+    def one(name: str) -> str:
+        value = record.get(name)
+        if not isinstance(value, str) or not value or value == "(null)":
+            return ""
+        if not os.path.isabs(value) and workdir:
+            value = os.path.join(workdir, value)
+        return os.path.normpath(value)
+
+    stdout_path = one("standard_output")
+    stderr_path = one("standard_error")
+    merged = bool(stdout_path and stderr_path and stdout_path == stderr_path)
+    return stdout_path, "" if merged else stderr_path, merged
+
+
+def _gpu_indices(gres: object) -> List[str]:
+    if not isinstance(gres, str):
+        return []
+    groups = re.findall(r"(?:^|,)gpu(?::[^,()]*)?\(IDX:([^)]+)\)", gres)
+    return [idx for group in groups for idx in _expand_idx(group)]
+
+
+def parse_job_json(
+    out: str,
+) -> Tuple[Dict[str, Dict[str, str]], Dict[str, str], Dict[str, int],
+           Dict[str, str], Dict[str, JobLogMetadata]]:
+    """Parse structured ``scontrol --json show jobs`` output.
+
+    Unlike the legacy one-line formatter, JSON keeps embedded newlines inside
+    their owning string and therefore cannot forge a second job record.
+    """
+    payload = json.loads(out)
+    records = payload.get("jobs") if isinstance(payload, dict) else None
+    if not isinstance(records, list):
+        raise ValueError("scontrol JSON has no jobs list")
+    alloc: Dict[str, Dict[str, str]] = {}
+    users: Dict[str, str] = {}
+    owner_uids: Dict[str, int] = {}
+    details: Dict[str, str] = {}
+    metadata: Dict[str, JobLogMetadata] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        ids = _json_job_ids(record)
+        if not ids:
+            continue
+        detail = _public_json_job_detail(record, ids)
+        log_spec = _json_job_log_spec(record)
+        for jobid in ids:
+            details[jobid] = detail
+            metadata[jobid] = log_spec
+        user = _public_json_scalar(record.get("user_name"))
+        owner_uid = _json_number(record.get("user_id"))
+        for jobid in ids:
+            if user:
+                users[jobid] = user
+            if owner_uid is not None and owner_uid >= 0:
+                owner_uids[jobid] = owner_uid
+
+        states = record.get("job_state")
+        state_set = {
+            str(item).upper() for item in states
+        } if isinstance(states, list) else {str(states).upper()}
+        if not state_set.intersection({"RUNNING", "COMPLETING"}):
+            continue
+        jobid = ids[0]
+        resources = record.get("job_resources")
+        allocated_nodes = resources.get("allocated_nodes") \
+            if isinstance(resources, dict) else None
+        node_names = []
+        if isinstance(allocated_nodes, list):
+            for node in allocated_nodes:
+                name = node.get("nodename") if isinstance(node, dict) else ""
+                if isinstance(name, str) and 0 < len(name) <= 255 \
+                        and re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+                    node_names.append(name)
+        gres_details = record.get("gres_detail")
+        if not isinstance(gres_details, list):
+            continue
+        # Slurm's gres_detail array follows the job allocation's node order.
+        # On any cardinality ambiguity, fail closed rather than attributing a
+        # GPU to the wrong node/user.
+        if len(node_names) != len(gres_details):
+            continue
+        for node, gres in zip(node_names, gres_details, strict=True):
+            for index in _gpu_indices(gres):
+                alloc.setdefault(node, {})[index] = jobid
+    return alloc, users, owner_uids, details, metadata
+
+
+def _job_record_ids(line: str) -> List[str]:
+    # `scontrol -o` starts each record with these canonical fields. Anchoring
+    # prevents submitter-controlled JobName/comments from forging aliases.
+    match = re.match(r"JobId=(\d+)\b", line)
+    if not match:
+        return []
+    ids = [match.group(1)]
+    rest = line[match.end():]
+    array = re.match(
+        r"\s+ArrayJobId=(\d+)\s+ArrayTaskId=([^\s]+)", rest,
+    )
+    if array:
+        task = array.group(2)
+        display_task = task if task.isdigit() else f"[{task}]"
+        ids.append(f"{array.group(1)}_{display_task}")
+    het = re.match(r"\s+HetJobId=(\d+)\s+HetJobOffset=(\d+)", rest)
+    if het:
+        ids.append(f"{het.group(1)}+{het.group(2)}")
+    return ids
+
+
+def _public_job_detail(line: str) -> str:
+    """Sanitize a root ``scontrol -o`` record for the public snapshot."""
+    try:
+        tokens = shlex.split(line)
+    except ValueError:
+        tokens = line.split()
+    fields_out = []
+    seen = set()
+    for token in tokens:
+        if "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        if key in _PUBLIC_JOB_DETAIL_FIELDS:
+            # Canonical scontrol fields occur once. A duplicate can only make
+            # the record ambiguous (for example embedded free-form text), so
+            # fail closed for that field instead of choosing attacker order.
+            if key in seen:
+                fields_out = [item for item in fields_out
+                              if not item.startswith(f"{key}=")]
+                continue
+            seen.add(key)
+            fields_out.append(f"{key}={value}")
+    return "\n".join(fields_out)[:JOB_DETAIL_MAX_CHARS]
+
+
+def parse_job_records(
+    out: str,
+) -> Tuple[Dict[str, str], Dict[str, JobLogMetadata]]:
+    """Legacy text parser used for compatibility tests and unprivileged views.
+
+    Never use this line-oriented form as input to privileged log sharing:
+    submitter-controlled Slurm strings can contain newlines. The collector uses
+    :func:`parse_job_json`, whose record boundaries cannot be forged.
+    """
+    details: Dict[str, str] = {}
+    log_metadata: Dict[str, JobLogMetadata] = {}
+    for raw_line in out.splitlines():
+        line = raw_line.strip()
+        ids = _job_record_ids(line)
+        if not ids:
+            continue
+        detail = _public_job_detail(line)
+        stdout_path, stderr_path, merged = job_log_spec(line)
+        metadata = (stdout_path, stderr_path, merged)
+        for jobid in ids:
+            details[jobid] = detail
+            log_metadata[jobid] = metadata
+    return details, log_metadata
+
+
+def parse_job_details(out: str) -> Dict[str, str]:
+    """Map display job IDs to sanitized, bounded scheduler detail."""
+    details, _log_metadata = parse_job_records(out)
+    return details
+
+
+def _published_detail_field(detail: str, name: str) -> str:
+    prefix = f"{name}="
+    return next(
+        (line[len(prefix):] for line in detail.splitlines()
+         if line.startswith(prefix)),
+        "",
+    )
+
+
+def collect_gpu_alloc() -> Tuple[
+    Dict[str, Dict[str, str]], Dict[str, str], Dict[str, int],
+    Dict[str, str], Dict[str, JobLogMetadata], str,
+]:
+    """GPU allocation plus public detail and private per-job log metadata."""
+    ok, out = run_cmd("scontrol --json show jobs")
+    if ok:
+        try:
+            alloc, users, owner_uids, details, log_metadata = parse_job_json(out)
+            return alloc, users, owner_uids, details, log_metadata, ""
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            json_error = f"scontrol JSON parse failed: {exc}"
+    else:
+        json_error = f"scontrol JSON failed: {out}"
+    # Text-mode scontrol prints JobName verbatim and cannot safely delimit
+    # records. Never let that representation drive privileged file access,
+    # allocation attribution, accounting, or public scheduler details.
+    return {}, {}, {}, {}, {}, json_error
 
 
 # Combined node-side payload commands: nvidia-smi metrics + pmon (PID→GPU)
@@ -834,7 +1227,10 @@ def cleanup_basic_executor() -> None:
 atexit.register(cleanup_basic_executor)
 
 
-def collect_basic() -> Tuple[List[dict], List[JobInfo], List[PendingJob], Dict[str, List[JobInfo]], Dict[str, Dict[str, str]], Dict[str, str], str]:
+def collect_basic() -> Tuple[
+    List[dict], List[JobInfo], List[PendingJob], Dict[str, List[JobInfo]],
+    Dict[str, Dict[str, str]], Dict[str, str], str,
+]:
     """Phase 1: fast local commands only (sinfo + squeue + scontrol)."""
     f_nodes = _basic_executor.submit(collect_nodes_basic)
     f_queue = _basic_executor.submit(_collect_queue)
@@ -842,12 +1238,40 @@ def collect_basic() -> Tuple[List[dict], List[JobInfo], List[PendingJob], Dict[s
     f_mem = _basic_executor.submit(collect_mem_alloc)
     nodes_raw, e1 = f_nodes.result()
     jobs, pending, queue_error = f_queue.result()
-    gpu_alloc, alloc_user_map, e4 = f_alloc.result()
+    gpu_alloc, alloc_user_map, owner_uids, job_details, job_log_metadata, e4 = (
+        f_alloc.result()
+    )
     mem_alloc, e5 = f_mem.result()
     e2 = f"squeue failed: {queue_error}" if queue_error else ""
     e3 = f"squeue PD failed: {queue_error}" if queue_error else ""
     for n in nodes_raw:
         n["mem_alloc"] = mem_alloc.get(n["name"], "")
+    for job in jobs:
+        job.detail = job_details.get(job.jobid, "")
+        job.jobname = _published_detail_field(job.detail, "JobName")
+        trusted_user = alloc_user_map.get(job.jobid, "")
+        if trusted_user:
+            job.user = trusted_user
+        job.uid = owner_uids.get(job.jobid, -1)
+        log_out, log_err, merged = job_log_metadata.get(
+            job.jobid, ("", "", False),
+        )
+        # Collector-only attributes: dataclasses.asdict deliberately cannot
+        # serialize these into the world-readable snapshot.
+        job._log_paths = (log_out, log_err)
+        job._log_stderr_merged = merged
+    for job in pending:
+        # Pending array ranges use e.g. 51317_[0-159%16] in squeue while
+        # scontrol keeps the parent record as JobId=51317.
+        job.detail = job_details.get(
+            job.jobid, job_details.get(job.jobid.split("_", 1)[0], ""),
+        )
+        job.jobname = _published_detail_field(job.detail, "JobName")
+        trusted_user = alloc_user_map.get(
+            job.jobid, alloc_user_map.get(job.jobid.split("_", 1)[0], ""),
+        )
+        if trusted_user:
+            job.user = trusted_user
     err = " | ".join(x for x in [e1, e2, e3, e4, e5] if x)
     return nodes_raw, jobs, pending, assign_node_jobs(jobs), gpu_alloc, alloc_user_map, err
 
@@ -1059,22 +1483,41 @@ def read_job_log(path: str, shared: str = "", limit: int = 65536) -> Tuple[str, 
     return "", ""
 
 
+def job_log_spec(scontrol_out: str) -> Tuple[str, str, bool]:
+    """Return stdout, distinct stderr, and whether stderr is merged."""
+    path_boundaries = (
+        "Command", "WorkDir", "StdErr", "StdIn", "StdOut", "Power",
+        "CpusPerTres", "TresPerNode", "TresPerTask", "TresPerSocket",
+        "TresPerJob",
+    )
+
+    def one(field: str) -> str:
+        boundary = "|".join(re.escape(name) for name in path_boundaries)
+        matches = list(re.finditer(
+            rf"(?:^|[ \t]){field}=(.*?)"
+            rf"(?=[ \t]+(?:{boundary})=|$)",
+            scontrol_out, re.M,
+        ))
+        # Canonical path fields are near the end of the record. Choosing the
+        # last occurrence avoids earlier free-form fields spoofing a key.
+        p = matches[-1].group(1).rstrip() if matches else ""
+        if not p or p == "(null)":
+            return ""
+        if not os.path.isabs(p):
+            wd = one("WorkDir")
+            p = os.path.join(wd, p) if wd else p
+        return os.path.normpath(p)
+
+    stdout_path = one("StdOut")
+    stderr_path = one("StdErr")
+    merged = bool(stdout_path and stderr_path and stderr_path == stdout_path)
+    return stdout_path, "" if merged else stderr_path, merged
+
+
 def job_log_paths(scontrol_out: str) -> Tuple[str, str]:
     """(stdout, stderr) paths from `scontrol show job` output.
 
     scontrol reports resolved paths (%j etc. already expanded); relative
     paths are relative to WorkDir. stderr is "" when merged into stdout."""
-    def one(field: str) -> str:
-        m = re.search(rf"{field}=(\S+)", scontrol_out)
-        p = m.group(1) if m else ""
-        if not p or p == "(null)":
-            return ""
-        if not os.path.isabs(p):
-            wd = re.search(r"WorkDir=(\S+)", scontrol_out)
-            p = os.path.join(wd.group(1), p) if wd else p
-        return p
-
-    stdout_path, stderr_path = one("StdOut"), one("StdErr")
-    if stderr_path == stdout_path:
-        stderr_path = ""
+    stdout_path, stderr_path, _merged = job_log_spec(scontrol_out)
     return stdout_path, stderr_path

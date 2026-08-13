@@ -81,6 +81,35 @@ def test_root_log_sharing_defaults_on_with_explicit_opt_out():
     assert "job log sharing needs a root collector" in installer
 
 
+def test_root_job_detail_sharing_defaults_on_with_explicit_opt_out():
+    installer = (ROOT / "install.sh").read_text()
+
+    assert 'elif [ "$(id -u)" = "0" ]; then\n    SHARE_JOB_DETAILS=1' in installer
+    assert "SGPU_SHARE_JOB_DETAILS=0" in installer
+    assert "Environment=SLURM_GPU_TUI_SHARE_JOB_DETAILS=1" in installer
+    assert "all-user job details need a root collector" in installer
+
+
+def test_uninstaller_removes_root_owned_and_unit_configured_shared_logs():
+    uninstaller = (ROOT / "uninstall.sh").read_text()
+
+    assert "SYSTEM_STATE_DIR=" in uninstaller
+    assert "SLURM_GPU_TUI_STATE_DIR=" in uninstaller
+    assert '_rm_data_dir "$SYSTEM_STATE_DIR"' in uninstaller
+    assert '_rm_data_dir "$SLURM_GPU_TUI_STATE_DIR" .sgpu-state' in uninstaller
+    assert (
+        '_rm_data_dir "$SLURM_GPU_TUI_STATE_DIR" .sgpu-state usage.json'
+        not in uninstaller
+    )
+    assert (
+        '_rm_data_dir "$HOME/.sgpu/state" .sgpu-state usage.json '
+        "idle_state.json inventory.json"
+    ) in uninstaller
+    assert "$SUDO rm -rf -- \"$d\"" in uninstaller
+    assert "/var/lib/sgpu .sgpu-state usage.json idle_state.json inventory.json" in uninstaller
+    assert 'inventory.json logs' not in uninstaller
+
+
 def test_installer_restarts_persistence_oneshot_on_every_install():
     installer = (ROOT / "install.sh").read_text()
     local = installer.split("_install_persistence_local() {", 1)[1].split(

@@ -122,6 +122,23 @@ if [ -n "$SHARE_LOGS" ] && [ "$SHARE_LOGS" != "0" ] && [ "$(id -u)" != "0" ]; th
     SHARE_LOGS=""
 fi
 
+# Root collector scheduler detail: publish the bounded `scontrol show job`
+# record already fetched for allocation mapping. This makes another user's
+# status/details independent of the viewer's Slurm privileges. Root installs
+# default to ON; SGPU_SHARE_JOB_DETAILS=0 is the explicit opt-out.
+if [ "${SGPU_SHARE_JOB_DETAILS+x}" = "x" ]; then
+    SHARE_JOB_DETAILS="$SGPU_SHARE_JOB_DETAILS"
+elif [ "$(id -u)" = "0" ]; then
+    SHARE_JOB_DETAILS=1
+else
+    SHARE_JOB_DETAILS=""
+fi
+if [ -n "$SHARE_JOB_DETAILS" ] && [ "$SHARE_JOB_DETAILS" != "0" ] \
+        && [ "$(id -u)" != "0" ]; then
+    echo "NOTE: all-user job details need a root collector — skipping."
+    SHARE_JOB_DETAILS=""
+fi
+
 if [ -n "$SHARE" ] && [ "$SHARE" != "0" ] && [ "$(id -u)" = "0" ]; then
     # A root collector calls `scontrol write batch_script` directly (see
     # collector.py), so a sudoers rule granting root what root already has is
@@ -311,6 +328,12 @@ if [ -n "$SHARE_LOGS" ] && [ "$SHARE_LOGS" != "0" ]; then
     echo "[3a] Job log sharing enabled — every user can read the last ${SLURM_GPU_TUI_LOG_TAIL_BYTES:-65536} bytes of every job stream"
 else
     echo "[3a] Job log sharing disabled (SGPU_SHARE_LOGS=0)"
+fi
+if [ -n "$SHARE_JOB_DETAILS" ] && [ "$SHARE_JOB_DETAILS" != "0" ]; then
+    sed -i "/^User=/a Environment=SLURM_GPU_TUI_SHARE_JOB_DETAILS=1" "$GENERATED_SERVICE"
+    echo "[3a] Job detail sharing enabled — all users can inspect every running/pending job"
+else
+    echo "[3a] Job detail sharing disabled (SGPU_SHARE_JOB_DETAILS=0)"
 fi
 # Root install: default the agent dir to a sibling of the install dir
 # (/home/shared/sgpu -> /home/shared/sgpu-nodes) so a shared-FS install gets

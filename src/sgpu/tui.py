@@ -31,7 +31,7 @@ from .cells import (
 from .common import (
     JobInfo, NodeInfo, NodeSSHResult, PendingJob,
     apply_gpu_alloc, build_nodes, cleanup_ssh_pool, collect_basic,
-    collect_node_data_parallel, from_dict, job_log_paths, node_from_dict,
+    collect_node_data_parallel, from_dict, job_log_spec, node_from_dict,
     read_job_log, run_cmd,
 )
 from .runtime import default_data_dir
@@ -83,6 +83,38 @@ def _node_source_counts(nodes: List[NodeInfo]) -> Tuple[int, int, int, int, int]
     cpu_poll = sum(1 for n in nodes if not n.has_gpu and n.source == "ssh")
     stale = sum(1 for n in nodes if n.source == "stale" or (n.stale and not n.source))
     return agent, gpu_fallback, cpu_push, cpu_poll, stale
+
+
+def _collector_job_detail(
+    job: JobInfo | None, pending: PendingJob | None,
+) -> str:
+    """Scheduler detail published by the root collector, when available."""
+    detail = job.detail if job else pending.detail if pending else ""
+    return detail + "\n\n(scheduler detail shared by root collector)" if detail else ""
+
+
+def _slurm_control_jobid(jobid: str) -> str:
+    """Normalize a compressed pending-array display ID for scontrol."""
+    return jobid.split("_", 1)[0] if "_[" in jobid else jobid
+
+
+def _job_log_views(
+    detail: str, job: JobInfo | None,
+) -> Tuple[str, str, str, str]:
+    """Resolve stdout/stderr views, including a shared merged stream."""
+    real_out, real_err, merged = job_log_spec(detail)
+    shared_out = job.log_out if job else ""
+    shared_err = job.log_err if job else ""
+    if job and job.log_status.get("err") == "merged":
+        merged = True
+    stdout_text, stdout_path = read_job_log(real_out, shared_out)
+    if merged:
+        stderr_text, stderr_path = read_job_log(real_out, shared_out)
+        if stderr_text:
+            stderr_text = "(stderr is merged into stdout)\n\n" + stderr_text
+    else:
+        stderr_text, stderr_path = read_job_log(real_err, shared_err)
+    return stdout_text, stdout_path, stderr_text, stderr_path
 
 
 
@@ -221,6 +253,7 @@ class SlurmGpuTui(App):
         self._watched: Dict[str, Dict[str, str]] = {}
         self._nodes_cache: List[NodeInfo] = []  # last applied nodes (waste view)
         self._jobs_by_id: Dict[str, JobInfo] = {}  # for detail popup scripts
+        self._pending_by_id: Dict[str, PendingJob] = {}
         # DataTable.clear()+add_row() is substantially more expensive than the
         # parsing and summary work on large clusters.  Keep a value-only model
         # of the last rendered pane so the common case (a fresh collector file
@@ -562,20 +595,30 @@ class SlurmGpuTui(App):
 
     @work(thread=True)
     def _show_detail(self, kind: str, name: str) -> None:
-        ok, out = run_cmd(f"scontrol show {kind} {name}")
-        if not ok:
-            out = f"scontrol failed: {out}"
+        j = self._jobs_by_id.get(name) if kind == "job" else None
+        pending = self._pending_by_id.get(name) if kind == "job" else None
+        shared_detail = _collector_job_detail(j, pending)
+        owner = j.user if j is not None else pending.user if pending is not None else ""
+        control_name = _slurm_control_jobid(name) if kind == "job" else name
+        # Keep the owner's full live record (especially private log paths).
+        # Other users get the collector's sanitized detail without depending
+        # on their Slurm RPC privileges.
+        if shared_detail and owner != self.current_user:
+            out = shared_detail
+        else:
+            ok, out = run_cmd(f"scontrol show {kind} {control_name}")
+            if not ok:
+                out = shared_detail or f"scontrol failed: {out}"
         if kind == "node":
             out += self._gpu_proc_table(name)
         if kind == "job":
             script, src = "", ""
             # 1) collector-shared script (SHARE_SCRIPTS on a privileged collector)
-            j = self._jobs_by_id.get(name)
             if j is not None and j.script:
                 script, src = j.script, "shared by collector"
             # 2) own job via scontrol (slurm reports failure as text, exit 0)
             if not script:
-                ok2, s = run_cmd(f"scontrol write batch_script {name} -")
+                ok2, s = run_cmd(f"scontrol write batch_script {control_name} -")
                 s = s.strip()
                 if ok2 and s and not s.startswith("job script retrieval failed"):
                     script, src = s, "scontrol"
@@ -590,18 +633,22 @@ class SlurmGpuTui(App):
                         out += "\n\n(batch script not readable: not your job and file permissions deny it)"
             # live step usage — sstat only answers for your own running jobs,
             # so a silent skip is the common case for everything else
-            ok3, s3 = run_cmd(f"sstat -a -j {name} "
-                              "--format=JobID%16,AveCPU,MaxRSS,MaxVMSize,MaxDiskRead,MaxDiskWrite")
-            if ok3 and len(s3.strip().splitlines()) > 2:
-                out += "\n\nLive usage (sstat, per step):\n" + s3
+            if j is not None and j.user == self.current_user:
+                ok3, s3 = run_cmd(f"sstat -a -j {control_name} "
+                                  "--format=JobID%16,AveCPU,MaxRSS,MaxVMSize,MaxDiskRead,MaxDiskWrite")
+                if ok3 and len(s3.strip().splitlines()) > 2:
+                    out += "\n\nLive usage (sstat, per step):\n" + s3
             # Fall back to the collector's shared mirror for jobs whose logs
             # our account cannot read — without it these tabs are blank for
             # everyone but the owner.
-            stdout_path, stderr_path = job_log_paths(out)
-            stdout_text, stdout_path = read_job_log(
-                stdout_path, j.log_out if j else "")
-            stderr_text, stderr_path = read_job_log(
-                stderr_path, j.log_err if j else "")
+            stdout_text, stdout_path, stderr_text, stderr_path = (
+                _job_log_views(out, j)
+            )
+            if j is not None and j.log_status:
+                status = ", ".join(
+                    f"{stream}={value}" for stream, value in sorted(j.log_status.items())
+                )
+                out += f"\n\nShared log status: {status}"
             self.call_from_thread(
                 self.push_screen,
                 DetailScreen(f"{kind} {name}", out, script=script, script_src=src,
@@ -831,6 +878,7 @@ class SlurmGpuTui(App):
 
         self._nodes_cache = nodes
         self._jobs_by_id = {j.jobid: j for j in jobs}
+        self._pending_by_id = {j.jobid: j for j in pending}
         self._last_applied = (nodes, jobs, pending, err)
 
         # Big clusters: start with every node collapsed (one line per node),

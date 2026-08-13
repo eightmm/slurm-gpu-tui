@@ -1,8 +1,9 @@
 """Job log helpers: path resolution, tail reading, error highlighting."""
 import os
 
-from sgpu.common import job_log_paths, tail_file
+from sgpu.common import JobInfo, job_log_paths, job_log_spec, tail_file
 from sgpu.screens import DetailScreen, _LOG_ERR_RE, _fmt_sacct_detail
+from sgpu.tui import _collector_job_detail, _job_log_views, _slurm_control_jobid
 
 
 # ── job_log_paths ─────────────────────────────────────────────────────────
@@ -28,6 +29,7 @@ def test_paths_merged_stderr_dropped():
     so, se = job_log_paths(out)
     assert so == "/home/alice/proj/out.log"
     assert se == ""
+    assert job_log_spec(out) == ("/home/alice/proj/out.log", "", True)
 
 
 def test_paths_relative_resolved_against_workdir():
@@ -36,9 +38,26 @@ def test_paths_relative_resolved_against_workdir():
     assert so == "/home/alice/proj/rel.out"
 
 
+def test_paths_with_spaces_are_not_truncated():
+    detail = (
+        "JobId=1 WorkDir=/home/alice/my project "
+        "StdErr=logs/error file.log StdIn=/dev/null "
+        "StdOut=logs/output file.log Power= TresPerTask=cpu:1"
+    )
+
+    assert job_log_spec(detail) == (
+        "/home/alice/my project/logs/output file.log",
+        "/home/alice/my project/logs/error file.log",
+        False,
+    )
+
+
 def test_paths_null_and_missing():
     assert job_log_paths("JobId=1 StdOut=(null) StdErr=(null)") == ("", "")
     assert job_log_paths("JobId=1") == ("", "")
+    assert job_log_spec("JobId=1 StdOut=/tmp/a StdErr=(null)") == (
+        "/tmp/a", "", False,
+    )
 
 
 # ── tail_file ─────────────────────────────────────────────────────────────
@@ -102,6 +121,134 @@ def test_detail_log_poll_retries_a_missing_file(tmp_path):
     log.write_text("started\n")
     updates = detail._collect_log_updates()
     assert len(updates) == 1 and "started" in updates[0][1].plain
+
+
+def test_tui_prefers_collector_detail_for_another_user():
+    from sgpu.common import PendingJob
+
+    running = JobInfo(jobid="1", user="alice", detail="JobId=1 JobState=RUNNING")
+    pending = PendingJob(jobid="2", user="bob", detail="JobId=2 JobState=PENDING")
+
+    assert "JobState=RUNNING" in _collector_job_detail(running, None)
+    assert "JobState=PENDING" in _collector_job_detail(None, pending)
+    assert _collector_job_detail(None, None) == ""
+
+
+def test_tui_detail_policy_keeps_owner_live_paths_and_cross_user_snapshot():
+    running = JobInfo(jobid="1", user="alice", detail="JobId=1\nJobState=RUNNING")
+    shared = _collector_job_detail(running, None)
+
+    # Mirrors the branch in SlurmGpuTui._show_detail: the owner queries live
+    # detail; another account uses the sanitized collector record.
+    assert bool(shared and running.user != "alice") is False
+    assert bool(shared and running.user != "bob") is True
+
+
+def test_tui_normalizes_compressed_pending_array_for_scontrol():
+    assert _slurm_control_jobid("51317_[0-159%16]") == "51317"
+    assert _slurm_control_jobid("53552_43") == "53552_43"
+    assert _slurm_control_jobid("123+1") == "123+1"
+
+
+def test_tui_merged_stderr_uses_shared_stdout_without_private_paths(tmp_path):
+    shared = tmp_path / "42.out"
+    shared.write_text("combined output\n")
+    job = JobInfo(
+        jobid="42", log_out=str(shared),
+        log_status={"out": "mirrored", "err": "merged"},
+    )
+
+    stdout_text, stdout_path, stderr_text, stderr_path = _job_log_views(
+        "JobId=42\nJobState=RUNNING", job,
+    )
+
+    assert stdout_path == stderr_path == str(shared)
+    assert stdout_text == "combined output\n"
+    assert "stderr is merged" in stderr_text
+    assert "combined output" in stderr_text
+
+
+def test_cli_logs_uses_shared_mirror_when_scontrol_is_denied(
+        tmp_path, monkeypatch, capsys):
+    import sgpu.cli as cli
+
+    shared = tmp_path / "42.out"
+    shared.write_text("cross-user output\n")
+    monkeypatch.setattr(cli, "_collector_snapshot", lambda: {"jobs": [{
+        "jobid": "42", "detail": "JobId=42\nJobState=RUNNING",
+        "log_out": str(shared), "log_err": "", "log_status": {"out": "mirrored"},
+    }]})
+    monkeypatch.setattr(cli, "run_cmd", lambda _cmd: (False, "Access denied"))
+
+    assert cli._cli_logs("42") == 0
+    assert "cross-user output" in capsys.readouterr().out
+
+
+def test_cli_merged_stderr_uses_shared_stdout(tmp_path, monkeypatch, capsys):
+    import sgpu.cli as cli
+
+    shared = tmp_path / "43.out"
+    shared.write_text("merged stream\n")
+    detail = "JobId=43 WorkDir=/private StdOut=job.log StdErr=job.log"
+    monkeypatch.setattr(cli, "_collector_snapshot", lambda: {"jobs": [{
+        "jobid": "43", "detail": detail, "log_out": str(shared), "log_err": "",
+        "log_status": {"out": "mirrored", "err": "merged"},
+    }]})
+    monkeypatch.setattr(cli, "run_cmd", lambda _cmd: (True, detail))
+
+    assert cli._cli_logs("43", want_err=True) == 0
+    captured = capsys.readouterr()
+    assert "merged stream" in captured.out
+    assert "stderr is merged" in captured.err
+
+
+def test_cli_merged_stderr_uses_status_when_private_detail_is_denied(
+        tmp_path, monkeypatch, capsys):
+    import sgpu.cli as cli
+
+    shared = tmp_path / "44.out"
+    shared.write_text("merged from collector\n")
+    monkeypatch.setattr(cli, "_collector_snapshot", lambda: {"jobs": [{
+        "jobid": "44", "detail": "JobId=44\nJobState=RUNNING",
+        "log_out": str(shared), "log_err": "",
+        "log_status": {"out": "mirrored", "err": "merged"},
+    }]})
+    monkeypatch.setattr(cli, "run_cmd", lambda _cmd: (False, "Access denied"))
+
+    assert cli._cli_logs("44", want_err=True) == 0
+    captured = capsys.readouterr()
+    assert "merged from collector" in captured.out
+    assert "stderr is merged" in captured.err
+
+
+def test_cli_readable_own_log_does_not_load_collector_snapshot(
+        tmp_path, monkeypatch, capsys):
+    import sgpu.cli as cli
+
+    real = tmp_path / "45.out"
+    real.write_text("owner output\n")
+    detail = f"JobId=45 StdOut={real} StdErr=(null)"
+    monkeypatch.setattr(cli, "run_cmd", lambda _cmd: (True, detail))
+    monkeypatch.setattr(
+        cli, "_collector_snapshot",
+        lambda: (_ for _ in ()).throw(AssertionError("snapshot loaded")),
+    )
+
+    assert cli._cli_logs("45") == 0
+    assert "owner output" in capsys.readouterr().out
+
+
+def test_shared_follow_overlap_emits_only_new_suffix():
+    from sgpu.cli import _suffix_prefix_overlap
+
+    previous = b"old line\nkept line\n"
+    current = b"kept line\nnew line\n"
+
+    overlap = _suffix_prefix_overlap(previous, current)
+
+    assert current[overlap:] == b"new line\n"
+    assert _suffix_prefix_overlap(b"abc", b"xyz") == 0
+    assert _suffix_prefix_overlap(b"same", b"same") == 4
 
 
 # ── error highlighting ────────────────────────────────────────────────────

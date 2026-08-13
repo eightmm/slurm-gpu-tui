@@ -20,7 +20,7 @@ from .cells import (
 )
 from .common import (
     GpuInfo, NodeInfo, apply_gpu_alloc, build_nodes, cleanup_ssh_pool,
-    collect_basic, collect_node_data_parallel, job_log_paths, node_from_dict,
+    collect_basic, collect_node_data_parallel, job_log_spec, node_from_dict,
     read_job_log, run_cmd, ssh_cmd,
 )
 from .runtime import state_dir_candidates
@@ -39,6 +39,17 @@ def _daemon_snapshot_fresh() -> bool:
         return False
 
 
+def _collector_snapshot() -> dict:
+    """Read only the collector snapshot; never trigger a cluster-wide sweep."""
+    if not _daemon_snapshot_fresh():
+        return {}
+    try:
+        raw = json.loads(_DAEMON_DATA_FILE.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def _oneshot_snapshot() -> dict:
     """Fresh snapshot dict: daemon file if recent, else direct collection.
 
@@ -46,11 +57,9 @@ def _oneshot_snapshot() -> dict:
     real load on the cluster. Callers that need the snapshot more than once
     must reuse the result rather than calling again.
     """
-    if _daemon_snapshot_fresh():
-        try:
-            return json.loads(_DAEMON_DATA_FILE.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            pass
+    snapshot = _collector_snapshot()
+    if snapshot:
+        return snapshot
     nodes_raw, jobs, pending, node_jobs, gpu_alloc, alloc_user_map, err = collect_basic()
     node_names = [n["name"] for n in nodes_raw]
     ssh_results, stale_nodes, ssh_errors = collect_node_data_parallel(node_names)
@@ -388,26 +397,42 @@ def _cli_wait_free(want: int, partition: str, interval: int) -> int:
 
 def _cli_logs(jobid: str, follow: bool = False, want_err: bool = False) -> int:
     """Tail a job's stdout (or stderr with -e); -f keeps following like tail -f."""
-    ok, out = run_cmd(f"scontrol show job {jobid}")
-    if not ok or "JobId=" not in out:
-        print(f"scontrol: {out.strip() or 'job not found'} "
-              "(log paths only exist for queued/running jobs)", file=sys.stderr)
-        return 1
-    stdout_path, stderr_path = job_log_paths(out)
-    path = stderr_path if want_err else stdout_path
-    if want_err and not stderr_path and stdout_path:
-        print("(stderr is merged into stdout)", file=sys.stderr)
-        path = stdout_path
-    if not path:
-        print("job has no log file path", file=sys.stderr)
-        return 1
-    # Someone else's job: their log is normally unreadable to us, so fall back
-    # to the collector's shared mirror when the site publishes one.
-    shared = ""
-    if not os.access(path, os.R_OK):
-        job = next((j for j in _oneshot_snapshot().get("jobs", [])
+    ok, live_detail = run_cmd(f"scontrol show job {jobid}")
+    out = live_detail if ok and "JobId=" in live_detail else ""
+    stdout_path, stderr_path, merged = job_log_spec(out)
+    path = stdout_path if want_err and merged else (
+        stderr_path if want_err else stdout_path
+    )
+    job: dict = {}
+    # The owner commonly has a readable real path and should not pay for a
+    # snapshot (or, without a daemon, a full-cluster SSH sweep). Only consult
+    # the collector when a shared mirror/detail may actually be needed.
+    if not path or not os.access(path, os.R_OK):
+        snapshot = _collector_snapshot()
+        job = next((j for j in snapshot.get("jobs", [])
                     if str(j.get("jobid")) == str(jobid)), {})
-        shared = job.get("log_err" if want_err else "log_out", "") or ""
+        if not out:
+            out = str(job.get("detail") or "")
+            stdout_path, stderr_path, merged = job_log_spec(out)
+    status = job.get("log_status") or {}
+    if want_err and isinstance(status, dict) and status.get("err") == "merged":
+        merged = True
+    path = stdout_path if want_err and merged else (
+        stderr_path if want_err else stdout_path
+    )
+    shared_key = "log_out" if want_err and merged else (
+        "log_err" if want_err else "log_out"
+    )
+    if want_err and merged:
+        print("(stderr is merged into stdout)", file=sys.stderr)
+    shared = str(job.get(shared_key) or "")
+    if not path and not shared:
+        stream = "err" if want_err else "out"
+        why = status.get(stream, "not available") if isinstance(status, dict) else status
+        detail_error = live_detail.strip() if not ok else ""
+        print(f"job log {why}" + (f": {detail_error}" if detail_error else ""),
+              file=sys.stderr)
+        return 1
     text, path = read_job_log(path, shared)
     if shared and path == shared:
         print(f"== {path} (shared by the collector; last "
@@ -418,15 +443,48 @@ def _cli_logs(jobid: str, follow: bool = False, want_err: bool = False) -> int:
     if not follow:
         sys.stdout.write(text if text.endswith("\n") else text + "\n")
         return 0
+    using_shared = bool(shared and path == shared)
+    previous_shared = b""
     try:
-        pos = max(0, os.path.getsize(path) - 4096)
+        initial = os.stat(path)
+        pos = max(0, initial.st_size - 4096)
+        signature = (initial.st_dev, initial.st_ino)
+        if using_shared:
+            with open(path, "rb") as stream:
+                previous_shared = stream.read()
     except OSError:
         pos = 0
+        signature = None
     last_job_check = time.time()
     try:
         while True:
             try:
-                size = os.path.getsize(path)
+                current = os.stat(path)
+                size = current.st_size
+                current_signature = (current.st_dev, current.st_ino)
+                if using_shared and signature is not None \
+                        and current_signature != signature:
+                    # The collector atomically replaces a bounded tail. Once
+                    # it reaches the cap, size remains constant; inode change
+                    # is the only reliable signal that fresh output arrived.
+                    with open(path, "rb") as stream:
+                        current_shared = stream.read()
+                    # Atomic mirrors are overlapping bounded tails. Emit only
+                    # the new suffix after the largest old-suffix/new-prefix
+                    # overlap, preserving tail -f semantics at the 64KB cap.
+                    overlap = _suffix_prefix_overlap(
+                        previous_shared, current_shared,
+                    )
+                    data = current_shared[overlap:]
+                    previous_shared = current_shared
+                    pos = size
+                    if data:
+                        sys.stdout.write(data.decode(errors="replace"))
+                        sys.stdout.flush()
+                    signature = current_signature
+                    time.sleep(1)
+                    continue
+                signature = current_signature
                 if size < pos:
                     pos = 0  # truncated — start over
                 if size > pos:
@@ -442,11 +500,40 @@ def _cli_logs(jobid: str, follow: bool = False, want_err: bool = False) -> int:
                 last_job_check = time.time()
                 ok2, out2 = run_cmd(f"scontrol show job {jobid}")
                 if not ok2 or "JobId=" not in out2:
-                    print("\n== job left the queue (finished)", file=sys.stderr)
-                    return 0
+                    fresh = _collector_snapshot()
+                    definitely_gone = (
+                        "invalid job id" in out2.lower()
+                        or "not found" in out2.lower()
+                        or bool(fresh) and not any(
+                            str(j.get("jobid")) == str(jobid)
+                            for j in fresh.get("jobs", [])
+                        )
+                    )
+                    if definitely_gone:
+                        print("\n== job left the queue (finished)", file=sys.stderr)
+                        return 0
             time.sleep(1)
     except KeyboardInterrupt:
         return 0
+
+
+def _suffix_prefix_overlap(previous: bytes, current: bytes) -> int:
+    """Length of the largest suffix of previous matching current's prefix."""
+    if not previous or not current:
+        return 0
+    # KMP over current + sentinel + the bounded suffix of previous. Integer
+    # symbols make the sentinel collision-free for arbitrary log bytes.
+    pattern = list(current)
+    sequence = pattern + [-1] + list(previous[-len(current):])
+    prefix = [0] * len(sequence)
+    for i in range(1, len(sequence)):
+        j = prefix[i - 1]
+        while j and sequence[i] != sequence[j]:
+            j = prefix[j - 1]
+        if sequence[i] == sequence[j]:
+            j += 1
+        prefix[i] = j
+    return min(prefix[-1], len(current))
 
 
 def _cli_doctor() -> int:
@@ -754,6 +841,22 @@ def _cli_doctor() -> int:
             report(None, "job log sharing",
                    "off — other users' stdout/stderr tabs stay empty "
                    "(root installs enable this by default; SGPU_SHARE_LOGS=0 opts out)")
+
+        details_on = _unit_env_enabled(
+            unit_text, "SLURM_GPU_TUI_SHARE_JOB_DETAILS",
+        )
+        detailed = sum(1 for j in jobs_raw if j.get("detail"))
+        pending_raw = raw.get("pending", [])
+        detailed += sum(1 for j in pending_raw if j.get("detail"))
+        total_jobs = len(jobs_raw) + len(pending_raw)
+        if details_on:
+            report(True if detailed == total_jobs else None, "job detail sharing",
+                   f"{detailed}/{total_jobs} running/pending job(s) published"
+                   + ("" if detailed == total_jobs else " — collector may be warming up"))
+        else:
+            report(None, "job detail sharing",
+                   "off — other users may not open scheduler details "
+                   "(root installs enable this by default)")
 
     # Slack notifier (optional). Search the collector's own locations plus the
     # collector user's home, since doctor may run as a different account.

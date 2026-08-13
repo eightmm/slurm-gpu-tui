@@ -59,6 +59,12 @@ fi
 
 # ── Stop collector ──────────────────────────────────────────────────────────
 echo "[uninstall] stopping collector..."
+SYSTEM_STATE_DIR=""
+if [ -f /etc/systemd/system/sgpu-collector.service ]; then
+    SYSTEM_STATE_DIR="$(sed -n \
+        's/^Environment=SLURM_GPU_TUI_STATE_DIR=//p' \
+        /etc/systemd/system/sgpu-collector.service | tail -n 1)"
+fi
 if $HAS_SUDO && [ -f /etc/systemd/system/sgpu-collector.service ]; then
     $SUDO systemctl stop sgpu-collector 2>/dev/null
     $SUDO systemctl disable sgpu-collector 2>/dev/null
@@ -87,25 +93,46 @@ _rm_data_dir() {
     fi
     for m in "$@"; do
         if [ -e "$d/$m" ]; then
-            rm -rf "$d"
+            if $HAS_SUDO; then
+                $SUDO rm -rf -- "$d"
+            else
+                rm -rf -- "$d"
+            fi
             return
         fi
     done
     echo "[uninstall] skipping $d (no sgpu files inside — not an sgpu dir?)"
 }
+# A unit-configured custom state path is external input. Delete it only when
+# the collector's explicit marker proves the whole directory belongs to sgpu;
+# legacy well-known defaults retain their older state-file marker fallback.
 _rm_data_dir "${SLURM_GPU_TUI_DATA_DIR:-/tmp/slurm-gpu-tui}" data.json collector.lock
-_rm_data_dir "${SLURM_GPU_TUI_STATE_DIR:-$HOME/.sgpu/state}" usage.json idle_state.json inventory.json
+if [ -n "${SLURM_GPU_TUI_STATE_DIR:-}" ]; then
+    # An operator-provided path may be any directory on the machine. Generic
+    # filenames are not sufficient proof that sgpu owns the whole tree.
+    _rm_data_dir "$SLURM_GPU_TUI_STATE_DIR" .sgpu-state
+else
+    # Historical default predates .sgpu-state; retain its legacy markers.
+    _rm_data_dir "$HOME/.sgpu/state" .sgpu-state usage.json idle_state.json inventory.json
+fi
+if [ -n "$SYSTEM_STATE_DIR" ]; then
+    _rm_data_dir "$SYSTEM_STATE_DIR" .sgpu-state
+fi
 # a root collector publishes state here instead of ~/.sgpu/state, which /root's
 # mode 0700 would hide from the very users the TUI is published for
 if [ -z "${SLURM_GPU_TUI_STATE_DIR:-}" ]; then
-    _rm_data_dir /var/lib/sgpu usage.json idle_state.json inventory.json
+    _rm_data_dir /var/lib/sgpu .sgpu-state usage.json idle_state.json inventory.json
 fi
 rm -rf "$HOME/.sgpu/nodes"
 
 if [ -n "$INSTALL_DIR" ] && [ -e "$INSTALL_DIR/bin/sgpu" ]; then
     # Marker check above keeps a bad INSTALL_DIR from deleting the wrong tree
     echo "[uninstall] removing $INSTALL_DIR"
-    rm -rf "$INSTALL_DIR"
+    if $HAS_SUDO; then
+        $SUDO rm -rf -- "$INSTALL_DIR"
+    else
+        rm -rf -- "$INSTALL_DIR"
+    fi
     rmdir "$HOME/.sgpu" 2>/dev/null  # only if now empty
 else
     echo "[uninstall] install dir not found (already removed?)"

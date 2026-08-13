@@ -79,8 +79,9 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstra
 **root/sudo**로 실행 시 시스템 서비스 + 모든 유저용 `/usr/local/bin/sgpu`;
 일반 유저 설치는 본인 계정만 설정. root 설치는 추가로 매 설치 때 GPU 노드의
 NVIDIA persistence mode를 활성화·재적용하고(`SGPU_ENABLE_PERSISTENCE=0`으로
-생략), 다른 사용자 작업의 로그 tail을 기본 공개하며(`SGPU_SHARE_LOGS=0`으로
-해제), 공유 FS 환경이면 CPU 전용 노드에 push 에이전트를 배치한다
+생략), 다른 사용자 작업의 로그 tail과 정제된 Slurm 상세를 기본 공개하며
+(`SGPU_SHARE_LOGS=0`, `SGPU_SHARE_JOB_DETAILS=0`으로 각각 해제), 공유 FS
+환경이면 CPU 전용 노드에 push 에이전트를 배치한다
 (`SGPU_ENABLE_CPU_PUSH=0`으로 생략).
 
 **설치 위치** (`SGPU_INSTALL_DIR`): 유저 설치는 `~/.sgpu/app`; root는
@@ -182,23 +183,33 @@ ssh <node> cat /run/sgpu-agent.log               # 노드 에이전트 (root; �
 | Usage 탭이 낡거나 비어 있음 | `sgpu doctor` → `usage history`가 읽은 파일 표시 |
 | 에이전트가 있는데 SSH로만 수집 | `sgpu doctor` → `agent payload trust` |
 | 남의 작업 로그 탭이 비어 있음 | `sgpu doctor` → `job log sharing`; root 설치 프로그램 재실행 |
+| 남의 작업 상세가 권한 오류 | `sgpu doctor` → `job detail sharing`; root 설치 프로그램 재실행 |
+| 그 외 | `sgpu doctor` |
 
 ### 다른 사용자 작업 공개
 
-둘 다 root collector가 필요하다. 스크립트 공유는 설치 시 선택하고, 로그 공유는
-root 설치에서 기본으로 켜진다(`SGPU_SHARE_LOGS=0`으로 해제):
+모두 root collector가 필요하다. 스크립트 공유는 설치 시 선택하고, 로그와 작업
+상세 공유는 root 설치에서 기본으로 켜진다(`SGPU_SHARE_LOGS=0`,
+`SGPU_SHARE_JOB_DETAILS=0`으로 각각 해제):
 
 | unit 환경변수 | 모든 사용자가 볼 수 있게 되는 것 |
 |---|---|
 | `SLURM_GPU_TUI_SHARE_SCRIPTS=1` | 모든 작업의 배치 스크립트 (상세 팝업) |
 | `SLURM_GPU_TUI_SHARE_LOGS=1` | 모든 작업의 stdout/stderr (마지막 64KB, `<state>/logs`로 미러링) |
+| `SLURM_GPU_TUI_SHARE_JOB_DETAILS=1` | 실행/대기 작업의 정제된 상태·시간·배치 노드·요청/할당 자원 |
 
 > **로그 공개는 런타임 산출물을 공개하는 것이다.** 배치 스크립트는 작성자가 쓴
 > 텍스트지만, 로그는 작업이 출력한 전부다 — 프레임워크가 찍은 토큰, 접속 문자열,
 > traceback 안의 환경변수 덤프. 클러스터 사용자 전원이 서로의 작업 출력을 볼
 > 권한이 있는 곳에서만 켜라. 스트림당 미러링 양은
-> `SLURM_GPU_TUI_LOG_TAIL_BYTES`로 제한한다.
-| 그 외 | `sgpu doctor` |
+> `SLURM_GPU_TUI_LOG_TAIL_BYTES`로 제한한다. 심볼릭 링크가 아닌 일반 파일이며
+> 구조화된 `scontrol --json`이 보고한 숫자 UID와 소유자가 일치할 때만 읽는다. NFS root-squash
+> 환경에서는 그 UID로 권한을 낮춘 짧은 프로세스로 읽고 collector 환경변수는
+> 넘기지 않는다.
+
+작업 상세에는 자유 형식 코멘트, 메일 주소, 실행 명령, 작업 디렉터리, 입출력
+경로를 넣지 않는다. 로그 경로는 collector 내부에서만 쓰며 `data.json`에
+기록하지 않는다.
 
 원샷 부가 설정 (root, 클러스터당 1회):
 
@@ -243,10 +254,13 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/uninstal
 | `SLURM_GPU_TUI_SLACK_NAG_SEC` | `21600` | 지속 상태 재알림 간격 |
 | `SLURM_GPU_TUI_ROGUE_IGNORE` | `root,gdm,xdm` | rogue로 안 잡을 유저 |
 | `SLURM_GPU_TUI_SHARE_SCRIPTS` | (없음) | 전체 잡 batch script를 모든 유저에게 공개 — **스크립트 내용(비밀키 포함) 전원 공개** |
+| `SLURM_GPU_TUI_SHARE_LOGS` | (없음) | 모든 작업의 log tail을 전체 사용자에게 공개 — **런타임 출력(비밀 포함 가능) 공개** |
+| `SLURM_GPU_TUI_SHARE_JOB_DETAILS` | (없음) | 실행/대기 작업의 정제된 Slurm 상세를 전체 사용자에게 공개 |
+| `SLURM_GPU_TUI_LOG_MIRROR_SEC` | `10` | 공유 로그 갱신 주기 |
 
 설치 시에만: `SGPU_INSTALL_DIR`, `SGPU_ENABLE_PERSISTENCE`(`0`이면 GPU 노드
 persistence 생략), `SGPU_ENABLE_CPU_PUSH`(`0`이면 CPU telemetry를 SSH polling
-으로 유지), `SGPU_SHARE_SCRIPTS`, `SGPU_SHARE_LOGS`(root 설치 기본값을 `0`으로
-해제).
+으로 유지), `SGPU_SHARE_SCRIPTS`, `SGPU_SHARE_LOGS`,
+`SGPU_SHARE_JOB_DETAILS`(각 root 설치 기본값을 `0`으로 해제).
 
 </details>

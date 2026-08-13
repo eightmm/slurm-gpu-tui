@@ -6,10 +6,12 @@ import glob
 import hashlib
 import json
 import os
+import pwd
 import re
 import shlex
 import signal
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -21,8 +23,9 @@ from typing import Dict, List
 
 from .common import (
     GpuInfo, JobInfo, NodeErrorKind, NodeMemInfo, PendingJob, ROGUE_IGNORE,
-    collect_basic, collect_node_data, job_log_paths, mem_to_mib,
+    collect_basic, collect_node_data, mem_to_mib,
     parse_gres_models, reconcile_gpu_alloc, resolve_user, run_cmd, ssh_cmd,
+    valid_slurm_job_id,
     _classify_error,
 )
 from .agent import AGENT_PAYLOAD_VERSION
@@ -43,6 +46,7 @@ DATA_DIR = default_data_dir()
 # reboots, so it lives outside /tmp — see runtime.default_state_dir for why a
 # root collector cannot keep it under ~/.sgpu
 STATE_DIR = default_state_dir()
+STATE_MARKER_FILE = STATE_DIR / ".sgpu-state"
 DATA_FILE = DATA_DIR / "data.json"
 PID_FILE = DATA_DIR / "collector.pid"
 LOCK_FILE = DATA_DIR / "collector.lock"
@@ -64,8 +68,17 @@ AGENT_PAYLOAD_MAX_BYTES = int(os.getenv("SLURM_GPU_TUI_AGENT_MAX_BYTES", str(102
 # can view them in the TUI. Requires a collector that may read them (root).
 # OFF by default — scripts can contain secrets; enabling shares them with
 # everyone who can read data.json.
-SHARE_SCRIPTS = bool(os.getenv("SLURM_GPU_TUI_SHARE_SCRIPTS", ""))
+def _env_enabled(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() not in (
+        "", "0", "false", "no", "off",
+    )
+
+
+SHARE_SCRIPTS = _env_enabled("SLURM_GPU_TUI_SHARE_SCRIPTS")
 SCRIPT_MAX_BYTES = 16384
+# data.json is world-readable. This gate exposes only allowlisted operational
+# fields from `scontrol show job`; free-form text and private paths stay out.
+SHARE_JOB_DETAILS = _env_enabled("SLURM_GPU_TUI_SHARE_JOB_DETAILS")
 
 # ── Long-lived executors / shared node results ───────────────────────────
 
@@ -346,7 +359,7 @@ def _fetch_scripts(jobs: List[JobInfo]) -> Dict[str, str]:
 # environment dumps inside tracebacks can all end up here, and this publishes
 # them to everyone who can read the state directory.
 
-SHARE_LOGS = bool(os.getenv("SLURM_GPU_TUI_SHARE_LOGS", ""))
+SHARE_LOGS = _env_enabled("SLURM_GPU_TUI_SHARE_LOGS")
 LOG_SPOOL_DIR = Path(
     os.getenv("SLURM_GPU_TUI_LOG_SPOOL_DIR", str(STATE_DIR / "logs"))
 )
@@ -361,6 +374,8 @@ _log_paths: Dict[str, tuple] = {}      # jobid -> (stdout src, stderr src)
 _log_owner_uids: Dict[str, int] = {}   # jobid -> scheduler-reported owner uid
 _log_fingerprint: Dict[str, tuple] = {}  # spool path -> (size, mtime) mirrored
 _log_published: Dict[str, Dict[str, str]] = {}
+_log_status: Dict[str, Dict[str, str]] = {}
+_log_seed_tokens: Dict[str, object] = {}  # invalidates stale async workers
 _log_next_check: Dict[str, float] = {}
 _log_live: set[str] = set()
 _log_inflight: set = set()
@@ -370,73 +385,186 @@ _log_lock = threading.Lock()
 _log_executor = ThreadPoolExecutor(max_workers=2)
 
 
+def _owner_identity(uid: int) -> tuple[int, List[int]] | None:
+    """Primary/supplementary groups for a scheduler-reported local UID."""
+    try:
+        pw = pwd.getpwuid(uid)
+        groups = [g for g in os.getgrouplist(pw.pw_name, pw.pw_gid)
+                  if g != pw.pw_gid]
+        return pw.pw_gid, groups
+    except (KeyError, OSError):
+        return None
+
+
+def _read_log_as_owner(src: str, owner_uid: int) -> tuple[bytes | None, str]:
+    """Read a bounded tail in a privilege-dropped child.
+
+    This is the NFS root-squash fallback. The helper itself opens with
+    O_NOFOLLOW and accepts only a regular file owned by its effective UID.
+    """
+    if os.geteuid() != 0:
+        return None, "unreadable"
+    identity = _owner_identity(owner_uid)
+    if identity is None:
+        return None, "unreadable"
+    gid, groups = identity
+    try:
+        result = subprocess.run(
+            [sys.executable, "-I", "-m", "sgpu.log_reader", src,
+             str(LOG_TAIL_BYTES)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=8, check=False, cwd="/", env={"LANG": "C.UTF-8"},
+            user=owner_uid, group=gid, extra_groups=groups,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None, "unreadable"
+    if result.returncode == 0:
+        return result.stdout[:LOG_TAIL_BYTES], "mirrored"
+    if result.returncode == 4:
+        return None, "unsafe"
+    return None, "unreadable"
+
+
+def _read_log_source(
+    src: str, owner_uid: int, known: tuple | None,
+) -> tuple[bytes | None, tuple | None, str]:
+    """Read one safe tail; ``None`` data with a fingerprint means unchanged."""
+    try:
+        before = os.lstat(src)
+        if not stat.S_ISREG(before.st_mode) or before.st_uid != owner_uid:
+            return None, None, "unsafe"
+        flags = os.O_RDONLY | os.O_NONBLOCK
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(src, flags)
+    except FileNotFoundError:
+        return None, None, "waiting"
+    except PermissionError:
+        data, status = _read_log_as_owner(src, owner_uid)
+        if data is None:
+            return None, None, status
+        fp = ("owner-tail", len(data), hashlib.blake2b(data, digest_size=16).digest())
+        return (None if fp == known else data), fp, status
+    except OSError:
+        return None, None, "unreadable"
+    try:
+        with os.fdopen(fd, "rb") as source:
+            st = os.fstat(source.fileno())
+            if (
+                not stat.S_ISREG(st.st_mode)
+                or st.st_uid != owner_uid
+                or (st.st_dev, st.st_ino) != (before.st_dev, before.st_ino)
+            ):
+                return None, None, "unsafe"
+            fp = (
+                st.st_dev, st.st_ino, st.st_size,
+                st.st_mtime_ns, st.st_ctime_ns,
+            )
+            if fp == known:
+                return None, fp, "mirrored"
+            if st.st_size > LOG_TAIL_BYTES:
+                source.seek(st.st_size - LOG_TAIL_BYTES)
+            return source.read(LOG_TAIL_BYTES), fp, "mirrored"
+    except OSError:
+        return None, None, "unreadable"
+
+
+def _set_log_status(
+    jid: str, suffix: str, status: str, token: object | None = None,
+) -> None:
+    with _log_lock:
+        if jid in _log_live and (
+            token is None or _log_seed_tokens.get(jid) is token
+        ):
+            _log_status.setdefault(jid, {})[suffix] = status
+
+
+def _log_spool_path(jid: str, suffix: str) -> Path | None:
+    """A validated direct child of the spool, never a caller-shaped path."""
+    if not valid_slurm_job_id(jid) or suffix not in ("out", "err"):
+        return None
+    return LOG_SPOOL_DIR / f"{jid}.{suffix}"
+
+
+def _unpublish_log_stream(
+    jid: str, suffix: str, token: object | None = None,
+) -> None:
+    """Remove a mirror that is no longer backed by a safe source."""
+    dst = _log_spool_path(jid, suffix)
+    if dst is None:
+        return
+    with _log_lock:
+        if token is not None and _log_seed_tokens.get(jid) is not token:
+            return
+        published = _log_published.get(jid)
+        if published is not None:
+            published.pop(suffix, None)
+            if not published:
+                _log_published.pop(jid, None)
+        _log_fingerprint.pop(str(dst), None)
+        try:
+            dst.unlink()
+        except OSError:
+            pass
+
+
 def _mirror_one_job_log(jid: str) -> None:
     """Copy the tail of one job's stdout/stderr into the shared spool."""
     try:
+        if not valid_slurm_job_id(jid):
+            return
         with _log_lock:
             paths = _log_paths.get(jid)
             owner_uid = _log_owner_uids.get(jid)
-        if paths is None or owner_uid is None:
-            # scontrol resolves %j/%A patterns for us; the answer cannot change
-            # while the job runs, so this costs one call per job, not per cycle
-            ok, out = run_cmd(f"scontrol show job {jid}", timeout=10)
-            owner = re.search(r"\bUserId=[^(\s]+\((\d+)\)", out) if ok else None
-            if not ok or "JobId=" not in out or owner is None:
-                return  # transient lookup failures are retried on the next scan
-            paths = job_log_paths(out)
-            owner_uid = int(owner.group(1))
-            with _log_lock:
-                if jid not in _log_live:
-                    return
-                _log_paths[jid] = paths
-                _log_owner_uids[jid] = owner_uid
+            token = _log_seed_tokens.get(jid)
+            if token is None:
+                token = object()
+                _log_seed_tokens[jid] = token
+        if owner_uid is None or owner_uid < 0:
+            _set_log_status(jid, "out", "untrusted-owner", token)
+            _set_log_status(jid, "err", "untrusted-owner", token)
+            return
+        if paths is None:
+            # Never recover privileged paths from scontrol's line-oriented
+            # output: JobName is printed verbatim and can forge another line.
+            _set_log_status(jid, "out", "metadata-unavailable", token)
+            _set_log_status(jid, "err", "metadata-unavailable", token)
+            return
         for src, suffix in ((paths[0], "out"), (paths[1], "err")):
             if not src:
+                with _log_lock:
+                    prior = _log_status.get(jid, {}).get(suffix)
+                _set_log_status(
+                    jid, suffix,
+                    prior if suffix == "err" and prior == "merged"
+                    else "not-configured",
+                    token,
+                )
                 continue
-            dst = LOG_SPOOL_DIR / f"{jid}.{suffix}"
-            try:
-                # The output path is controlled by the submitting user while
-                # this collector commonly runs as root.  Mirror only a regular
-                # file owned by the scheduler-reported job uid and keep that
-                # check on the opened fd, closing symlink/TOCTOU exfiltration
-                # paths into arbitrary root-readable files.
-                before = os.lstat(src)
-                if not stat.S_ISREG(before.st_mode) or before.st_uid != owner_uid:
-                    continue
-                flags = os.O_RDONLY | os.O_NONBLOCK
-                flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-                fd = os.open(src, flags)
-            except OSError:
-                continue  # not created yet, or gone with the job
-            try:
-                with os.fdopen(fd, "rb") as f:
-                    st = os.fstat(f.fileno())
-                    if (
-                        not stat.S_ISREG(st.st_mode)
-                        or st.st_uid != owner_uid
-                        or (st.st_dev, st.st_ino) != (before.st_dev, before.st_ino)
-                    ):
-                        continue
-                    fp = (
-                        st.st_dev, st.st_ino, st.st_size,
-                        st.st_mtime_ns, st.st_ctime_ns,
-                    )
-                    with _log_lock:
-                        unchanged = _log_fingerprint.get(str(dst)) == fp
-                    if unchanged and dst.is_file():
-                        with _log_lock:
-                            if jid in _log_live:
-                                _log_published.setdefault(jid, {})[suffix] = str(dst)
-                        continue
-                    if st.st_size > LOG_TAIL_BYTES:
-                        f.seek(st.st_size - LOG_TAIL_BYTES)
-                    data = f.read(LOG_TAIL_BYTES)
-            except OSError:
+            dst = _log_spool_path(jid, suffix)
+            if dst is None:  # defense in depth; jid/suffix were checked above
+                continue
+            with _log_lock:
+                known = _log_fingerprint.get(str(dst)) if dst.is_file() else None
+            data, fp, status = _read_log_source(src, owner_uid, known)
+            _set_log_status(jid, suffix, status, token)
+            if fp is None:
+                # Do not keep serving a stale world-readable tail after its
+                # source vanished, became unreadable, or failed validation.
+                _unpublish_log_stream(jid, suffix, token)
+                continue
+            if data is None and dst.is_file():
+                with _log_lock:
+                    if jid in _log_live \
+                            and _log_seed_tokens.get(jid) is token:
+                        _log_published.setdefault(jid, {})[suffix] = str(dst)
+                continue
+            if data is None:
                 continue
             # raw bytes, not tail_file's decorated text: readers run their own
             # tail_file over this and `sgpu logs -f` tracks byte offsets
             with _log_lock:
-                if jid not in _log_live:
+                if jid not in _log_live \
+                        or _log_seed_tokens.get(jid) is not token:
                     continue
                 # Serialize the publish with live-set removal. If a job exits
                 # during a mirror, either this finishes before cleanup (which
@@ -456,9 +584,13 @@ def _drop_log_spool(jid: str) -> None:
         _log_published.pop(jid, None)
         _log_next_check.pop(jid, None)
         _log_owner_uids.pop(jid, None)
+        _log_status.pop(jid, None)
+        _log_seed_tokens.pop(jid, None)
         _log_live.discard(jid)
     for suffix in ("out", "err"):
-        p = LOG_SPOOL_DIR / f"{jid}.{suffix}"
+        p = _log_spool_path(jid, suffix)
+        if p is None:
+            continue
         with _log_lock:
             _log_fingerprint.pop(str(p), None)
         try:
@@ -477,26 +609,106 @@ def _clear_stale_log_spool() -> None:
                 pass
 
 
+def _prepare_log_spool() -> bool:
+    """Secure/clean the spool, including remnants after sharing is disabled."""
+    if not SHARE_LOGS and not LOG_SPOOL_DIR.exists():
+        return True
+    try:
+        ensure_secure_dir(LOG_SPOOL_DIR)
+    except UnsafeRuntimeDir as exc:
+        print(f"[collector] {exc}", flush=True)
+        return False
+    _clear_stale_log_spool()
+    return True
+
+
+def _prepare_state_dir() -> None:
+    """Secure persistent state and mark only a directory created by sgpu."""
+    existed = STATE_DIR.exists()
+    ensure_secure_dir(STATE_DIR)
+    if not existed:
+        atomic_write(STATE_MARKER_FILE, "sgpu\n", mode=0o644)
+
+
 def _share_logs(jobs: List[JobInfo]) -> Dict[str, dict]:
     """Refresh the shared log spool; return jobid -> {"out"/"err": path}."""
     if not SHARE_LOGS:
         return {}
-    live = {j.jobid for j in jobs}
+    # Reuse private metadata parsed from the root collector's combined
+    # scontrol result instead of issuing one scheduler RPC per job. These
+    # paths/UIDs are dynamic attributes and cannot leak through asdict.
+    seeds = []
+    invalid_seeds = []
+    for job in jobs:
+        paths = getattr(job, "_log_paths", None)
+        owner_uid = job.uid
+        if valid_slurm_job_id(job.jobid) \
+                and paths is not None and owner_uid >= 0:
+            seeds.append((
+                job.jobid, paths, owner_uid,
+                bool(getattr(job, "_log_stderr_merged", False)),
+            ))
+        elif valid_slurm_job_id(job.jobid):
+            invalid_seeds.append(job.jobid)
+    live = {j.jobid for j in jobs if valid_slurm_job_id(j.jobid)}
     now = time.monotonic()
+    reset_streams = []
     with _log_lock:
+        # A live queue row without a fresh structured owner/path record must
+        # invalidate the previous cycle. Otherwise a transient JSON failure
+        # would keep publishing and refreshing a stale privileged path.
+        for jid in invalid_seeds:
+            _log_seed_tokens[jid] = object()
+            token = _log_seed_tokens[jid]
+            reset_streams.extend(
+                (jid, suffix, token) for suffix in ("out", "err")
+            )
+            _log_paths.pop(jid, None)
+            _log_owner_uids.pop(jid, None)
+            _log_next_check.pop(jid, None)
+            _log_status[jid] = {
+                "out": "metadata-unavailable", "err": "metadata-unavailable",
+            }
+        for jid, paths, owner_uid, stderr_merged in seeds:
+            previous_paths = _log_paths.get(jid)
+            previous_owner = _log_owner_uids.get(jid)
+            seed_changed = previous_paths is not None and (
+                previous_paths != paths or previous_owner != owner_uid
+            )
+            if seed_changed:
+                _log_seed_tokens[jid] = object()
+                token = _log_seed_tokens[jid]
+                reset_streams.extend(
+                    (jid, suffix, token) for suffix in ("out", "err")
+                )
+                _log_status.pop(jid, None)
+            elif jid not in _log_seed_tokens:
+                _log_seed_tokens[jid] = object()
+            _log_paths[jid] = paths
+            _log_owner_uids[jid] = owner_uid
+            statuses = _log_status.setdefault(jid, {})
+            if not paths[0]:
+                statuses["out"] = "not-configured"
+            if not paths[1]:
+                statuses["err"] = (
+                    "merged" if stderr_merged else "not-configured"
+                )
         known = set(_log_paths) | set(_log_owner_uids) | set(_log_published) \
-            | set(_log_next_check) | set(_log_live)
+            | set(_log_status) | set(_log_next_check) | set(_log_live)
         gone = [jid for jid in known if jid not in live]
         _log_live.clear()
         _log_live.update(live)
+        trusted = {jid for jid, *_rest in seeds}
         todo = [
-            j.jobid for j in jobs
-            if j.jobid not in _log_inflight
-            and now >= _log_next_check.get(j.jobid, 0.0)
+            jid for jid in trusted
+            if jid not in _log_inflight
+            and now >= _log_next_check.get(jid, 0.0)
         ]
         _log_inflight.update(todo)
         for jid in todo:
             _log_next_check[jid] = now + LOG_MIRROR_SEC
+    for jid, suffix, token in reset_streams:
+        _unpublish_log_stream(jid, suffix, token)
     for jid in gone:
         with _log_lock:
             _log_paths.pop(jid, None)
@@ -505,8 +717,13 @@ def _share_logs(jobs: List[JobInfo]) -> Dict[str, dict]:
         _log_executor.submit(_mirror_one_job_log, jid)
     with _log_lock:
         return {
-            j.jobid: dict(_log_published[j.jobid])
-            for j in jobs if _log_published.get(j.jobid)
+            j.jobid: dict(
+                _log_published.get(j.jobid, {}),
+                status=dict(_log_status.get(j.jobid, {})),
+            )
+            for j in jobs
+            if valid_slurm_job_id(j.jobid)
+            and (_log_published.get(j.jobid) or _log_status.get(j.jobid))
         }
 
 
@@ -758,8 +975,31 @@ def _job_to_dict(job: JobInfo) -> dict:
     return asdict(job)
 
 
+def _node_job_to_dict(job: JobInfo) -> dict:
+    """Compact copy for per-node rows; full detail lives in top-level jobs."""
+    out = asdict(job)
+    for name in ("detail", "script", "log_out", "log_err", "log_status"):
+        out.pop(name, None)
+    return out
+
+
+def _published_job_to_dict(job: JobInfo, script: str, logs: dict) -> dict:
+    """World-readable top-level job record, behind explicit share gates."""
+    return dict(
+        _job_to_dict(job),
+        script=script,
+        detail=job.detail if SHARE_JOB_DETAILS else "",
+        log_out=logs.get("out", ""),
+        log_err=logs.get("err", ""),
+        log_status=logs.get("status", {}),
+    )
+
+
 def _pending_to_dict(pj: PendingJob) -> dict:
-    return asdict(pj)
+    return dict(
+        asdict(pj),
+        detail=pj.detail if SHARE_JOB_DETAILS else "",
+    )
 
 
 _agent_build_cache: tuple = (0.0, "0")  # (checked monotonic ts, value)
@@ -1032,7 +1272,8 @@ def collect_all() -> dict:
         _prune_node_caches({n["name"] for n in nodes_raw})
 
     node_jobs: Dict[str, List[dict]] = {
-        k: [_job_to_dict(j) for j in v] for k, v in node_jobs_from_basic.items()
+        k: [_node_job_to_dict(j) for j in v]
+        for k, v in node_jobs_from_basic.items()
     }
     # scontrol's UserId map wins over squeue: it resolves array-task jobids
     # (38182_0 in squeue vs the real 38192 in the alloc) and carries the name
@@ -1155,9 +1396,9 @@ def collect_all() -> dict:
         "ts": datetime.now().isoformat(),
         "nodes": result_nodes,
         "jobs": [
-            dict(_job_to_dict(j), script=scripts.get(j.jobid, ""),
-                 log_out=logs.get(j.jobid, {}).get("out", ""),
-                 log_err=logs.get(j.jobid, {}).get("err", ""))
+            _published_job_to_dict(
+                j, scripts.get(j.jobid, ""), logs.get(j.jobid, {}),
+            )
             for j in jobs
         ],
         "pending": [_pending_to_dict(p) for p in pending],
@@ -1610,22 +1851,23 @@ def run_collector():
 
     atomic_write(PID_FILE, str(os.getpid()), mode=0o644)
     try:
-        ensure_secure_dir(STATE_DIR)
+        # A custom setting may point at an existing parent such as /srv/state;
+        # never mark that parent as wholly owned by sgpu for recursive removal.
+        _prepare_state_dir()
     except UnsafeRuntimeDir as e:
         print(f"[collector] {e}", flush=True)
         sys.exit(1)
+    # 0755 while enabled: every user must traverse it. Cleanup also runs when
+    # disabled so an opt-out removes old world-readable tails immediately.
+    if not _prepare_log_spool() and SHARE_LOGS:
+        sys.exit(1)
     if SHARE_LOGS:
-        # 0755: the whole point is that users other than the job owner can
-        # read what lands in here
-        try:
-            ensure_secure_dir(LOG_SPOOL_DIR)
-        except UnsafeRuntimeDir as e:
-            print(f"[collector] {e}", flush=True)
-            sys.exit(1)
-        _clear_stale_log_spool()
         print(f"[collector] job log sharing on (spool={LOG_SPOOL_DIR}, "
               f"tail={LOG_TAIL_BYTES // 1024}KB) — every user can read every "
               "job's stdout/stderr", flush=True)
+    if SHARE_JOB_DETAILS:
+        print("[collector] job detail sharing on — every user can inspect "
+              "running/pending scheduler records", flush=True)
     _load_idle_state()
     _load_inventory()
     _load_usage()

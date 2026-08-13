@@ -1,11 +1,14 @@
 """Parser tests against captured real-cluster output."""
 from datetime import datetime
 
+import pytest
+
 from sgpu import common
 from sgpu.common import (
     NodeErrorKind, _classify_error, _expand_idx, _gpu_count_from_gres,
     assign_node_jobs, expand_nodelist, parse_gpu_alloc, parse_gres_models,
-    parse_node_payload, shorten_gpu_name,
+    parse_job_details, parse_job_json, parse_job_records, parse_node_payload,
+    shorten_gpu_name,
 )
 from sgpu.common import GpuInfo, JobInfo, NodeInfo
 from sgpu.cells import (
@@ -38,8 +41,8 @@ def test_assign_node_jobs_multinode():
 
 def test_combined_squeue_splits_running_and_pending(monkeypatch):
     output = (
-        "RUNNING|10|alice|gpu|train|01:02|gpu1|gpu:h100:2|2:00:00|8|64G|None|9|N/A\n"
-        "PENDING|11|bob|gpu|wait|0:00|(Priority)|gpu:a100:1|1:00:00|4|32G|Priority|7|2030-01-02T03:04:05"
+        "RUNNING|10|alice|gpu|01:02|gpu1|gpu:h100:2|2:00:00|8|64G|None|9|N/A\n"
+        "PENDING|11|bob|gpu|0:00|(Priority)|gpu:a100:1|1:00:00|4|32G|Priority|7|2030-01-02T03:04:05"
     )
     calls = []
     monkeypatch.setattr(
@@ -50,18 +53,52 @@ def test_combined_squeue_splits_running_and_pending(monkeypatch):
     jobs, pending, error = common._collect_queue()
 
     assert error == "" and len(calls) == 1
-    assert [(j.jobid, j.gpu_count, j.cpu_count, j.mem) for j in jobs] == [
-        ("10", 2, 8, "64G")
+    assert [(j.jobid, j.gpu_count, j.cpu_count, j.mem, j.uid) for j in jobs] == [
+        ("10", 2, 8, "64G", -1)
     ]
     assert [(p.jobid, p.gpu_count, p.reason, p.start_time) for p in pending] == [
         ("11", 1, "Priority", "2030-01-02T03:04:05")
     ]
 
 
+def test_squeue_rejects_newline_injected_job_record(monkeypatch):
+    output = (
+        "RUNNING|10|alice|gpu|01:02|gpu1|gpu:h100:1|1:00:00|4|8G|None|9|N/A\n"
+        "RUNNING|../../victim|root|gpu|01:02|gpu[1-99999]|gpu:8|1:00:00|4|8G|None|9|N/A"
+    )
+    monkeypatch.setattr(common, "run_cmd", lambda _cmd: (True, output))
+
+    jobs, _pending, error = common._collect_queue()
+
+    assert error == ""
+    assert jobs[0].uid == -1
+    assert jobs[0].node == "gpu1"
+    assert [job.jobid for job in jobs] == ["10"]
+    assert jobs[0].jobname == ""
+    assert "SLURM_BITSTR_LEN=0" in common._SQUEUE_COMBINED_CMD
+    assert "%j" not in common._SQUEUE_COMBINED_CMD
+
+
+@pytest.mark.parametrize("jobid", [
+    "42", "53557_3", "51317_[0-159%16]", "51317_[0-30:2%4]", "123+1",
+])
+def test_valid_slurm_job_ids(jobid):
+    assert common.valid_slurm_job_id(jobid)
+
+
+@pytest.mark.parametrize("jobid", [
+    "../../victim", "42/../7", "42\n99", "", "[42]", "42;id",
+])
+def test_unsafe_slurm_job_ids_are_rejected(jobid):
+    assert not common.valid_slurm_job_id(jobid)
+
+
 def test_collect_basic_uses_one_squeue_and_preserves_errors(monkeypatch):
     calls = []
     monkeypatch.setattr(common, "collect_nodes_basic", lambda: ([], ""))
-    monkeypatch.setattr(common, "collect_gpu_alloc", lambda: ({}, {}, ""))
+    monkeypatch.setattr(
+        common, "collect_gpu_alloc", lambda: ({}, {}, {}, {}, {}, ""),
+    )
     monkeypatch.setattr(common, "collect_mem_alloc", lambda: ({}, ""))
     monkeypatch.setattr(
         common, "run_cmd",
@@ -166,6 +203,181 @@ def test_parse_gpu_alloc_array_task_user():
     alloc, users = parse_gpu_alloc(line)
     assert alloc == {"gpu2": {"0": "38192"}}
     assert users == {"38192": "untaek"}
+
+
+def test_parse_job_details_maps_normal_and_array_display_ids():
+    out = (
+        SCONTROL_LINE + "\n"
+        "JobId=38192 ArrayJobId=38182 ArrayTaskId=0 JobName=stb "
+        "UserId=untaek(1019) JobState=RUNNING StdOut=/logs/38182_0.out"
+    )
+
+    details = parse_job_details(out)
+
+    assert details["37671"].startswith("JobId=37671")
+    assert details["38192"] == details["38182_0"]
+    assert "JobState=RUNNING" in details["38182_0"]
+    assert "StdOut=" not in details["38182_0"]
+
+
+def test_structured_job_json_cannot_forge_records_or_public_private_paths():
+    import json
+
+    payload = {"jobs": [{
+        "job_id": 77,
+        "array_job_id": {"set": True, "number": 70},
+        "array_task_id": {"set": True, "number": 3},
+        "array_task_string": "",
+        "het_job_id": {"set": True, "number": 0},
+        "het_job_offset": {"set": True, "number": 0},
+        "name": "train\nJobId=999 StdOut=/root/secret",
+        "user_id": 1001,
+        "user_name": "alice",
+        "job_state": ["RUNNING"],
+        "partition": "gpu",
+        "nodes": "gpu2",
+        "standard_output": "/home/alice/private job.out",
+        "standard_error": "/home/alice/private job.out",
+        "current_working_directory": "/home/alice",
+        "gres_detail": ["gpu:a5000:2(IDX:4-5)"],
+        "job_resources": {"allocated_nodes": [{"nodename": "gpu2"}]},
+    }]}
+
+    alloc, users, owner_uids, details, metadata = parse_job_json(
+        json.dumps(payload),
+    )
+
+    assert alloc == {"gpu2": {"4": "77", "5": "77"}}
+    assert users == {"77": "alice", "70_3": "alice"}
+    assert owner_uids == {"77": 1001, "70_3": 1001}
+    assert set(details) == {"77", "70_3"}
+    assert "\nJobId=999" not in details["77"]
+    assert not any(
+        line.startswith("StdOut=") for line in details["77"].splitlines()
+    )
+    assert "train JobId=999 StdOut=/root/secret" in details["77"]
+    assert metadata["70_3"] == (
+        "/home/alice/private job.out", "", True,
+    )
+
+
+def test_collect_gpu_alloc_fails_closed_without_structured_json(
+        monkeypatch):
+    calls = []
+
+    def fake_run(command):
+        calls.append(command)
+        return False, "unknown option"
+
+    monkeypatch.setattr(common, "run_cmd", fake_run)
+
+    alloc, users, owner_uids, details, metadata, error = (
+        common.collect_gpu_alloc()
+    )
+
+    assert alloc == {} and users == {} and owner_uids == {}
+    assert details == {} and metadata == {}
+    assert "JSON failed" in error
+    assert calls == ["scontrol --json show jobs"]
+
+
+def test_job_record_ids_map_compressed_array_range_exactly():
+    details = parse_job_details(
+        "JobId=51317 ArrayJobId=51317 ArrayTaskId=0-159%16 "
+        "JobName=batch JobState=PENDING"
+    )
+
+    assert "51317_[0-159%16]" in details
+    assert "51317_0" not in details
+
+
+def test_job_record_ids_map_heterogeneous_component():
+    details = parse_job_details(
+        "JobId=124 HetJobId=123 HetJobOffset=1 "
+        "JobName=component JobState=RUNNING"
+    )
+
+    assert details["123+1"].startswith("JobId=124")
+
+
+def test_job_record_alias_cannot_be_forged_by_free_form_fields():
+    legitimate = (
+        "JobId=200 ArrayJobId=100 ArrayTaskId=0 JobName=real "
+        "JobState=RUNNING StdOut=/logs/real.out StdErr=(null)"
+    )
+    malicious = (
+        "JobId=300 JobName=x-ArrayJobId=100-ArrayTaskId=0 "
+        "JobState=RUNNING StdOut=/victim/secret StdErr=(null)"
+    )
+
+    details, metadata = parse_job_records(legitimate + "\n" + malicious)
+
+    assert details["100_0"].startswith("JobId=200")
+    assert metadata["100_0"][0] == "/logs/real.out"
+
+
+def test_public_detail_drops_ambiguous_duplicate_fields():
+    details = parse_job_details(
+        "JobId=77 JobName=train JobState=COMPLETED JobState=RUNNING"
+    )
+
+    assert "JobState=" not in details["77"]
+
+
+def test_job_records_keep_private_log_metadata_out_of_public_detail():
+    long_secret = "x" * 20000
+    out = (
+        "JobId=77 JobName=train UserId=alice(1001) JobState=RUNNING "
+        f"Comment={long_secret} MailUser=alice@example.test "
+        "WorkDir=/home/alice/private Command=/home/alice/run.sh "
+        "StdOut=/home/alice/private/job.out StdErr=/home/alice/private/job.out"
+    )
+
+    details, metadata = parse_job_records(out)
+
+    assert details["77"] == "JobId=77\nJobName=train\nUserId=alice(1001)\nJobState=RUNNING"
+    assert "private" not in details["77"]
+    assert "example.test" not in details["77"]
+    assert metadata["77"] == ("/home/alice/private/job.out", "", True)
+
+
+def test_collect_basic_attaches_privileged_detail_to_running_and_pending(monkeypatch):
+    running = JobInfo(jobid="10", user="alice", uid=1001)
+    pending = common.PendingJob(jobid="11", user="bob")
+    monkeypatch.setattr(common, "collect_nodes_basic", lambda: ([], ""))
+    monkeypatch.setattr(common, "_collect_queue", lambda: ([running], [pending], ""))
+    monkeypatch.setattr(
+        common, "collect_gpu_alloc",
+        lambda: ({}, {"10": "alice", "11": "bob"}, {"10": 1001},
+                 {"10": "JobId=10 JobState=RUNNING",
+                  "11": "JobId=11 JobState=PENDING"},
+                 {"10": ("/logs/10.out", "", True)}, ""),
+    )
+    monkeypatch.setattr(common, "collect_mem_alloc", lambda: ({}, ""))
+
+    _nodes, jobs, pending_jobs, *_rest = common.collect_basic()
+
+    assert jobs[0].detail == "JobId=10 JobState=RUNNING"
+    assert pending_jobs[0].detail == "JobId=11 JobState=PENDING"
+    assert jobs[0]._log_paths == ("/logs/10.out", "")
+    assert jobs[0].uid == 1001
+    assert jobs[0]._log_stderr_merged is True
+
+
+def test_collect_basic_maps_pending_array_range_to_parent_detail(monkeypatch):
+    pending = common.PendingJob(jobid="51317_[0-159%16]", user="alice")
+    monkeypatch.setattr(common, "collect_nodes_basic", lambda: ([], ""))
+    monkeypatch.setattr(common, "_collect_queue", lambda: ([], [pending], ""))
+    monkeypatch.setattr(
+        common, "collect_gpu_alloc",
+        lambda: ({}, {}, {},
+                 {"51317": "JobId=51317\nJobState=PENDING"}, {}, ""),
+    )
+    monkeypatch.setattr(common, "collect_mem_alloc", lambda: ({}, ""))
+
+    _nodes, _jobs, pending_jobs, *_rest = common.collect_basic()
+
+    assert pending_jobs[0].detail == "JobId=51317\nJobState=PENDING"
 
 
 # ── SSH node payload (nvidia-smi + pmon + meminfo + ps) ───────────────────
