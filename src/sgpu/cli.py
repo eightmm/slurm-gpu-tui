@@ -618,7 +618,10 @@ def _cli_doctor() -> int:
         persistence_bad: List[str] = []
 
         def check_persistence(node: str) -> Tuple[str, bool, str]:
-            ok, out = ssh_cmd(node, _PERSISTENCE_STATUS_CMD, timeout=10)
+            ok, out = ssh_cmd(
+                node, _PERSISTENCE_STATUS_CMD,
+                timeout=_PERSISTENCE_PROBE_TIMEOUT_SEC,
+            )
             modes, unit = _parse_persistence_status(out)
             return node, bool(ok and modes and all(m == "Enabled" for m in modes)), unit
 
@@ -848,6 +851,7 @@ def _split_node_sources(nodes: List[dict]) -> Tuple[Dict[str, int], Dict[str, in
     return gpu, cpu
 
 
+_PERSISTENCE_PROBE_TIMEOUT_SEC = 20
 _PERSISTENCE_STATUS_CMD = (
     "printf 'modes='; "
     "nvidia-smi --query-gpu=persistence_mode --format=csv,noheader 2>/dev/null "

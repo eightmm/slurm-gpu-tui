@@ -37,6 +37,10 @@ def test_parse_persistence_status_handles_missing_gpu_output():
     assert unit == "inactive"
 
 
+def test_persistence_probe_allows_slow_nvidia_initialization():
+    assert cli._PERSISTENCE_PROBE_TIMEOUT_SEC == 20
+
+
 def test_split_node_sources_separates_cpu_poll_from_gpu_fallback():
     gpu, cpu = cli._split_node_sources([
         {"name": "cpu1", "has_gpu": False, "source": "ssh", "gpus": []},

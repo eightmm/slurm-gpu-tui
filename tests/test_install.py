@@ -101,6 +101,10 @@ def test_installer_restarts_persistence_oneshot_on_every_install():
         assert "systemctl enable --now sgpu-gpu-persistence.service" not in path
 
     assert "GPU persistence could not be enabled" in installer
+    assert "PERSISTENCE_PROBE_TIMEOUT_SEC=20" in installer
+    assert 'timeout "$PERSISTENCE_PROBE_TIMEOUT_SEC"' in installer
+    assert "PERSISTENCE_APPLY_TIMEOUT_SEC=60" in installer
+    assert 'timeout "$PERSISTENCE_APPLY_TIMEOUT_SEC"' in installer
 
 
 def test_installer_has_cpu_push_opt_out():

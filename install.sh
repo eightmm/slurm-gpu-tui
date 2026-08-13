@@ -347,6 +347,8 @@ done
 # master install. Set SGPU_ENABLE_PERSISTENCE=0 to skip this remote change.
 PERSISTENCE_REQUEST="${SGPU_ENABLE_PERSISTENCE:-auto}"
 PERSISTENCE_SERVICE="$INSTALL_DIR/sgpu-gpu-persistence.service"
+PERSISTENCE_PROBE_TIMEOUT_SEC=20
+PERSISTENCE_APPLY_TIMEOUT_SEC=60
 _persistence_requested=false
 case "${PERSISTENCE_REQUEST,,}" in
     0|false|no|off) ;;
@@ -470,13 +472,18 @@ printf "%s\n" "$modes" | awk '\''
                     continue
                 fi
                 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=3)
-                if ! probe="$(timeout 8 ssh "${SSH_OPTS[@]}" "$node" \
+                # Cold NVIDIA initialization can take several seconds on
+                # older/mixed-GPU nodes. Leave enough headroom so a healthy
+                # node is not skipped before the unit is even installed.
+                if ! probe="$(timeout "$PERSISTENCE_PROBE_TIMEOUT_SEC" \
+                        ssh "${SSH_OPTS[@]}" "$node" \
                         'command -v nvidia-smi >/dev/null && nvidia-smi -L' 2>&1)"; then
                     echo "     $node: WARNING: GPU probe failed: ${probe%%$'\n'*}"
                     PERSIST_FAIL=$((PERSIST_FAIL + 1))
                     continue
                 fi
-                if out="$(timeout 30 ssh "${SSH_OPTS[@]}" "$node" \
+                if out="$(timeout "$PERSISTENCE_APPLY_TIMEOUT_SEC" \
+                        ssh "${SSH_OPTS[@]}" "$node" \
                         "$REMOTE_INSTALL_SCRIPT" < "$PERSISTENCE_SERVICE" 2>&1)"; then
                     echo "     $node: enabled"
                     PERSIST_OK=$((PERSIST_OK + 1))
