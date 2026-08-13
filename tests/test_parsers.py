@@ -41,8 +41,8 @@ def test_assign_node_jobs_multinode():
 
 def test_combined_squeue_splits_running_and_pending(monkeypatch):
     output = (
-        "RUNNING|10|alice|gpu|01:02|gpu1|gpu:h100:2|2:00:00|8|64G|None|9|N/A\n"
-        "PENDING|11|bob|gpu|0:00|(Priority)|gpu:a100:1|1:00:00|4|32G|Priority|7|2030-01-02T03:04:05"
+        "RUNNING|10|alice|1001|gpu|01:02|gpu1|gpu:h100:2|2:00:00|8|64G|None|9|N/A\n"
+        "PENDING|11|bob|1002|gpu|0:00|(Priority)|gpu:a100:1|1:00:00|4|32G|Priority|7|2030-01-02T03:04:05"
     )
     calls = []
     monkeypatch.setattr(
@@ -54,7 +54,7 @@ def test_combined_squeue_splits_running_and_pending(monkeypatch):
 
     assert error == "" and len(calls) == 1
     assert [(j.jobid, j.gpu_count, j.cpu_count, j.mem, j.uid) for j in jobs] == [
-        ("10", 2, 8, "64G", -1)
+        ("10", 2, 8, "64G", 1001)
     ]
     assert [(p.jobid, p.gpu_count, p.reason, p.start_time) for p in pending] == [
         ("11", 1, "Priority", "2030-01-02T03:04:05")
@@ -63,18 +63,32 @@ def test_combined_squeue_splits_running_and_pending(monkeypatch):
 
 def test_squeue_rejects_newline_injected_job_record(monkeypatch):
     output = (
-        "RUNNING|10|alice|gpu|01:02|gpu1|gpu:h100:1|1:00:00|4|8G|None|9|N/A\n"
-        "RUNNING|../../victim|root|gpu|01:02|gpu[1-99999]|gpu:8|1:00:00|4|8G|None|9|N/A"
+        "RUNNING|10|alice|1001|gpu|01:02|gpu1|gpu:h100:1|1:00:00|4|8G|None|9|N/A\n"
+        "RUNNING|../../victim|root|0|gpu|01:02|gpu[1-99999]|gpu:8|1:00:00|4|8G|None|9|N/A"
     )
     monkeypatch.setattr(common, "run_cmd", lambda _cmd: (True, output))
 
     jobs, _pending, error = common._collect_queue()
 
     assert error == ""
-    assert jobs[0].uid == -1
+    assert jobs[0].uid == 1001
     assert jobs[0].node == "gpu1"
     assert [job.jobid for job in jobs] == ["10"]
     assert jobs[0].jobname == ""
+
+
+def test_squeue_rejects_unbounded_array_identifier(monkeypatch):
+    huge_id = "1_[" + "1," * 5000 + "2]"
+    output = (
+        f"PENDING|{huge_id}|alice|1001|gpu|0:00|(Priority)|gpu:1|"
+        "1:00:00|4|8G|Priority|9|N/A"
+    )
+    monkeypatch.setattr(common, "run_cmd", lambda _cmd: (True, output))
+
+    jobs, pending, error = common._collect_queue()
+
+    assert error == ""
+    assert jobs == [] and pending == []
     assert "SLURM_BITSTR_LEN=0" in common._SQUEUE_COMBINED_CMD
     assert "%j" not in common._SQUEUE_COMBINED_CMD
 
@@ -345,7 +359,14 @@ def test_collect_basic_attaches_privileged_detail_to_running_and_pending(monkeyp
     running = JobInfo(jobid="10", user="alice", uid=1001)
     pending = common.PendingJob(jobid="11", user="bob")
     monkeypatch.setattr(common, "collect_nodes_basic", lambda: ([], ""))
-    monkeypatch.setattr(common, "_collect_queue", lambda: ([running], [pending], ""))
+    anchors = {
+        "10": common._QueueAnchor("alice", 1001, "RUNNING", ("gpu1",)),
+        "11": common._QueueAnchor("bob", 1002, "PENDING", ()),
+    }
+    monkeypatch.setattr(
+        common, "_collect_queue_snapshot",
+        lambda: ([running], [pending], anchors, ""),
+    )
     monkeypatch.setattr(
         common, "collect_gpu_alloc",
         lambda: ({}, {"10": "alice", "11": "bob"}, {"10": 1001},
@@ -367,7 +388,14 @@ def test_collect_basic_attaches_privileged_detail_to_running_and_pending(monkeyp
 def test_collect_basic_maps_pending_array_range_to_parent_detail(monkeypatch):
     pending = common.PendingJob(jobid="51317_[0-159%16]", user="alice")
     monkeypatch.setattr(common, "collect_nodes_basic", lambda: ([], ""))
-    monkeypatch.setattr(common, "_collect_queue", lambda: ([], [pending], ""))
+    monkeypatch.setattr(
+        common, "_collect_queue_snapshot",
+        lambda: ([], [pending], {
+            pending.jobid: common._QueueAnchor(
+                "alice", 1001, "PENDING", (),
+            ),
+        }, ""),
+    )
     monkeypatch.setattr(
         common, "collect_gpu_alloc",
         lambda: ({}, {}, {},

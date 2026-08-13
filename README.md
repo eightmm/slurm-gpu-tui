@@ -187,6 +187,7 @@ ssh <node> cat /run/sgpu-agent.log               # node agent (root; else /tmp/s
 | Node stuck on SSH despite an agent | `sgpu doctor` → `agent payload trust` |
 | Other users' log tabs empty | `sgpu doctor` → `job log sharing`; rerun the root installer |
 | Other users' job details denied | `sgpu doctor` → `job detail sharing`; rerun the root installer |
+| GPU/job binding or every shared detail is empty | `sgpu doctor` → `scheduler jobs`; modern Slurm uses JSON and older Slurm automatically uses the validated compatibility backend |
 | Anything else | `sgpu doctor` |
 
 ### Sharing other users' jobs
@@ -207,8 +208,20 @@ log and scheduler-detail sharing default to **on** for root installs
 > where every cluster user is entitled to see every other user's job output.
 > `SLURM_GPU_TUI_LOG_TAIL_BYTES` caps how much is mirrored per stream. The
 > collector mirrors only regular, non-symlink files owned by the job's
-> numeric UID reported by structured `scontrol --json`. On root-squashed NFS homes it reads in a
-> short-lived process dropped to that UID; no collector environment is passed.
+> numeric UID reported by the scheduler. Modern Slurm uses structured
+> `scontrol --json`; releases without that option automatically use a hardened
+> text compatibility backend whose UID, state, and node placement must match
+> numeric-UID `squeue` snapshots taken immediately before and after the query.
+> Ambiguous or changed records are rejected. On root-squashed NFS homes the
+> collector reads in a short-lived process dropped to that UID; no collector
+> environment is passed. `sgpu doctor` shows the selected backend under
+> `scheduler jobs`.
+>
+> Legacy mode is intentionally fail-closed: because old one-line output has
+> no unforgeable record boundary, an ambiguous/duplicate physical `JobId`
+> suppresses the affected record (and its allocation) for that cycle. Doctor
+> reports the count instead of risking attribution or log access to the wrong
+> user.
 
 Job-detail sharing deliberately excludes free-form comments, mail addresses,
 commands, working directories, and input/output paths. Private log paths stay

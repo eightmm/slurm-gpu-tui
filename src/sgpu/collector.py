@@ -654,9 +654,9 @@ def _share_logs(jobs: List[JobInfo]) -> Dict[str, dict]:
     now = time.monotonic()
     reset_streams = []
     with _log_lock:
-        # A live queue row without a fresh structured owner/path record must
-        # invalidate the previous cycle. Otherwise a transient JSON failure
-        # would keep publishing and refreshing a stale privileged path.
+        # A live queue row without a freshly validated owner/path record must
+        # invalidate the previous cycle. Otherwise a transient scheduler
+        # failure would keep publishing and refreshing a stale privileged path.
         for jid in invalid_seeds:
             _log_seed_tokens[jid] = object()
             token = _log_seed_tokens[jid]
@@ -1264,7 +1264,10 @@ def collect_all() -> dict:
     Node SSH polls run in the background and never block this cycle — a dead
     node only goes stale, it cannot stall data for healthy nodes.
     """
-    nodes_raw, jobs, pending, node_jobs_from_basic, gpu_alloc, alloc_user_map, basic_err = collect_basic()
+    (
+        nodes_raw, jobs, pending, node_jobs_from_basic, gpu_alloc,
+        alloc_user_map, scheduler_status, basic_err,
+    ) = collect_basic()
     # An empty roster can mean sinfo failed, so retain caches in that case.
     # Repeated non-empty snapshots retire renamed or decommissioned nodes;
     # one partial snapshot keeps the last-good telemetry.
@@ -1275,8 +1278,8 @@ def collect_all() -> dict:
         k: [_node_job_to_dict(j) for j in v]
         for k, v in node_jobs_from_basic.items()
     }
-    # scontrol's UserId map wins over squeue: it resolves array-task jobids
-    # (38182_0 in squeue vs the real 38192 in the alloc) and carries the name
+    # The validated scheduler owner map resolves array-task jobids (38182_0 in
+    # squeue vs the real 38192 in the alloc) and carries the canonical name.
     jobid_user = {j.jobid: j.user for j in jobs}
     jobid_user.update({k: v for k, v in alloc_user_map.items() if v})
 
@@ -1405,6 +1408,7 @@ def collect_all() -> dict:
         "stale_nodes": stale_nodes,
         # node -> uid of a rejected <node>.json, so `sgpu doctor` can name it
         "untrusted_payloads": dict(_untrusted_payloads),
+        "scheduler": scheduler_status,
         "errors": basic_err,
     }
 

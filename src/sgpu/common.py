@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import MISSING, dataclass, field, fields, replace
 from enum import Enum
@@ -227,7 +228,7 @@ class JobInfo:
     # use it when their own Slurm account cannot inspect another user's job.
     detail: str = ""
     log_status: Dict[str, str] = field(default_factory=dict)
-    uid: int = -1  # structured scheduler owner; authorizes log mirroring
+    uid: int = -1  # validated scheduler owner; authorizes log mirroring
 
 
 @dataclass
@@ -375,12 +376,12 @@ def _classify_error(error_str: str, exc: Exception = None) -> NodeErrorKind:
 # ── Data collection ──────────────────────────────────────────────────────
 
 _SQUEUE_COMBINED_CMD = (
-    'env SLURM_BITSTR_LEN=0 squeue -h -t R,PD -o '
+    'env SLURM_BITSTR_LEN=0 squeue -h -t R,PD,CG -o '
     # JobName is intentionally absent. Slurm prints it verbatim, including
     # embedded newlines, so it cannot safely share this line-oriented protocol.
-    # Names and the authoritative numeric UID are joined later from scontrol's
-    # structured JSON response.
-    '"%T|%i|%u|%P|%M|%N|%b|%l|%C|%m|%r|%Q|%S"'
+    # %U is the numeric owner UID. It also anchors the hardened compatibility
+    # backend on Slurm releases that predate scontrol --json.
+    '"%T|%i|%u|%U|%P|%M|%N|%b|%l|%C|%m|%r|%Q|%S"'
 )
 
 _SLURM_JOB_ID_RE = re.compile(
@@ -390,43 +391,163 @@ _SLURM_JOB_ID_RE = re.compile(
 
 def valid_slurm_job_id(value: object) -> bool:
     """Whether ``value`` is a safe canonical squeue job/array/het ID."""
-    return isinstance(value, str) and bool(_SLURM_JOB_ID_RE.fullmatch(value))
+    return isinstance(value, str) and len(value) <= 8192 \
+        and bool(_SLURM_JOB_ID_RE.fullmatch(value))
 
 
-def _collect_queue() -> Tuple[List[JobInfo], List[PendingJob], str]:
-    """Fetch running and pending jobs with one scheduler RPC."""
-    ok, out = run_cmd(_SQUEUE_COMBINED_CMD)
-    if not ok:
-        return [], [], out
+@dataclass(frozen=True)
+class _QueueAnchor:
+    """Scheduler-owned identity used to validate legacy scontrol records."""
+
+    user: str
+    uid: int
+    state: str
+    nodes: tuple[str, ...]
+
+
+_QUEUE_USER_RE = re.compile(r"[A-Za-z0-9_.@-]{1,256}")
+_NODE_NAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,255}")
+_LEGACY_MAX_NODES = 4096
+_LEGACY_MAX_GPU_INDICES = 1024
+_LEGACY_MAX_GPU_INDEX = 65535
+_LEGACY_MAX_LINE_CHARS = 128 * 1024
+_LEGACY_MAX_OUTPUT_CHARS = 32 * 1024 * 1024
+
+
+def _strict_range_values(spec: str, limit: int) -> List[str] | None:
+    values: List[str] = []
+    for part in spec.split(","):
+        if not part:
+            return None
+        start, sep, end = part.partition("-")
+        if not start.isascii() or not start.isdigit():
+            return None
+        if sep:
+            if not end.isascii() or not end.isdigit():
+                return None
+            lo, hi = int(start), int(end)
+            if lo > hi or hi - lo + 1 > limit - len(values):
+                return None
+            values.extend(str(i).zfill(len(start)) for i in range(lo, hi + 1))
+        else:
+            values.append(start)
+        if len(values) > limit:
+            return None
+    return values
+
+
+def _strict_expand_nodes(expr: str) -> tuple[str, ...] | None:
+    """Bounded expansion of a scheduler nodelist, rejecting odd spellings."""
+    if not expr or expr in {"(null)", "N/A"}:
+        return ()
+    if len(expr) > 8192 or any(ord(ch) < 32 for ch in expr):
+        return None
+    hosts: List[str] = []
+    for name in _split_top_level(expr):
+        groups: List[List[str]] = []
+        cursor = 0
+        for match in _NODE_TOKEN_RE.finditer(name):
+            if match.start() != cursor:
+                return None
+            cursor = match.end()
+            spec, literal = match.group(1), match.group(2)
+            if spec is None:
+                if not literal or not re.fullmatch(r"[A-Za-z0-9_.-]+", literal):
+                    return None
+                values = [literal]
+            else:
+                values = _strict_range_values(spec, _LEGACY_MAX_NODES)
+                if not values:
+                    return None
+            groups.append(values)
+        if cursor != len(name) or not groups:
+            return None
+        total = 1
+        for group in groups:
+            total *= len(group)
+            if total > _LEGACY_MAX_NODES - len(hosts):
+                return None
+        hosts.extend("".join(parts) for parts in product(*groups))
+    if not hosts or len(set(hosts)) != len(hosts) \
+            or any(not _NODE_NAME_RE.fullmatch(host) for host in hosts):
+        return None
+    return tuple(sorted(hosts))
+
+
+def _parse_queue_output(
+    out: str,
+) -> Tuple[List[JobInfo], List[PendingJob], Dict[str, _QueueAnchor]]:
     jobs: List[JobInfo] = []
     pending: List[PendingJob] = []
+    anchors_seen: Dict[str, List[_QueueAnchor]] = defaultdict(list)
+    job_rows: List[tuple[str, JobInfo]] = []
+    pending_rows: List[tuple[str, PendingJob]] = []
     for line in out.splitlines():
         p = line.split("|")
-        if len(p) != 13:
+        if len(p) != 14:
             continue
         state = p[0].strip().upper()
         jobid = p[1].strip()
-        if not valid_slurm_job_id(jobid):
+        user = p[2].strip()
+        uid_text = p[3].strip()
+        if state not in {"RUNNING", "PENDING", "COMPLETING"} \
+                or not valid_slurm_job_id(jobid) \
+                or not _QUEUE_USER_RE.fullmatch(user) \
+                or not uid_text.isascii() or not uid_text.isdigit():
             continue
+        uid = int(uid_text)
+        if uid > 2 ** 32 - 1:
+            continue
+        nodes = () if state == "PENDING" else _strict_expand_nodes(p[6].strip())
+        if nodes is None or (state in {"RUNNING", "COMPLETING"} and not nodes):
+            continue
+        anchor = _QueueAnchor(user=user, uid=uid, state=state, nodes=nodes)
+        anchors_seen[jobid].append(anchor)
         if state == "RUNNING":
-            gres = p[6].strip()
+            gres = p[7].strip()
             try:
-                cpu_count = int(p[8].strip())
+                cpu_count = int(p[9].strip())
             except ValueError:
                 cpu_count = 0
-            jobs.append(JobInfo(
-                jobid, p[2], p[3], "", p[4], p[5],
-                _gpu_count_from_gres(gres), cpu_count, gres, p[7].strip(),
-                mem=p[9].strip(),
-            ))
+            job_rows.append((jobid, JobInfo(
+                jobid=jobid, user=user, uid=uid, partition=p[4].strip(),
+                elapsed=p[5].strip(), node=p[6].strip(),
+                gpu_count=_gpu_count_from_gres(gres),
+                cpu_count=cpu_count, gres_raw=gres, time_limit=p[8].strip(),
+                mem=p[10].strip(),
+            )))
         elif state == "PENDING":
-            gres = p[6].strip()
-            pending.append(PendingJob(
-                jobid, p[2], p[3], "", p[7].strip(),
-                _gpu_count_from_gres(gres), p[10].strip(), p[11].strip(),
-                p[12].strip(),
-            ))
-    return jobs, pending, ""
+            gres = p[7].strip()
+            pending_rows.append((jobid, PendingJob(
+                jobid=jobid, user=user, partition=p[4].strip(),
+                time_limit=p[8].strip(),
+                gpu_count=_gpu_count_from_gres(gres), reason=p[11].strip(),
+                priority=p[12].strip(), start_time=p[13].strip(),
+            )))
+    anchors = {
+        jobid: values[0] for jobid, values in anchors_seen.items()
+        if len(values) == 1
+    }
+    jobs.extend(job for jobid, job in job_rows if jobid in anchors)
+    pending.extend(job for jobid, job in pending_rows if jobid in anchors)
+    return jobs, pending, anchors
+
+
+def _collect_queue_snapshot() -> Tuple[
+    List[JobInfo], List[PendingJob], Dict[str, _QueueAnchor], str,
+]:
+    """Fetch UI rows plus a collision-free scheduler identity roster."""
+    ok, out = run_cmd(_SQUEUE_COMBINED_CMD)
+    if not ok:
+        return [], [], {}, out
+    jobs, pending, anchors = _parse_queue_output(out)
+    return jobs, pending, anchors, ""
+
+
+def _collect_queue() -> Tuple[List[JobInfo], List[PendingJob], str]:
+    """Compatibility wrapper for callers that only need visible queue rows."""
+    jobs, pending, _anchors, error = _collect_queue_snapshot()
+    return jobs, pending, error
 
 
 def collect_jobs() -> Tuple[List[JobInfo], str]:
@@ -917,6 +1038,246 @@ def parse_job_json(
     return alloc, users, owner_uids, details, metadata
 
 
+_LEGACY_FIELD_RE = re.compile(
+    r"(?:^|[ \t]+)([A-Za-z][A-Za-z0-9_/:.-]*)="
+)
+_LEGACY_IDENTITY_FIELDS = frozenset({
+    "JobId", "ArrayJobId", "ArrayTaskId", "HetJobId", "HetJobOffset",
+    "UserId", "JobState", "NodeList",
+})
+_LEGACY_PATH_FIELDS = frozenset({"WorkDir", "StdOut", "StdErr"})
+
+
+def _legacy_field_items(line: str) -> List[tuple[str, str]]:
+    matches = list(_LEGACY_FIELD_RE.finditer(line))
+    return [
+        (
+            match.group(1),
+            line[match.end():matches[index + 1].start()].rstrip(),
+        )
+        for index, match in enumerate(matches)
+        if index + 1 < len(matches)
+    ] + ([
+        (matches[-1].group(1), line[matches[-1].end():].rstrip())
+    ] if matches else [])
+
+
+def _legacy_one(
+    grouped: Dict[str, List[str]], name: str, required: bool = False,
+) -> str | None:
+    values = grouped.get(name, [])
+    if len(values) > 1 or (required and len(values) != 1):
+        return None
+    return values[0] if values else ""
+
+
+def _legacy_safe_path(value: str, workdir: str = "") -> str | None:
+    if not value or value == "(null)":
+        return ""
+    # Oneline output has no quoting contract that lets us distinguish spaces
+    # inside a path from the next key. Reject ambiguous paths in legacy mode.
+    if len(value) > 4096 or any(ch.isspace() or ord(ch) < 32 for ch in value):
+        return None
+    if not os.path.isabs(value):
+        if not workdir:
+            return None
+        value = os.path.join(workdir, value)
+    normalized = os.path.normpath(value)
+    if not os.path.isabs(normalized) or len(normalized) > 4096:
+        return None
+    return normalized
+
+
+def _strict_gpu_indices(gres: str) -> List[str] | None:
+    groups = re.findall(r"(?:^|,)gpu(?::[^,()]*)?\(IDX:([^)]+)\)", gres)
+    if gres.count("IDX:") != len(groups):
+        return None
+    indices: List[str] = []
+    for group in groups:
+        if group.upper() == "N/A":
+            continue
+        values = _strict_range_values(
+            group, _LEGACY_MAX_GPU_INDICES - len(indices),
+        )
+        if values is None:
+            return None
+        for value in values:
+            if int(value) > _LEGACY_MAX_GPU_INDEX:
+                return None
+        indices.extend(str(int(value)) for value in values)
+    return indices
+
+
+def _legacy_gpu_claims(
+    line: str, anchor_nodes: tuple[str, ...], raw_jobid: str,
+) -> List[tuple[str, str, str]] | None:
+    matches = list(re.finditer(
+        r"(?:^|\s)Nodes=(\S+)\s+CPU_IDs=\S+\s+Mem=\S+\s+GRES=(\S+)",
+        line,
+    ))
+    if not matches:
+        return []
+    expected = set(anchor_nodes)
+    seen_nodes: set[str] = set()
+    claims: List[tuple[str, str, str]] = []
+    for match in matches:
+        nodes = _strict_expand_nodes(match.group(1))
+        indices = _strict_gpu_indices(match.group(2))
+        if nodes is None or indices is None or not set(nodes) <= expected \
+                or seen_nodes.intersection(nodes):
+            return None
+        seen_nodes.update(nodes)
+        claims.extend(
+            (node, index, raw_jobid) for node in nodes for index in indices
+        )
+    # A forged segment cannot supplement or replace the scheduler's real node
+    # segment: the validated segments must cover the stable queue placement.
+    if seen_nodes != expected:
+        return None
+    return claims
+
+
+def _legacy_public_detail(items: List[tuple[str, str]]) -> str:
+    return "\n".join(
+        f"{key}={_public_json_scalar(value)}"
+        for key, value in items
+        if key in _PUBLIC_JOB_DETAIL_FIELDS and value and value != "(null)"
+    )[:JOB_DETAIL_MAX_CHARS]
+
+
+def _parse_legacy_jobs(
+    out: str,
+    before: Dict[str, _QueueAnchor],
+    after: Dict[str, _QueueAnchor],
+) -> Tuple[
+    Dict[str, Dict[str, str]], Dict[str, str], Dict[str, int],
+    Dict[str, str], Dict[str, JobLogMetadata], set[str],
+]:
+    """Parse old ``scontrol -o`` only after bookend queue authorization.
+
+    Slurm 19.05 prints submitter-controlled strings verbatim, including
+    newlines. Every physical JobId claim is counted before content validation;
+    a duplicate, owner/placement race, ambiguous field, or unsafe path rejects
+    that whole identity. The caller supplies two numeric-UID queue rosters,
+    captured immediately before and after this output.
+    """
+    if len(out) > _LEGACY_MAX_OUTPUT_CHARS:
+        raise ValueError("legacy scontrol output exceeds safety limit")
+    candidates: List[tuple[str, tuple[str, ...]]] = []
+    claim_counts: Counter[str] = Counter()
+    for line in out.splitlines():
+        match = re.match(r"JobId=(\d+)\b", line)
+        if not match:
+            continue
+        ids = tuple(dict.fromkeys(
+            jobid for jobid in _job_record_ids(line)
+            if valid_slurm_job_id(jobid)
+        ))
+        if not ids:
+            continue
+        candidates.append((line, ids))
+        claim_counts.update(ids)
+
+    stable = {
+        jobid: anchor for jobid, anchor in before.items()
+        if after.get(jobid) == anchor
+    }
+    known = set(before) | set(after)
+    users: Dict[str, str] = {}
+    owner_uids: Dict[str, int] = {}
+    details: Dict[str, str] = {}
+    metadata: Dict[str, JobLogMetadata] = {}
+    rejected: set[str] = set()
+    gpu_claims: Dict[tuple[str, str], List[tuple[str, tuple[str, ...]]]] = (
+        defaultdict(list)
+    )
+
+    for line, ids in candidates:
+        relevant = set(ids) & known
+        if not relevant:
+            continue
+        if any(claim_counts[jobid] != 1 for jobid in ids):
+            rejected.update(ids)
+            continue
+        anchored = [(jobid, stable[jobid]) for jobid in ids if jobid in stable]
+        if not anchored or any(anchor != anchored[0][1] for _, anchor in anchored):
+            rejected.update(ids)
+            continue
+        anchor = anchored[0][1]
+        if len(line) > _LEGACY_MAX_LINE_CHARS \
+                or any(ord(ch) < 32 and ch != "\t" for ch in line):
+            rejected.update(ids)
+            continue
+
+        items = _legacy_field_items(line)
+        grouped: Dict[str, List[str]] = defaultdict(list)
+        for key, value in items:
+            grouped[key].append(value)
+        unique_fields = _LEGACY_IDENTITY_FIELDS | _LEGACY_PATH_FIELDS \
+            | _PUBLIC_JOB_DETAIL_FIELDS
+        if any(len(grouped.get(key, [])) > 1 for key in unique_fields):
+            rejected.update(ids)
+            continue
+        raw_jobid = _legacy_one(grouped, "JobId", required=True)
+        text_owner = _legacy_one(grouped, "UserId", required=True)
+        state = _legacy_one(grouped, "JobState", required=True)
+        node_expr = _legacy_one(grouped, "NodeList")
+        if None in (raw_jobid, text_owner, state, node_expr) \
+                or raw_jobid != ids[0]:
+            rejected.update(ids)
+            continue
+        owner_match = re.fullmatch(
+            r"([A-Za-z0-9_.@-]{1,256})\(([0-9]{1,10})\)", text_owner,
+        )
+        nodes = _strict_expand_nodes(node_expr)
+        if owner_match is None or nodes is None \
+                or owner_match.group(1) != anchor.user \
+                or int(owner_match.group(2)) != anchor.uid \
+                or state != anchor.state or nodes != anchor.nodes:
+            rejected.update(ids)
+            continue
+
+        workdir_value = _legacy_one(grouped, "WorkDir")
+        stdout_value = _legacy_one(grouped, "StdOut")
+        stderr_value = _legacy_one(grouped, "StdErr")
+        if None in (workdir_value, stdout_value, stderr_value):
+            rejected.update(ids)
+            continue
+        workdir = _legacy_safe_path(workdir_value or "")
+        stdout_path = _legacy_safe_path(stdout_value or "", workdir or "") \
+            if workdir is not None else None
+        stderr_path = _legacy_safe_path(stderr_value or "", workdir or "") \
+            if workdir is not None else None
+        if workdir is None or stdout_path is None or stderr_path is None:
+            rejected.update(ids)
+            continue
+        merged = bool(stdout_path and stderr_path and stdout_path == stderr_path)
+        log_spec = (stdout_path, "" if merged else stderr_path, merged)
+        detail = _legacy_public_detail(items)
+        for jobid in ids:
+            users[jobid] = anchor.user
+            owner_uids[jobid] = anchor.uid
+            details[jobid] = detail
+            metadata[jobid] = log_spec
+
+        if state in {"RUNNING", "COMPLETING"}:
+            claims = _legacy_gpu_claims(line, anchor.nodes, raw_jobid)
+            if claims is None:
+                rejected.update(ids)
+            else:
+                for node, index, allocation_jobid in claims:
+                    gpu_claims[(node, index)].append((allocation_jobid, ids))
+
+    alloc: Dict[str, Dict[str, str]] = {}
+    for (node, index), claims in gpu_claims.items():
+        if len(claims) != 1:
+            for _jobid, ids in claims:
+                rejected.update(ids)
+            continue
+        alloc.setdefault(node, {})[index] = claims[0][0]
+    return alloc, users, owner_uids, details, metadata, rejected
+
+
 def _job_record_ids(line: str) -> List[str]:
     # `scontrol -o` starts each record with these canonical fields. Anchoring
     # prevents submitter-controlled JobName/comments from forging aliases.
@@ -968,9 +1329,10 @@ def parse_job_records(
 ) -> Tuple[Dict[str, str], Dict[str, JobLogMetadata]]:
     """Legacy text parser used for compatibility tests and unprivileged views.
 
-    Never use this line-oriented form as input to privileged log sharing:
-    submitter-controlled Slurm strings can contain newlines. The collector uses
-    :func:`parse_job_json`, whose record boundaries cannot be forged.
+    Never use this permissive line-oriented helper as input to privileged log
+    sharing: submitter-controlled Slurm strings can contain newlines. The
+    collector uses :func:`parse_job_json` or :func:`_parse_legacy_jobs`; the
+    latter adds duplicate-claim rejection and two numeric-UID queue anchors.
     """
     details: Dict[str, str] = {}
     log_metadata: Dict[str, JobLogMetadata] = {}
@@ -1021,6 +1383,137 @@ def collect_gpu_alloc() -> Tuple[
     # records. Never let that representation drive privileged file access,
     # allocation attribution, accounting, or public scheduler details.
     return {}, {}, {}, {}, {}, json_error
+
+
+_job_query_backend = "auto"
+_job_query_fallback_reason = ""
+_job_query_lock = threading.Lock()
+
+
+def _json_option_unsupported(message: str) -> bool:
+    """Narrowly recognize old scontrol's rejection of the --json option."""
+    text = " ".join(str(message).lower().split())
+    return (
+        ("unrecognized option" in text and "json" in text)
+        or ("unknown option" in text and "json" in text)
+        # Old getopt reports a leading '-' as the invalid short option when it
+        # receives any unsupported GNU-style long option. This classifier is
+        # called only for the known `scontrol --json` command.
+        or "invalid option -- '-'" in text
+    )
+
+
+def _scheduler_status(
+    backend: str, *, fallback_reason: str = "", error: str = "",
+    rejected: int = 0,
+) -> Dict[str, object]:
+    return {
+        "job_backend": backend,
+        "fallback_reason": fallback_reason,
+        "error": error,
+        "rejected_records": max(0, int(rejected)),
+    }
+
+
+def _remember_job_backend(backend: str, reason: str = "") -> None:
+    global _job_query_backend, _job_query_fallback_reason
+    with _job_query_lock:
+        _job_query_backend = backend
+        _job_query_fallback_reason = reason
+
+
+def _known_job_backend() -> tuple[str, str]:
+    with _job_query_lock:
+        return _job_query_backend, _job_query_fallback_reason
+
+
+def _legacy_scheduler_jobs(
+    jobs: List[JobInfo], pending: List[PendingJob],
+    before: Dict[str, _QueueAnchor], fallback_reason: str,
+) -> tuple:
+    ok, out = run_cmd("scontrol -o show job -d")
+    if not ok:
+        error = f"scontrol legacy failed: {out}"
+        return (
+            jobs, pending, {}, {}, {}, {}, {},
+            _scheduler_status("unavailable", error=error), error,
+        )
+    _after_jobs, _after_pending, after, after_error = _collect_queue_snapshot()
+    if after_error:
+        error = f"legacy post-check squeue failed: {after_error}"
+        return (
+            jobs, pending, {}, {}, {}, {}, {},
+            _scheduler_status("unavailable", error=error), error,
+        )
+    try:
+        alloc, users, uids, details, metadata, rejected = _parse_legacy_jobs(
+            out, before, after,
+        )
+    except ValueError as exc:
+        error = f"scontrol legacy parse failed: {exc}"
+        return (
+            jobs, pending, {}, {}, {}, {}, {},
+            _scheduler_status("unavailable", error=error), error,
+        )
+    status = _scheduler_status(
+        "legacy-text", fallback_reason=fallback_reason,
+        rejected=len(rejected),
+    )
+    return jobs, pending, alloc, users, uids, details, metadata, status, ""
+
+
+def _collect_scheduler_jobs(json_future=None) -> tuple:
+    """Queue plus one safe job-detail backend selected by capability.
+
+    The legacy backend deliberately bookends its single text scontrol RPC with
+    numeric-UID queue snapshots. Modern Slurm keeps the faster structured JSON
+    path. Only a definite unsupported-option response is cached as legacy;
+    timeouts, permission errors, and malformed JSON remain fail-closed.
+    """
+    jobs, pending, before, queue_error = _collect_queue_snapshot()
+    if queue_error:
+        # The modern query may have been started in parallel. Observe it so
+        # executor exceptions never become detached, but scheduler identity
+        # still fails closed when the queue anchor is unavailable.
+        if json_future is not None:
+            try:
+                json_future.result()
+            except Exception:
+                pass
+        error = (
+            f"squeue failed: {queue_error} | "
+            f"squeue PD failed: {queue_error}"
+        )
+        return (
+            jobs, pending, {}, {}, {}, {}, {},
+            _scheduler_status("unavailable", error=error), error,
+        )
+    backend, fallback_reason = _known_job_backend()
+    if backend == "legacy-text":
+        return _legacy_scheduler_jobs(
+            jobs, pending, before,
+            fallback_reason or "scontrol --json unsupported",
+        )
+
+    json_result = json_future.result() if json_future is not None \
+        else collect_gpu_alloc()
+    alloc, users, uids, details, metadata, json_error = json_result
+    if not json_error:
+        _remember_job_backend("structured-json")
+        return (
+            jobs, pending, alloc, users, uids, details, metadata,
+            _scheduler_status("structured-json"), "",
+        )
+    if _json_option_unsupported(json_error):
+        fallback_reason = "scontrol --json unsupported"
+        _remember_job_backend("legacy-text", fallback_reason)
+        return _legacy_scheduler_jobs(
+            jobs, pending, before, fallback_reason,
+        )
+    return (
+        jobs, pending, {}, {}, {}, {}, {},
+        _scheduler_status("unavailable", error=json_error), json_error,
+    )
 
 
 # Combined node-side payload commands: nvidia-smi metrics + pmon (PID→GPU)
@@ -1229,21 +1722,24 @@ atexit.register(cleanup_basic_executor)
 
 def collect_basic() -> Tuple[
     List[dict], List[JobInfo], List[PendingJob], Dict[str, List[JobInfo]],
-    Dict[str, Dict[str, str]], Dict[str, str], str,
+    Dict[str, Dict[str, str]], Dict[str, str], Dict[str, object], str,
 ]:
     """Phase 1: fast local commands only (sinfo + squeue + scontrol)."""
     f_nodes = _basic_executor.submit(collect_nodes_basic)
-    f_queue = _basic_executor.submit(_collect_queue)
-    f_alloc = _basic_executor.submit(collect_gpu_alloc)
+    backend, _fallback_reason = _known_job_backend()
+    # Keep modern Slurm's squeue and structured scontrol RPCs parallel. The
+    # legacy path cannot overlap its text query with the queue anchors, but a
+    # one-time capability probe can still run beside the first pre-check.
+    f_json = _basic_executor.submit(collect_gpu_alloc) \
+        if backend != "legacy-text" else None
+    f_scheduler = _basic_executor.submit(_collect_scheduler_jobs, f_json)
     f_mem = _basic_executor.submit(collect_mem_alloc)
     nodes_raw, e1 = f_nodes.result()
-    jobs, pending, queue_error = f_queue.result()
-    gpu_alloc, alloc_user_map, owner_uids, job_details, job_log_metadata, e4 = (
-        f_alloc.result()
-    )
+    (
+        jobs, pending, gpu_alloc, alloc_user_map, owner_uids, job_details,
+        job_log_metadata, scheduler_status, scheduler_error,
+    ) = f_scheduler.result()
     mem_alloc, e5 = f_mem.result()
-    e2 = f"squeue failed: {queue_error}" if queue_error else ""
-    e3 = f"squeue PD failed: {queue_error}" if queue_error else ""
     for n in nodes_raw:
         n["mem_alloc"] = mem_alloc.get(n["name"], "")
     for job in jobs:
@@ -1272,8 +1768,11 @@ def collect_basic() -> Tuple[
         )
         if trusted_user:
             job.user = trusted_user
-    err = " | ".join(x for x in [e1, e2, e3, e4, e5] if x)
-    return nodes_raw, jobs, pending, assign_node_jobs(jobs), gpu_alloc, alloc_user_map, err
+    err = " | ".join(x for x in [e1, scheduler_error, e5] if x)
+    return (
+        nodes_raw, jobs, pending, assign_node_jobs(jobs), gpu_alloc,
+        alloc_user_map, scheduler_status, err,
+    )
 
 
 def assign_node_jobs(jobs: List[JobInfo]) -> Dict[str, List[JobInfo]]:

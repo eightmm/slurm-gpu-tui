@@ -60,7 +60,10 @@ def _oneshot_snapshot() -> dict:
     snapshot = _collector_snapshot()
     if snapshot:
         return snapshot
-    nodes_raw, jobs, pending, node_jobs, gpu_alloc, alloc_user_map, err = collect_basic()
+    (
+        nodes_raw, jobs, pending, node_jobs, gpu_alloc, alloc_user_map,
+        scheduler_status, err,
+    ) = collect_basic()
     node_names = [n["name"] for n in nodes_raw]
     ssh_results, stale_nodes, ssh_errors = collect_node_data_parallel(node_names)
     nodes = build_nodes(nodes_raw, node_jobs, ssh_results, stale_nodes)
@@ -77,6 +80,7 @@ def _oneshot_snapshot() -> dict:
         # no push agents on this path, but keep the key so consumers see one
         # schema whether or not a collector was running
         "untrusted_payloads": {},
+        "scheduler": scheduler_status,
         "errors": " | ".join(x for x in [err] + ssh_errors if x),
     }
 
@@ -521,6 +525,7 @@ def _suffix_prefix_overlap(previous: bytes, current: bytes) -> int:
     """Length of the largest suffix of previous matching current's prefix."""
     if not previous or not current:
         return 0
+
     # KMP over current + sentinel + the bounded suffix of previous. Integer
     # symbols make the sentinel collision-free for arbitrary log bytes.
     pattern = list(current)
@@ -534,6 +539,44 @@ def _suffix_prefix_overlap(previous: bytes, current: bytes) -> int:
             j += 1
         prefix[i] = j
     return min(prefix[-1], len(current))
+
+
+def _diagnostic_text(value: object, limit: int = 500) -> str:
+    """One bounded, terminal-safe line for collector diagnostics."""
+    return " ".join(
+        re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or "")).split()
+    )[:limit]
+
+
+def _scheduler_diagnostic(
+    value: object,
+) -> Tuple[Optional[bool], str, str]:
+    """Return doctor status, text, and normalized scheduler backend."""
+    if not isinstance(value, dict):
+        return None, "backend unknown — restart/deploy collector", ""
+    backend = str(value.get("job_backend") or "")
+    error = _diagnostic_text(value.get("error"))
+    try:
+        rejected = max(0, int(value.get("rejected_records") or 0))
+    except (TypeError, ValueError):
+        rejected = 0
+    if backend == "structured-json":
+        return True, "structured JSON", backend
+    if backend == "legacy-text":
+        reason = _diagnostic_text(value.get("fallback_reason"))
+        detail = "legacy text compatibility"
+        if reason:
+            detail += f" — {reason}"
+        if rejected:
+            detail += (
+                f"; {rejected} ambiguous/changed job ID(s) rejected or "
+                "allocation-suppressed"
+            )
+            return None, detail, backend
+        return True, detail, backend
+    if backend == "unavailable":
+        return False, error or "scheduler job metadata unavailable", backend
+    return None, "backend unknown — restart/deploy collector", backend
 
 
 def _cli_doctor() -> int:
@@ -569,6 +612,7 @@ def _cli_doctor() -> int:
     gpu_srcs: Dict[str, int] = {}
     cpu_srcs: Dict[str, int] = {}
     raw: dict = {}
+    scheduler_backend = ""
     try:
         age = time.time() - _DAEMON_DATA_FILE.stat().st_mtime
         raw = json.loads(_DAEMON_DATA_FILE.read_text())
@@ -600,6 +644,29 @@ def _cli_doctor() -> int:
     except (OSError, ValueError):
         report(False, "collector data", f"{_DAEMON_DATA_FILE} missing — collector not running (TUI falls back to slow SSH)")
 
+    if raw:
+        scheduler_ok, scheduler_detail, scheduler_backend = (
+            _scheduler_diagnostic(raw.get("scheduler"))
+        )
+        report(scheduler_ok, "scheduler jobs", scheduler_detail)
+
+        # Keep non-scheduler collector failures visible without counting the
+        # same backend outage twice. Older snapshots have no structured
+        # scheduler status, so their existing aggregate error remains useful.
+        collector_error = _diagnostic_text(raw.get("errors"))
+        scheduler_error = ""
+        scheduler = raw.get("scheduler")
+        if isinstance(scheduler, dict):
+            scheduler_error = _diagnostic_text(scheduler.get("error"))
+        collector_only = collector_error.replace(scheduler_error, "", 1) \
+            if scheduler_error else collector_error
+        remaining_errors = [
+            part.strip() for part in collector_only.split(" | ")
+            if part.strip()
+        ]
+        if remaining_errors:
+            report(False, "collector errors", " | ".join(remaining_errors))
+
     # Forged push payloads. AGENT_DIR is mode 1777, so anyone can drop a
     # <node>.json; the collector rejects ones written by an untrusted uid and
     # records them here. A hit means either an attempt to spoof telemetry or a
@@ -617,7 +684,10 @@ def _cli_doctor() -> int:
     # GPU→job attribution sanity: a process's cgroup names its own job. If a
     # card runs job X's process but the snapshot binds job Y (or nothing),
     # allocation mapping is broken (heterogeneous-node IDX drift regression).
-    if raw:
+    if raw and scheduler_backend == "unavailable":
+        report(None, "gpu-job binding",
+               "not checked — scheduler job metadata unavailable")
+    elif raw:
         mismatches: List[str] = []
         probed = 0
         for n in raw.get("nodes", []):
@@ -825,7 +895,12 @@ def _cli_doctor() -> int:
     # because the log lives under their home. Count what actually got mirrored
     # rather than trusting the unit — a job whose log is not written yet, or
     # whose path the collector cannot stat, silently produces nothing.
-    if raw:
+    if raw and scheduler_backend == "unavailable":
+        report(None, "job log sharing",
+               "not checked — scheduler job metadata unavailable")
+        report(None, "job detail sharing",
+               "not checked — scheduler job metadata unavailable")
+    elif raw:
         jobs_raw = raw.get("jobs", [])
         shared_logs = sum(1 for j in jobs_raw if j.get("log_out") or j.get("log_err"))
         logs_on = _unit_env_enabled(unit_text, "SLURM_GPU_TUI_SHARE_LOGS")

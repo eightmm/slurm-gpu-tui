@@ -184,6 +184,7 @@ ssh <node> cat /run/sgpu-agent.log               # 노드 에이전트 (root; �
 | 에이전트가 있는데 SSH로만 수집 | `sgpu doctor` → `agent payload trust` |
 | 남의 작업 로그 탭이 비어 있음 | `sgpu doctor` → `job log sharing`; root 설치 프로그램 재실행 |
 | 남의 작업 상세가 권한 오류 | `sgpu doctor` → `job detail sharing`; root 설치 프로그램 재실행 |
+| GPU-작업 연결이나 공유 상세가 전부 비어 있음 | `sgpu doctor` → `scheduler jobs`; 최신 Slurm은 JSON, 구형 Slurm은 검증된 호환 backend를 자동 사용 |
 | 그 외 | `sgpu doctor` |
 
 ### 다른 사용자 작업 공개
@@ -203,9 +204,18 @@ ssh <node> cat /run/sgpu-agent.log               # 노드 에이전트 (root; �
 > traceback 안의 환경변수 덤프. 클러스터 사용자 전원이 서로의 작업 출력을 볼
 > 권한이 있는 곳에서만 켜라. 스트림당 미러링 양은
 > `SLURM_GPU_TUI_LOG_TAIL_BYTES`로 제한한다. 심볼릭 링크가 아닌 일반 파일이며
-> 구조화된 `scontrol --json`이 보고한 숫자 UID와 소유자가 일치할 때만 읽는다. NFS root-squash
-> 환경에서는 그 UID로 권한을 낮춘 짧은 프로세스로 읽고 collector 환경변수는
-> 넘기지 않는다.
+> 스케줄러가 보고한 숫자 UID와 소유자가 일치할 때만 읽는다. 최신 Slurm은 구조화된
+> `scontrol --json`을 사용한다. 이 옵션이 없는 구형 Slurm은 조회 직전·직후의
+> 숫자 UID·상태·배치 노드 `squeue` 결과와 모두 일치하는 레코드만 허용하는 강화된
+> 텍스트 호환 backend로 자동 전환한다. 모호하거나 조회 중 바뀐 레코드는 버린다.
+> NFS root-squash 환경에서는 그 UID로 권한을 낮춘 짧은 프로세스로 읽고 collector
+> 환경변수는 넘기지 않는다. 실제 선택된 backend는 `sgpu doctor`의
+> `scheduler jobs`에서 확인할 수 있다.
+>
+> 구형 호환 모드는 의도적으로 fail-closed다. 구형 한 줄 출력에는 위조할 수 없는
+> 레코드 경계가 없으므로 물리적 `JobId`가 중복되거나 모호하면 해당 주기의 작업
+> 상세와 GPU 할당 연결을 버린다. 잘못된 사용자에게 작업이나 로그를 연결하는
+> 대신, 버린 개수를 doctor에 표시한다.
 
 작업 상세에는 자유 형식 코멘트, 메일 주소, 실행 명령, 작업 디렉터리, 입출력
 경로를 넣지 않는다. 로그 경로는 collector 내부에서만 쓰며 `data.json`에

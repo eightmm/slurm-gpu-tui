@@ -41,6 +41,37 @@ def test_persistence_probe_allows_slow_nvidia_initialization():
     assert cli._PERSISTENCE_PROBE_TIMEOUT_SEC == 20
 
 
+def test_scheduler_diagnostic_reports_selected_backend():
+    ok, detail, backend = cli._scheduler_diagnostic({
+        "job_backend": "legacy-text",
+        "fallback_reason": "scontrol --json unsupported",
+        "error": "",
+        "rejected_records": 2,
+    })
+
+    assert ok is None
+    assert backend == "legacy-text"
+    assert "legacy text compatibility" in detail
+    assert "2 ambiguous/changed" in detail
+
+
+def test_scheduler_diagnostic_fails_closed_and_sanitizes_error():
+    ok, detail, backend = cli._scheduler_diagnostic({
+        "job_backend": "unavailable",
+        "error": "timeout\nforged-line",
+    })
+
+    assert ok is False
+    assert backend == "unavailable"
+    assert detail == "timeout forged-line"
+
+
+def test_scheduler_diagnostic_handles_precompat_snapshot():
+    assert cli._scheduler_diagnostic(None) == (
+        None, "backend unknown — restart/deploy collector", "",
+    )
+
+
 def test_split_node_sources_separates_cpu_poll_from_gpu_fallback():
     gpu, cpu = cli._split_node_sources([
         {"name": "cpu1", "has_gpu": False, "source": "ssh", "gpus": []},

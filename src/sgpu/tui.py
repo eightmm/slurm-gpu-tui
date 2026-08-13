@@ -759,7 +759,10 @@ class SlurmGpuTui(App):
                 return
 
         # Fallback: direct collection (2-phase)
-        nodes_raw, jobs, pending, node_jobs, gpu_alloc, alloc_user_map, err1 = collect_basic()
+        (
+            nodes_raw, jobs, pending, node_jobs, gpu_alloc, alloc_user_map,
+            _scheduler_status, err1,
+        ) = collect_basic()
         node_names = [n["name"] for n in nodes_raw]
 
         # Show basic data immediately (use cache or empty)

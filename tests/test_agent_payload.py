@@ -200,7 +200,7 @@ def test_collect_all_does_not_repair_cpu_only_nodes(monkeypatch):
     }]
     monkeypatch.setattr(
         collector, "collect_basic",
-        lambda: (nodes, [], [], {}, {}, {}, ""),
+        lambda: (nodes, [], [], {}, {}, {}, {}, ""),
     )
     monkeypatch.setattr(collector, "_should_poll_node", lambda name: False)
     monkeypatch.setattr(collector, "_read_agent_payload", lambda *args: None)
@@ -214,6 +214,7 @@ def test_collect_all_does_not_repair_cpu_only_nodes(monkeypatch):
 
     assert repaired == []
     assert data["nodes"][0]["has_gpu"] is False
+    assert data["scheduler"] == {}
 
 
 def test_collect_all_prefers_cpu_agent_over_ssh(monkeypatch):
@@ -226,7 +227,7 @@ def test_collect_all_prefers_cpu_agent_over_ssh(monkeypatch):
     payload = _payload("cpu1", "cpu")
     monkeypatch.setattr(
         collector, "collect_basic",
-        lambda: (nodes, [], [], {}, {}, {}, ""),
+        lambda: (nodes, [], [], {}, {}, {}, {}, ""),
     )
     monkeypatch.setattr(collector, "_read_agent_payload", lambda name, kind: payload)
     polled = []
@@ -241,6 +242,7 @@ def test_collect_all_prefers_cpu_agent_over_ssh(monkeypatch):
     assert data["nodes"][0]["source"] == "agent"
     assert data["nodes"][0]["mem_total"] == "250000"
     assert data["nodes"][0]["mem_avail"] == "249000"
+    assert data["scheduler"] == {}
 
 
 def test_effective_mem_total_falls_back_for_invalid_live_value():
