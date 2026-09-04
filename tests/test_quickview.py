@@ -8,7 +8,7 @@ from datetime import datetime
 from sgpu.quickview import (
     _expand_gpu_node_field, aggregate_gpu_jobs, compute_thread_usage,
     expand_hostlist, extract_gpu_count, natural_sort_key, parse_gpu_nodes,
-    split_squeue,
+    parse_sinfo_nodes, split_squeue,
 )
 
 
@@ -26,9 +26,11 @@ def test_split_squeue_survives_spaces_in_job_names():
 
 
 def test_expand_gpu_node_field_forms():
-    assert _expand_gpu_node_field("gpu3") == [3]
-    assert _expand_gpu_node_field("gpu[1-4,7]") == [1, 2, 3, 4, 7]
-    assert _expand_gpu_node_field("cpu1") == []
+    assert _expand_gpu_node_field("gpu3") == ["gpu3"]
+    assert _expand_gpu_node_field("gpu[1-4,7]") == [
+        "gpu1", "gpu2", "gpu3", "gpu4", "gpu7",
+    ]
+    assert _expand_gpu_node_field("master") == ["master"]
 
 
 def test_extract_gpu_count_handles_typed_and_plain_gres():
@@ -54,9 +56,35 @@ def test_parse_gpu_nodes_expands_ranges(tmp_path):
     cfg.write_text(
         "NodeName=gpu[1-2] Gres=gpu:a100:4 CPUs=64\n"
         "NodeName=gpu9 Gres=gpu:2 CPUs=32\n"
+        "NodeName=master Gres=gpu:h100:1 CPUs=64\n"
         "NodeName=cpu1 CPUs=32\n"
     )
-    assert parse_gpu_nodes(str(cfg)) == ([1, 2, 9], [4, 4, 2])
+    assert parse_gpu_nodes(str(cfg)) == (
+        ["gpu1", "gpu2", "gpu9", "master"], [4, 4, 2, 1],
+    )
+
+
+def test_sinfo_gpu_inventory_includes_controller_slurmd_node():
+    status, partitions, nodes, counts = parse_sinfo_nodes(
+        "gpu1|idle|gpu:a100:4(S:0-1)|gpu*\n"
+        "master|mix|gpu:h100:1|gpu*\n"
+        "cpu1|alloc|(null)|cpu\n"
+    )
+
+    assert nodes == ["gpu1", "master"]
+    assert counts == [4, 1]
+    assert status["master"] == "mix"
+    assert partitions["master"] == "gpu"
+
+
+def test_sinfo_duplicate_partition_rows_do_not_duplicate_gpu_capacity():
+    _status, _partitions, nodes, counts = parse_sinfo_nodes(
+        "master|mix|gpu:2|gpu*\n"
+        "master|mix|gpu:2|debug\n"
+    )
+
+    assert nodes == ["master"]
+    assert counts == [2]
 
 
 # ── GPU aggregation ───────────────────────────────────────────────────────

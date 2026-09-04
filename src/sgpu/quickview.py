@@ -67,45 +67,62 @@ def find_slurm_conf():
 
 
 def _expand_gpu_node_field(name_field):
-    """'gpu3' -> [3]; 'gpu[1-4,7]' -> [1,2,3,4,7]; other names -> []."""
-    m = re.match(r'gpu\[([^\]]+)\]$', name_field)
-    if m:
-        nums = []
-        for part in m.group(1).split(','):
-            if '-' in part:
-                a, b = part.split('-', 1)
-                nums.extend(range(int(a), int(b) + 1))
-            else:
-                nums.append(int(part))
-        return nums
-    m = re.match(r'gpu(\d+)$', name_field)
-    return [int(m.group(1))] if m else []
+    """Expand any Slurm NodeName, including a controller acting as slurmd."""
+    return list(expand_hostlist(name_field))
 
 
 def parse_gpu_nodes(slurm_cfg):
-    """NodeName=gpu... lines -> (node numbers, gpus per node), ranges expanded."""
+    """GPU-bearing NodeName lines -> (node names, GPUs per node)."""
     pairs = []
     for line in readInputFile(slurm_cfg):
-        if not line.startswith('NodeName=gpu'):
+        if not line.startswith('NodeName='):
             continue
         parts = line.split()
-        nums  = _expand_gpu_node_field(parts[0].replace('NodeName=', ''))
-        if not nums:
+        names = _expand_gpu_node_field(parts[0].replace('NodeName=', ''))
+        if not names:
             continue
         gres_part = next((p for p in parts if p.startswith('Gres=')), '')
-        total = 0
-        for item in gres_part.replace('Gres=', '').split(','):
-            try:
-                total += int(item.split(':')[-1])
-            except ValueError:
-                pass
-        pairs.extend((n, total) for n in nums)
-    pairs.sort()
+        total = extract_gpu_count(gres_part.replace('Gres=', ''))
+        if total <= 0:
+            continue
+        pairs.extend((name, total) for name in names)
+    pairs.sort(key=lambda item: natural_sort_key(item[0]))
     return [n for n, _ in pairs], [g for _, g in pairs]
 
 
+def parse_sinfo_nodes(sinfo_out):
+    """Parse one ``sinfo -N`` result into status, partition and GPU inventory.
+
+    Unlike the historical slurm.conf parser this accepts arbitrary node names,
+    so a host named ``master`` can be both slurmctld and a GPU slurmd node.
+    """
+    node_status = {}
+    node_partition = {}
+    gpu_counts = {}
+    for line in sinfo_out.splitlines():
+        parts = line.strip().split('|')
+        if len(parts) != 4:
+            continue
+        node, state, gres, partition = (part.strip() for part in parts)
+        if not node:
+            continue
+        node = node.split('.')[0]
+        node_status.setdefault(node, state.lower())
+        node_partition.setdefault(node, partition.rstrip('*'))
+        gpu_count = extract_gpu_count(gres)
+        if gpu_count > 0:
+            gpu_counts[node] = max(gpu_counts.get(node, 0), gpu_count)
+    gpu_nodes = sorted(gpu_counts, key=natural_sort_key)
+    return node_status, node_partition, gpu_nodes, [
+        gpu_counts[node] for node in gpu_nodes
+    ]
+
+
 def extract_gpu_count(tres_str):
-    return sum(int(m) for m in re.findall(r'gpu(?::[^:,\s]+)*:(\d+)', tres_str))
+    return sum(int(m) for m in re.findall(
+        r'(?:^|,)(?:gres/)?gpu(?::[^:,()]+)?:(\d+)(?=\(|,|$)',
+        tres_str,
+    ))
 
 
 @lru_cache(maxsize=None)
@@ -277,12 +294,8 @@ def print_thread_section(title, nodes, users_sorted,
 def main():
     print(datetime.now().strftime('%Y/%m/%d %H:%M:%S'))
 
+    # slurm.conf remains a fallback for installations whose sinfo omits GRES.
     SLURM_CFG = find_slurm_conf()
-    if SLURM_CFG:
-        gpu_nodes, gpu_nums = parse_gpu_nodes(SLURM_CFG)
-    else:
-        print(f'{C_WARN}slurm.conf not found (set $SLURM_CONF); GPU section skipped{C_RST}')
-        gpu_nodes, gpu_nums = [], []
 
     # squeue / sinfo 병렬 호출 — 파이프 구분자: 공백 포함 잡 이름에도 안전.
     # argv lists, not shell=True: the format strings are full of % and | that
@@ -290,27 +303,24 @@ def main():
     proc_sq = subprocess.Popen(
         ['squeue', '--noheader', '-o', '%i|%P|%j|%u|%T|%M|%D|%C|%p|%Q|%b|%e|%R'],
         stdout=subprocess.PIPE, text=True)
-    proc_si = subprocess.Popen(['sinfo', '--noheader', '-o', '%n %T'],
+    proc_si = subprocess.Popen(['sinfo', '-N', '--noheader', '-o', '%n|%T|%G|%P'],
                                stdout=subprocess.PIPE, text=True)
     proc_cpu = subprocess.Popen(['sinfo', '-Nho', '%N %C'],
                                 stdout=subprocess.PIPE, text=True)
-    proc_part = subprocess.Popen(['sinfo', '--noheader', '-o', '%n %P'],
-                                 stdout=subprocess.PIPE, text=True)
 
     squeue_out, _ = proc_sq.communicate()
     sinfo_out, _ = proc_si.communicate()
     cpuinfo_out, _ = proc_cpu.communicate()
-    partinfo_out, _ = proc_part.communicate()
     squeue = squeue_out.split('\n')
 
-    # GPU 노드 상태
-    node_status = {}
-    for line in sinfo_out.splitlines():
-        parts = line.strip().split()
-        if len(parts) == 2:
-            m = re.match(r'gpu(\d+)', parts[0])
-            if m:
-                node_status[int(m.group(1))] = parts[1].lower()
+    node_status, node_partition, gpu_nodes, gpu_nums = parse_sinfo_nodes(
+        sinfo_out,
+    )
+    if not gpu_nodes and SLURM_CFG:
+        gpu_nodes, gpu_nums = parse_gpu_nodes(SLURM_CFG)
+    if not gpu_nodes and not SLURM_CFG:
+        print(f'{C_WARN}GPU nodes not found in sinfo; slurm.conf not found '
+              f'(set $SLURM_CONF){C_RST}')
 
     # 노드별 전체 CPU 수
     node_total_cpu = {}
@@ -322,17 +332,6 @@ def main():
         val_str = parts[1].split('/')[-1] if '/' in parts[1] else parts[1]
         if val_str.isdigit():
             node_total_cpu[node] = int(val_str)
-
-    # 노드별 파티션 (첫 번째 파티션 사용)
-    node_partition = {}
-    for line in partinfo_out.splitlines():
-        parts = line.strip().split()
-        if len(parts) == 2:
-            m = re.match(r'gpu(\d+)', parts[0])
-            if m:
-                node_num = int(m.group(1))
-                if node_num not in node_partition:
-                    node_partition[node_num] = parts[1].rstrip('*')  # * = default partition
 
     # Pending job 집계: {user: {partition: count}}
     pending_by_user = defaultdict(lambda: defaultdict(int))
@@ -349,7 +348,7 @@ def main():
     all_end_times = {}
     for i in ret:
         for node in gpu_nodes:
-            cnt = int(i[1].get(f'gpu{node}', 0))
+            cnt = int(i[1].get(node, 0))
             tota_usage       += cnt
             node_usage[node] += cnt
         for nk, end_dt in i[3].items():
@@ -368,7 +367,7 @@ def main():
     # 노드 컬럼 폭: 노드명 기준 (파티션명은 폭에 맞게 축약 — veryshort 같은
     # 접미사 때문에 표가 옆으로 터지는 것 방지)
     _node_col_w = max(
-        max((len(f'GPU{n}') for n in gpu_nodes), default=4),
+        max((len(n.upper()) for n in gpu_nodes), default=4),
         7,
     ) + 2  # 양쪽 여백
 
@@ -402,7 +401,7 @@ def main():
         state = node_status.get(node, '')
         warn  = any(s in state for s in ('down', 'drain'))
         mark  = '!' if warn else ''
-        print(hdr(gcell(f'GPU{node}{mark}'), warn=warn), end='')
+        print(hdr(gcell(f'{node.upper()}{mark}'), warn=warn), end='')
     print('|' + hdr(tcell('Total')))
 
     # 유저별 행
@@ -412,7 +411,7 @@ def main():
 
         print(C_USER + user.rjust(USER_W - 2) + C_RST + ' |', end='')
         for node in gpu_nodes:
-            cnt = i[1].get(f'gpu{node}', 0)
+            cnt = i[1].get(node, 0)
             print(gcell(str(cnt) if cnt > 0 else ''), end='')
         print('|' + tcell(str(gpu_total) if gpu_total > 0 else ''))
 
@@ -426,10 +425,10 @@ def main():
 
     # Next free 행
     now = datetime.now()
-    if any(f'gpu{n}' in all_end_times for n in gpu_nodes):
+    if any(n in all_end_times for n in gpu_nodes):
         print('Next free'.rjust(USER_W - 2) + ' |', end='')
         for node in gpu_nodes:
-            nk = f'gpu{node}'
+            nk = node
             if nk in all_end_times and node_usage.get(node, 0) > 0:
                 secs = max(0, int((all_end_times[nk] - now).total_seconds()))
                 d, rem = divmod(secs, 86400)
@@ -442,12 +441,14 @@ def main():
         print('|' + tcell(''))
 
     # ==================== CPU 스레드 섹션 ====================
-    gpu_thr_nodes = sorted([n for n in node_total_cpu if n.startswith('gpu')],
+    gpu_node_set = set(gpu_nodes)
+    gpu_thr_nodes = sorted([n for n in node_total_cpu if n in gpu_node_set],
                             key=natural_sort_key)
-    cpu_nodes     = sorted([n for n in node_total_cpu if n.startswith('cpu')],
+    cpu_nodes     = sorted([n for n in node_total_cpu
+                            if n not in gpu_node_set and n.startswith('cpu')],
                             key=natural_sort_key)
     other_nodes   = sorted([n for n in node_total_cpu
-                             if not n.startswith('gpu') and not n.startswith('cpu')],
+                             if n not in gpu_node_set and not n.startswith('cpu')],
                             key=natural_sort_key)
 
     # GPU 사용량 순서 기준으로 thread 섹션도 동일하게 정렬
