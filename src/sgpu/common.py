@@ -19,6 +19,8 @@ from functools import lru_cache
 from itertools import product
 from typing import Dict, List, Tuple
 
+from .telemetry import record_command
+
 
 class NodeErrorKind(str, Enum):
     OK = "ok"
@@ -40,6 +42,7 @@ ROGUE_IGNORE = {
 
 
 _uid_name_cache: Dict[str, str] = {}
+_uid_name_expires: Dict[str, float] = {}
 
 
 def resolve_user(name: str) -> str:
@@ -54,23 +57,27 @@ def resolve_user(name: str) -> str:
     if not name or not name.isdigit():
         return name
     cached = _uid_name_cache.get(name)
-    if cached is not None:
+    if cached is not None and time.monotonic() < _uid_name_expires.get(name, 0):
         return cached
     try:
         resolved = pwd.getpwuid(int(name)).pw_name
     except (KeyError, ValueError, OverflowError):
         resolved = name
     _uid_name_cache[name] = resolved
+    _uid_name_expires[name] = time.monotonic() + (30 if resolved == name else 300)
     return resolved
 
 
 # ── Shell helpers ─────────────────────────────────────────────────────────
 
 def run_cmd(cmd: str, timeout: int = 12) -> Tuple[bool, str]:
+    started = time.monotonic()
+    success = False
     try:
         out = subprocess.check_output(
             shlex.split(cmd), stderr=subprocess.STDOUT, timeout=timeout, text=True
         )
+        success = True
         return True, out.strip()
     except subprocess.CalledProcessError as e:
         # the captured stderr is what error classification and logs need,
@@ -79,6 +86,8 @@ def run_cmd(cmd: str, timeout: int = 12) -> Tuple[bool, str]:
         return False, out or str(e)
     except Exception as e:
         return False, str(e)
+    finally:
+        record_command(cmd, time.monotonic() - started, success)
 
 
 # ── SSH ControlMaster pool ────────────────────────────────────────────────
@@ -196,6 +205,9 @@ class GpuInfo:
     ecc: str = ""        # uncorrectable ECC error count ("" / N/A on consumer GPUs)
     sm_clock: str = ""   # current SM clock MHz
     mem_clock: str = ""  # current memory clock MHz
+    clock_reasons: str = ""
+    recovery_action: str = ""
+    health_observed_at: float = 0.0
     pids: List[str] = field(default_factory=list)
     users: List[str] = field(default_factory=list)
     pid_mem: Dict[str, str] = field(default_factory=dict)    # pid -> FB MiB (pmon)
@@ -229,6 +241,8 @@ class JobInfo:
     detail: str = ""
     log_status: Dict[str, str] = field(default_factory=dict)
     uid: int = -1  # validated scheduler owner; authorizes log mirroring
+    qos: str = ""
+    telemetry: Dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass
@@ -243,6 +257,12 @@ class PendingJob:
     priority: str = ""
     start_time: str = ""  # scheduler's estimated start (squeue %S)
     detail: str = ""  # collector-published scontrol detail for cross-user UI
+    submit_time: str = ""
+    eligible_time: str = ""
+    dependency: str = ""
+    qos: str = ""
+    cpu_count: int = 0
+    mem: str = ""
 
 
 @dataclass
@@ -250,6 +270,7 @@ class NodeMemInfo:
     total: str = ""   # MB
     used: str = ""    # MB
     avail: str = ""   # MB
+    pressure: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -276,6 +297,15 @@ class NodeInfo:
     mem_avail: str = ""
     stale: bool = False
     error_kind: str = ""  # NodeErrorKind value as string
+    observed_at: float = 0.0
+    data_age_sec: float = -1.0
+    scheduler_age_sec: float = -1.0
+    scheduler_mem_total: str = ""
+    scheduler_available: bool = True
+    cpu_util: str = ""
+    pressure: Dict[str, str] = field(default_factory=dict)
+    telemetry_observed_at: float = 0.0
+    jobs_truncated: bool = False
 
 
 @dataclass
@@ -381,7 +411,7 @@ _SQUEUE_COMBINED_CMD = (
     # embedded newlines, so it cannot safely share this line-oriented protocol.
     # %U is the numeric owner UID. It also anchors the hardened compatibility
     # backend on Slurm releases that predate scontrol --json.
-    '"%T|%i|%u|%U|%P|%M|%N|%b|%l|%C|%m|%r|%Q|%S"'
+    '"%T|%i|%u|%U|%P|%M|%N|%b|%l|%C|%m|%r|%Q|%S|%V"'
 )
 
 _SLURM_JOB_ID_RE = re.compile(
@@ -484,7 +514,7 @@ def _parse_queue_output(
     pending_rows: List[tuple[str, PendingJob]] = []
     for line in out.splitlines():
         p = line.split("|")
-        if len(p) != 14:
+        if len(p) not in (14, 15):
             continue
         state = p[0].strip().upper()
         jobid = p[1].strip()
@@ -523,6 +553,9 @@ def _parse_queue_output(
                 time_limit=p[8].strip(),
                 gpu_count=_gpu_count_from_gres(gres), reason=p[11].strip(),
                 priority=p[12].strip(), start_time=p[13].strip(),
+                submit_time=p[14].strip() if len(p) == 15 else "",
+                cpu_count=int(p[9]) if p[9].strip().isdigit() and len(p[9]) < 12 else 0,
+                mem=p[10].strip(),
             )))
     anchors = {
         jobid: values[0] for jobid, values in anchors_seen.items()
@@ -1551,6 +1584,13 @@ _NODE_CGROUP_CMD = (
     "sed -E 's#^/proc/([0-9]+)/cgroup:job_#\\1 #'; fi; "
 )
 
+_NODE_PRESSURE_CMD = (
+    "for r in cpu memory io; do "
+    "if [ -r /proc/pressure/$r ]; then "
+    "awk -v r=\"$r\" '/^some /{for(i=2;i<=NF;i++){split($i,a,\"=\"); "
+    "if(a[1]==\"avg10\") print r,a[2]}}' /proc/pressure/$r; fi; done; true"
+)
+
 NODE_DYNAMIC_PAYLOAD_CMD = (
     _NODE_PAYLOAD_PREFIX
     # Empty minor section; the agent merges its cached topology after parse.
@@ -1592,6 +1632,7 @@ NODE_PAYLOAD_CMD = (
     + _NODE_CGROUP_CMD
     + "echo '---SEP---'; "
     + _NODE_SLOT_CMD
+    + "; echo '---SEP---'; " + _NODE_PRESSURE_CMD
 )
 
 
@@ -1634,6 +1675,14 @@ def parse_node_payload(out: str) -> Tuple[List[GpuInfo], NodeMemInfo]:
     mem_parts = mem_raw.split()
     if len(mem_parts) >= 3:
         mem_info = NodeMemInfo(total=mem_parts[0], used=mem_parts[1], avail=mem_parts[2])
+    if len(sections) > 7:
+        from .telemetry import metric_number
+        for line in sections[7].splitlines():
+            fields = line.split()
+            if len(fields) == 2 and fields[0] in ("cpu", "memory", "io"):
+                value = metric_number(fields[1])
+                if value is not None and 0 <= value <= 100:
+                    mem_info.pressure[fields[0]] = f"{value:.1f}"
 
     # Parse pmon (-s m: gpu pid type fb ccpm cmd): gpu_idx -> PIDs, pid -> FB MiB
     gpu_pids: Dict[str, List[str]] = {}
@@ -1710,6 +1759,21 @@ def collect_mem_alloc() -> Tuple[Dict[str, str], str]:
 
 
 _basic_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="sgpu-basic")
+_mem_snapshot = None
+_mem_snapshot_at = 0.0
+_mem_snapshot_lock = threading.Lock()
+
+
+def _collect_mem_snapshot(refresh_sec: float) -> Tuple[Dict[str, str], str]:
+    global _mem_snapshot, _mem_snapshot_at
+    with _mem_snapshot_lock:
+        now = time.monotonic()
+        if refresh_sec > 0 and _mem_snapshot is not None and now - _mem_snapshot_at < refresh_sec:
+            return dict(_mem_snapshot), ""
+        values, error = collect_mem_alloc()
+        if not error:
+            _mem_snapshot, _mem_snapshot_at = dict(values), now
+        return values, error
 
 
 def cleanup_basic_executor() -> None:
@@ -1720,11 +1784,12 @@ def cleanup_basic_executor() -> None:
 atexit.register(cleanup_basic_executor)
 
 
-def collect_basic() -> Tuple[
+def collect_basic(*, mem_refresh_sec: float = 0) -> Tuple[
     List[dict], List[JobInfo], List[PendingJob], Dict[str, List[JobInfo]],
     Dict[str, Dict[str, str]], Dict[str, str], Dict[str, object], str,
 ]:
     """Phase 1: fast local commands only (sinfo + squeue + scontrol)."""
+    started_at = time.time()
     f_nodes = _basic_executor.submit(collect_nodes_basic)
     backend, _fallback_reason = _known_job_backend()
     # Keep modern Slurm's squeue and structured scontrol RPCs parallel. The
@@ -1733,7 +1798,7 @@ def collect_basic() -> Tuple[
     f_json = _basic_executor.submit(collect_gpu_alloc) \
         if backend != "legacy-text" else None
     f_scheduler = _basic_executor.submit(_collect_scheduler_jobs, f_json)
-    f_mem = _basic_executor.submit(collect_mem_alloc)
+    f_mem = _basic_executor.submit(_collect_mem_snapshot, mem_refresh_sec)
     nodes_raw, e1 = f_nodes.result()
     (
         jobs, pending, gpu_alloc, alloc_user_map, owner_uids, job_details,
@@ -1749,6 +1814,7 @@ def collect_basic() -> Tuple[
         if trusted_user:
             job.user = trusted_user
         job.uid = owner_uids.get(job.jobid, -1)
+        job.qos = _published_detail_field(job.detail, "QOS")
         log_out, log_err, merged = job_log_metadata.get(
             job.jobid, ("", "", False),
         )
@@ -1763,11 +1829,16 @@ def collect_basic() -> Tuple[
             job.jobid, job_details.get(job.jobid.split("_", 1)[0], ""),
         )
         job.jobname = _published_detail_field(job.detail, "JobName")
+        job.submit_time = _published_detail_field(job.detail, "SubmitTime") or job.submit_time
+        job.eligible_time = _published_detail_field(job.detail, "EligibleTime")
+        job.dependency = _published_detail_field(job.detail, "Dependency")
+        job.qos = _published_detail_field(job.detail, "QOS")
         trusted_user = alloc_user_map.get(
             job.jobid, alloc_user_map.get(job.jobid.split("_", 1)[0], ""),
         )
         if trusted_user:
             job.user = trusted_user
+    scheduler_status["observed_at"] = started_at
     err = " | ".join(x for x in [e1, scheduler_error, e5] if x)
     return (
         nodes_raw, jobs, pending, assign_node_jobs(jobs), gpu_alloc,
@@ -1876,6 +1947,8 @@ def build_nodes(
     node_jobs: Dict[str, List[JobInfo]],
     ssh_results: Dict[str, NodeSSHResult],
     stale_nodes: List[str],
+    *, scheduler_status: dict | None = None,
+    scheduler_error: str = "",
 ) -> List[NodeInfo]:
     result: List[NodeInfo] = []
     for n in nodes_raw:
@@ -1899,6 +1972,13 @@ def build_nodes(
             mem_used=mem.used, mem_avail=mem.avail,
             stale=stale,
             error_kind=r.error_kind.value if r and hasattr(r, 'error_kind') else "",
+            observed_at=time.time() if r and not stale and not gerr else 0.0,
+            data_age_sec=0.0 if r and not stale and not gerr else -1.0,
+            scheduler_age_sec=float((scheduler_status or {}).get("age_sec", 0)),
+            scheduler_available=not scheduler_error and (scheduler_status or {}).get("job_backend") != "unavailable",
+            scheduler_mem_total=n["mem_total"],
+            pressure=mem.pressure if not stale else {},
+            telemetry_observed_at=time.time() if r and not stale and not gerr else 0.0,
         ))
     return result
 

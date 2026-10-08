@@ -164,11 +164,23 @@ Cluster summary:
   `time() - <this>` = data age. The dashboard's **Data Age** stat goes
   orange/red when the collector freezes or dies.)
 - `sgpu_build_info{version,build}` (exact collector build; compare with `sgpu --version`)
+- `sgpu_collector_cycle_seconds` / `sgpu_collector_interval_seconds` (previous
+  completed cycle wall time and time between cycle starts)
+- `sgpu_collector_phase_seconds{phase}` (`collect`, `write`, `idle`, `usage`,
+  `metrics`, `notify`; snapshot diagnostics lag one completed cycle)
+- `sgpu_collector_ssh_inflight` / `sgpu_collector_log_inflight` (running + queued)
+- `sgpu_collector_notify_backlog` (unfinished outcome lookup and delivery work)
+- `sgpu_command_calls_total{command}` / `sgpu_command_failures_total{command}` /
+  `sgpu_command_seconds_total{command}` / `sgpu_command_last_seconds{command}`
+  (process-local counters and last RPC time; fixed labels `sinfo`, `squeue`,
+  `scontrol_jobs`, `scontrol_nodes`, `sacct`, `other`; no command arguments)
 
 Per node/GPU:
 
 - `sgpu_node_up{node}`
 - `sgpu_node_stale{node}`
+- `sgpu_node_data_age_seconds{node}` / `sgpu_node_scheduler_age_seconds{node}`
+  (source ages at publication; `-1` means unknown, distinct from snapshot age)
 - `sgpu_node_info{node,partition,source}`
 - `sgpu_node_cpus_total{node}` / `sgpu_node_cpus_alloc{node}` (Slurm view)
 - `sgpu_node_cpu_load{node}` (load average)
@@ -195,7 +207,9 @@ Per node/GPU:
 - `sgpu_gpu_parked_seconds{node,gpu}`
 - `sgpu_gpu_sm_clock_mhz{node,gpu}` / `sgpu_gpu_mem_clock_mhz{node,gpu}`
 - `sgpu_pending_job_info{jobid,user,partition,jobname,reason,gpus}` (one
-  series per queued job; disappears when the job starts)
+  series per queued job, first `SLURM_GPU_TUI_METRICS_PENDING_MAX` (100) in
+  squeue order; disappears when the job starts. `sgpu_jobs_pending` is the
+  uncapped total)
 
 Per running GPU job (RAM fair share):
 
@@ -206,6 +220,30 @@ Per running GPU job (RAM fair share):
   job's GPU fair share (node RAM × job GPUs ÷ node GPUs). `> 1` = the job
   reserves more memory than its GPU count entitles it to.
   `prometheus/sgpu-alerts.yml` ships a 30-minute warning rule on it.
+
+Optional local telemetry (absent when unsupported, unverified or stale):
+
+- `sgpu_node_cpu_util_percent{node}` — actual busy CPU percent from deltas.
+- `sgpu_node_pressure_percent{node,resource}` — PSI `some avg10`, with
+  `resource=cpu|memory|io`; this indicates pressure, not its cause.
+- `sgpu_node_telemetry_timestamp_seconds{node}` — CPU/PSI sample timestamp.
+- `sgpu_job_cpu_cores{jobid,user,node}` — average cores used over the interval.
+- `sgpu_job_mem_current_mib`, `sgpu_job_mem_peak_mib`,
+  `sgpu_job_mem_limit_mib{jobid,user,node}` — cgroup current, node-local peak
+  and finite limit; includes cache/descendants, distinct from sstat MaxRSS.
+  An unlimited limit is absent. Summed node-local peaks may occur separately.
+- `sgpu_job_oom_kills{jobid,user,node}` — cumulative cgroup OOM kills.
+- `sgpu_job_pid_vram_mib{jobid,user,node}` — PID-attributed GPU memory.
+- `sgpu_job_telemetry_timestamp_seconds{jobid,user,node}` — job sample timestamp.
+- `sgpu_pending_wait_seconds{jobid}` — time since submission (same cap).
+- `sgpu_gpu_health_severity{node,gpu}` — 0 normal/informational, 1 caution,
+  2 recovery/thermal action. Aggregate ECC is cumulative, not a new event.
+
+FREE now excludes stale/unavailable nodes, unknown utilization, and GPUs
+requiring recovery/thermal action; totals describe observed usable capacity.
+Missing job/node fields are omitted rather than emitted as zero. These series
+are available to custom panels; existing dashboards keep their current panels.
+Sampling paths and limits are documented in [PUSH.md](PUSH.md).
 
 Master host (the machine the collector runs on — lets a remote Grafana
 monitor this cluster without node_exporter here):
@@ -230,6 +268,22 @@ metric-name prefix:
   `<prefix>sgpu_*` into the local textfile dir. The ssh target and prefix
   come from `~/.config/sgpu/bridge.env` (site file, not in git — copy
   `grafana/bridge.env.example`).
+  The bridge runs as a user, but a root collector keeps its data dir
+  root-only (`/tmp/slurm-gpu-tui`, 0755) on purpose, so the default
+  `SGPU_BRIDGE_OUT` fails with `mktemp: ... Permission denied`. Give
+  node_exporter a textfile dir the bridge user owns and link the
+  collector's file into it:
+
+  ```bash
+  sudo install -d -o "$USER" -m 755 /var/lib/sgpu-textfile
+  ln -s /tmp/slurm-gpu-tui/metrics.prom /var/lib/sgpu-textfile/sgpu.prom
+  echo SGPU_BRIDGE_OUT=/var/lib/sgpu-textfile/master_sgpu.prom >> ~/.config/sgpu/bridge.env
+  # node_exporter: --collector.textfile.directory=/var/lib/sgpu-textfile
+  ```
+
+  node_exporter follows the symlink (and reports the target's mtime). Do
+  not make the collector's dir user-writable instead: root writes
+  `data.json` there.
   On fetch failure the data series are dropped (panels go honest
   "No data") and only `<prefix>sgpu_bridge_up 0` remains. For remotes on
   an older sgpu without `sgpu_master_*`, it falls back to sampling the

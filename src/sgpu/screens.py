@@ -186,7 +186,9 @@ class DetailScreen(ModalScreen):
 
 
 HELP_TEXT = """\
- 1/2/3    Tabs: GPU / CPU / Usage  (g also opens Usage)
+ 1/2/3/4  Tabs: GPU / CPU / Usage / Jobs  (g also opens Usage)
+ v        Expand / fold pending jobs (initially folded)
+ t        Show / hide the 5-minute cluster trend
  r        Refresh now
  s        Cycle sort: Node → Utilization → User → Free
  S        Reverse current sort order
@@ -194,7 +196,8 @@ HELP_TEXT = """\
  u        Filter by user (pick from list; u again clears)
  p        Cycle partition filter (all → each partition)
  m        My jobs only (m again clears)
- i        Idle filter (truly free GPUs only)
+ i        Free-GPU filter (GPU tab and GPU summary only)
+ f        Free capacity by model/VRAM and largest single node
  d        Detail columns (Temp / Power / JobID / JobName)
  Space    Collapse / expand node (on header row)
  Enter    Job / node details — Tab cycles Info/Script/StdOut/StdErr
@@ -222,9 +225,18 @@ HELP_TEXT = """\
    parked           VRAM held at ~0% util
    user !slurm      GPU process with no SLURM allocation
 
+ Jobs CPU/RAM a/r = actual / requested; ? = unavailable.
+ RAM requests retain Slurm c (per CPU) / n (per node) units.
+ ~ = partial node coverage; Enter shows peak, limit and OOM.
+ PID VRAM covers attributed GPU processes, not reserved VRAM.
+ Est.Start is the scheduler estimate; Wait starts at submission.
+ PSI is stall pressure, not a diagnosis. Health CAP is a power
+ cap event; low clocks alone do not indicate a hardware fault.
+ ECC is the aggregate counter, not a newly observed error.
+
  Korean IME: same physical keys work without switching
  (ㅂ=q, ㄱ=r, ㄴ=s, ㅇ=d, ㅑ=i, ㅕ=u, ㅔ=p, ㅡ=m, ㄷ=e, ㅈ=w,
-  ㅎ=g, ㅗ=h, ㅜ=n, ㅓ=j, ㅏ=k)
+  ㅎ=g, ㅗ=h, ㅜ=n, ㅓ=j, ㅏ=k, ㅍ=v, ㅅ=t, ㄹ=f)
 """
 
 
@@ -504,7 +516,9 @@ _JAMO_ACTIONS = {
     "ㅗ": "show_history",        # h
     "ㅜ": "watch_job",           # n
     "ㅎ": "show_usage",          # g
+    "ㅍ": "toggle_pending",      # v
+    "ㅅ": "toggle_trend",        # t
+    "ㄹ": "show_free",           # f
     "ㅓ": "cursor_down",         # j
     "ㅏ": "cursor_up",           # k
 }
-

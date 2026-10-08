@@ -27,7 +27,14 @@ SUDO=""
 
 cd "$REPO"
 echo "== tests =="
-"$UV" run --project "$REPO" pytest tests/ -q
+TEST_TMP="$(mktemp -d "${TMPDIR:-/tmp}/sgpu-deploy-tests.XXXXXXXX")"
+trap 'rm -rf -- "$TEST_TMP"' EXIT
+# sudo/su can retain a username whose existing pytest directory has another uid.
+# Give pytest a private, newly created parent rather than changing its owner checks.
+PYTHONDONTWRITEBYTECODE=1 "$UV" run --project "$REPO" pytest tests/ -q \
+    -p no:cacheprovider --basetemp "$TEST_TMP/pytest"
+rm -rf -- "$TEST_TMP"
+trap - EXIT
 
 echo "== install -> $PROD_VENV =="
 [ -d "$PROD_VENV" ] || "$UV" venv "$PROD_VENV"

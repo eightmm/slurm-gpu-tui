@@ -166,6 +166,82 @@ def _gpu(jid="", users=(), util="0", mem_used="0", mem_total="81920"):
             "util": util, "mem_used": mem_used, "mem_total": mem_total}
 
 
+def test_stale_telemetry_is_not_credited_as_busy():
+    gpu = dict(_gpu(jid="42", util="90"), alloc_user="alice")
+    collector._accumulate_usage([{"gpus": [gpu]}], 1000)
+    collector._accumulate_usage([{"gpus": [gpu]}], 1003)
+    collector._accumulate_usage([{"gpus": [gpu], "stale": True}], 1006)
+    day = next(iter(collector._usage["days"]))
+    user = collector._usage["days"][day]["alice"]
+    assert (user["alloc"], user["busy"], user["observed_alloc"]) == (6, 3, 3)
+    assert collector._usage["telemetry"][day] == {"fresh_gpu_sec": 3, "stale_gpu_sec": 3}
+
+
+def test_poll_admission_and_inventory_write_release_results_lock(monkeypatch):
+    from sgpu.common import GpuInfo, NodeMemInfo
+    callbacks = []
+    class Executor:
+        def submit(self, callback):
+            callbacks.append(callback)
+    monkeypatch.setattr(collector, "_node_executor", Executor())
+    monkeypatch.setattr(collector, "_inflight", set())
+    monkeypatch.setattr(collector, "_node_results", {})
+    monkeypatch.setattr(collector, "_node_poll_state", {})
+    monkeypatch.setattr(collector, "MAX_PENDING_POLLS", 2)
+    monkeypatch.setattr(collector, "collect_node_data", lambda *a: ([GpuInfo(index="0")], NodeMemInfo(), ""))
+    def inventory(*args):
+        assert collector._results_lock.acquire(blocking=False)
+        collector._results_lock.release()
+    monkeypatch.setattr(collector, "_update_inventory", inventory)
+    for name in ("a", "b"):
+        assert collector._poll_node_bg({"name": name, "state": "mix"}, True)
+    assert not collector._poll_node_bg({"name": "c", "state": "mix"}, True)
+    assert not collector._poll_node_bg({"name": "a", "state": "mix"}, True)
+    callbacks[0]()
+    assert collector._poll_node_bg({"name": "c", "state": "mix"}, True)
+
+
+def test_scheduler_sampler_single_flight_staleness_and_recovery(monkeypatch):
+    from concurrent.futures import Future
+    from sgpu.common import JobInfo
+    sampler = collector.SchedulerSampler()
+    calls, futures = [], []
+    class Executor:
+        def submit(self, function, **kwargs):
+            calls.append(kwargs)
+            future = Future()
+            futures.append(future)
+            return future
+    sampler.executor.shutdown()
+    sampler.executor = Executor()
+    clock = [100.0]
+    monkeypatch.setattr(collector.time, "time", lambda: clock[0])
+    monkeypatch.setattr(collector.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(collector, "SCHEDULER_SEC", 3)
+    monkeypatch.setattr(collector, "SCHEDULER_MAX_AGE", 10)
+    assert sampler.read()[-1] == "scheduler initializing"
+    sampler.read()
+    assert len(calls) == 1
+    job = JobInfo(jobid="42", user="alice", uid=123)
+    job._log_paths = ("private", "")
+    futures[0].set_result(([{"name": "n"}], [job], [], {}, {"n": {"0": "42"}}, {"42": "alice"}, {"observed_at": 100.0}, ""))
+    assert sampler.read()[1][0].uid == 123
+    clock[0] = 111.0
+    stale = sampler.read()
+    assert stale[-1] == "scheduler snapshot stale"
+    assert stale[6]["job_backend"] == "unavailable"
+    assert stale[1][0].uid == -1 and not hasattr(stale[1][0], "_log_paths")
+    assert stale[4] == stale[5] == {}
+    assert len(calls) == 2
+    futures[1].set_result(([], [], [], {}, {}, {}, {"observed_at": 111.0}, "failed"))
+    failed = sampler.read()
+    assert failed[0] == [{"name": "n"}] and failed[-1] == "failed"
+    clock[0] = 115.0
+    sampler.read()
+    futures[2].set_result(([], [], [], {}, {}, {}, {"observed_at": 115.0}, ""))
+    assert sampler.read()[-1] == ""
+
+
 def test_track_waste_idle_accumulates():
     t0 = 1000.0
     g = _gpu(jid="42")
@@ -313,3 +389,38 @@ def test_sacct_backfill_failure_counts(monkeypatch):
     collector._sacct_backfill(time.time())
     assert collector._sacct_failures == 1
     assert "sacct_days" not in collector._usage
+
+
+def test_job_telemetry_is_bound_to_valid_scheduler_node_and_owner(monkeypatch):
+    from sgpu.common import JobInfo
+    monkeypatch.setattr(collector.time, 'time', lambda: 1000)
+    job = JobInfo(jobid='123_4', uid=1000, node='gpu1', detail='JobId=789')
+    invalid = JobInfo(jobid='456', uid=-1, node='gpu1')
+    node = {'name': 'gpu1', 'stale': False, 'observed_at': 999,
+            'gpus': [{'pid_mem': {'11': '1024', '12': '2048'}, 'pid_jobid': {'11': '789', '12': 'other'}}]}
+    results = {'gpu1': {'telemetry': {'observed_at': 995, 'cpu_util': 25, 'pressure': {'io': 2},
+                                    'jobs': {'789': {'observed_at': 995, 'mem_current_mib': 512, 'cpu_cores': 2,
+                                                    'path': '/secret'}, '456': {'observed_at': 995, 'cpu_cores': 99}}}}}
+    collector._attach_telemetry([job, invalid], {'gpu1': [job, invalid]}, [node], results)
+    assert job.telemetry == {'gpu1': {'observed_at': 995, 'cpu_cores': 2, 'mem_current_mib': 512, 'vram_mib': 1024}}
+    assert invalid.telemetry == {}
+    assert node['cpu_util'] == '25.0' and node['pressure'] == {'io': '2.0'}
+    collector._attach_telemetry([job], {}, [node], results)
+    assert job.telemetry == {}
+    collector._attach_telemetry([job], {'gpu1': [job]}, [node], results, 'scheduler failed')
+    assert job.telemetry == {}
+    node['stale'] = True
+    collector._attach_telemetry([job], {'gpu1': [job]}, [node], results)
+    assert job.telemetry == {}
+    assert node['cpu_util'] == '' and node['pressure'] == {}
+
+
+def test_job_telemetry_discards_old_and_future_cgroup_values(monkeypatch):
+    from sgpu.common import JobInfo
+    monkeypatch.setattr(collector.time, 'time', lambda: 1000)
+    job = JobInfo(jobid='123', uid=1000, node='cpu1')
+    node = {'name': 'cpu1', 'stale': False, 'observed_at': 999, 'gpus': []}
+    for timestamp in (900, 1006):
+        results = {'cpu1': {'telemetry': {'observed_at': 999, 'jobs': {'123': {'observed_at': timestamp, 'cpu_cores': 4}}}}}
+        collector._attach_telemetry([job], {'cpu1': [job]}, [node], results)
+        assert job.telemetry == {}

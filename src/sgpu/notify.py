@@ -52,7 +52,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from .common import ROGUE_IGNORE, job_log_paths, mem_to_mib, run_cmd, tail_file
+from .common import ROGUE_IGNORE, mem_to_mib, run_cmd, valid_slurm_job_id
 from .runtime import atomic_write_with_signature, read_regular_file_with_signature
 
 DEBOUNCE_SEC = int(os.getenv(
@@ -252,6 +252,11 @@ class Notifier:
         # and stops a hung Slack call from stacking one thread per alert
         self._queue: "queue.Queue[tuple[str, str, float, str]]" = queue.Queue(maxsize=200)
         self._consumer: Optional[threading.Thread] = None
+        self._consumer_lock = threading.Lock()
+        self._outcome_queue = queue.Queue(maxsize=8)
+        self._outcome_worker = None
+        self._job_logs: dict = {}
+        self._finished_sources: dict = {}
         self._parent_worker: Optional[threading.Thread] = None
         self._parent_fail_ts = 0.0
         self._save_failed = False
@@ -321,7 +326,7 @@ class Notifier:
     def enabled(self) -> bool:
         return bool(self.bot_token and self.channel)
 
-    def process(self, data: dict) -> None:
+    def process(self, data: dict, *, job_log_sources: dict | None = None) -> None:
         """Diff one collector snapshot against remembered state; fire alerts."""
         self._maybe_reload()
         if not self.enabled:
@@ -412,31 +417,29 @@ class Notifier:
                 jid for jid, j in gone
                 if fail_all or j.get("user", "?") in self.job_fail_users
             ]
-            final_states = self._query_job_final_states(state_jids)
-            for jid, j in gone:
-                user = j.get("user", "?")
-                state = final_states.get(jid, "")
-                if state.startswith(_FAIL_STATES):
-                    text = self._m("job_fail", jid=jid, name=j.get("jobname", "?"),
-                                   user=user, state=state,
-                                   elapsed=j.get("elapsed", "?"))
-                    self._post(text)
-                    # stderr tail goes to the owner's DM only — the channel
-                    # is everyone, and stderr can leak paths/secrets (the
-                    # collector may read files the audience can't)
-                    dm_text = text
-                    if self.dm_users.get(user):
-                        tail = self._fail_log_tail(jid)
-                        if tail:
-                            dm_text += f"\n```{tail}```"
-                    self._post_dm(user, dm_text)
-                elif user in self.job_done_users:
-                    text = self._m("job_done", jid=jid, name=j.get("jobname", "?"),
-                                   user=user, elapsed=j.get("elapsed", "?"))
-                    self._post(text)
-                    self._post_dm(user, text)
+            deferred = {}
+            for offset in range(0, len(gone), 32):
+                batch = gone[offset:offset + 32]
+                event = ([(jid, dict(job)) for jid, job in batch],
+                         [jid for jid, _ in batch if jid in state_jids],
+                         dict(self.dm_users), set(self.job_done_users),
+                         {jid: self._job_logs[jid] for jid, _ in batch if jid in self._job_logs},
+                         self.lang)
+                if self._outcome_worker is None or not self._outcome_worker.is_alive():
+                    self._outcome_worker = threading.Thread(target=self._drain_outcomes, daemon=True, name="sgpu-outcomes")
+                    self._outcome_worker.start()
+                try:
+                    self._outcome_queue.put_nowait(event)
+                except queue.Full:
+                    deferred.update(batch)
             self._jobs = {jid: {"jobname": j.get("jobname", ""), "user": j.get("user", ""),
                                 "elapsed": j.get("elapsed", "")} for jid, j in current.items()}
+            self._jobs.update(deferred)
+            self._job_logs = dict(job_log_sources or {}) | {
+                jid: source for jid, source in self._job_logs.items() if jid in deferred
+            }
+        elif data.get("errors"):
+            self._job_logs.clear()
 
         # A job stuck PENDING on the scheduler (not a user hold/dependency)
         # for hours usually means an impossible request or a starved queue.
@@ -555,31 +558,54 @@ class Notifier:
 
         self._save()
 
+    def _drain_outcomes(self) -> None:
+        while True:
+            batch, state_ids, targets, done_users, sources, language = self._outcome_queue.get()
+            try:
+                final_states = self._query_job_final_states(state_ids)
+                self._finished_sources = sources
+                for jid, job in batch:
+                    user = job.get("user", "?")
+                    state = final_states.get(jid, "")
+                    failed = state.startswith(_FAIL_STATES)
+                    if not failed and user not in done_users:
+                        continue
+                    values = {"jid": jid, "name": job.get("jobname", "?"), "user": user,
+                              "elapsed": job.get("elapsed", "?"), "state": state}
+                    text = MSG[language]["job_fail" if failed else "job_done"].format(**values)
+                    self._post(text)
+                    member = targets.get(user)
+                    if member:
+                        dm_text = text
+                        if failed:
+                            tail = self._fail_log_tail(jid)
+                            if tail:
+                                dm_text += f"\n```{tail}```"
+                        self._post(dm_text, channel=member)
+            except Exception as exc:
+                print(f"[notify] outcome worker failed: {type(exc).__name__}", flush=True)
+            finally:
+                self._finished_sources = {}
+                self._outcome_queue.task_done()
+
     def _fail_log_tail(self, jid: str, max_lines: int = 15) -> str:
-        """Last lines of a failed job's stderr (stdout when merged). Best
-        effort: scontrol still knows the log paths for ~MinJobAge after the
-        job ends; after that fall back to the default slurm-<jid>.out in the
-        job's WorkDir. '' when nothing is readable."""
-        path = ""
-        ok, out = run_cmd(f"scontrol show job {jid}", timeout=10)
-        if ok and "JobId=" in out:
-            stdout_path, stderr_path = job_log_paths(out)
-            path = stderr_path or stdout_path
-        if not path:
-            ok, wd = run_cmd(f"sacct -j {jid} -X -n -o WorkDir --parsable2", timeout=10)
-            if ok and wd.strip():
-                cand = os.path.join(wd.strip().splitlines()[0], f"slurm-{jid}.out")
-                if os.path.exists(cand):
-                    path = cand
+        """Read only a validated, private owner/path snapshot; never rediscover paths."""
+        source = getattr(self, "_finished_sources", {}).get(jid)
+        if source is None or not valid_slurm_job_id(jid):
+            return ""
+        owner_uid, paths = source
+        if not isinstance(owner_uid, int) or owner_uid < 0 or len(paths) != 2:
+            return ""
+        path = paths[1] or paths[0]
         if not path:
             return ""
-        text = tail_file(path, limit=8192)
-        if text.startswith("("):  # missing / unreadable / empty
+        # Import at use time: collector constructs Notifier and owns this
+        # shared validation/privilege-drop boundary.
+        from .collector import _read_log_source
+        data, _fingerprint, _status = _read_log_source(path, owner_uid, None, limit=8192)
+        if data is None:
             return ""
-        lines = text.splitlines()
-        if lines and lines[0].startswith("…"):  # tail_file's truncation banner
-            lines = lines[1:]
-        return "\n".join(lines[-max_lines:]).strip()
+        return "\n".join(data.decode(errors="replace").splitlines()[-max_lines:]).strip()
 
     def _job_final_states(self, jids: List[str]) -> Dict[str, str]:
         """Outcomes for finished jobs from one slurmdbd query.
@@ -659,10 +685,11 @@ class Notifier:
     def _post(self, text: str, key: str = "", channel: str = "") -> None:
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         body = f"{text}\n_{self._origin} · {stamp}_"
-        if self._consumer is None or not self._consumer.is_alive():
-            self._consumer = threading.Thread(target=self._drain, daemon=True,
-                                              name="slack")
-            self._consumer.start()
+        with self._consumer_lock:
+            if self._consumer is None or not self._consumer.is_alive():
+                self._consumer = threading.Thread(target=self._drain, daemon=True,
+                                                  name="slack")
+                self._consumer.start()
         try:
             self._queue.put_nowait((body, key, time.time(), channel))
         except queue.Full:

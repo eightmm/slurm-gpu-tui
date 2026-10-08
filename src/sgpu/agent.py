@@ -1,7 +1,8 @@
 """Per-node resident agent: pushes lightweight node telemetry to shared FS.
 
-GPU mode collects nvidia-smi data every few seconds. CPU mode only reads
+GPU mode collects nvidia-smi data every few seconds. CPU mode reads
 /proc/meminfo at a slower interval and is normally kept alive by systemd.
+Both modes cache CPU/PSI and optional Slurm cgroup-v2 job measurements.
 The collector reads both payloads locally and falls back to SSH when stale.
 """
 from __future__ import annotations
@@ -22,6 +23,7 @@ from pathlib import Path
 from . import __build__, __version__
 from .common import NODE_DYNAMIC_PAYLOAD_CMD, NODE_PAYLOAD_CMD, parse_node_payload
 from .runtime import agent_runtime_path, atomic_write, open_append, open_lock
+from .node_telemetry import NodeSampler
 
 AGENT_DIR = Path(os.getenv("SLURM_GPU_TUI_AGENT_DIR", str(Path.home() / ".sgpu" / "nodes")))
 GPU_INTERVAL = int(os.getenv("SLURM_GPU_TUI_AGENT_SEC", "3"))
@@ -38,7 +40,10 @@ LOCK_FILE = agent_runtime_path("lock")
 LOG_FILE = agent_runtime_path("log")
 LOG_MAX_BYTES = 2 * 1024 * 1024
 
-AGENT_PAYLOAD_VERSION = 8  # v8: GPU sm/mem clocks (v7: node power dict)
+AGENT_PAYLOAD_VERSION = 9  # v9: optional node/job telemetry and GPU health
+TELEMETRY_INTERVAL = max(1.0, float(os.getenv("SLURM_GPU_TUI_TELEMETRY_SEC", "10")))
+_node_sampler = NodeSampler(interval=TELEMETRY_INTERVAL, max_jobs=int(os.getenv("SLURM_GPU_TUI_TELEMETRY_MAX_JOBS", "256")))
+_health_cache = {"next": 0.0, "fields": None, "values": {}, "observed_at": 0.0}
 
 # Fingerprint of the agent source (shared FS ⇒ same value on all hosts).
 # The collector compares this against agent.py's current mtime and restarts
@@ -224,6 +229,54 @@ def _collect_gpu_payload(now: float | None = None):
     return gpus, mem
 
 
+def _apply_gpu_health(gpus, now: float | None = None) -> None:
+    now = time.monotonic() if now is None else now
+    if now >= _health_cache["next"]:
+        try:
+            if _health_cache["fields"] is None:
+                help_result = subprocess.run(["nvidia-smi", "--help-query-gpu"], capture_output=True, text=True, timeout=3)
+                if help_result.returncode != 0:
+                    raise OSError("GPU health capability query failed")
+                fields = []
+                for choices in (("clocks_event_reasons.active", "clocks_throttle_reasons.active"), ("gpu_recovery_action",)):
+                    supported = next((field for field in choices if field in help_result.stdout), "")
+                    if supported:
+                        fields.append(supported)
+                _health_cache["fields"] = tuple(fields)
+            fields = _health_cache["fields"]
+            values = {}
+            if fields:
+                result = subprocess.run(["nvidia-smi", "--query-gpu=index," + ",".join(fields), "--format=csv,noheader,nounits"],
+                                        capture_output=True, text=True, timeout=3)
+                if result.returncode != 0:
+                    raise OSError("GPU health sample failed")
+                for line in result.stdout.splitlines()[:64]:
+                    parts = [part.strip() for part in line.split(",")]
+                    if len(parts) != len(fields) + 1 or not parts[0].isdigit():
+                        continue
+                    item = {}
+                    for field, raw in zip(fields, parts[1:], strict=True):
+                        if field.endswith(".active"):
+                            try:
+                                mask = int(raw, 0)
+                            except ValueError:
+                                continue
+                            reasons = [(4, "power-cap"), (8, "hw-slowdown"), (16, "sync-boost"),
+                                       (32, "sw-thermal"), (64, "hw-thermal"), (128, "power-brake")]
+                            item["clock_reasons"] = ",".join(label for flag, label in reasons if mask & flag) or "none"
+                        elif raw.lower() in ("none", "reset", "reboot", "drain p2p", "drain and reset"):
+                            item["recovery_action"] = raw
+                    values[parts[0]] = item
+            _health_cache.update(values=values, observed_at=time.time(), next=now + max(10, TELEMETRY_INTERVAL))
+        except (OSError, subprocess.TimeoutExpired):
+            _health_cache.update(values={}, observed_at=0.0, next=now + 60)
+    for gpu in gpus:
+        item = _health_cache["values"].get(gpu.index, {})
+        gpu.clock_reasons = item.get("clock_reasons", "")
+        gpu.recovery_action = item.get("recovery_action", "")
+        gpu.health_observed_at = _health_cache["observed_at"] if item else 0.0
+
+
 def collect_local(mode: str = "gpu") -> dict:
     """Collect a GPU or CPU-only payload locally."""
     if mode == "cpu":
@@ -231,6 +284,7 @@ def collect_local(mode: str = "gpu") -> dict:
         mem_dict = _read_meminfo()
     elif mode == "gpu":
         gpus, mem = _collect_gpu_payload()
+        _apply_gpu_health(gpus)
         gpu_dicts = [asdict(g) for g in gpus]
         mem_dict = {"total": mem.total, "used": mem.used, "avail": mem.avail}
     else:
@@ -245,6 +299,7 @@ def collect_local(mode: str = "gpu") -> dict:
         "node_kind": mode,
         "gpus": gpu_dicts,
         "mem": mem_dict,
+        "telemetry": _node_sampler.sample(),
         "power": {
             **_read_rapl_power(),
             **({"sys": v} if (v := _read_ipmi_power()) else {}),

@@ -96,6 +96,7 @@ def test_job_done_fires_when_job_leaves_queue(tmp_path):
     n.process({"nodes": [], "jobs": [_job()], "errors": ""})
     assert sent == []
     n.process({"nodes": [], "jobs": [], "errors": ""})
+    n._outcome_queue.join()
     assert len(sent) == 1 and "7" in sent[0]
 
 
@@ -107,6 +108,7 @@ def test_job_done_skipped_on_collect_error(tmp_path):
     assert sent == []
     assert "7" in n._jobs  # baseline preserved for recovery
     n.process({"nodes": [], "jobs": [], "errors": ""})
+    n._outcome_queue.join()
     assert len(sent) == 1  # real disappearance still alerts afterwards
 
 
@@ -288,6 +290,7 @@ def test_job_fail_alerts_on_bad_outcome(tmp_path):
     n._job_final_states = lambda jids: dict.fromkeys(jids, "OUT_OF_MEMORY")
     n.process({"nodes": [], "jobs": [_job()], "errors": ""})
     n.process({"nodes": [], "jobs": [], "errors": ""})
+    n._outcome_queue.join()
     assert len(sent) == 1 and "OUT_OF_MEMORY" in sent[0]
 
 
@@ -297,6 +300,7 @@ def test_job_fail_quiet_on_clean_finish(tmp_path):
     n._job_final_states = lambda jids: dict.fromkeys(jids, "COMPLETED")
     n.process({"nodes": [], "jobs": [_job()], "errors": ""})
     n.process({"nodes": [], "jobs": [], "errors": ""})
+    n._outcome_queue.join()
     assert sent == []
 
 
@@ -314,11 +318,58 @@ def test_job_fail_batches_finished_state_lookup_once(tmp_path, monkeypatch):
     jobs = [_job("7"), _job("8"), _job("9_3")]
     n.process({"nodes": [], "jobs": jobs, "errors": ""})
     n.process({"nodes": [], "jobs": [], "errors": ""})
+    n._outcome_queue.join()
 
     assert len(calls) == 1
     assert "-j 7,8,9_3" in calls[0]
     assert len(sent) == 2
     assert "7" in sent[0] and "9_3" in sent[1]
+
+
+def test_slow_outcome_query_does_not_block_and_private_paths_are_not_persisted(tmp_path):
+    import os
+    n, _sent = _mk(tmp_path, job_fail_users=["*"], dm_users={"alice": "U01"})
+    entered, release = threading.Event(), threading.Event()
+    posts = []
+    n._post = lambda text, key="", channel="": posts.append((channel, text))
+    def slow_query(jids):
+        entered.set()
+        assert release.wait(2)
+        return dict.fromkeys(jids, "FAILED")
+    n._job_final_states = slow_query
+    log = tmp_path / "private-log"
+    log.write_text("synthetic failure")
+    base = {"nodes": [], "errors": ""}
+    n.process(dict(base, jobs=[_job()]), job_log_sources={"7": (os.geteuid(), ("", str(log)))})
+    assert str(log) not in n._state_file.read_text()
+    try:
+        n.process(dict(base, jobs=[]))
+        assert entered.wait(1)
+        assert posts == []
+        n.dm_users["alice"] = "U02"
+    finally:
+        release.set()
+    n._outcome_queue.join()
+    assert any(channel == "U01" and "synthetic failure" in text for channel, text in posts)
+    assert all("synthetic failure" not in text for channel, text in posts if not channel)
+    assert all(channel != "U02" for channel, _ in posts)
+
+
+def test_outcome_backpressure_retries_jobs_instead_of_losing_them(tmp_path):
+    from queue import Queue
+    from types import SimpleNamespace
+    n, _ = _mk(tmp_path, job_done_users=["alice"])
+    n._outcome_queue = Queue(maxsize=1)
+    n._outcome_queue.put("busy")
+    n._outcome_worker = SimpleNamespace(is_alive=lambda: True)
+    n.process({"nodes": [], "jobs": [_job()], "errors": ""})
+    n.process({"nodes": [], "jobs": [], "errors": ""})
+    assert "7" in n._jobs
+    n._outcome_queue.get()
+    n._outcome_queue.task_done()
+    n.process({"nodes": [], "jobs": [], "errors": ""})
+    assert "7" not in n._jobs
+    assert n._outcome_queue.get()[0][0][0] == "7"
 
 
 def test_job_final_states_exact_jobidraw_ignores_steps_and_duplicates(
@@ -410,6 +461,7 @@ def test_job_done_also_dms_the_user(tmp_path):
     n._post = lambda text, key="", channel="": calls.append((text, channel))
     n.process({"nodes": [], "jobs": [_job()], "errors": ""})
     n.process({"nodes": [], "jobs": [], "errors": ""})
+    n._outcome_queue.join()
     channels = [c for _, c in calls]
     assert "" in channels and "U012AB" in channels  # channel post + DM
 
@@ -421,6 +473,7 @@ def test_notifier_disabled_without_bot_token(tmp_path):
     n._post = lambda text, key="", channel="": calls.append(channel)
     n.process({"nodes": [], "jobs": [_job()], "errors": ""})
     n.process({"nodes": [], "jobs": [], "errors": ""})
+    n._outcome_queue.join()
     assert calls == []
 
 
@@ -447,6 +500,7 @@ def test_daily_parent_created_without_alerts(tmp_path):
     n._slack_api = lambda method, payload: calls.append((method, payload)) or {"ts": "123.456"}
 
     n.process({"nodes": [], "jobs": [], "errors": ""})
+    n._outcome_queue.join()
     assert n._parent_worker is not None
     n._parent_worker.join(timeout=1)
 
@@ -458,6 +512,7 @@ def test_daily_parent_created_without_alerts(tmp_path):
     assert n._thread_ts == "123.456"
 
     n.process({"nodes": [], "jobs": [], "errors": ""})
+    n._outcome_queue.join()
     assert len(calls) == 1
 
 

@@ -23,10 +23,12 @@ from textual.widgets import (
 )
 
 from .cells import (
-    WASTE_MIN_SEC, classify_gpu, collect_waste, ellipsize, fmt_idle_age,
-    fmt_span, fmt_start_time, gpu_strip, highlight_row, make_bar, mem_cell,
-    pct_color, power_cell, remaining_cell, state_cell, temp_cell, util_cell,
+    WASTE_MIN_SEC, collect_waste, ellipsize, fmt_idle_age,
+    fmt_span, fmt_start_time, gpu_strip, highlight_row,
+    power_cell, remaining_cell, state_cell, temp_cell, util_cell,
     vram_cell,
+    gpu_health_status, node_gpu_classes, job_resource_summary,
+    pending_reason, pending_wait_seconds, pending_explanation,
 )
 from .common import (
     JobInfo, NodeInfo, NodeSSHResult, PendingJob,
@@ -40,6 +42,8 @@ from .screens import (
     UserSelectScreen, WasteScreen,
 )
 from .usage import render_usage
+from .telemetry import ObservationHistory, metric_number as _metric_number
+from .node_telemetry import TELEMETRY_MAX_AGE
 
 
 # ── Daemon data reader ────────────────────────────────────────────────────
@@ -125,15 +129,17 @@ class SlurmGpuTui(App):
     CSS = """
     Screen { layout: vertical; }
     #status { height: 1; background: $surface; color: $text-muted; padding: 0 1; }
-    #summary { height: 3; padding: 0 1; background: $surface; }
+    #summary { height: 2; padding: 0 1; background: $surface; }
     #main-tabs { height: 1fr; }
     #cpu-summary { height: 2; padding: 0 1; background: $surface; }
     #cpu-tbl { height: 1fr; }
+    #jobs-tbl { height: 1fr; }
     #usage-scroll { height: 1fr; padding: 1 2; }
     #tbl-container { height: 1fr; layout: vertical; }
     #tbl { height: 1fr; }
-    #pending-container { height: auto; max-height: 12; border-top: solid $primary; }
-    #pending-tbl { height: auto; max-height: 10; }
+    #trend { height: 2; padding: 0 1; }
+    #pending-container { height: auto; max-height: 9; border-top: solid $primary; }
+    #pending-tbl { height: auto; max-height: 7; }
     #pending-label { background: $primary; color: $text; padding: 0 1; }
     #search-input { display: none; height: 1; border: none; padding: 0 1; background: $surface; }
     """
@@ -147,6 +153,7 @@ class SlurmGpuTui(App):
         ("p", "toggle_partition_filter", "Partition"),
         ("m", "toggle_my_filter", "Mine"),
         ("i", "toggle_idle_filter", "Free GPUs"),
+        ("f", "show_free", "Capacity"),
         ("space", "toggle_collapse", "Collapse"),
         ("d", "toggle_details", "Details"),
         ("j", "cursor_down", "↓"),
@@ -160,6 +167,9 @@ class SlurmGpuTui(App):
         ("1", "tab_gpu", "GPU"),
         ("2", "tab_cpu", "CPU"),
         ("3", "tab_usage", "Usage"),
+        ("4", "tab_jobs", "Jobs"),
+        ("v", "toggle_pending", "Pending"),
+        ("t", "toggle_trend", "Trend"),
         ("e", "export_json", "Export JSON"),
         ("question_mark", "help", "Help"),
         ("q", "quit", "Quit"),
@@ -170,6 +180,7 @@ class SlurmGpuTui(App):
         yield Static("loading...", id="summary")
         with TabbedContent(initial="pane-gpu", id="main-tabs"):
             with TabPane("GPU [1]", id="pane-gpu"):
+                yield Static("", id="trend")
                 with Vertical(id="tbl-container"):
                     yield DataTable(id="tbl")
                     with Vertical(id="pending-container"):
@@ -182,6 +193,8 @@ class SlurmGpuTui(App):
             with TabPane("Usage [3]", id="pane-usage"):
                 with VerticalScroll(id="usage-scroll"):
                     yield Static("", id="usage-view")
+            with TabPane("Jobs [4]", id="pane-jobs"):
+                yield DataTable(id="jobs-tbl")
         yield Input(placeholder="/ filter: node or user (Esc to clear)", id="search-input")
         yield Static("", id="status")
         yield Footer()
@@ -190,20 +203,23 @@ class SlurmGpuTui(App):
         self.tbl = self.query_one("#tbl", DataTable)
         self.pending_tbl = self.query_one("#pending-tbl", DataTable)
         self.cpu_tbl = self.query_one("#cpu-tbl", DataTable)
+        self.jobs_tbl = self.query_one("#jobs-tbl", DataTable)
         self.cpu_summary = self.query_one("#cpu-summary", Static)
         self.usage_view = self.query_one("#usage-view", Static)
         self.summary_w = self.query_one("#summary", Static)
         self.status_w = self.query_one("#status", Static)
+        self.trend_w = self.query_one("#trend", Static)
+        self._history = ObservationHistory()
+        self._compact = self.size.width < 130
+        self._pending_expanded = False
+        self._show_trend = False
+        self.trend_w.display = False
+        self.pending_tbl.display = False
 
-        self.cpu_tbl.add_column("Node", key="c_node", width=12)
-        self.cpu_tbl.add_column("State", key="c_state", width=10)
-        self.cpu_tbl.add_column("Partition", key="c_part", width=14)
-        self.cpu_tbl.add_column("CPU alloc", key="c_cpu", width=34)
-        self.cpu_tbl.add_column("Load", key="c_load", width=8)
-        self.cpu_tbl.add_column("RAM", key="c_ram", width=22)
-        self.cpu_tbl.add_column("CPU users (cores)", key="c_users")
         self.cpu_tbl.cursor_type = "row"
         self.cpu_tbl.zebra_stripes = True
+        self.jobs_tbl.cursor_type = "row"
+        self.jobs_tbl.zebra_stripes = True
         # NOT os.getlogin(): it raises OSError without a controlling TTY
         # (tmux detach, systemd, nohup)
         try:
@@ -220,14 +236,6 @@ class SlurmGpuTui(App):
         self.tbl.cursor_type = "row"
         self.tbl.zebra_stripes = True
 
-        self.pending_tbl.add_column("JobID", key="p_jobid")
-        self.pending_tbl.add_column("User", key="p_user")
-        self.pending_tbl.add_column("GPUs", key="p_gpu")
-        self.pending_tbl.add_column("Partition", key="p_part")
-        self.pending_tbl.add_column("JobName", key="p_name")
-        self.pending_tbl.add_column("Reason", key="p_reason")
-        self.pending_tbl.add_column("Priority", key="p_pri")
-        self.pending_tbl.add_column("Est.Start", key="p_start")
         self.pending_tbl.cursor_type = "row"
         self.pending_tbl.zebra_stripes = True
 
@@ -244,6 +252,7 @@ class SlurmGpuTui(App):
         self._last_data_mtime: float | None = None
         self._force_render = False
         self._row_job: Dict[str, str] = {}  # table row key -> jobid for detail popup
+        self._jobs_row_job: Dict[str, str] = {}
         self._pending_user: Dict[str, str] = {}  # pending jobid -> user (for cancel)
         # toast baselines (None = no refresh seen yet)
         self._toast_jobs: Optional[Dict[str, JobInfo]] = None
@@ -258,10 +267,11 @@ class SlurmGpuTui(App):
         # parsing and summary work on large clusters.  Keep a value-only model
         # of the last rendered pane so the common case (a fresh collector file
         # whose visible values did not change) can leave the table untouched.
-        # Any structural, ordering, filter, or displayed-cell change falls back
-        # to the existing full rebuild, preserving compatibility with old
-        # Textual versions whose row-mutation APIs differ from current ones.
+        # Reuse unchanged node rows; update cells when row/column keys match.
+        # Structural or ordering changes rebuild while retaining cursor/scroll.
         self._last_gpu_view_signature: tuple | None = None
+        self._table_models: dict = {}
+        self._gpu_node_rows_cache: dict = {}
         self._last_cpu_view_signature: tuple | None = None
         self._auto_collapsed = False  # big clusters start collapsed, once
         self._last_applied: Optional[Tuple[List[NodeInfo], List[JobInfo], List[PendingJob], str]] = None
@@ -273,6 +283,13 @@ class SlurmGpuTui(App):
         self._search_timer: Timer | None = None
         self._reset_timer(self.refresh_sec)
         self.refresh_all()
+        # Initial TabPane layout can leave the hidden search Input focused.
+        self.call_after_refresh(self._focus_initial_table)
+
+    def _focus_initial_table(self) -> None:
+        search = self.query_one("#search-input", Input)
+        if search.has_focus and not search.display:
+            self._focus_tab()
 
     def _reset_timer(self, sec: int) -> None:
         if self._timer is not None:
@@ -356,8 +373,6 @@ class SlurmGpuTui(App):
         """Cycle: all -> partition A -> partition B -> ... -> all."""
         parts: List[str] = []
         for n in self._nodes_cache:
-            if not n.has_gpu:
-                continue
             for p in (n.partition or "").split(","):
                 if p and p not in parts:
                     parts.append(p)
@@ -382,8 +397,10 @@ class SlurmGpuTui(App):
 
     def _job_under_cursor(self) -> str:
         """jobid of the row under the cursor, in whichever table has focus."""
-        tables = [t for t in (self.tbl, self.pending_tbl) if t.has_focus] or [self.tbl]
+        tables = [t for t in (self.tbl, self.pending_tbl, self.jobs_tbl) if t.has_focus] or [self._active_scrollable()]
         for tbl in tables:
+            if not isinstance(tbl, DataTable):
+                continue
             if tbl.row_count == 0:
                 continue
             try:
@@ -395,7 +412,7 @@ class SlurmGpuTui(App):
                 return key[5:]
             if key.startswith("hdr_"):
                 return ""
-            return self._row_job.get(key, "")
+            return self._jobs_row_job.get(key, self._row_job.get(key, ""))
         return ""
 
     def action_show_history(self) -> None:
@@ -501,26 +518,76 @@ class SlurmGpuTui(App):
         self._rerender()
 
     def _setup_columns(self) -> None:
-        self.tbl.clear(columns=True)
-        self.tbl.add_column("Node", key="node", width=12)
-        self.tbl.add_column("State", key="state", width=10)
-        self.tbl.add_column("Part", key="part", width=9)
-        if not self.show_details:
-            # details mode trades the CPU/RAM columns for Temp/Power/Job info
-            self.tbl.add_column("CPU a/t", key="cpu", width=8)
-            self.tbl.add_column("RAM", key="ram", width=20)
-        self.tbl.add_column("GPU#", key="gpu_idx")
-        self.tbl.add_column("GPU Name", key="gpu_name")
-        self.tbl.add_column("Util", key="util")
-        self.tbl.add_column("VRAM", key="vram")
+        compact = self._compact
+        columns = [("Node / GPU", "node", 10 if compact else 14)]
+        if not compact:
+            columns.append(("Model", "gpu_name", 13))
+        columns += [("Util", "util", 5 if compact else 15),
+                    ("VRAM", "vram", 11 if compact else 26),
+                    ("User / job", "user", 18), ("Left", "remaining", 8),
+                    ("Health", "health", 10)]
         if self.show_details:
-            self.tbl.add_column("T", key="temp")
-            self.tbl.add_column("Power", key="power")
-        self.tbl.add_column("User", key="user", width=14 if self.show_details else 17)
+            columns += [("Temp", "temp", 9), ("Power", "power", 18),
+                        ("JobID", "jobid", 10), ("JobName", "jobname", 16)]
+        cpu = [("Node", "c_node", 12), ("Alloc C", "c_cpu", 9),
+               ("CPU%", "c_actual", 5), ("Load", "c_load", 5),
+               ("RAM", "c_mem", 11), ("PSI C/M/I", "c_psi", 11),
+               ("Users", "c_users", 9 if compact else 20)]
+        if not compact:
+            cpu.insert(1, ("State", "c_state", 10))
+            cpu.insert(2, ("Part", "c_part", 14))
+        pend = [("JobID", "p_jobid", 10), ("User", "p_user", 9),
+                ("GPU", "p_gpu", 3), ("Reason", "p_reason", 19 if compact else 26),
+                ("Wait", "p_wait", 6), ("Est.Start", "p_start", 15)]
+        if not compact:
+            pend[3:3] = [("Part", "p_part", 10), ("Name", "p_name", 16)]
+            pend.insert(-2, ("Priority", "p_pri", 8))
+        jobs = [("JobID", "j_id", 9), ("User", "j_user", 8),
+                ("State", "j_state", 4), ("GPU", "j_gpu", 3),
+                ("CPU a/r", "j_cpu", 8), ("RAM a/r", "j_mem", 11),
+                ("Left/wait", "j_span", 8), ("Coverage / reason", "j_note", 10 if compact else 22)]
+        if not compact:
+            jobs.insert(-2, ("PID VRAM", "j_vram", 10))
         if self.show_details:
-            self.tbl.add_column("JobID", key="jobid")
-            self.tbl.add_column("JobName", key="jobname")
-        self.tbl.add_column("Remaining", key="remaining")
+            jobs += [("Nodes", "j_nodes", 18), ("Name", "j_name", 20)]
+        for table, specs in ((self.tbl, columns), (self.cpu_tbl, cpu),
+                             (self.pending_tbl, pend), (self.jobs_tbl, jobs)):
+            if table.row_count:
+                views = getattr(self, "_column_views", {})
+                key = table.coordinate_to_cell_key(Coordinate(table.cursor_row, 0)).row_key
+                views[table.id] = (table.cursor_row, table.cursor_column, table.scroll_x, table.scroll_y, key)
+                self._column_views = views
+            table.clear(columns=True)
+            for label, key, width in specs:
+                table.add_column(label, key=key, width=width)
+        self._last_gpu_view_signature = self._last_cpu_view_signature = None
+        self._gpu_node_rows_cache = {}
+
+    def on_resize(self, event) -> None:
+        if not hasattr(self, "_last_applied"):
+            return
+        compact = event.size.width < 130
+        if compact != self._compact:
+            self._compact = compact
+            self._setup_columns()
+        if self._last_applied is not None:
+            self._rerender()
+
+    def action_toggle_pending(self) -> None:
+        self._pending_expanded = not self._pending_expanded
+        self.pending_tbl.display = self._pending_expanded
+        if not self._pending_expanded and self.pending_tbl.has_focus:
+            self.tbl.focus()
+        self._rerender()
+
+    def action_toggle_trend(self) -> None:
+        self._show_trend = not self._show_trend
+        self.trend_w.display = self._show_trend
+        self._rerender()
+
+    def on_click(self, event) -> None:
+        if getattr(event.widget, "id", None) == "pending-label":
+            self.action_toggle_pending()
 
     def action_toggle_idle_filter(self) -> None:
         self.idle_filter_only = not self.idle_filter_only
@@ -541,12 +608,42 @@ class SlurmGpuTui(App):
     def action_show_waste(self) -> None:
         self.push_screen(WasteScreen(collect_waste(self._nodes_cache, WASTE_MIN_SEC)))
 
+    def action_show_free(self) -> None:
+        from collections import defaultdict
+        grouped = defaultdict(lambda: defaultdict(int))
+        classes = {node.name: node_gpu_classes(node) for node in self._nodes_cache}
+        for node in self._nodes_cache:
+            if not self._node_visible(node, classes):
+                continue
+            for gpu, kind in zip(node.gpus, classes[node.name], strict=True):
+                if kind == "free":
+                    capacity = _metric_number(gpu.mem_total)
+                    label = f"{gpu.name or '?'} / {capacity / 1024:.0f}GiB" if capacity else f"{gpu.name or '?'} / ?GiB"
+                    grouped[label][node.name] += 1
+        lines = ["Current GPU view: user, partition, search and free-GPU filters apply.",
+                 "Stale/unavailable nodes and GPUs needing recovery are excluded.", ""]
+        for model, counts in sorted(grouped.items()):
+            lines += [f"{model}: {sum(counts.values())} free; single-node max {max(counts.values())}",
+                      "  " + ", ".join(f"{name} × {count}" for name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])))]
+        if not grouped:
+            lines.append("No observed free capacity in this view.")
+        lines.append("\nObserved capacity is not a reservation or scheduler admission guarantee.")
+        self.push_screen(DetailScreen("Free GPU capacity", "\n".join(lines)))
+
     def _set_tab(self, pane: str) -> None:
         self.query_one("#main-tabs", TabbedContent).active = pane
+        self._focus_tab()
+
+    def _focus_tab(self) -> None:
+        pane = self.query_one("#main-tabs", TabbedContent).active
         if pane == "pane-gpu":
             self.tbl.focus()
         elif pane == "pane-cpu":
             self.cpu_tbl.focus()
+        elif pane == "pane-jobs":
+            self.jobs_tbl.focus()
+        elif pane == "pane-usage":
+            self.query_one("#usage-scroll", VerticalScroll).focus()
 
     def action_tab_gpu(self) -> None:
         self._set_tab("pane-gpu")
@@ -556,6 +653,9 @@ class SlurmGpuTui(App):
 
     def action_tab_usage(self) -> None:
         self._set_tab("pane-usage")
+
+    def action_tab_jobs(self) -> None:
+        self._set_tab("pane-jobs")
 
     def action_show_usage(self) -> None:
         self._set_tab("pane-usage")
@@ -567,19 +667,34 @@ class SlurmGpuTui(App):
         elif key.startswith("pend_"):
             self._show_detail("job", key[5:])
         else:
-            jid = self._row_job.get(key, "")
+            jid = self._jobs_row_job.get(key, self._row_job.get(key, ""))
             if jid:
                 self._show_detail("job", jid)
 
     def _gpu_proc_table(self, node_name: str) -> str:
         """Per-GPU process lines (pid/user/VRAM/job) for the node detail modal."""
         node = next((n for n in self._nodes_cache if n.name == node_name), None)
-        if node is None or not node.gpus:
+        if node is None:
             return ""
-        lines = ["", "GPU processes:"]
+        fresh = self._node_telemetry_fresh(node)
+        lines = ["", "Node telemetry:",
+                 f"  CPU actual: {node.cpu_util + '%' if fresh and node.cpu_util else '?'}; allocated: {node.cpu_alloc}/{node.cpus}",
+                 "  PSI some avg10 (%): " + ", ".join(f"{resource}={node.pressure.get(resource, '?') if fresh else '?'}" for resource in ("cpu", "memory", "io")),
+                 f"  Telemetry observed: {node.telemetry_observed_at:.0f}; node data age: {node.data_age_sec:.0f}s",
+                 f"  Scheduler state: {node.state}; partition: {node.partition}; RAM: {self._ram_brief(node)}"]
+        lines.append(f"  Source: {node.source or '?'}; scheduler age: {node.scheduler_age_sec:.0f}s")
+        if node.jobs_truncated:
+            lines.append("  Job cgroup scan reached its limit; some samples are unavailable.")
+        lines.append("GPU health / processes:")
         for g in node.gpus:
+            status = "STALE" if node.stale else gpu_health_status(g)[0]
+            health_fresh = g.health_observed_at > 0 and -5 <= time.time() - g.health_observed_at <= TELEMETRY_MAX_AGE
+            lines += [f"  GPU{g.index} ({g.name}): {status}",
+                      f"    Temp {g.temp or '?'}C; power {g.power or '?'}/{g.power_cap or '?'}W; SM/memory clocks {g.sm_clock or '?'}/{g.mem_clock or '?'} MHz",
+                      f"    ECC uncorrectable aggregate: {g.ecc or '?'} (cumulative, not new faults)",
+                      f"    Clock events: {g.clock_reasons or '?' if health_fresh else '?'}; recovery: {g.recovery_action or '?' if health_fresh else '?'}"]
             if not g.pids:
-                lines.append(f"  GPU{g.index} ({g.name})  —")
+                lines.append("    processes: —")
                 continue
             for pid in g.pids:
                 jid = g.pid_jobid.get(pid, "")
@@ -592,6 +707,23 @@ class SlurmGpuTui(App):
                 job = f"  job {jid}" if jid else ""
                 lines.append(f"  GPU{g.index} ({g.name})  pid {pid}  {user}  VRAM {vram}{job}")
         return "\n".join(lines)
+
+    def _job_telemetry_detail(self, job: JobInfo) -> str:
+        summary = job_resource_summary(job, self._nodes_cache)
+        def value(key, unit="", memory=False):
+            return self._resource_actual(summary, key, memory) + unit
+        detail = (f"\n\nJob telemetry: {summary['sampled_nodes']}/{summary['expected_nodes']} nodes sampled"
+                f"\n  Requested: {job.cpu_count} CPUs; RAM {job.mem or '?'}; {job.gpu_count} GPUs"
+                f"\n  CPU actual: {value('cpu_cores', ' cores')}"
+                f"\n  Cgroup memory current / peak / finite limit: {value('mem_current_mib', memory=True)} / {value('mem_peak_mib', memory=True)} / {value('mem_limit_mib', memory=True)}"
+                f"\n  OOM kills (cgroup lifetime): {value('oom_kill')}"
+                f"\n  PID-attributed GPU VRAM: {value('vram_mib', memory=True)}"
+                "\n  ? = unavailable; ~ = incomplete node coverage. Cgroup memory includes cache."
+                "\n  Peak is a sum of node-local peaks; they may occur at different times.")
+        for key, label in (("cpu_cores", "CPU"), ("mem_current_mib", "RAM"), ("mem_peak_mib", "peak"),
+                           ("mem_limit_mib", "finite limit"), ("oom_kill", "OOM"), ("vram_mib", "PID VRAM")):
+            detail += f"\n  {label} coverage: {summary.get(key + '_nodes', 0)}/{summary['expected_nodes']} nodes"
+        return detail
 
     @work(thread=True)
     def _show_detail(self, kind: str, name: str) -> None:
@@ -612,6 +744,14 @@ class SlurmGpuTui(App):
         if kind == "node":
             out += self._gpu_proc_table(name)
         if kind == "job":
+            if j is not None:
+                out += self._job_telemetry_detail(j)
+            elif pending is not None:
+                wait = pending_wait_seconds(pending)
+                out += (f"\n\nPending: {pending_reason(pending)}; wait {int(wait)}s" if wait is not None else f"\n\nPending: {pending_reason(pending)}; wait ?")
+                out += f"\n  Submitted: {pending.submit_time or '?'}; eligible: {pending.eligible_time or '?'}; QOS: {pending.qos or '?'}"
+                out += f"\n  Estimated start: {pending.start_time or '?'} (scheduler estimate)"
+                out += f"\n  {pending_explanation(pending)}"
             script, src = "", ""
             # 1) collector-shared script (SHARE_SCRIPTS on a privileged collector)
             if j is not None and j.script:
@@ -637,7 +777,7 @@ class SlurmGpuTui(App):
                 ok3, s3 = run_cmd(f"sstat -a -j {control_name} "
                                   "--format=JobID%16,AveCPU,MaxRSS,MaxVMSize,MaxDiskRead,MaxDiskWrite")
                 if ok3 and len(s3.strip().splitlines()) > 2:
-                    out += "\n\nLive usage (sstat, per step):\n" + s3
+                    out += "\n\nLive usage (sstat, per step; MaxRSS is the largest single task):\n" + s3
             # Fall back to the collector's shared mirror for jobs whose logs
             # our account cannot read — without it these tabs are blank for
             # everyone but the owner.
@@ -665,6 +805,8 @@ class SlurmGpuTui(App):
         active = self.query_one("#main-tabs", TabbedContent).active
         if active == "pane-cpu":
             return self.cpu_tbl
+        if active == "pane-jobs":
+            return self.jobs_tbl
         if active == "pane-usage":
             return self.query_one("#usage-scroll", VerticalScroll)
         return self.tbl
@@ -712,7 +854,7 @@ class SlurmGpuTui(App):
         if event.input.id == "search-input":
             self._cancel_search_rerender()
             self._rerender()
-            self.tbl.focus()
+            self._focus_tab()
 
     def on_key(self, event) -> None:
         if event.key == "escape":
@@ -721,7 +863,7 @@ class SlurmGpuTui(App):
                 w.clear()
                 w.display = False
                 self.search_text = ""
-                self.tbl.focus()
+                self._focus_tab()
                 self._cancel_search_rerender()
                 self._rerender()
             return
@@ -761,7 +903,7 @@ class SlurmGpuTui(App):
         # Fallback: direct collection (2-phase)
         (
             nodes_raw, jobs, pending, node_jobs, gpu_alloc, alloc_user_map,
-            _scheduler_status, err1,
+            scheduler_status, err1,
         ) = collect_basic()
         node_names = [n["name"] for n in nodes_raw]
 
@@ -773,7 +915,8 @@ class SlurmGpuTui(App):
                 gpus, mem = self._node_cache[name]
                 cached_results[name] = NodeSSHResult(gpus, mem, "")
                 stale_now.append(name)
-        phase1_nodes = build_nodes(nodes_raw, node_jobs, cached_results, stale_now)
+        phase1_nodes = build_nodes(nodes_raw, node_jobs, cached_results, stale_now,
+                                   scheduler_status=scheduler_status, scheduler_error=err1)
         apply_gpu_alloc(phase1_nodes, gpu_alloc, jobs, alloc_user_map)
         loading_msg = f"loading GPUs from {len(node_names)} nodes..."
         self.call_from_thread(self._apply, phase1_nodes, jobs, pending, loading_msg if node_names else err1)
@@ -785,7 +928,8 @@ class SlurmGpuTui(App):
                 cache=self._node_cache,
             )
             all_errors = [x for x in [err1] + ssh_errors if x]
-            phase2_nodes = build_nodes(nodes_raw, node_jobs, ssh_results, stale_nodes)
+            phase2_nodes = build_nodes(nodes_raw, node_jobs, ssh_results, stale_nodes,
+                                       scheduler_status=scheduler_status, scheduler_error=err1)
             apply_gpu_alloc(phase2_nodes, gpu_alloc, jobs, alloc_user_map)
             self.call_from_thread(self._apply, phase2_nodes, jobs, pending, " | ".join(all_errors) if all_errors else "")
 
@@ -843,7 +987,7 @@ class SlurmGpuTui(App):
             self._toast_pending = mine_pend
         self._toast_down = down_now
 
-    def _node_visible(self, node: NodeInfo, node_classes: Dict[str, List[str]]) -> bool:
+    def _node_visible(self, node: NodeInfo, node_classes: Dict[str, List[str]], gpu_filter: bool = True) -> bool:
         """GPU-tab filters: user/partition filters, free-GPU filter, live search."""
         if self.filter_partition:
             node_parts = {p for p in (node.partition or "").split(",") if p}
@@ -856,7 +1000,7 @@ class SlurmGpuTui(App):
             has_user = has_user or any(j.user == fu for j in node.jobs)
             if not has_user:
                 return False
-        if self.idle_filter_only and "free" not in node_classes[node.name]:
+        if gpu_filter and self.idle_filter_only and "free" not in node_classes[node.name]:
             return False
         if self.search_text:
             node_users = set()
@@ -867,14 +1011,19 @@ class SlurmGpuTui(App):
             for j in node.jobs:
                 node_users.add(j.user)
             if (self.search_text not in node.name.lower() and
-                    not any(self.search_text in u.lower() for u in node_users)):
+                    not any(self.search_text in u.lower() for u in node_users) and
+                    not any(self.search_text in value.lower() for job in node.jobs for value in (job.jobid, job.jobname))):
                 return False
         return True
 
-    def on_tabbed_content_activated(self, event) -> None:
+    def on_tabbed_content_tab_activated(self, event) -> None:
+        if event.tabbed_content.id != "main-tabs":
+            return
         # tabs render lazily — repaint the newly shown pane with current data
         if getattr(self, "_timer", None) is not None:  # fires during compose too
             self._rerender()
+            if not self.query_one("#search-input", Input).display:
+                self._focus_tab()
 
     def _apply(self, nodes: List[NodeInfo], jobs: List[JobInfo], pending: List[PendingJob], err: str) -> None:
         self._toast_check(nodes, jobs, pending, err)
@@ -883,10 +1032,19 @@ class SlurmGpuTui(App):
         self._jobs_by_id = {j.jobid: j for j in jobs}
         self._pending_by_id = {j.jobid: j for j in pending}
         self._last_applied = (nodes, jobs, pending, err)
+        nodes = list(nodes)
+        now = time.time()
+        self._history.observe(nodes, now)
+        self.trend_w.update(Text(
+            f"Cluster 5m GPU% {self._history.sparkline(1, now)}  "
+            f"VRAM% {self._history.sparkline(2, now)}\n"
+            f"GPU W {self._history.sparkline(3, now)}  · = no fresh observation",
+            style="dim cyan",
+        ))
 
         # Big clusters: start with every node collapsed (one line per node),
         # Space expands. Only on first data, never after user interaction.
-        if not self._auto_collapsed:
+        if not self._auto_collapsed and nodes:
             self._auto_collapsed = True
             limit = int(os.getenv("SLURM_GPU_TUI_AUTO_COLLAPSE_NODES", "12"))
             gpu_nodes_n = sum(1 for n in nodes if n.has_gpu)
@@ -895,13 +1053,13 @@ class SlurmGpuTui(App):
 
         # Pre-classify every GPU (header strips, FREE chip, sorting, filters)
         node_classes: Dict[str, List[str]] = {
-            n.name: [classify_gpu(g) for g in n.gpus] for n in nodes
+            n.name: node_gpu_classes(n) for n in nodes
         }
 
         # Sorting nodes logic (simplistic)
         if self.sort_by == "util":
             # Sort by max util on node
-            nodes.sort(key=lambda n: max([float(g.util or 0) for g in n.gpus] + [0]), reverse=True)
+            nodes.sort(key=lambda n: max([_metric_number(g.util) or 0 for g in n.gpus] + [0]), reverse=True)
         elif self.sort_by == "user":
             # Nodes with current user first
             nodes.sort(key=lambda n: any(self.current_user in g.users for g in n.gpus), reverse=True)
@@ -930,507 +1088,400 @@ class SlurmGpuTui(App):
                 total_gpus += 1
                 stats = partition_gpu_stats.setdefault(stat_key, [0, 0])
                 stats[1] += 1
-                try:
-                    if float(gpu.util) > 5:
-                        busy_gpus += 1
-                        stats[0] += 1
-                except (ValueError, TypeError):
-                    pass
+                if not node.stale and (_metric_number(gpu.util) or 0) > 5:
+                    busy_gpus += 1
+                    stats[0] += 1
 
         active_pane = self.query_one("#main-tabs", TabbedContent).active
         if active_pane == "pane-gpu":
             self._apply_gpu_tab(visible, node_classes, pending)
         elif active_pane == "pane-cpu":
             self._apply_cpu_tab(nodes)
+        elif active_pane == "pane-jobs":
+            self._pending_user = {job.jobid: job.user for job in pending}
+            self._apply_jobs_tab(jobs, pending, nodes)
         elif active_pane == "pane-usage":
             self.usage_view.update(render_usage())
 
         self._apply_summary(nodes, jobs, pending, err, node_classes,
                             total_gpus, busy_gpus, partition_gpu_stats)
 
+    def _sync_table(self, table: DataTable, rows: list) -> None:
+        columns = tuple(table.columns)
+        keys = tuple(key for key, _ in rows)
+        previous = self._table_models.get(table.id)
+        if previous is not None and previous[0] == columns and previous[1] == keys and table.row_count == len(rows):
+            for (key, cells), (_old_key, old_cells) in zip(rows, previous[2], strict=True):
+                if cells is old_cells:
+                    continue
+                for column, old, new in zip(columns, old_cells, cells, strict=True):
+                    # Rich Text equality omits its base style.
+                    if old != new or old.style != new.style:
+                        table.update_cell(key, column, new, update_width=True)
+        else:
+            row, col = table.cursor_row, table.cursor_column
+            scroll_x, scroll_y = table.scroll_x, table.scroll_y
+            key = None
+            try:
+                key = table.coordinate_to_cell_key(Coordinate(row, 0)).row_key
+            except Exception:
+                pass
+            saved = getattr(self, "_column_views", {}).pop(table.id, None)
+            if saved is not None:
+                row, col, scroll_x, scroll_y, key = saved
+            table.clear()
+            for row_key, cells in rows:
+                table.add_row(*cells, key=row_key)
+            if table.row_count:
+                try:
+                    target = table.get_row_index(key) if key is not None else row
+                except Exception:
+                    target = row
+                table.move_cursor(row=min(target, table.row_count - 1), column=col, animate=False)
+            table.scroll_to(x=scroll_x, y=scroll_y, animate=False)
+        self._table_models[table.id] = (columns, keys, rows)
+
+    def _row_cells(self, table: DataTable, values: dict) -> list:
+        cells = []
+        for key, column in table.columns.items():
+            value = values.get(str(key.value), Text(""))
+            cell = value.copy() if isinstance(value, Text) else Text(str(value))
+            cell.truncate(column.width, overflow="ellipsis")
+            cells.append(cell)
+        return cells
+
+    @staticmethod
+    def _ram_brief(node: NodeInfo) -> str:
+        total = _metric_number(node.mem_total)
+        if total is None or total <= 0:
+            return "?"
+        available = _metric_number(node.mem_avail)
+        if available is None:
+            available = _metric_number(node.mem_free)
+        allocated = _metric_number(node.mem_alloc)
+        used = total - available if available is not None else allocated
+        prefix = "~" if available is None else ""
+        if used is None:
+            return f"?/{total / 1024:.0f}G"
+        return f"{prefix}{max(0, min(total, used)) / 1024:.0f}/{total / 1024:.0f}G"
+
+    @staticmethod
+    def _node_telemetry_fresh(node: NodeInfo) -> bool:
+        return (not node.stale and not node.error and node.telemetry_observed_at > 0
+                and -5 <= time.time() - node.telemetry_observed_at <= TELEMETRY_MAX_AGE)
+
     def _apply_gpu_tab(self, visible: List[NodeInfo], node_classes: Dict[str, List[str]],
                        pending: List[PendingJob]) -> None:
+        self._apply_pending_tab(pending)
         view_signature = self._gpu_view_signature(visible, node_classes, pending)
         if view_signature == self._last_gpu_view_signature:
             return
-
-        saved_row = self.tbl.cursor_row
-        saved_col = self.tbl.cursor_column
-        saved_scroll_x = self.tbl.scroll_x
-        saved_scroll_y = self.tbl.scroll_y
-        saved_key = None
-        try:
-            cell_key = self.tbl.coordinate_to_cell_key(Coordinate(saved_row, 0))
-            saved_key = cell_key.row_key.value
-        except Exception:
-            pass
-
-        self.tbl.clear()
-        self.pending_tbl.clear()
+        rows = []
         self._row_job.clear()
-
-        _HDR_BG = "on #0d1f0d"  # dark green tint for node header rows
-
-        for node in visible:
-            node_partition = node.partition or (node.jobs[0].partition if node.jobs else "")
-            # GPU-ish partitions first so "cpu_only" doesn't hog the display
-            parts_sorted = sorted(
-                (p for p in node_partition.split(",") if p),
-                key=lambda p: ("cpu" in p.lower(), p),
-            )
-
-            alloc = node.cpu_alloc or "0"
-            cpu_text = Text()
-            cpu_text.append(f"{alloc}", style="bold")
-            cpu_text.append(f"/{node.cpus}", style="dim")
-
-            # ── Node header row ──────────────────────────────────────────────
-            is_collapsed = node.name in self._collapsed
-            arrow = "▶" if is_collapsed else "▼"
-            _ERROR_LABELS = {
-                "ssh_timeout": "~timeout",
-                "ssh_unreachable": "~unreachable",
-                "ssh_auth": "~auth_err",
-                "nvidia_smi_missing": "~no_smi",
-                "nvidia_smi_failed": "~smi_err",
-                "parse_error": "~parse_err",
-                "slurm_down": "~down",
-                "stale_cached": "~stale",
-                "unknown": "~err",
-            }
-            nname = Text(f"{arrow} {node.name}", style="bold white")
-            if node.stale:
-                label = _ERROR_LABELS.get(node.error_kind, "~stale")
-                nname.append(f" {label}", style="dim yellow")
-
-            # Partition cell: first (GPU-ish) partition + "+n" beats truncation
-            part_disp = parts_sorted[0] + (f"+{len(parts_sorted) - 1}" if len(parts_sorted) > 1 else "") if parts_sorted else ""
-
-            # Per-GPU glyph strip + waste/free counts — the node summary
-            # stays informative even when the node is collapsed
-            classes = node_classes[node.name]
-            strip = gpu_strip(classes)
-            n_busy, n_free = classes.count("busy"), classes.count("free")
-            n_parked, n_rsv = classes.count("parked"), classes.count("idle")
-            use_txt = Text()
-            if n_busy:
-                use_txt.append(f"{n_busy} busy", style="green")
-            if n_free:
-                use_txt.append("  " if n_busy else "")
-                use_txt.append(f"{n_free} free", style="bold cyan")
-            waste_txt = Text()
-            n_rogue = classes.count("rogue")
-            if n_rogue:
-                waste_txt.append(f"{n_rogue} rogue", style="bold red")
-            if n_parked:
-                waste_txt.append("  " if waste_txt else "")
-                waste_txt.append(f"{n_parked} parked", style="blue")
-            if n_rsv:
-                waste_txt.append("  " if waste_txt else "")
-                waste_txt.append(f"{n_rsv} idle", style="yellow")
-
-            if self.show_details:
-                hdr_cells = [
-                    nname, state_cell(node.state), Text(part_disp, style="cyan"),
-                    Text(""), strip, use_txt, waste_txt,
-                    Text(""), Text(""), Text(""), Text(""),
-                    Text(""), Text(""),
-                ]
-            else:
-                hdr_cells = [
-                    nname, state_cell(node.state), Text(part_disp, style="cyan"),
-                    cpu_text, mem_cell(node),
-                    Text(""), strip, use_txt, waste_txt, Text(""), Text(""),
-                ]
-            for cell in hdr_cells:
-                cell.stylize(_HDR_BG)
-            self.tbl.add_row(*hdr_cells, key=f"hdr_{node.name}")
-
-            if is_collapsed:
-                pass
-            elif node.gpus:
-                jobs_by_id: Dict[str, JobInfo] = {}
-                jobs_by_user: Dict[str, Tuple[int, JobInfo]] = {}
-                for rank, job in enumerate(node.jobs):
-                    jobs_by_id.setdefault(job.jobid, job)
-                    jobs_by_user.setdefault(job.user, (rank, job))
-                for gpu_i, gpu in enumerate(node.gpus):
-                    user = ""
-                    jobid = ""
-                    jobname = ""
-                    elapsed = ""
-                    is_me = False
-                    reserved_idle = False
-                    matched_job = None
-                    if gpu.users:
-                        user = ",".join(gpu.users)
-                        is_me = self.current_user in gpu.users
-                    elif gpu.alloc_user:
-                        # Allocated by SLURM but no GPU process — reserved, sitting
-                        # idle. On stale placeholder rows process info is unknown,
-                        # so only claim idle when a tracked age says so.
-                        user = gpu.alloc_user
-                        reserved_idle = gpu.idle_sec > 0 or not node.stale
-                        is_me = gpu.alloc_user == self.current_user
-                    # Exact job match via SLURM allocation, fallback to user match
-                    if gpu.alloc_jobid:
-                        matched_job = jobs_by_id.get(gpu.alloc_jobid)
-                    if matched_job is None and gpu.users:
-                        candidates = [jobs_by_user[u] for u in gpu.users
-                                      if u in jobs_by_user]
-                        if candidates:
-                            matched_job = min(candidates, key=lambda item: item[0])[1]
-                    if matched_job:
-                        jobid, jobname, elapsed = matched_job.jobid, matched_job.jobname, matched_job.elapsed
-
-                    vcell = vram_cell(gpu.mem_used, gpu.mem_total)
-                    if classes[gpu_i] == "parked":
-                        age = fmt_span(gpu.parked_sec)
-                        vcell = vcell + Text(f" parked {age}".rstrip(), style="bold blue")
-                    gutter = [Text(""), Text(""), Text("")]  # node, state, part
-                    if not self.show_details:
-                        gutter += [Text(""), Text("")]       # cpu, ram
-                    row_cells = gutter + [
-                        Text(f"  {gpu.index}", style="bold"),
-                        Text(gpu.name) if gpu.name else Text("?", style="bright_black"),
-                        util_cell(gpu.util),
-                        vcell,
-                    ]
-                    if self.show_details:
-                        row_cells.append(temp_cell(gpu.temp))
-                        row_cells.append(power_cell(gpu.power, gpu.power_cap))
-                    if user and classes[gpu_i] == "rogue":
-                        # A same-user job on this node with no gres means the
-                        # job simply skipped --gres; otherwise it's a raw
-                        # process outside SLURM entirely
-                        tag = "!gres" if (matched_job and matched_job.gpu_count == 0) else "!slurm"
-                        user_cell = Text(user, style="bold red")
-                        user_cell.append(f" {tag}", style="bold red reverse")
-                        row_cells.append(user_cell)
-                    elif user and reserved_idle:
-                        user_cell = Text(f"{user} ", style="magenta")
-                        age = fmt_idle_age(gpu.idle_sec)
-                        user_cell.append(age, style="bold yellow" if gpu.idle_sec >= 3600 else "dim yellow")
-                        row_cells.append(user_cell)
-                    elif user:
-                        row_cells.append(Text(user, style="bold magenta"))
-                    else:
-                        row_cells.append(Text(""))
-                    if self.show_details:
-                        row_cells.append(Text(jobid, style="dim") if jobid else Text(""))
-                        row_cells.append(Text(ellipsize(jobname, 16)) if jobname else Text(""))
-                    row_cells.append(remaining_cell(elapsed, matched_job.time_limit) if matched_job else Text("", style="dim"))
-                    if is_me:
-                        highlight_row(row_cells)
-                    gpu_key = f"gpu_{node.name}_{gpu.index}"
-                    detail_jid = jobid or gpu.alloc_jobid
-                    if detail_jid:
-                        self._row_job[gpu_key] = detail_jid
-                    self.tbl.add_row(*row_cells, key=gpu_key)
-
-            elif node.jobs:
-                for j in node.jobs:
-                    is_me = (j.user == self.current_user)
-                    if self.filter_user and j.user != self.filter_user:
-                        continue
-                    gutter = [Text(""), Text(""), Text("")]
-                    if not self.show_details:
-                        gutter += [Text(""), Text("")]
-                    row_cells = gutter + [
-                        Text(""), Text("-", style="dim"),
-                        Text("-", style="dim"), Text("-", style="dim"),
-                    ]
-                    if self.show_details:
-                        row_cells.append(Text("-", style="dim"))
-                        row_cells.append(Text("-", style="dim"))
-                    row_cells.append(Text(j.user, style="bold magenta"))
-                    if self.show_details:
-                        row_cells.append(Text(j.jobid, style="dim"))
-                        row_cells.append(Text(ellipsize(j.jobname, 16)))
-                    row_cells.append(remaining_cell(j.elapsed, j.time_limit))
-                    if is_me:
-                        highlight_row(row_cells)
-                    job_key = f"job_{node.name}_{j.jobid}"
-                    self._row_job[job_key] = j.jobid
-                    self.tbl.add_row(*row_cells, key=job_key)
-
-        # ── Pending Jobs Table (lives in the GPU pane) ──
-        self.query_one("#pending-container").display = bool(pending)
-        self._pending_user = {pj.jobid: pj.user for pj in pending}
-        for pj in pending:
-            is_me = (pj.user == self.current_user)
-            if self.filter_user and pj.user != self.filter_user:
+        for node, node_model in zip(visible, view_signature[3], strict=True):
+            signature = (view_signature[:3], node_model)
+            cached = self._gpu_node_rows_cache.get(node.name)
+            if cached is not None and cached[0] == signature:
+                rows.extend(cached[1])
+                self._row_job.update(cached[2])
                 continue
-            reason_style = "bold red" if pj.reason == "Resources" else "yellow" if pj.reason == "Priority" else "dim"
-            gpu_txt = f"x{pj.gpu_count}" if pj.gpu_count else "-"
-            row_cells = [
-                Text(pj.jobid, style="dim"),
-                Text(pj.user, style="bold magenta"),
-                Text(gpu_txt, style="bold"),
-                Text(pj.partition, style="dim"),
-                Text(ellipsize(pj.jobname, 24)),
-                Text(pj.reason, style=reason_style),
-                Text(pj.priority, style="dim"),
-                Text(fmt_start_time(pj.start_time), style="cyan"),
-            ]
-            if is_me:
-                highlight_row(row_cells)
-            self.pending_tbl.add_row(*row_cells, key=f"pend_{pj.jobid}")
-
-        if self.tbl.row_count > 0:
-            row = None
-            if saved_key is not None:
-                try:
-                    row = self.tbl.get_row_index(saved_key)
-                except Exception:
-                    row = None
-            if row is None:
-                row = min(saved_row, self.tbl.row_count - 1)
-            self.tbl.move_cursor(row=row, column=saved_col, animate=False)
-        self.tbl.scroll_to(x=saved_scroll_x, y=saved_scroll_y, animate=False)
+            first_row = len(rows)
+            collapsed = node.name in self._collapsed
+            classes = node_classes[node.name]
+            health = [gpu_health_status(gpu) for gpu in node.gpus]
+            warnings = sum(severity > 0 for _label, severity in health)
+            severity = max((value for _label, value in health), default=0)
+            status = "STALE" if node.stale else "ERROR" if node.error else f"!{warnings}" if warnings else ""
+            nname = Text(("▶ " if collapsed else "▼ ") + node.name,
+                         style="yellow" if node.stale else "bold red" if node.error else "bold")
+            models = ",".join(dict.fromkeys(gpu.name or "?" for gpu in node.gpus))
+            free = classes.count("free")
+            values = {"node": nname, "gpu_name": state_cell(node.state),
+                      "util": state_cell(node.state) if self._compact else Text(f"C {node.cpu_alloc or '0'}/{node.cpus}", style="dim"),
+                      "vram": gpu_strip(classes) if self._compact else Text("RAM " + self._ram_brief(node), style="dim"),
+                      "user": Text(models if self._compact else node.partition, style="dim"),
+                      "remaining": Text(f"free {free}", style="cyan" if free else "dim"),
+                      "health": Text(status, style="red" if node.error or not node.stale and severity == 2 else "yellow" if status else "dim")}
+            header = self._row_cells(self.tbl, values)
+            for cell in header:
+                cell.stylize("on #17201e")
+            rows.append((f"hdr_{node.name}", header))
+            if not collapsed:
+                by_id = {job.jobid: job for job in node.jobs}
+                by_user = {}
+                for job in node.jobs:
+                    by_user.setdefault(job.user, job)
+                for index, gpu in enumerate(node.gpus):
+                    matched = by_id.get(gpu.alloc_jobid)
+                    if matched is None:
+                        matched = next((by_user[user] for user in gpu.users if user in by_user), None)
+                    jid = matched.jobid if matched else gpu.alloc_jobid
+                    user = ",".join(gpu.users) or gpu.alloc_user
+                    label = user
+                    if classes[index] == "rogue":
+                        label += " !gres" if matched and matched.gpu_count == 0 else " !slurm"
+                    elif user and not gpu.users and not node.stale:
+                        label += " " + fmt_idle_age(gpu.idle_sec)
+                    elif classes[index] == "parked":
+                        label += " parked"
+                    elif jid:
+                        label += " #" + jid
+                    user_style = "bold red" if classes[index] == "rogue" else "yellow" if classes[index] == "idle" else "dim"
+                    if self.current_user in gpu.users or self.current_user == gpu.alloc_user:
+                        user_style = "bold cyan"
+                    vcell = vram_cell(gpu.mem_used, gpu.mem_total)
+                    ucell = util_cell(gpu.util)
+                    if self._compact:
+                        util = _metric_number(gpu.util)
+                        ucell = Text(f"{util:.0f}%" if util is not None else "?", style="dim")
+                        used, total = _metric_number(gpu.mem_used), _metric_number(gpu.mem_total)
+                        vcell = Text((f"{used / 1024:.1f}" if used is not None else "?") +
+                                     (f"/{total / 1024:.0f}G" if total else "/?"), style="dim")
+                    health_label, severity = health[index]
+                    if node.stale:
+                        health_label, severity = "STALE", 1
+                    values = {"node": Text(f"  GPU{gpu.index}", style="dim"), "gpu_name": Text(gpu.name or "?", style="dim"),
+                              "util": ucell, "vram": vcell, "user": Text(label, style=user_style),
+                              "remaining": remaining_cell(matched.elapsed, matched.time_limit) if matched else Text(""),
+                              "health": Text(health_label, style="bold red" if severity == 2 else "yellow" if severity else "dim"),
+                              "temp": temp_cell(gpu.temp), "power": power_cell(gpu.power, gpu.power_cap),
+                              "jobid": Text(jid, style="dim"), "jobname": Text(matched.jobname if matched else "")}
+                    cells = self._row_cells(self.tbl, values)
+                    if self.current_user in gpu.users or self.current_user == gpu.alloc_user:
+                        highlight_row(cells)
+                    key = f"gpu_{node.name}_{gpu.index}"
+                    if jid:
+                        self._row_job[key] = jid
+                    rows.append((key, cells))
+            node_rows = rows[first_row:]
+            self._gpu_node_rows_cache[node.name] = (
+                signature, node_rows, {key: self._row_job[key] for key, _ in node_rows if key in self._row_job})
+        live = {node.name for node in visible}
+        self._gpu_node_rows_cache = {name: value for name, value in self._gpu_node_rows_cache.items() if name in live}
+        self._sync_table(self.tbl, rows)
         self._last_gpu_view_signature = view_signature
 
-    def _gpu_view_signature(
-        self,
-        visible: List[NodeInfo],
-        node_classes: Dict[str, List[str]],
-        pending: List[PendingJob],
-    ) -> tuple:
-        """Hashable model of every value that can affect the GPU tables."""
-        node_rows = []
-        for node in visible:
-            collapsed = node.name in self._collapsed
-            node_partition = node.partition or (
-                node.jobs[0].partition if node.jobs else ""
-            )
-            # Collapsed rows show aggregate GPU classes, not live utilization,
-            # VRAM, or job details.  Excluding hidden values is important: those
-            # metrics normally fluctuate every collector cycle even though the
-            # one-line collapsed view remains byte-for-byte identical.
-            detail_rows = ()
-            if not collapsed:
-                jobs = tuple(
-                    (
-                        job.jobid, job.user, job.jobname, job.elapsed,
-                        job.gpu_count, job.time_limit,
-                    )
-                    for job in node.jobs
-                )
-                gpus = tuple(
-                    (
-                        gpu.index, gpu.name, gpu.util, gpu.mem_used,
-                        gpu.mem_total, gpu.temp, gpu.power, gpu.power_cap,
-                        tuple(gpu.users), gpu.alloc_jobid, gpu.alloc_user,
-                        gpu.idle_sec, gpu.parked_sec,
-                    )
-                    for gpu in node.gpus
-                )
-                detail_rows = (jobs, gpus)
-            node_rows.append((
-                node.name, node.state, node_partition, node.stale,
-                node.error_kind, node.cpus, node.cpu_alloc, node.mem_total,
-                node.mem_free, node.mem_alloc, node.mem_avail,
-                collapsed, tuple(node_classes[node.name]), detail_rows,
-            ))
-        pending_rows = tuple(
-            (
-                job.jobid, job.user, job.partition, job.jobname,
-                job.gpu_count, job.reason, job.priority, job.start_time,
-            )
-            for job in pending
-        )
-        return (
-            self.show_details, self.filter_user, self.current_user,
-            # Estimated start times switch from HH:MM to MM-DD HH:MM at
-            # midnight even when the collector values themselves are unchanged.
-            datetime.now().date(), tuple(node_rows), pending_rows,
-        )
+    def _pending_visible(self, job: PendingJob) -> bool:
+        return (not self.filter_user or job.user == self.filter_user) and (
+            not self.filter_partition or job.partition == self.filter_partition) and (
+            not self.search_text or any(self.search_text in value.lower()
+                                       for value in (job.jobid, job.user, job.jobname, job.partition, pending_reason(job))))
+
+    def _apply_pending_tab(self, pending: List[PendingJob]) -> None:
+        from collections import Counter
+        self._pending_user = {job.jobid: job.user for job in pending}
+        visible = [job for job in pending if self._pending_visible(job)]
+        self.query_one("#pending-container").display = bool(visible)
+        counts = Counter(job.reason for job in visible)
+        reasons = " · ".join(f"{reason or '?'} {count}" for reason, count in counts.most_common(3))
+        label = f"{'▼' if self._pending_expanded else '▶'} Pending {len(visible)} · {reasons} [v]"
+        self.query_one("#pending-label", Static).update(ellipsize(label, max(10, self.size.width - 3)))
+        rows = []
+        for job in visible:
+            wait = pending_wait_seconds(job)
+            values = {"p_jobid": Text(job.jobid, style="dim"), "p_user": Text(job.user, style="dim"),
+                      "p_gpu": Text(str(job.gpu_count) if job.gpu_count else "—"),
+                      "p_part": Text(job.partition, style="dim"), "p_name": Text(job.jobname),
+                      "p_reason": Text(pending_reason(job), style="yellow"), "p_pri": Text(job.priority, style="dim"),
+                      "p_wait": Text((fmt_span(int(wait)) or f"{int(wait)}s") if wait is not None else "?", style="dim"),
+                      "p_start": Text(fmt_start_time(job.start_time), style="dim")}
+            cells = self._row_cells(self.pending_tbl, values)
+            if job.user == self.current_user:
+                highlight_row(cells)
+            rows.append((f"pend_{job.jobid}", cells))
+        self._sync_table(self.pending_tbl, rows)
+
+    def _gpu_view_signature(self, visible, node_classes, pending) -> tuple:
+        return ((self.show_details, self._compact), self.filter_user, self.current_user,
+                tuple(self._gpu_node_signature(node, node_classes) for node in visible))
+
+    def _gpu_node_signature(self, node, node_classes) -> tuple:
+        collapsed = node.name in self._collapsed
+        health = tuple(gpu_health_status(gpu) for gpu in node.gpus)
+        detail_rows = ()
+        if not collapsed:
+            jobs = tuple((job.jobid, job.user, job.jobname if self.show_details else "", job.elapsed,
+                          job.gpu_count, job.time_limit) for job in node.jobs)
+            gpus = tuple((gpu.index, gpu.name, gpu.util, gpu.mem_used, gpu.mem_total,
+                          (gpu.temp, gpu.power, gpu.power_cap) if self.show_details else (),
+                          tuple(gpu.users), gpu.alloc_jobid, gpu.alloc_user, gpu.idle_sec, gpu.parked_sec)
+                         for gpu in node.gpus)
+            detail_rows = (jobs, gpus, health)
+        return (node.name, node.state, node.partition, node.stale, bool(node.error),
+                node.cpus, node.cpu_alloc, self._ram_brief(node),
+                tuple(gpu.name for gpu in node.gpus) if self._compact else (),
+                sum(severity > 0 for _label, severity in health),
+                max((severity for _label, severity in health), default=0),
+                collapsed, tuple(node_classes[node.name]), detail_rows)
 
     def _apply_cpu_tab(self, nodes: List[NodeInfo]) -> None:
-        view_signature = self._cpu_view_signature(nodes)
-        if view_signature == self._last_cpu_view_signature:
+        visible = [node for node in nodes if self._node_visible(node, {}, gpu_filter=False)]
+        visible.sort(key=lambda node: (-(_metric_number(node.cpu_alloc) or 0) / max(1, _metric_number(node.cpus) or 1), node.name))
+        signature = self._cpu_view_signature(visible)
+        if signature == self._last_cpu_view_signature:
             return
-
-        # ── CPU tab (all nodes, CPU-only included) ──
-        self.cpu_tbl.clear()
-        cpu_rows = []
-        cluster_cores = cluster_alloc = 0
-        all_user_cores: Dict[str, int] = {}
-        for node in nodes:
-            try:
-                total_c = float(node.cpus)
-                alloc_c = float(node.cpu_alloc or 0)
-                cpct = alloc_c / total_c if total_c > 0 else 0.0
-            except (ValueError, TypeError):
-                total_c, alloc_c, cpct = 0.0, 0.0, 0.0
-            cluster_cores += int(total_c)
-            cluster_alloc += int(alloc_c)
-            user_cores: Dict[str, int] = {}
-            for j in node.jobs:
-                if j.cpu_count:
-                    user_cores[j.user] = user_cores.get(j.user, 0) + j.cpu_count
-                    all_user_cores[j.user] = all_user_cores.get(j.user, 0) + j.cpu_count
-            cpu_rows.append((cpct, node, user_cores, total_c))
-
-        for cpct, node, user_cores, total_c in sorted(cpu_rows, key=lambda r: (-r[0], r[1].name)):
-            cbar = make_bar(cpct, width=20)
-            cbar.append(f" {node.cpu_alloc or 0}/{node.cpus} {cpct:.0%}", style=f"bold {pct_color(cpct)}")
-            try:
-                load = float(node.cpu_load)
-                load_style = "red" if total_c and load > total_c else "yellow" if total_c and load > total_c * 0.8 else "green"
-                load_cell = Text(f"{load:.1f}", style=load_style)
-            except (ValueError, TypeError):
-                load_cell = Text(node.cpu_load or "-", style="bright_black")
-            users_txt = Text()
-            for u, c in sorted(user_cores.items(), key=lambda x: -x[1]):
-                users_txt.append(f" {u}", style="bold magenta" if u == self.current_user else "magenta")
-                users_txt.append(f":{c}", style="bold")
-            cparts = sorted((p for p in node.partition.split(",") if p),
-                            key=lambda p: ("cpu" in p.lower(), p))
-            marker = "" if node.has_gpu else " ·cpu"
-            nname_cell = Text(node.name, style="bold cyan")
-            if marker:
-                nname_cell.append(marker, style="dim")
-            self.cpu_tbl.add_row(
-                nname_cell, state_cell(node.state),
-                Text(ellipsize(",".join(cparts), 14), style="cyan"),
-                cbar, load_cell, mem_cell(node), users_txt,
-                key=f"hdr_{node.name}",
-            )
-
-        cpu_sum = Text()
-        cpu_sum.append(" CPU ", style="bold white on dark_green")
-        cpct_all = cluster_alloc / cluster_cores if cluster_cores else 0
-        cpu_sum.append(f" {cluster_alloc}/{cluster_cores} cores ", style="bold")
-        cpu_sum.append_text(make_bar(cpct_all, width=20))
-        cpu_sum.append(f" {cpct_all:.0%}\n", style=f"bold {pct_color(cpct_all)}")
-        cpu_sum.append(" TOP ", style="bold white on purple")
-        for u, c in sorted(all_user_cores.items(), key=lambda x: -x[1])[:10]:
-            cpu_sum.append(f" {u}", style="bold yellow underline" if u == self.current_user else "bold magenta")
-            cpu_sum.append(f":{c}", style="bold")
-        self.cpu_summary.update(cpu_sum)
-        self._last_cpu_view_signature = view_signature
-
-    def _cpu_view_signature(self, nodes: List[NodeInfo]) -> tuple:
-        """Hashable model of every value that can affect the CPU table."""
-        node_rows = []
-        for node in nodes:
-            try:
-                total_c = float(node.cpus)
-                alloc_c = float(node.cpu_alloc or 0)
-                cpct = alloc_c / total_c if total_c > 0 else 0.0
-            except (ValueError, TypeError):
-                cpct = 0.0
-            user_cores: Dict[str, int] = {}
+        rows = []
+        total_cores = alloc_cores = actual_cores = reporting_cores = 0
+        for node in visible:
+            total = _metric_number(node.cpus) or 0
+            alloc = _metric_number(node.cpu_alloc) or 0
+            total_cores += total
+            alloc_cores += alloc
+            fresh = self._node_telemetry_fresh(node)
+            actual = _metric_number(node.cpu_util) if fresh else None
+            if actual is not None:
+                actual_cores += total * actual / 100
+                reporting_cores += total
+            pressure = [_metric_number(node.pressure.get(resource)) if fresh else None for resource in ("cpu", "memory", "io")]
+            psi = "/".join(f"{value:.0f}" if value is not None else "?" for value in pressure)
+            users = {}
             for job in node.jobs:
                 if job.cpu_count:
-                    user_cores[job.user] = (
-                        user_cores.get(job.user, 0) + job.cpu_count
-                    )
-            node_rows.append((
-                cpct, node.name, node.state, node.partition, node.has_gpu,
-                node.cpus, node.cpu_alloc, node.cpu_load, node.mem_total,
-                node.mem_free, node.mem_alloc, node.mem_avail,
-                tuple(sorted(user_cores.items())),
-            ))
-        return (
-            self.current_user,
-            tuple(sorted(node_rows, key=lambda row: (-row[0], row[1]))),
-        )
+                    users[job.user] = users.get(job.user, 0) + job.cpu_count
+            users_text = Text()
+            for user, cores in sorted(users.items(), key=lambda item: -item[1]):
+                users_text.append((" " if users_text else "") + f"{user}:{cores}",
+                                  style="bold cyan" if user == self.current_user else "dim")
+            values = {"c_node": Text(node.name + (" !" if node.stale else ""), style="yellow" if node.stale else "bold"),
+                      "c_state": state_cell(node.state), "c_part": Text(node.partition, style="dim"),
+                      "c_cpu": Text(f"{alloc:.0f}/{total:.0f}", style="dim"),
+                      "c_actual": Text(f"{actual:.0f}" if actual is not None else "?", style="dim"),
+                      "c_load": Text(node.cpu_load or "?", style="dim"),
+                      "c_mem": Text(self._ram_brief(node), style="dim"),
+                      "c_psi": Text(psi, style="yellow" if any(value is not None and value >= 10 for value in pressure) else "dim"),
+                      "c_users": users_text}
+            rows.append((f"hdr_{node.name}", self._row_cells(self.cpu_tbl, values)))
+        self._sync_table(self.cpu_tbl, rows)
+        coverage = f"{reporting_cores:.0f}/{total_cores:.0f} cores sampled"
+        self.cpu_summary.update(Text(
+            f"VIEW CPU alloc {alloc_cores:.0f}/{total_cores:.0f} · actual {actual_cores:.1f} cores ({coverage})\n"
+            "PSI C/M/I = CPU/memory/I/O some avg10 stall % · RAM ~ = scheduler allocation", style="dim"))
+        self._last_cpu_view_signature = signature
+
+    def _cpu_view_signature(self, nodes: List[NodeInfo]) -> tuple:
+        rows = []
+        for node in nodes:
+            users = {}
+            for job in node.jobs:
+                users[job.user] = users.get(job.user, 0) + job.cpu_count
+            rows.append((node.name, node.state, node.partition, node.stale, node.cpus,
+                         node.cpu_alloc, node.cpu_load, self._ram_brief(node),
+                         self._node_telemetry_fresh(node), node.cpu_util,
+                         tuple(sorted(node.pressure.items())), tuple(sorted(users.items()))))
+        return self._compact, self.current_user, tuple(rows)
+
+    @staticmethod
+    def _resource_actual(summary: dict, key: str, memory: bool = False) -> str:
+        value = summary.get(key)
+        if value is None:
+            return "?"
+        partial = summary.get(key + "_nodes", 0) < summary["expected_nodes"]
+        return ("~" if partial else "") + (f"{value / 1024:.1f}G" if memory else f"{value:.1f}")
+
+    def _job_visible(self, job: JobInfo) -> bool:
+        from .common import _strict_expand_nodes
+        targets = (job.jobid, job.user, job.jobname, job.partition, job.node)
+        if self.search_text:
+            targets += tuple(_strict_expand_nodes(job.node) or ())
+        return (not self.filter_user or job.user == self.filter_user) and (
+            not self.filter_partition or job.partition == self.filter_partition) and (
+            not self.search_text or any(self.search_text in value.lower()
+                                       for value in targets))
+
+    def _apply_jobs_tab(self, jobs: List[JobInfo], pending: List[PendingJob], nodes: List[NodeInfo]) -> None:
+        rows = []
+        self._jobs_row_job.clear()
+        for job in jobs:
+            if not self._job_visible(job):
+                continue
+            summary = job_resource_summary(job, nodes)
+            sampled, expected = summary["sampled_nodes"], summary["expected_nodes"]
+            note = f"{sampled}/{expected} sampled" if sampled else "no sample"
+            if summary.get("oom_kill", 0):
+                note = f"OOM {summary['oom_kill']:.0f} · {note}"
+            elif sampled and (sampled < expected or any(summary.get(key + "_nodes", 0) < expected for key in ("cpu_cores", "mem_current_mib"))):
+                note = f"partial {sampled}/{expected}"
+            state = "R"
+            values = {"j_id": Text(job.jobid, style="dim"), "j_user": Text(job.user, style="bold cyan" if job.user == self.current_user else "dim"),
+                      "j_state": Text(state, style="dim"), "j_gpu": Text(str(job.gpu_count) if job.gpu_count else "—"),
+                      "j_cpu": Text(self._resource_actual(summary, "cpu_cores") + f"/{job.cpu_count}", style="dim"),
+                      "j_mem": Text(self._resource_actual(summary, "mem_current_mib", True) + "/" + (job.mem or "?"), style="dim"),
+                      "j_vram": Text(self._resource_actual(summary, "vram_mib", True), style="dim"),
+                      "j_span": remaining_cell(job.elapsed, job.time_limit), "j_note": Text(note, style="bold red" if summary.get("oom_kill", 0) else "dim"),
+                      "j_nodes": Text(job.node, style="dim"), "j_name": Text(job.jobname)}
+            cells = self._row_cells(self.jobs_tbl, values)
+            if job.user == self.current_user:
+                highlight_row(cells)
+            key = f"job_{job.jobid}"
+            rows.append((key, cells))
+            self._jobs_row_job[key] = job.jobid
+        for job in pending:
+            if not self._pending_visible(job):
+                continue
+            wait = pending_wait_seconds(job)
+            values = {"j_id": Text(job.jobid, style="dim"), "j_user": Text(job.user, style="dim"),
+                      "j_state": Text("PD", style="yellow"), "j_gpu": Text(str(job.gpu_count) if job.gpu_count else "—"),
+                      "j_cpu": Text(f"?/{job.cpu_count}", style="dim"), "j_mem": Text("?/" + (job.mem or "?"), style="dim"),
+                      "j_span": Text((fmt_span(int(wait)) or f"{int(wait)}s") if wait is not None else "?", style="dim"),
+                      "j_note": Text(pending_reason(job), style="yellow"), "j_name": Text(job.jobname)}
+            cells = self._row_cells(self.jobs_tbl, values)
+            if job.user == self.current_user:
+                highlight_row(cells)
+            rows.append((f"pend_{job.jobid}", cells))
+        self._sync_table(self.jobs_tbl, rows)
 
     def _apply_summary(self, nodes: List[NodeInfo], jobs: List[JobInfo],
                        pending: List[PendingJob], err: str,
                        node_classes: Dict[str, List[str]],
                        total_gpus: int, busy_gpus: int,
                        partition_gpu_stats: Dict[str, List[int]]) -> None:
+        from collections import Counter
         user_gpu_count: Dict[str, int] = {}
-        for j in jobs:
-            if j.gpu_count > 0:
-                user_gpu_count[j.user] = user_gpu_count.get(j.user, 0) + j.gpu_count
+        for job in jobs:
+            user_gpu_count[job.user] = user_gpu_count.get(job.user, 0) + job.gpu_count
         self._user_gpu_count = user_gpu_count
-
+        visible = [node for node in nodes if node.has_gpu and self._node_visible(node, node_classes)]
+        free_nodes = [(node, node_classes[node.name].count("free")) for node in visible]
+        free = sum(count for _node, count in free_nodes)
+        maximum = max((count for _node, count in free_nodes), default=0)
+        models = Counter()
+        for node in visible:
+            for gpu, kind in zip(node.gpus, node_classes[node.name], strict=True):
+                if kind == "free":
+                    memory = _metric_number(gpu.mem_total)
+                    capacity = f"{memory / 1024:.0f}G" if memory else "?G"
+                    model = gpu.name.removeprefix("NVIDIA ") or "?"
+                    models[(model, capacity)] += 1
+        running = sum(self._job_visible(job) for job in jobs)
+        waiting = sum(self._pending_visible(job) for job in pending)
+        unknown = sum(node_classes[node.name].count("unknown") for node in visible)
+        stale = sum(node.stale for node in nodes)
+        first = Text(f"VIEW GPU {busy_gpus}/{total_gpus} active · FREE {free} (node max {maximum}) · JOBS {running}/{waiting} wait", style="bold")
+        if unknown:
+            first.append(f" · ? {unknown}", style="yellow")
+        second = Text("FREE " + (" · ".join(f"{model}/{capacity}×{count}" for (model, capacity), count in models.most_common()) or "—"), style="dim")
+        filters = [f"u:{self.filter_user}" if self.filter_user else "", f"p:{self.filter_partition}" if self.filter_partition else "",
+                   "free" if self.idle_filter_only else "", f"/{self.search_text}" if self.search_text else ""]
+        if any(filters):
+            second.append(" · " + " ".join(filter(None, filters)), style="cyan")
+        if stale:
+            second.append(f" · ALL stale {stale}", style="yellow")
+        width = max(10, self.size.width - 3)
+        first.truncate(width, overflow="ellipsis")
+        second.truncate(width, overflow="ellipsis")
+        self.summary_w.update(first + Text("\n") + second)
         ts = datetime.now().strftime("%H:%M:%S")
-        sort_label = Text(f" SORT:{self.sort_by.upper()}{'↑' if self.sort_reverse else ''} ",
-                          style="bold white on #444444")
-
-        summary = Text()
-        summary.append(" GPU ", style="bold white on dark_green")
-        summary.append(f" {busy_gpus}/{total_gpus} active  ", style="bold")
-        # FREE chip answers "where can I submit" without scanning rows.
-        # Computed over ALL nodes (pre-filter) so filters don't hide capacity.
-        free_by_node = sorted(
-            ((name, cl.count("free")) for name, cl in node_classes.items() if cl.count("free")),
-            key=lambda x: -x[1],
-        )
-        total_free = sum(c for _, c in free_by_node)
-        summary.append(" FREE ", style="bold black on cyan")
-        summary.append(f" {total_free} ", style="bold cyan")
-        for nn, cnt in free_by_node[:4]:
-            summary.append(f" {nn}×{cnt}", style="cyan")
-        if len(free_by_node) > 4:
-            summary.append(" …", style="dim cyan")
-        summary.append("  ")
-        # Data-source health. CPU-only SSH is normal telemetry for live RAM;
-        # only a GPU node on SSH means the push agent fell back.
-        (n_agent, n_gpu_fallback, n_cpu_push,
-         n_cpu_poll, n_stale) = _node_source_counts(nodes)
-        n_rogue_total = sum(cl.count("rogue") for cl in node_classes.values())
-        if n_rogue_total:
-            summary.append(" ROGUE ", style="bold white on red")
-            summary.append(f" {n_rogue_total} ", style="bold red")
-        if n_agent or n_gpu_fallback or n_cpu_push or n_cpu_poll or n_stale:
-            summary.append(" SRC ", style="bold white on grey37")
-            summary.append(f" agent:{n_agent}", style="green" if n_agent else "dim")
-            if n_gpu_fallback:
-                summary.append(f" fallback:{n_gpu_fallback}", style="yellow")
-            if n_cpu_push:
-                summary.append(f" cpu-push:{n_cpu_push}", style="green")
-            if n_cpu_poll:
-                summary.append(f" cpu-poll:{n_cpu_poll}", style="cyan")
-            if n_stale:
-                summary.append(f" stale:{n_stale}", style="bold red")
-            summary.append("  ")
-        # Per-partition GPU breakdown
-        if partition_gpu_stats:
-            for part, (pbsy, ptot) in sorted(partition_gpu_stats.items()):
-                summary.append(f" [{part} {pbsy}/{ptot}]", style="dim cyan")
-            summary.append("  ")
-        summary.append(" JOBS ", style="bold white on dark_blue")
-        summary.append(f" {len(jobs)} run  ", style="bold")
-        if pending:
-            summary.append(" WAIT ", style="bold white on dark_orange3")
-            summary.append(f" {len(pending)}  ", style="bold")
-        summary.append_text(sort_label)
-        if self.filter_user:
-            summary.append(f" USER:{self.filter_user} ", style="bold white on #666600")
-        if self.idle_filter_only:
-            summary.append(" IDLE ", style="bold white on dark_cyan")
-        if self.search_text:
-            summary.append(f" /{self.search_text} ", style="bold white on #664400")
-        summary.append(f" {self.refresh_sec}s  ")
-        summary.append(f"[{ts}]\n", style="dim")
-
-        summary.append(" USER/GPU ", style="bold white on purple")
-        summary.append(" ")
-        for u, g in sorted(user_gpu_count.items(), key=lambda x: -x[1])[:10]: # Top 10
-            style = "bold yellow underline" if u == self.current_user else "bold magenta"
-            summary.append(f" {u}", style=style)
-            summary.append(f":{g} ", style="bold")
-        # compact legend for the glyph/marker vocabulary
-        summary.append("\n ")
-        for glyph, label, style in (
-            ("█", "busy", "green"), ("▅", "parked", "blue"), ("▂", "rsv-idle", "yellow"),
-            ("▁", "free", "bold cyan"), ("!", "rogue", "bold red"), ("?", "no-data", "bright_black"),
-        ):
-            summary.append(glyph, style=style)
-            summary.append(f" {label}  ", style="dim")
-
-        self.summary_w.update(summary)
-
         if err:
-            self.status_w.update(Text(f" WARN: {err} ", style="bold yellow on dark_red"))
+            self.status_w.update(Text(ellipsize(f"WARN: {err}", width), style="bold yellow"))
         else:
-            self.status_w.update(Text(f" OK [{ts}] ", style="dim"))
+            age = max((node.scheduler_age_sec for node in nodes if node.scheduler_age_sec >= 0), default=-1)
+            source = _node_source_counts(nodes)
+            status = f"{ts} · {self.refresh_sec}s · sort:{self.sort_by}{'↑' if self.sort_reverse else ''} · ALL source {source[0]} GPU push/{source[1]} fallback"
+            status += f" · CPU {source[2]} push/{source[3]} poll"
+            if age >= 0:
+                status += f" · scheduler {age:.0f}s"
+            self.status_w.update(Text(ellipsize(status, width), style="dim"))
+
 
 
 

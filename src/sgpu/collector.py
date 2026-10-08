@@ -15,7 +15,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -26,6 +26,7 @@ from .common import (
     collect_basic, collect_node_data, mem_to_mib,
     parse_gres_models, reconcile_gpu_alloc, resolve_user, run_cmd, ssh_cmd,
     valid_slurm_job_id,
+    assign_node_jobs,
     _classify_error,
 )
 from .agent import AGENT_PAYLOAD_VERSION
@@ -38,6 +39,8 @@ from .runtime import (
     trusted_payload_uids,
 )
 from . import __build__, __version__
+from .telemetry import command_snapshot, metric_number
+from .node_telemetry import clean_telemetry, clean_sample, TELEMETRY_MAX_AGE
 
 # ── Config ────────────────────────────────────────────────────────────────
 
@@ -53,6 +56,10 @@ LOCK_FILE = DATA_DIR / "collector.lock"
 REFRESH_SEC = int(os.getenv("SLURM_GPU_TUI_COLLECTOR_SEC", "3"))
 NODE_TIMEOUT = int(os.getenv("SLURM_GPU_TUI_NODE_TIMEOUT_SEC", "30"))
 MAX_WORKERS = int(os.getenv("SLURM_GPU_TUI_MAX_WORKERS", "8"))
+MAX_PENDING_POLLS = max(MAX_WORKERS, int(os.getenv("SLURM_GPU_TUI_MAX_PENDING_POLLS", str(MAX_WORKERS * 2))))
+SCHEDULER_SEC = max(1.0, float(os.getenv("SLURM_GPU_TUI_SCHEDULER_SEC", str(REFRESH_SEC))))
+SCHEDULER_MAX_AGE = max(SCHEDULER_SEC, float(os.getenv("SLURM_GPU_TUI_SCHEDULER_MAX_AGE_SEC", "30")))
+MEM_REFRESH_SEC = max(1.0, float(os.getenv("SLURM_GPU_TUI_MEM_REFRESH_SEC", "15")))
 LOG_MAX_BYTES = int(os.getenv("SLURM_GPU_TUI_LOG_MAX_BYTES", str(5 * 1024 * 1024)))
 
 # Push-mode agents: nodes write their own payloads to this shared-FS dir
@@ -94,6 +101,52 @@ _node_results: Dict[str, dict] = {}
 _inflight: set = set()
 _node_absent_cycles: Dict[str, int] = {}
 _NODE_CACHE_PRUNE_AFTER = 2
+_poll_cursor = 0
+_notification_log_sources: dict = {}
+_cycle_stats: dict = {}
+
+
+class SchedulerSampler:
+    """Single in-flight scheduler generation, independent of telemetry publishing."""
+
+    def __init__(self):
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sgpu-scheduler")
+        self.future = None
+        self.snapshot = None
+        self.next_poll = 0.0
+        self.error = ""
+
+    def read(self):
+        now = time.monotonic()
+        if self.future is not None and self.future.done():
+            try:
+                result = self.future.result()
+                self.error = result[-1]
+                if not self.error or self.snapshot is None:
+                    self.snapshot = result
+            except Exception as exc:
+                self.error = f"scheduler collect failed: {exc}"
+            self.future = None
+            self.next_poll = now + SCHEDULER_SEC
+        if self.future is None and now >= self.next_poll:
+            self.future = self.executor.submit(collect_basic, mem_refresh_sec=MEM_REFRESH_SEC)
+        if self.snapshot is None:
+            error = self.error or "scheduler initializing"
+            return ([], [], [], {}, {}, {}, {"job_backend": "unavailable", "age_sec": -1.0, "error": error}, error)
+        nodes, jobs, pending, node_jobs, alloc, users, status, error = self.snapshot
+        age = max(0.0, time.time() - float(status.get("observed_at", 0)))
+        status = dict(status, age_sec=age)
+        if self.error or age > SCHEDULER_MAX_AGE:
+            error = self.error or "scheduler snapshot stale"
+            jobs = [replace(job, uid=-1, detail="") for job in jobs]
+            pending = [replace(job, detail="") for job in pending]
+            node_jobs = assign_node_jobs(jobs)
+            alloc, users = {}, {}
+            status.update(job_backend="unavailable", error=error)
+        return nodes, jobs, pending, node_jobs, alloc, users, status, error
+
+
+_scheduler_sampler = SchedulerSampler()
 
 # ── Waste-age tracking (idle / parked) ────────────────────────────────────
 # "node:gpu_index" -> {"jobid"/"owner": str, "since": float}.
@@ -369,6 +422,8 @@ LOG_TAIL_BYTES = int(os.getenv("SLURM_GPU_TUI_LOG_TAIL_BYTES", str(64 * 1024)))
 LOG_MIRROR_SEC = max(
     1.0, float(os.getenv("SLURM_GPU_TUI_LOG_MIRROR_SEC", "10")),
 )
+LOG_MIRROR_MAX_SEC = max(LOG_MIRROR_SEC, float(os.getenv("SLURM_GPU_TUI_LOG_MIRROR_MAX_SEC", "60")))
+_log_unchanged: dict[str, int] = {}
 
 _log_paths: Dict[str, tuple] = {}      # jobid -> (stdout src, stderr src)
 _log_owner_uids: Dict[str, int] = {}   # jobid -> scheduler-reported owner uid
@@ -396,7 +451,7 @@ def _owner_identity(uid: int) -> tuple[int, List[int]] | None:
         return None
 
 
-def _read_log_as_owner(src: str, owner_uid: int) -> tuple[bytes | None, str]:
+def _read_log_as_owner(src: str, owner_uid: int, limit: int | None = None) -> tuple[bytes | None, str]:
     """Read a bounded tail in a privilege-dropped child.
 
     This is the NFS root-squash fallback. The helper itself opens with
@@ -411,7 +466,7 @@ def _read_log_as_owner(src: str, owner_uid: int) -> tuple[bytes | None, str]:
     try:
         result = subprocess.run(
             [sys.executable, "-I", "-m", "sgpu.log_reader", src,
-             str(LOG_TAIL_BYTES)],
+             str(LOG_TAIL_BYTES if limit is None else limit)],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             timeout=8, check=False, cwd="/", env={"LANG": "C.UTF-8"},
             user=owner_uid, group=gid, extra_groups=groups,
@@ -419,14 +474,14 @@ def _read_log_as_owner(src: str, owner_uid: int) -> tuple[bytes | None, str]:
     except (OSError, subprocess.TimeoutExpired):
         return None, "unreadable"
     if result.returncode == 0:
-        return result.stdout[:LOG_TAIL_BYTES], "mirrored"
+        return result.stdout[:LOG_TAIL_BYTES if limit is None else limit], "mirrored"
     if result.returncode == 4:
         return None, "unsafe"
     return None, "unreadable"
 
 
 def _read_log_source(
-    src: str, owner_uid: int, known: tuple | None,
+    src: str, owner_uid: int, known: tuple | None, *, limit: int | None = None,
 ) -> tuple[bytes | None, tuple | None, str]:
     """Read one safe tail; ``None`` data with a fingerprint means unchanged."""
     try:
@@ -439,7 +494,7 @@ def _read_log_source(
     except FileNotFoundError:
         return None, None, "waiting"
     except PermissionError:
-        data, status = _read_log_as_owner(src, owner_uid)
+        data, status = _read_log_as_owner(src, owner_uid) if limit is None else _read_log_as_owner(src, owner_uid, limit)
         if data is None:
             return None, None, status
         fp = ("owner-tail", len(data), hashlib.blake2b(data, digest_size=16).digest())
@@ -461,9 +516,10 @@ def _read_log_source(
             )
             if fp == known:
                 return None, fp, "mirrored"
-            if st.st_size > LOG_TAIL_BYTES:
-                source.seek(st.st_size - LOG_TAIL_BYTES)
-            return source.read(LOG_TAIL_BYTES), fp, "mirrored"
+            cap = LOG_TAIL_BYTES if limit is None else limit
+            if st.st_size > cap:
+                source.seek(st.st_size - cap)
+            return source.read(cap), fp, "mirrored"
     except OSError:
         return None, None, "unreadable"
 
@@ -529,6 +585,7 @@ def _mirror_one_job_log(jid: str) -> None:
             _set_log_status(jid, "out", "metadata-unavailable", token)
             _set_log_status(jid, "err", "metadata-unavailable", token)
             return
+        unchanged = True
         for src, suffix in ((paths[0], "out"), (paths[1], "err")):
             if not src:
                 with _log_lock:
@@ -546,6 +603,7 @@ def _mirror_one_job_log(jid: str) -> None:
             with _log_lock:
                 known = _log_fingerprint.get(str(dst)) if dst.is_file() else None
             data, fp, status = _read_log_source(src, owner_uid, known)
+            unchanged = unchanged and fp is not None and fp == known and data is None
             _set_log_status(jid, suffix, status, token)
             if fp is None:
                 # Do not keep serving a stale world-readable tail after its
@@ -572,6 +630,11 @@ def _mirror_one_job_log(jid: str) -> None:
                 atomic_write(dst, data, mode=0o644)
                 _log_fingerprint[str(dst)] = fp
                 _log_published.setdefault(jid, {})[suffix] = str(dst)
+        with _log_lock:
+            if jid in _log_live and _log_seed_tokens.get(jid) is token:
+                count = min(6, _log_unchanged.get(jid, 0) + 1) if unchanged else 0
+                _log_unchanged[jid] = count
+                _log_next_check[jid] = time.monotonic() + min(LOG_MIRROR_MAX_SEC, LOG_MIRROR_SEC * 2 ** count)
     except Exception as e:
         print(f"[collector] log mirror {jid} failed: {e}", flush=True)
     finally:
@@ -583,6 +646,7 @@ def _drop_log_spool(jid: str) -> None:
     with _log_lock:
         _log_published.pop(jid, None)
         _log_next_check.pop(jid, None)
+        _log_unchanged.pop(jid, None)
         _log_owner_uids.pop(jid, None)
         _log_status.pop(jid, None)
         _log_seed_tokens.pop(jid, None)
@@ -658,6 +722,7 @@ def _share_logs(jobs: List[JobInfo]) -> Dict[str, dict]:
         # invalidate the previous cycle. Otherwise a transient scheduler
         # failure would keep publishing and refreshing a stale privileged path.
         for jid in invalid_seeds:
+            _log_unchanged.pop(jid, None)
             _log_seed_tokens[jid] = object()
             token = _log_seed_tokens[jid]
             reset_streams.extend(
@@ -676,6 +741,7 @@ def _share_logs(jobs: List[JobInfo]) -> Dict[str, dict]:
                 previous_paths != paths or previous_owner != owner_uid
             )
             if seed_changed:
+                _log_unchanged.pop(jid, None)
                 _log_seed_tokens[jid] = object()
                 token = _log_seed_tokens[jid]
                 reset_streams.extend(
@@ -810,7 +876,14 @@ def _accumulate_usage(result_nodes: List[dict], now: float) -> None:
                 if not user:
                     continue
                 u = bucket.setdefault(user, {"alloc": 0, "busy": 0})
+                u.setdefault("observed_alloc", u.get("alloc", 0))
                 u["alloc"] += dt
+                coverage = _usage.setdefault("telemetry", {}).setdefault(day, {"fresh_gpu_sec": 0.0, "stale_gpu_sec": 0.0})
+                fresh = not n.get("stale", False)
+                coverage["fresh_gpu_sec" if fresh else "stale_gpu_sec"] += dt
+                if not fresh:
+                    continue
+                u["observed_alloc"] += dt
                 try:
                     if float(g.get("util") or 0) > 5:
                         u["busy"] += dt
@@ -826,6 +899,8 @@ def _accumulate_usage(result_nodes: List[dict], now: float) -> None:
             del _usage["days"][d]
         for d in [d for d in _usage.get("meta", {}) if d < cutoff]:
             del _usage["meta"][d]
+        for d in [d for d in _usage.get("telemetry", {}) if d < cutoff]:
+            del _usage["telemetry"][d]
         _usage_dirty = True
 
 
@@ -978,7 +1053,7 @@ def _job_to_dict(job: JobInfo) -> dict:
 def _node_job_to_dict(job: JobInfo) -> dict:
     """Compact copy for per-node rows; full detail lives in top-level jobs."""
     out = asdict(job)
-    for name in ("detail", "script", "log_out", "log_err", "log_status"):
+    for name in ("detail", "script", "log_out", "log_err", "log_status", "telemetry"):
         out.pop(name, None)
     return out
 
@@ -1076,6 +1151,13 @@ def _valid_agent_payload(name: str, payload: object, expected_kind: str | None =
         seen.add(index)
         if not isinstance(gpu["pids"], list) or not isinstance(gpu["users"], list):
             return False
+        if any(not isinstance(gpu.get(key, ""), str) or len(gpu.get(key, "")) > 128
+               for key in ("clock_reasons", "recovery_action")):
+            return False
+        if "health_observed_at" in gpu:
+            stamp = clean_sample({"observed_at": gpu["health_observed_at"]}).get("observed_at")
+            if stamp is None:
+                return False
     return True
 
 
@@ -1165,12 +1247,12 @@ def _maybe_repair_agent(name: str) -> None:
     _repair_executor.submit(_run_logged)
 
 
-def _poll_node_bg(n: dict, has_jobs: bool) -> None:
+def _poll_node_bg(n: dict, has_jobs: bool) -> bool:
     """Submit a background SSH poll for one node unless one is already in flight."""
     name, slurm_state = n["name"], n["state"]
     with _results_lock:
-        if name in _inflight:
-            return
+        if name in _inflight or len(_inflight) >= MAX_PENDING_POLLS:
+            return False
         _inflight.add(name)
 
     def _run() -> None:
@@ -1196,15 +1278,24 @@ def _poll_node_bg(n: dict, has_jobs: bool) -> None:
                 _node_results[name] = {
                     "gpus": gpu_dicts, "mem": mem_dict, "error": "",
                     "error_kind": NodeErrorKind.OK.value, "stale": False,
+                    "observed_at": time.time(),
+                    "telemetry": {"pressure": mem.pressure, "observed_at": time.time()},
                 }
-                _update_inventory(name, gpu_dicts)
                 node_is_cold = (
                     all(g.util in ("0", "", "N/A") for g in gpus) and not has_jobs
                 )
             _update_poll_state(name, success=not err, node_is_cold=node_is_cold, slurm_state=slurm_state)
             _inflight.discard(name)
+        if not err:
+            _update_inventory(name, gpu_dicts)
 
-    _node_executor.submit(_run)
+    try:
+        _node_executor.submit(_run)
+    except Exception:
+        with _results_lock:
+            _inflight.discard(name)
+        raise
+    return True
 
 
 def _effective_mem_total(mem: object, slurm_total: str) -> str:
@@ -1258,7 +1349,44 @@ def _prune_node_caches(live_names: set[str]) -> None:
         _node_absent_cycles.pop(name, None)
 
 
-def collect_all() -> dict:
+def _attach_telemetry(jobs, node_jobs, nodes, results, scheduler_error="") -> None:
+    now = time.time()
+    for job in jobs:
+        job.telemetry = {}
+    for node in nodes:
+        name = node["name"]
+        node.update(cpu_util="", pressure={}, telemetry_observed_at=0.0, jobs_truncated=False)
+        telemetry = clean_telemetry(results.get(name, {}).get("telemetry"))
+        observed = telemetry.get("observed_at", 0)
+        fresh = not node["stale"] and observed > 0 and -5 <= now - observed <= TELEMETRY_MAX_AGE
+        if fresh:
+            node.update(cpu_util=telemetry.get("cpu_util", ""), pressure=telemetry.get("pressure", {}),
+                        telemetry_observed_at=observed, jobs_truncated=telemetry.get("jobs_truncated", False))
+        if scheduler_error or node["stale"]:
+            continue
+        for job in node_jobs.get(name, []):
+            if job.uid < 0:
+                continue
+            aliases = {job.jobid}
+            from .common import _published_detail_field
+            canonical = _published_detail_field(job.detail, "JobId")
+            if canonical.isascii() and canonical.isdigit():
+                aliases.add(canonical)
+            candidates = [telemetry.get("jobs", {}).get(jid) for jid in aliases]
+            sample = next((clean_sample(value) for value in candidates if value), {}) if fresh else {}
+            stamp = sample.get("observed_at", 0)
+            if not stamp or not -5 <= now - stamp <= TELEMETRY_MAX_AGE:
+                sample = {}
+            amounts = [float(amount) for gpu in node["gpus"] for pid, amount in gpu.get("pid_mem", {}).items()
+                       if gpu.get("pid_jobid", {}).get(pid) in aliases and re.fullmatch(r"[0-9]{1,12}(?:\.[0-9]+)?", str(amount))]
+            if amounts and node.get("observed_at", 0) > 0:
+                sample["vram_mib"] = sum(amounts)
+                sample["observed_at"] = min(sample.get("observed_at", node["observed_at"]), node["observed_at"])
+            if len(sample) > 1:
+                job.telemetry[name] = sample
+
+
+def collect_all(*, background_basic: bool = False) -> dict:
     """One collection cycle: fast local data + latest async node results.
 
     Node SSH polls run in the background and never block this cycle — a dead
@@ -1267,7 +1395,7 @@ def collect_all() -> dict:
     (
         nodes_raw, jobs, pending, node_jobs_from_basic, gpu_alloc,
         alloc_user_map, scheduler_status, basic_err,
-    ) = collect_basic()
+    ) = _scheduler_sampler.read() if background_basic else collect_basic()
     # An empty roster can mean sinfo failed, so retain caches in that case.
     # Repeated non-empty snapshots retire renamed or decommissioned nodes;
     # one partial snapshot keeps the last-good telemetry.
@@ -1287,7 +1415,11 @@ def collect_all() -> dict:
     # collector-repaired; CPU agents are systemd-managed on their node. Either
     # kind falls back to async SSH when its payload is absent or stale.
     agent_nodes: set = set()
-    for n in nodes_raw:
+    global _poll_cursor, _notification_log_sources
+    start = _poll_cursor % len(nodes_raw) if nodes_raw else 0
+    poll_order = nodes_raw[start:] + nodes_raw[:start]
+    _poll_cursor = start
+    for offset, n in enumerate(poll_order):
         name = n["name"]
         has_jobs = name in node_jobs_from_basic
         has_gpu = n.get("has_gpu", True)
@@ -1299,7 +1431,9 @@ def collect_all() -> dict:
                 _node_results[name] = {
                     "gpus": gpu_dicts, "mem": payload.get("mem", {}),
                     "power": payload.get("power", {}),
+                    "telemetry": clean_telemetry(payload.get("telemetry")),
                     "error": "", "error_kind": NodeErrorKind.OK.value, "stale": False,
+                    "observed_at": float(_agent_payload_cache.get(name, (0,))[0]),
                 }
                 node_is_cold = not has_jobs and (
                     not has_gpu
@@ -1310,7 +1444,8 @@ def collect_all() -> dict:
             _update_inventory(name, gpu_dicts)
             continue
         if _should_poll_node(name):
-            _poll_node_bg(n, has_jobs=has_jobs)
+            if _poll_node_bg(n, has_jobs=has_jobs):
+                _poll_cursor = start + offset + 1
         if has_gpu:
             _maybe_repair_agent(name)
 
@@ -1322,6 +1457,11 @@ def collect_all() -> dict:
     for n in nodes_raw:
         name = n["name"]
         r = results.get(name, {"gpus": [], "mem": {}, "error": "", "error_kind": NodeErrorKind.OK.value, "stale": False})
+        now = time.time()
+        observed_at = float(r.get("observed_at", 0))
+        freshness_limit = max(AGENT_MAX_AGE, NODE_TIMEOUT + _node_poll_state.get(name, {}).get("interval", _INTERVAL_HOT))
+        if observed_at and now - observed_at > freshness_limit:
+            r = dict(r, stale=True, error_kind=NodeErrorKind.STALE_CACHED.value)
         skeleton_mode = False
         if not r["gpus"]:
             # No live data (cold start or unreachable node): render the known
@@ -1335,7 +1475,6 @@ def collect_all() -> dict:
         if r["stale"]:
             stale_nodes.append(name)
         node_alloc = gpu_alloc.get(name, {})
-        now = time.time()
         gpus = [dict(g) for g in r["gpus"]]
         for g in gpus:
             # node-side ps reports a bare UID when the node lacks the account;
@@ -1354,7 +1493,7 @@ def collect_all() -> dict:
         for g, (jid, _user) in zip(gpus, alloc_pairs, strict=True):
             g["alloc_jobid"] = jid
             g["alloc_user"] = _user
-            if skeleton_mode:
+            if skeleton_mode or r["stale"]:
                 # Placeholder rows carry no process info — show previously
                 # tracked waste ages but never start or reset the timers.
                 key = f"{name}:{g.get('index', '')}"
@@ -1386,12 +1525,24 @@ def collect_all() -> dict:
             "gpus": gpus, "jobs": node_jobs.get(name, []),
             "error": r["error"], "stale": r["stale"],
             "error_kind": r["error_kind"],
+            "observed_at": float(r.get("observed_at", 0)),
+            "data_age_sec": max(0.0, now - float(r["observed_at"])) if r.get("observed_at") else -1.0,
+            "scheduler_age_sec": float(scheduler_status.get("age_sec", 0)),
+            "scheduler_mem_total": n["mem_total"],
+            "scheduler_available": not basic_err and scheduler_status.get("job_backend") != "unavailable",
+            "cpu_util": "", "pressure": {}, "telemetry_observed_at": 0.0,
+            "jobs_truncated": False,
         })
 
+    _attach_telemetry(jobs, node_jobs_from_basic, result_nodes, results, basic_err)
     _accumulate_usage(result_nodes, time.time())
 
     scripts = _fetch_scripts(jobs)
     logs = _share_logs(jobs)
+    _notification_log_sources = {
+        job.jobid: (job.uid, tuple(job._log_paths)) for job in jobs
+        if job.uid >= 0 and getattr(job, "_log_paths", None) is not None
+    }
     return {
         "version": 1,
         "release": __version__,
@@ -1410,6 +1561,8 @@ def collect_all() -> dict:
         "untrusted_payloads": dict(_untrusted_payloads),
         "scheduler": scheduler_status,
         "errors": basic_err,
+        "collector": dict(_cycle_stats, ssh_inflight=len(_inflight),
+                          log_inflight=len(_log_inflight), rpc=command_snapshot()),
     }
 
 
@@ -1426,6 +1579,10 @@ METRICS_REFRESH_SEC = max(
     float(os.getenv("SLURM_GPU_TUI_METRICS_SEC", "15")),
 )
 _metrics_last_write = 0.0
+# Per-job pending series carry the jobid label: a deep queue (thousands of
+# array rows whose compressed ids change as tasks start) would dominate the
+# textfile and churn Prometheus series. sgpu_jobs_pending keeps the full count.
+PENDING_METRICS_MAX = max(0, int(os.getenv("SLURM_GPU_TUI_METRICS_PENDING_MAX", "100")))
 
 
 def _prom_escape(s: str) -> str:
@@ -1434,11 +1591,9 @@ def _prom_escape(s: str) -> str:
 
 def _format_metrics(data: dict) -> str:
     """Return a Prometheus textfile snapshot for the merged cluster state."""
-    def num(v):
-        try:
-            return float(v)
-        except (ValueError, TypeError):
-            return None
+    from .cells import node_gpu_classes, gpu_health_status, pending_wait_seconds
+    from .common import node_from_dict, from_dict
+    num = metric_number
 
     lines = [
         "# HELP sgpu_jobs_running Running Slurm jobs visible to sgpu",
@@ -1525,6 +1680,30 @@ def _format_metrics(data: dict) -> str:
         "# TYPE sgpu_node_info gauge",
         "# HELP sgpu_collector_last_success_timestamp_seconds Unix time of this snapshot",
         "# TYPE sgpu_collector_last_success_timestamp_seconds gauge",
+        "# HELP sgpu_node_data_age_seconds Age of the last node observation; -1 means unknown",
+        "# TYPE sgpu_node_data_age_seconds gauge",
+        "# HELP sgpu_node_scheduler_age_seconds Age of the scheduler generation; -1 means unknown",
+        "# TYPE sgpu_node_scheduler_age_seconds gauge",
+        "# HELP sgpu_collector_phase_seconds Wall time of each phase in the previous completed cycle",
+        "# TYPE sgpu_collector_phase_seconds gauge",
+        "# HELP sgpu_collector_cycle_seconds Wall time of the previous completed collector cycle",
+        "# TYPE sgpu_collector_cycle_seconds gauge",
+        "# HELP sgpu_collector_interval_seconds Time between the last two cycle starts",
+        "# TYPE sgpu_collector_interval_seconds gauge",
+        "# HELP sgpu_collector_ssh_inflight Admitted SSH polls running or queued",
+        "# TYPE sgpu_collector_ssh_inflight gauge",
+        "# HELP sgpu_collector_log_inflight Log mirrors running or queued",
+        "# TYPE sgpu_collector_log_inflight gauge",
+        "# HELP sgpu_collector_notify_backlog Unfinished outcome lookup and delivery work",
+        "# TYPE sgpu_collector_notify_backlog gauge",
+        "# HELP sgpu_command_calls_total Local command calls since collector start",
+        "# TYPE sgpu_command_calls_total counter",
+        "# HELP sgpu_command_failures_total Failed local command calls since collector start",
+        "# TYPE sgpu_command_failures_total counter",
+        "# HELP sgpu_command_seconds_total Cumulative local command wall time since collector start",
+        "# TYPE sgpu_command_seconds_total counter",
+        "# HELP sgpu_command_last_seconds Wall time of the last local command call",
+        "# TYPE sgpu_command_last_seconds gauge",
         "# HELP sgpu_build_info sgpu collector release information",
         "# TYPE sgpu_build_info gauge",
     ]
@@ -1541,14 +1720,13 @@ def _format_metrics(data: dict) -> str:
     stale_nodes = sum(1 for n in nodes if n.get("stale"))
     total_gpus = allocated_gpus = free_gpus = idle_gpus = parked_gpus = rogue_gpus = 0
     for n in nodes:
+        free_gpus += node_gpu_classes(node_from_dict(n)).count("free")
         for g in n.get("gpus", []):
             total_gpus += 1
             allocated = bool(g.get("alloc_jobid") or g.get("alloc_user"))
             has_process = bool(g.get("users"))
             if allocated:
                 allocated_gpus += 1
-            if not allocated and not has_process:
-                free_gpus += 1
             if g.get("idle_sec", 0) > 0:
                 idle_gpus += 1
             if g.get("parked_sec", 0) > 0:
@@ -1566,7 +1744,7 @@ def _format_metrics(data: dict) -> str:
     lines.append(f"sgpu_gpus_idle {idle_gpus}")
     lines.append(f"sgpu_gpus_parked {parked_gpus}")
     lines.append(f"sgpu_gpus_rogue {rogue_gpus}")
-    for pj in data.get("pending", []):
+    for pj in data.get("pending", [])[:PENDING_METRICS_MAX]:
         lines.append(
             "sgpu_pending_job_info{"
             f'jobid="{_prom_escape(str(pj.get("jobid", "")))}"'
@@ -1616,6 +1794,8 @@ def _format_metrics(data: dict) -> str:
             ("sgpu_node_cpu_power_watts", "cpu_power"),
             ("sgpu_node_ram_power_watts", "ram_power"),
             ("sgpu_node_sys_power_watts", "sys_power"),
+            ("sgpu_node_data_age_seconds", "data_age_sec"),
+            ("sgpu_node_scheduler_age_seconds", "scheduler_age_sec"),
         ):
             v = num(n.get(key))
             if v is not None:
@@ -1656,6 +1836,70 @@ def _format_metrics(data: dict) -> str:
                 )
             lines.append(f"sgpu_gpu_idle_seconds{{{lbl}}} {g.get('idle_sec', 0)}")
             lines.append(f"sgpu_gpu_parked_seconds{{{lbl}}} {g.get('parked_sec', 0)}")
+    diagnostics = data.get("collector", {})
+    for phase, seconds in diagnostics.get("phase_seconds", {}).items():
+        if phase in ("collect", "write", "idle", "usage", "metrics", "notify"):
+            lines.append(f'sgpu_collector_phase_seconds{{phase="{phase}"}} {seconds:g}')
+    for field in ("cycle_seconds", "interval_seconds", "ssh_inflight", "log_inflight", "notify_backlog"):
+        if field in diagnostics:
+            lines.append(f'sgpu_collector_{field} {diagnostics[field]:g}')
+    for command, values in diagnostics.get("rpc", {}).items():
+        if command in ("sinfo", "squeue", "scontrol_jobs", "scontrol_nodes", "sacct", "other"):
+            for field in ("calls", "failures", "seconds"):
+                lines.append(f'sgpu_command_{field}_total{{command="{command}"}} {values[field]:g}')
+            lines.append(f'sgpu_command_last_seconds{{command="{command}"}} {values["last_seconds"]:g}')
+    optional = {
+        "sgpu_node_cpu_util_percent": "Node CPU busy percent from counter deltas",
+        "sgpu_node_pressure_percent": "Node PSI some avg10 stall percent by resource",
+        "sgpu_node_telemetry_timestamp_seconds": "Last CPU and PSI sample timestamp",
+        "sgpu_job_cpu_cores": "Job cgroup CPU cores used over the sample interval",
+        "sgpu_job_mem_current_mib": "Job cgroup memory including cache in MiB",
+        "sgpu_job_mem_peak_mib": "Job cgroup local memory peak in MiB",
+        "sgpu_job_mem_limit_mib": "Finite job cgroup memory limit in MiB",
+        "sgpu_job_oom_kills": "Job cgroup lifetime OOM kills",
+        "sgpu_job_pid_vram_mib": "VRAM attributed to job GPU processes in MiB",
+        "sgpu_job_telemetry_timestamp_seconds": "Last validated job sample timestamp",
+        "sgpu_pending_wait_seconds": "Pending age since submission in seconds",
+        "sgpu_gpu_health_severity": "GPU health severity: zero normal, one caution, two action needed",
+    }
+    for metric, description in optional.items():
+        lines.extend((f"# HELP {metric} {description}", f"# TYPE {metric} gauge"))
+    now = time.time()
+    live_nodes = {node["name"] for node in nodes if not node.get("stale") and not node.get("error")
+                  and node.get("scheduler_available", True) and (num(node.get("scheduler_age_sec")) or 0) <= 30}
+    for node in nodes:
+        label = f'node="{_prom_escape(node["name"])}"'
+        stamp = num(node.get("telemetry_observed_at")) or 0
+        if not node.get("stale") and stamp > 0 and -5 <= now - stamp <= TELEMETRY_MAX_AGE:
+            lines.append(f"sgpu_node_telemetry_timestamp_seconds{{{label}}} {stamp:g}")
+            cpu = num(node.get("cpu_util"))
+            if cpu is not None and 0 <= cpu <= 100:
+                lines.append(f"sgpu_node_cpu_util_percent{{{label}}} {cpu:g}")
+            for resource, value in node.get("pressure", {}).items():
+                pressure = num(value)
+                if resource in ("cpu", "memory", "io") and pressure is not None and 0 <= pressure <= 100:
+                    lines.append(f'sgpu_node_pressure_percent{{{label},resource="{resource}"}} {pressure:g}')
+        if not node.get("stale"):
+            for gpu in node.get("gpus", []):
+                status, severity = gpu_health_status(from_dict(GpuInfo, gpu), now)
+                if status != "—":
+                    lines.append(f'sgpu_gpu_health_severity{{{label},gpu="{_prom_escape(gpu.get("index", ""))}"}} {severity}')
+    mapping = {"cpu_cores": "cpu_cores", "mem_current_mib": "mem_current_mib", "mem_peak_mib": "mem_peak_mib",
+               "mem_limit_mib": "mem_limit_mib", "oom_kill": "oom_kills", "vram_mib": "pid_vram_mib", "observed_at": "telemetry_timestamp_seconds"}
+    for job in data.get("jobs", []):
+        for node, raw in job.get("telemetry", {}).items():
+            sample = clean_sample(raw)
+            stamp = sample.get("observed_at", 0)
+            if node not in live_nodes or not stamp or not -5 <= now - stamp <= TELEMETRY_MAX_AGE:
+                continue
+            label = f'jobid="{_prom_escape(job.get("jobid", ""))}",user="{_prom_escape(job.get("user", ""))}",node="{_prom_escape(node)}"'
+            for key, suffix in mapping.items():
+                if key in sample:
+                    lines.append(f"sgpu_job_{suffix}{{{label}}} {sample[key]:g}")
+    for job in data.get("pending", [])[:PENDING_METRICS_MAX]:
+        wait = pending_wait_seconds(from_dict(PendingJob, job), now)
+        if wait is not None:
+            lines.append(f'sgpu_pending_wait_seconds{{jobid="{_prom_escape(job.get("jobid", ""))}"}} {wait:g}')
     return "\n".join(lines) + "\n"
 
 
@@ -1742,19 +1986,25 @@ def _master_host_lines(proc: str = "/proc", sys_dir: str = "/sys") -> List[str]:
     except Exception:
         pass
     try:
+        coretemp_seen = 0
         for h in sorted(glob.glob(f"{sys_dir}/class/hwmon/hwmon*")):
             try:
                 name = read(f"{h}/name").strip()
             except OSError:
                 continue
             if name == "coretemp":
+                # one hwmon per CPU package: label each by its platform device
+                # (coretemp.0, coretemp.1, ...) or the sockets collide
+                dev = os.path.basename(os.path.realpath(f"{h}/device"))
+                chip = _prom_escape(f"platform_{dev}" if dev.startswith("coretemp") else f"platform_coretemp.{coretemp_seen}")
+                coretemp_seen += 1
                 for t in sorted(glob.glob(f"{h}/temp*_input")):
                     sensor = os.path.basename(t)[:-len("_input")]
                     try:
                         val = int(read(t)) / 1000
                     except (OSError, ValueError):
                         continue
-                    lines.append(f'sgpu_master_hwmon_temp_celsius{{chip="platform_coretemp.0",'
+                    lines.append(f'sgpu_master_hwmon_temp_celsius{{chip="{chip}",'
                                  f'sensor="{sensor}"}} {val:.1f}')
             for pf in sorted(glob.glob(f"{h}/power*_average")):
                 sensor = os.path.basename(pf)[:-len("_average")]
@@ -1820,6 +2070,41 @@ def _rotate_log_if_big() -> None:
             sys.stderr = sys.stdout
     except Exception:
         pass
+
+
+_last_cycle_started = 0.0
+
+
+def _collect_cycle(notifier) -> tuple[dict, dict]:
+    global _cycle_stats, _last_cycle_started
+    started = time.monotonic()
+    interval = started - _last_cycle_started if _last_cycle_started else 0.0
+    _last_cycle_started = started
+    phases = {}
+
+    def timed(name, callback):
+        before = time.monotonic()
+        try:
+            return callback()
+        finally:
+            phases[name] = time.monotonic() - before
+
+    data = timed("collect", lambda: collect_all(background_basic=True))
+    timed("write", lambda: atomic_write(DATA_FILE, json.dumps(data, ensure_ascii=False), mode=0o644))
+    timed("idle", _save_idle_state)
+    _maybe_backfill_sacct(time.time())
+    timed("usage", _save_usage)
+    timed("metrics", lambda: _write_metrics(data))
+    try:
+        timed("notify", lambda: notifier.process(data, job_log_sources=dict(_notification_log_sources)))
+    except Exception as exc:
+        print(f"[collector] notify error: {exc}", flush=True)
+    _cycle_stats = {
+        "phase_seconds": phases, "cycle_seconds": time.monotonic() - started,
+        "interval_seconds": interval,
+        "notify_backlog": notifier._outcome_queue.unfinished_tasks + notifier._queue.unfinished_tasks,
+    }
+    return data, _cycle_stats
 
 
 def run_collector():
@@ -1895,21 +2180,8 @@ def run_collector():
     # GRES) render the full layout while real polls land asynchronously.
     while _running:
         try:
-            t0 = time.time()
-            data = collect_all()
-            elapsed = time.time() - t0
-
-            # 0644: the whole point of the daemon is that every user's TUI
-            # reads this instead of running its own SSH sweep
-            atomic_write(DATA_FILE, json.dumps(data, ensure_ascii=False), mode=0o644)
-            _save_idle_state()
-            _maybe_backfill_sacct(time.time())
-            _save_usage()
-            _write_metrics(data)
-            try:
-                notifier.process(data)
-            except Exception as e:
-                print(f"[collector] notify error: {e}", flush=True)
+            data, diagnostics = _collect_cycle(notifier)
+            elapsed = diagnostics["cycle_seconds"]
 
             n_gpus = sum(len(n.get("gpus", [])) for n in data["nodes"])
             print(f"[collector] {data['ts']} nodes={len(data['nodes'])} "

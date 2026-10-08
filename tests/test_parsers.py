@@ -128,6 +128,36 @@ def test_collect_basic_uses_one_squeue_and_preserves_errors(monkeypatch):
     )
 
 
+def test_mem_snapshot_cadence_does_not_cache_failures(monkeypatch):
+    monkeypatch.setattr(common, "_mem_snapshot", None)
+    monkeypatch.setattr(common, "_mem_snapshot_at", 0)
+    clock, calls = [100.0], []
+    monkeypatch.setattr(common.time, "monotonic", lambda: clock[0])
+    results = iter([({"n": "4"}, ""), ({}, "failed"), ({"n": "8"}, "")])
+    monkeypatch.setattr(common, "collect_mem_alloc", lambda: (calls.append(1), next(results))[1])
+    assert common._collect_mem_snapshot(15) == ({"n": "4"}, "")
+    clock[0] = 110
+    assert common._collect_mem_snapshot(15) == ({"n": "4"}, "")
+    clock[0] = 116
+    assert common._collect_mem_snapshot(15) == ({}, "failed")
+    assert common._collect_mem_snapshot(15) == ({"n": "8"}, "")
+    assert len(calls) == 3
+
+
+def test_unknown_uid_cache_expires(monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr(common, "_uid_name_cache", {})
+    monkeypatch.setattr(common, "_uid_name_expires", {})
+    clock = [100.0]
+    monkeypatch.setattr(common.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(common.pwd, "getpwuid", lambda uid: (_ for _ in ()).throw(KeyError(uid)))
+    assert common.resolve_user("123") == "123"
+    monkeypatch.setattr(common.pwd, "getpwuid", lambda uid: SimpleNamespace(pw_name="alice"))
+    assert common.resolve_user("123") == "123"
+    clock[0] += 31
+    assert common.resolve_user("123") == "alice"
+
+
 def test_public_queue_error_prefixes_are_unchanged(monkeypatch):
     monkeypatch.setattr(common, "run_cmd", lambda _cmd: (False, "down"))
     assert common.collect_jobs() == ([], "squeue failed: down")
@@ -539,6 +569,17 @@ def test_mem_cell_fallbacks():
     assert str(mem_cell(NodeInfo(mem_total="1000", mem_free="N/A"))) == "-/1G"
 
 
+def test_metric_cells_preserve_unknowns_and_bound_bars():
+    from sgpu.cells import classify_gpu, make_bar, util_cell
+    for value in ("NaN", "inf", "-inf", "N/A"):
+        assert classify_gpu(GpuInfo(util=value)) == "unknown"
+        assert util_cell(value).plain == f"{value}%"
+    assert make_bar(float("nan")).plain == "?"
+    assert make_bar(float("inf")).plain == "?"
+    assert len(make_bar(1000000, width=6).plain) == 6
+    assert len(make_bar(-1, width=6).plain) == 6
+
+
 def test_fmt_start_time():
     assert fmt_start_time("N/A") == ""
     assert fmt_start_time("") == ""
@@ -841,3 +882,45 @@ def test_gpu_count_from_gres_prefix_variants():
     assert _gpu_count_from_gres("gpu:h100:1,gpu:a6000:2") == 3
     assert _gpu_count_from_gres("gres/gpu:1(IDX:0)") == 1
     assert _gpu_count_from_gres("N/A") == 0
+
+
+def test_new_metrics_keep_unknown_and_stale_telemetry_out(monkeypatch):
+    import time
+    from datetime import datetime
+    from sgpu.collector import _format_metrics
+    now = time.time()
+    data = {'nodes': [{'name': 'cpu1', 'has_gpu': False, 'gpus': [], 'state': 'idle',
+                       'telemetry_observed_at': now, 'cpu_util': '25', 'pressure': {'cpu': '5.0', 'io': 'nan'}}],
+            'jobs': [{'jobid': '123', 'user': 'alice', 'telemetry': {
+                'cpu1': {'observed_at': now, 'cpu_cores': 2, 'mem_current_mib': 512, 'oom_kill': 0}}}],
+            'pending': [{'jobid': '124', 'submit_time': datetime.fromtimestamp(now - 600).isoformat()}]}
+    metrics = _format_metrics(data)
+    assert 'sgpu_node_cpu_util_percent{node="cpu1"} 25' in metrics
+    assert 'sgpu_node_pressure_percent{node="cpu1",resource="cpu"} 5' in metrics
+    assert 'resource="io"' not in metrics
+    assert 'sgpu_job_cpu_cores{jobid="123",user="alice",node="cpu1"} 2' in metrics
+    assert 'sgpu_pending_wait_seconds{jobid="124"}' in metrics
+    # per-job pending series are capped; the total count stays exact
+    monkeypatch.setattr("sgpu.collector.PENDING_METRICS_MAX", 2)
+    data['pending'] = [dict(data['pending'][0], jobid=str(200 + i)) for i in range(5)]
+    metrics = _format_metrics(data)
+    assert metrics.count("sgpu_pending_job_info{") == 2
+    assert metrics.count("sgpu_pending_wait_seconds{") == 2
+    assert 'sgpu_pending_job_info{jobid="201"' in metrics and 'jobid="202"' not in metrics
+    assert "sgpu_jobs_pending 5" in metrics
+    data['nodes'][0]['stale'] = True
+    metrics = _format_metrics(data)
+    assert 'sgpu_node_cpu_util_percent{node=' not in metrics
+    assert 'sgpu_job_cpu_cores{jobid=' not in metrics
+
+
+def test_direct_collection_does_not_claim_free_capacity_without_scheduler():
+    from sgpu.common import NodeMemInfo, NodeSSHResult, build_nodes
+    from sgpu.cells import node_gpu_classes
+    raw = {'name': 'gpu1', 'state': 'idle', 'cpus': '32', 'cpu_load': '0',
+           'mem_total': '1000', 'mem_free': '900', 'gres': 'gpu:1'}
+    result = NodeSSHResult([GpuInfo(index='0', util='0', mem_used='0', mem_total='81920')], NodeMemInfo())
+    node = build_nodes([raw], {}, {'gpu1': result}, [],
+                       scheduler_status={'job_backend': 'unavailable'}, scheduler_error='scheduler failed')[0]
+    assert not node.scheduler_available
+    assert node_gpu_classes(node) == ['unknown']

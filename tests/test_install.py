@@ -1,5 +1,11 @@
 """Install-time service template contracts."""
+import json
+import os
+import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -168,3 +174,90 @@ def test_installer_configures_slack_bot_only_and_shows_existing_values():
     assert 'cfg.pop("url", None)' in installer
     assert "SGPU_WEBHOOK_URL" not in installer
     assert "Slack webhook URL" not in installer
+
+
+@pytest.mark.parametrize("tests_pass", [True, False])
+def test_deploy_isolates_pytest_and_stops_before_install_on_failure(tmp_path, tests_pass):
+    repo = tmp_path / "checkout"
+    repo.mkdir()
+    script = repo / "deploy.sh"
+    script.write_bytes((ROOT / "deploy.sh").read_bytes())
+    mock_bin = tmp_path / "bin"
+    mock_bin.mkdir()
+    temp_root = tmp_path / "deployment-temp"
+    temp_root.mkdir(mode=0o700)
+    # Reproduce pytest's inherited-name/different-uid collision without root.
+    foreign_root = tmp_path / "foreign-temp"
+    foreign_root.mkdir()
+    (foreign_root / "pytest-of-fixture").mkdir(mode=0o700)
+    smoke = repo / "test_smoke.py"
+    smoke.write_text("import os\ndef test_temp(tmp_path):\n"
+                     "    assert tmp_path.stat().st_uid == os.getuid()\n"
+                     "    assert os.environ['SGPU_TEST_PASS'] == '1'\n")
+    calls = tmp_path / "calls.jsonl"
+
+    def executable(path, body):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+        path.chmod(0o755)
+
+    executable(mock_bin / "uv", f"#!{sys.executable}\n" + '''
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+with open(os.environ['SGPU_TEST_CALLS'], 'a') as log:
+    log.write(json.dumps(['uv', *args]) + '\\n')
+if args[0] == 'run':
+    import pytest
+    import _pytest.tmpdir as tmpdir
+    tmpdir.get_user = lambda: 'fixture'
+    tmpdir.get_user_id = lambda: os.getuid() + 1
+    options = ['-q', '-p', 'no:cacheprovider', os.environ['SGPU_TEST_SMOKE']]
+    if '--basetemp' in args:
+        base = Path(args[args.index('--basetemp') + 1])
+        assert base.parent.stat().st_uid == os.getuid()
+        assert base.parent.stat().st_mode & 0o077 == 0
+        assert os.environ['PYTHONDONTWRITEBYTECODE'] == '1'
+        options += ['--basetemp', str(base)]
+    sys.exit(pytest.main(options))
+''')
+    executable(mock_bin / "id", "#!/bin/sh\nprintf '0\\n'\n")
+    executable(mock_bin / "grep", "#!/bin/sh\nexit 0\n")
+    executable(mock_bin / "sed", "#!/bin/sh\nexit 99\n")
+    executable(mock_bin / "sleep", "#!/bin/sh\nexit 0\n")
+    executable(mock_bin / "mktemp", f"#!{sys.executable}\n" + '''
+import os, sys, tempfile
+from pathlib import Path
+assert sys.argv[1] == '-d'
+assert Path(sys.argv[2]).name.startswith('sgpu-deploy-tests.')
+print(tempfile.mkdtemp(prefix='sgpu-deploy-tests.', dir=os.environ['SGPU_TEST_TMPDIR']))
+''')
+    record = f"#!{sys.executable}\n" + '''
+import json, os, sys
+from pathlib import Path
+with open(os.environ['SGPU_TEST_CALLS'], 'a') as log:
+    log.write(json.dumps([Path(sys.argv[0]).name, *sys.argv[1:]]) + '\\n')
+'''
+    executable(mock_bin / "systemctl", record)
+    prod = tmp_path / "prod"
+    executable(prod / "bin" / "python", record)
+    env = dict(os.environ, PATH=f"{mock_bin}:{os.environ['PATH']}",
+               SGPU_UV=str(mock_bin / "uv"), SGPU_PROD_VENV=str(prod),
+               SGPU_TEST_CALLS=str(calls), SGPU_TEST_TMPDIR=str(temp_root),
+               SGPU_TEST_SMOKE=str(smoke), SGPU_TEST_PASS="1" if tests_pass else "0",
+               PYTEST_DEBUG_TEMPROOT=str(foreign_root))
+    result = subprocess.run(["bash", str(script)], env=env, capture_output=True,
+                            text=True, timeout=20)
+    recorded = [json.loads(line) for line in calls.read_text().splitlines()]
+    test_call = recorded[0]
+    assert test_call[:2] == ["uv", "run"]
+    assert "--basetemp" in test_call and "no:cacheprovider" in test_call
+    assert list(temp_root.iterdir()) == []
+    assert (foreign_root / "pytest-of-fixture").exists()
+    if tests_pass:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert any(call[:3] == ["uv", "pip", "install"] for call in recorded)
+        assert ["systemctl", "restart", "sgpu-collector"] in recorded
+    else:
+        assert result.returncode != 0
+        assert len(recorded) == 1

@@ -208,12 +208,17 @@ def test_collect_all_does_not_repair_cpu_only_nodes(monkeypatch):
     monkeypatch.setattr(collector, "_maybe_repair_agent", repaired.append)
     monkeypatch.setattr(collector, "_accumulate_usage", lambda *args: None)
     monkeypatch.setattr(collector, "_fetch_scripts", lambda jobs: {})
-    collector._node_results.clear()
+    monkeypatch.setattr(collector, "_node_results", {"cpu1": {
+        "gpus": [], "mem": {}, "error": "", "error_kind": "ok", "stale": False,
+        "observed_at": time.time() - 1000,
+    }})
 
     data = collector.collect_all()
 
     assert repaired == []
     assert data["nodes"][0]["has_gpu"] is False
+    assert data["nodes"][0]["stale"] is True
+    assert data["nodes"][0]["data_age_sec"] >= 1000
     assert data["scheduler"] == {}
 
 
@@ -243,6 +248,42 @@ def test_collect_all_prefers_cpu_agent_over_ssh(monkeypatch):
     assert data["nodes"][0]["mem_total"] == "250000"
     assert data["nodes"][0]["mem_avail"] == "249000"
     assert data["scheduler"] == {}
+
+
+def test_collect_all_rotates_admission_and_keeps_notification_paths_private(monkeypatch):
+    from sgpu.common import JobInfo
+    nodes = [{"name": f"cpu{i}", "state": "idle", "partition": "cpu",
+              "has_gpu": False, "cpus": "64", "cpu_alloc": "0", "cpu_load": "0",
+              "mem_total": "250000", "mem_free": "240000", "mem_alloc": "0",
+              "gres": "(null)"} for i in range(5)]
+    job = JobInfo(jobid="42", user="alice", uid=123)
+    job._log_paths = ("/private/job.out", "/private/job.err")
+    monkeypatch.setattr(collector, "collect_basic", lambda: (nodes, [job], [], {}, {}, {}, {}, ""))
+    monkeypatch.setattr(collector, "_node_results", {})
+    monkeypatch.setattr(collector, "_poll_cursor", 0)
+    monkeypatch.setattr(collector, "_read_agent_payload", lambda *args: None)
+    monkeypatch.setattr(collector, "_should_poll_node", lambda name: True)
+    monkeypatch.setattr(collector, "_accumulate_usage", lambda *args: None)
+    monkeypatch.setattr(collector, "_fetch_scripts", lambda jobs: {})
+    monkeypatch.setattr(collector, "SHARE_LOGS", False)
+    monkeypatch.setattr(collector, "_notification_log_sources", {})
+    admitted, capacity = [], [2]
+
+    def admit(node, **kwargs):
+        if capacity[0] == 0:
+            return False
+        capacity[0] -= 1
+        admitted.append(node["name"])
+        return True
+
+    monkeypatch.setattr(collector, "_poll_node_bg", admit)
+    for slots, expected_cursor in ((2, 2), (0, 2), (2, 4), (2, 1)):
+        capacity[0] = slots
+        data = collector.collect_all()
+        assert collector._poll_cursor % len(nodes) == expected_cursor
+        assert "/private/" not in json.dumps(data)
+        assert collector._notification_log_sources == {"42": (123, job._log_paths)}
+    assert admitted == ["cpu0", "cpu1", "cpu2", "cpu3", "cpu4", "cpu0"]
 
 
 def test_effective_mem_total_falls_back_for_invalid_live_value():
@@ -308,3 +349,40 @@ def test_parse_ipmi_power():
     assert agent._parse_ipmi_power(out) == "612"
     assert agent._parse_ipmi_power("") == ""
     assert agent._parse_ipmi_power("Instantaneous power reading: N/A Watts") == ""
+
+
+def test_optional_gpu_health_is_capability_gated_and_cached(monkeypatch):
+    monkeypatch.setattr(agent, '_health_cache', {'next': 0.0, 'fields': None, 'values': {}, 'observed_at': 0.0})
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        output = 'clocks_event_reasons.active gpu_recovery_action' if '--help-query-gpu' in command else '0, 0x0000000000000044, Reset\n'
+        return subprocess.CompletedProcess(command, 0, output, '')
+
+    monkeypatch.setattr(agent.subprocess, 'run', run)
+    gpu = GpuInfo(index='0')
+    agent._apply_gpu_health([gpu], now=10)
+    assert gpu.clock_reasons == 'power-cap,hw-thermal'
+    assert gpu.recovery_action == 'Reset' and gpu.health_observed_at > 0
+    agent._apply_gpu_health([gpu], now=11)
+    assert len(calls) == 2
+    monkeypatch.setattr(agent.subprocess, 'run', lambda *a, **kw: (_ for _ in ()).throw(OSError('unsupported')))
+    agent._apply_gpu_health([gpu], now=100)
+    assert gpu.clock_reasons == gpu.recovery_action == ''
+    assert gpu.health_observed_at == 0
+
+
+def test_optional_health_shape_cannot_break_public_gpu_decoder():
+    payload = _payload()
+    payload['gpus'][0]['clock_reasons'] = []
+    assert not collector._valid_agent_payload('gpu1', payload)
+    payload['gpus'][0]['clock_reasons'] = ''
+    payload['gpus'][0]['health_observed_at'] = float('nan')
+    assert not collector._valid_agent_payload('gpu1', payload)
+
+
+def test_ssh_pressure_section_is_optional_and_numeric():
+    payload = '---SEP---'.join(['', '', '1024 512 512', '', '', '', '', 'cpu 10.5\nmemory nan\nio -1\nprivate /path'])
+    _, mem = parse_node_payload(payload)
+    assert mem.pressure == {'cpu': '10.5'}

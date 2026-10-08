@@ -88,6 +88,43 @@ instead of impersonating it. The agent says so explicitly in its log
 (`cannot publish ... push mode is blocked for this node`) rather than
 degrading silently to SSH.
 
+## Optional node and job telemetry
+
+Payload v9 adds CPU counter deltas, `/proc/pressure/{cpu,memory,io}` `some`
+`avg10`, and numeric per-job cgroup-v2 values. GPU health probes first check
+`nvidia-smi --help-query-gpu`, support both `clocks_event_reasons.active` and
+the older `clocks_throttle_reasons.active`, and tolerate missing recovery action.
+
+`SLURM_GPU_TUI_TELEMETRY_SEC` defaults to 10s; sampling runs only when the
+existing agent next collects, so CPU-only agents retain their 20s push cadence.
+`SLURM_GPU_TUI_TELEMETRY_MAX_JOBS` defaults to 256 (clamped to 1–4096). Configure
+these in the agent's environment; matching telemetry intervals on readers keep
+freshness consistent (the greater of 30s or twice the configured interval).
+
+The bounded scan examines Slurm-managed `slurm` or `[node_]slurmstepd.scope`
+directories under the cgroup root or `system.slice`, including optional
+`uid_<id>` wrappers. Numeric `job_<id>` paths are supported. Newer Slurm's
+SLUID directories are mapped only via a root-owned `slurmstepd: [job.step]`
+process in the step's `slurm/cgroup.procs`; unresolved or duplicate IDs are
+omitted. No user environment variables or arbitrary process titles establish
+job identity. The scan never traverses `user.slice`, follows symlinks, or reads
+more than 8 KiB per kernel record. Reaching the scan limit is published as
+`jobs_truncated`; unsupported cgroup v1, missing files and permission failures
+leave metrics absent. No Slurm configuration or privilege change is needed.
+
+`memory.current` includes descendants and cache, `memory.peak` is node-local,
+`memory.max=max` has no finite limit, and `memory.events` supplies cumulative
+`oom_kill`. CPU cores use `cpu.stat` deltas; first samples and counter resets
+are unknown. The collector checks trusted payload authorship, finite numeric
+fields, sample age and validated scheduler job/node membership. GPU process
+VRAM is attributed separately. The TUI shows per-metric coverage and partial
+values, and SSH fallback contributes only PSI to this optional telemetry.
+
+Semantics: [Linux cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html),
+[Linux PSI](https://docs.kernel.org/accounting/psi.html),
+[Slurm cgroup v2 paths](https://slurm.schedmd.com/cgroup_v2.html),
+[NVIDIA SMI queries](https://docs.nvidia.com/deploy/nvidia-smi/index.html).
+
 ## Operational checks
 
 ```bash

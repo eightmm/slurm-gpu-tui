@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import time
 from datetime import datetime
 from typing import List
 
@@ -9,6 +10,8 @@ from rich.cells import cell_len
 from rich.text import Text
 
 from .common import GpuInfo, NodeInfo, ROGUE_IGNORE
+from .telemetry import metric_number
+from .node_telemetry import clean_sample, TELEMETRY_MAX_AGE
 
 # ── Rich visual helpers ───────────────────────────────────────────────────
 
@@ -28,7 +31,9 @@ def pct_color(pct: float) -> str:
 
 
 def make_bar(pct: float, width: int = 20) -> Text:
-    filled = int(pct * width)
+    if metric_number(pct) is None:
+        return Text("?", style="bright_black")
+    filled = int(min(1.0, max(0.0, pct)) * width)
     empty = width - filled
     color = pct_color(pct)
     bar = Text()
@@ -40,11 +45,10 @@ def make_bar(pct: float, width: int = 20) -> Text:
 def util_cell(util_str: str) -> Text:
     if not util_str:
         return Text("-", style="bright_black")
-    try:
-        val = float(util_str)
-        pct = val / 100.0
-    except (ValueError, TypeError):
+    val = metric_number(util_str)
+    if val is None:
         return Text(f"{util_str}%", style="bright_black")
+    pct = val / 100.0
     bar = make_bar(pct, width=10)
     label = Text(f" {val:3.0f}%", style=f"bold {pct_color(pct)}")
     return bar + label
@@ -106,15 +110,11 @@ def state_cell(state: str) -> Text:
     disp = state
     for long, short in _STATE_SHORT.items():
         disp = disp.replace(long, short)
-    if "idle" in s:
-        return Text(f"● {disp}", style="bold green")
-    if "mix" in s:
-        return Text(f"◐ {disp}", style="bold yellow")
-    if "alloc" in s:
-        return Text(f"○ {disp}", style="bold blue")
-    if "down" in s or "drain" in s:
-        return Text(f"✖ {disp}", style="bold bright_black")
-    return Text(disp)
+    if any(word in s for word in ("down", "fail")):
+        return Text(f"✖ {disp}", style="bold red")
+    if any(word in s for word in ("drain", "maint", "unknown")):
+        return Text(f"! {disp}", style="yellow")
+    return Text(disp, style="dim")
 
 
 def ellipsize(s: str, n: int = 20) -> str:
@@ -135,10 +135,6 @@ def highlight_row(cells: list) -> list:
         if isinstance(cell, Text):
             cell.stylize("on #1a1a3a")
     return cells
-
-
-def node_cell(name: str) -> Text:
-    return Text(name, style="bold cyan")
 
 
 def mem_cell(node: NodeInfo) -> Text:
@@ -201,9 +197,8 @@ def classify_gpu(g: GpuInfo) -> str:
     real_users = [u for u in g.users if u not in ROGUE_IGNORE]
     if real_users and not g.alloc_jobid:
         return "rogue"
-    try:
-        util = float(g.util)
-    except (ValueError, TypeError):
+    util = metric_number(g.util)
+    if util is None:
         return "unknown"
     if util > 5:
         return "busy"
@@ -227,6 +222,100 @@ _CLASS_GLYPH = {
     "rogue": ("!", "bold red"),
     "unknown": ("?", "bright_black"),
 }
+
+
+def node_schedulable(node: NodeInfo) -> bool:
+    return not (node.stale or node.error or not node.scheduler_available or node.scheduler_age_sec > 30
+                or any(state in node.state.lower() for state in ("down", "drain", "fail", "maint", "unknown")))
+
+
+def node_gpu_classes(node: NodeInfo) -> List[str]:
+    if node.stale:
+        return ["unknown"] * len(node.gpus)
+    classes = [classify_gpu(gpu) for gpu in node.gpus]
+    return ["unknown" if kind == "free" and (not node_schedulable(node) or gpu_health_status(gpu)[1] == 2) else kind
+            for gpu, kind in zip(node.gpus, classes, strict=True)]
+
+
+def gpu_health_status(gpu: GpuInfo, now: float | None = None) -> tuple[str, int]:
+    now = time.time() if now is None else now
+    flags, severity = [], 0
+    if gpu.health_observed_at > 0 and -5 <= now - gpu.health_observed_at <= TELEMETRY_MAX_AGE:
+        action = gpu.recovery_action.lower()
+        if action and action != "none":
+            flags.append("REBOOT" if action == "reboot" else "RESET" if action == "reset" else "DRAIN")
+            severity = 2
+        if "thermal" in gpu.clock_reasons:
+            flags.append("THERMAL")
+            severity = 2
+        elif any(reason in gpu.clock_reasons for reason in ("hw-slowdown", "power-brake")):
+            flags.append("SLOW")
+            severity = max(severity, 1)
+        elif "power-cap" in gpu.clock_reasons:
+            flags.append("CAP")
+    temperature, ecc = metric_number(gpu.temp), metric_number(gpu.ecc)
+    if temperature is not None and temperature >= 85:
+        flags.append("HOT")
+        severity = max(severity, 1)
+    if ecc is not None and ecc > 0:
+        flags.append(f"ECC:{ecc:.0f}")
+        severity = max(severity, 1)
+    known = temperature is not None or ecc is not None or (gpu.health_observed_at > 0 and -5 <= now - gpu.health_observed_at <= TELEMETRY_MAX_AGE)
+    return "/".join(flags) or ("OK" if known else "—"), severity
+
+
+def pending_wait_seconds(job, now: float | None = None) -> float | None:
+    try:
+        stamp = datetime.fromisoformat(job.submit_time).timestamp()
+    except (ValueError, TypeError):
+        return None
+    return max(0, (time.time() if now is None else now) - stamp)
+
+
+def pending_reason(job) -> str:
+    if job.reason in ("Dependency", "DependencyNeverSatisfied"):
+        dependency = job.dependency if job.dependency not in ("", "(null)", "None") else ""
+        return job.reason + (f" {dependency}" if dependency else "")
+    if job.reason.startswith(("QOS", "Assoc")) and job.qos:
+        return f"{job.reason} [{job.qos}]"
+    return job.reason or "unknown"
+
+
+def pending_explanation(job) -> str:
+    explanations = {
+        "Resources": "Requested resources are not currently available.",
+        "Priority": "Higher-priority jobs are ahead in scheduling consideration.",
+        "Dependency": "Waiting for the specified job dependencies.",
+        "DependencyNeverSatisfied": "A dependency cannot be satisfied.",
+        "BeginTime": "The requested begin time has not arrived.",
+        "ReqNodeNotAvail": "A requested node is unavailable or reserved.",
+        "PartitionTimeLimit": "The time request exceeds the partition limit.",
+        "PartitionNodeLimit": "The node request does not fit the partition limits.",
+    }
+    if job.reason.startswith(("QOS", "Assoc")):
+        return "A QOS or account policy limit blocks scheduling; inspect the exact reason and QOS."
+    return explanations.get(job.reason, "Inspect the scheduler's exact reason below.")
+
+
+def job_resource_summary(job, nodes, now: float | None = None) -> dict:
+    from .common import _strict_expand_nodes
+    now = time.time() if now is None else now
+    expected = set(_strict_expand_nodes(job.node) or ())
+    live = {node.name for node in nodes if not node.stale and not node.error and node.scheduler_available and node.scheduler_age_sec <= 30}
+    samples = {}
+    if isinstance(job.telemetry, dict):
+        for name, value in job.telemetry.items():
+            sample = clean_sample(value)
+            stamp = sample.get("observed_at", 0)
+            if len(sample) > 1 and name in expected & live and stamp > 0 and -5 <= now - stamp <= TELEMETRY_MAX_AGE:
+                samples[name] = sample
+    result = {"sampled_nodes": len(samples), "expected_nodes": len(expected)}
+    for key in ("cpu_cores", "mem_current_mib", "mem_peak_mib", "mem_limit_mib", "oom_kill", "vram_mib"):
+        values = [sample[key] for sample in samples.values() if key in sample]
+        if values:
+            result[key] = sum(values)
+        result[key + "_nodes"] = len(values)
+    return result
 
 
 def gpu_strip(classes: List[str]) -> Text:
@@ -324,4 +413,3 @@ def remaining_cell(elapsed: str, time_limit: str) -> Text:
         return Text(label, style="yellow")
     else:
         return Text(label, style="dim green")
-

@@ -30,6 +30,9 @@ terminal TUI · collector daemon · push agents · usage/waste accounting · Sla
 </tr>
 </table>
 
+<p align="center"><img src="docs/tab-jobs.svg" alt="Jobs tab: requested and actual resources, OOM and coverage" width="100%"><br>
+<sub><b>Jobs tab (4)</b> — GPU/CPU jobs and pending work; screenshots use synthetic data.</sub></p>
+
 ## Features
 
 - Per-node GPU status (utilization, VRAM, temp, power) and CPU/RAM — GPUs
@@ -61,7 +64,7 @@ Runs on a SLURM login/master node (Python 3.10+, `sinfo`/`squeue`, optionally
 ```
 
 - **Push mode (preferred):** GPU agents push `nvidia-smi` data every 3s,
-  CPU-only agents `/proc/meminfo` every 20s — no SSH in the hot path.
+  CPU-only agents RAM/CPU/PSI data every 20s — no SSH in the hot path.
 - **SSH-pull fallback:** nodes without a live agent are polled over SSH
   (ControlMaster-pooled, async). Modes mix freely; stale CPU payloads fall
   back to low-frequency SSH polling (`cpu-poll`).
@@ -113,7 +116,9 @@ sgpu        # launch the monitor
 
 | Key | Action |
 |-----|--------|
-| `1` `2` `3` | Tabs: GPU / CPU / Usage |
+| `1` `2` `3` `4` | Tabs: GPU / CPU / Usage / Jobs |
+| `v` / `t` | Expand pending queue / show cluster trend (both initially hidden) |
+| `f` | Free capacity by GPU model/VRAM, single-node maximum and node list |
 | `r` / `s` | Refresh / cycle sort (Node → Util → User → Free) |
 | `u` / `i` | Filter by user (me first) / free-GPU filter |
 | `p` / `m` | Cycle partition filter / my jobs only |
@@ -142,33 +147,99 @@ sgpu --jobs [days] [--user U]          # job history: outcomes, GPU-hours, waits
 sgpu logs JOBID [-f] [-e]              # tail a job's stdout (-e: stderr, -f: follow)
 sgpu --report [YYYY-MM]                # markdown monthly report
 sgpu --wait-free 2 --partition heavy   # block until 2 GPUs free
-sgpu fit 2 [--vram 40] [--partition P] # where 2 GPUs fit right now + sbatch line
+sgpu fit 2 --vram 40 --model h100 --cpus 16 --ram 64 --partition P --explain
+                                     # resource fit + exclusion reasons + sbatch line
+sgpu bench --nodes 128 --repeat 5      # offline synthetic TUI update timings
+sgpu bench --replay snapshot.json     # offline replay of exported snapshots
 sgpu me              # my jobs, my wasted GPUs, my week (exit 1 if wasting)
 chkgpu               # one-shot user × node matrix with next-free ETA
 ```
 
+`fit` options are optional; VRAM and RAM are in GiB. `--model` takes an exact
+Slurm GRES type (for example `h100`); CPU/RAM use scheduler allocation rather
+than observed process usage. Stale telemetry is excluded. Results estimate
+capacity; reservations, QOS and scheduler policy still decide admission.
+`bench` makes no Slurm, SSH or network calls. Replay accepts one exported
+snapshot, a JSON list, or `{"snapshots": [...]}` (up to 64 MiB), including
+snapshots with missing metrics or stale nodes. Timings cover `_apply`, excluding
+JSON decoding and asynchronous screen painting; clear counts expose table rebuilds.
+
 ### Reading the Display
 
 ```
-▼ node01   ● idle   gpu_short   32/64   ████░░░░ 128/256G
-               0   A100    ████████░  85%   █████░░  40/80G   72C   280W   eightmm  12345   2:30h
-               1   A100    ░░░░░░░░░   0%   ░░░░░░░   0/80G   35C    45W
+Node / GPU   Util    VRAM       User / job         Left     Health
+▼ node01     mix    █▁         A100               free 1
+  GPU0       85%    40.0/80G   alice #12345       2.3h      OK
+  GPU1        0%     0.0/80G                             OK
+▶ Pending 12 · Resources 8 · Priority 4 [v]
 ```
 
-- **Node header**: name, state (`●` idle · `◐` mixed · `○` alloc · `✖` drain),
-  partition, CPU alloc, RAM bar, per-GPU glyph strip
-  (`█` busy · `▅` parked · `▂` reserved-idle · `▁` free · `!` rogue)
-- **`user !gres` / `user !slurm` (red)**: rogue — GPU process with no SLURM
-  allocation for that GPU
-- **`user idle 3.2h`**: allocated but no process, bold yellow after 1h
-- **Stale nodes**: `~timeout`, `~unreachable`, `~smi_err`
+- **Responsive layout**: below 130 columns, GPU rows use numeric utilization
+  and VRAM and omit the model column. Node headers carry the model; Enter shows
+  CPU/RAM, partition, hardware health and process details. Pending rows start
+  folded; `v` expands them. Normal states are muted, caution yellow, failures
+  red, and your jobs use one accent.
+- **FREE**: counts only fresh, schedulable nodes and GPUs without recovery or
+  thermal action flags. The two-line summary applies the current GPU filters;
+  `f` lists every model/VRAM group, its largest single-node fit and node counts.
+  Source/stale status explicitly covers the whole cluster. Capacity is an
+  observation, not a reservation or scheduler admission guarantee.
+- **GPU health**: HOT, aggregate uncorrectable ECC, power-cap/thermal/slowdown
+  clock events and recovery action when the driver supports them. CAP alone
+  is informational; low clocks alone are not a fault. Enter shows full values.
+- **Jobs (4)**: running GPU and CPU jobs plus pending jobs, requested CPU/RAM,
+  actual CPU cores and cgroup RAM, PID-attributed VRAM, remaining time or wait,
+  OOM kills and node coverage. `?` means unavailable; `~` means partial coverage.
+  RAM requests keep Slurm's raw units (`c` per CPU, `n` per node). Enter shows
+  RAM peak, finite limit and coverage for each metric. Summed node-local peaks
+  are not necessarily a simultaneous whole-job peak; cgroup memory includes
+  cache and descendants. Watch, detail and own-job cancellation work here too.
+- **Pending**: wait since submission, exact reasons with dependencies/QOS,
+  eligible time in details, and an explicitly estimated start. No queue position
+  is inferred from priority. User/partition/search filters also apply here.
+- **CPU (2)**: allocated cores, actual CPU busy %, load, RAM and PSI CPU/memory/
+  I/O `some avg10` stall %. PSI is a pressure indicator, not a causal diagnosis.
+- **Cluster trend (`t`)**: up to five minutes of GPU utilization, VRAM and total
+  GPU power. Unknown/stale observations are gaps (`·`); utilization/VRAM use a
+  0–100% scale and power uses the window peak.
+- **Usage coverage**: stale telemetry contributes no busy/waste samples or
+  efficiency denominator; allocated GPU-hours remain counted. The Usage tab
+  shows fresh coverage over assigned GPUs and unobserved GPU-hours.
+
+Optional CPU/PSI/job sampling is local to the existing agent, cached for 10s
+(`SLURM_GPU_TUI_TELEMETRY_SEC`), and scans at most 256 Slurm jobs per node
+(`SLURM_GPU_TUI_TELEMETRY_MAX_JOBS`). CPU counters need a second sample. Job
+metrics require accessible cgroup v2; v1, missing files, unlimited memory,
+permissions or unverified SLUID mappings produce missing values. Reads are
+bounded and do not follow symlinks. The collector publishes only numeric
+allowlisted fields tied to validated jobs and their allocated nodes. SSH
+fallback supplies PSI, but not cgroup job or CPU-delta measurements.
+GPU health sampling is capability-gated and cached for at least 10s.
+No repeated `sstat` polling or Slurm configuration changes are required.
+See [docs/PUSH.md](docs/PUSH.md) for supported paths and collection limits.
 
 ## Slack Alerts
 
 Config is `~/.sgpu/slack.json` (hot-reloaded); the installer sets it up and
 `sgpu doctor` shows the active mode. Full setup: **[docs/ALERTS.md](docs/ALERTS.md)**
 
+Finished-job state lookups run in a bounded background queue. Failure log tails
+go only to the owner's configured DM, using the last validated scheduler UID
+and private paths with the same safe reader as log sharing. After a restart
+or metadata loss, the summary can be sent without a log tail.
+
 ## Operations
+
+The collector publishes telemetry independently of a single background Slurm
+generation. It polls AllocMem less often, bounds SSH admission and rotates
+through eligible nodes. Cached SSH results become stale after the greater of
+the agent freshness limit and the node's polling interval plus SSH timeout.
+Failed/over-age scheduler generations keep the last
+node roster but invalidate privileged job metadata and allocation mappings;
+they never trigger a finished-job diff. Shared logs with unchanged content
+back off from the base scan interval to the configured maximum and reset
+after changes. Cycle, phase, RPC and queue metrics are documented in
+[docs/GRAFANA.md](docs/GRAFANA.md).
 
 ```bash
 systemctl status|restart sgpu-collector          # root install
@@ -236,7 +307,10 @@ sudo grafana/install.sh       # Grafana + Prometheus + alertmanager + dashboards
 ```
 
 Reinstall cleanly by re-running the one-line install. Deploying from a dev
-checkout? See `deploy.sh`. Uninstall (stops collector and agents, removes
+checkout? Run `bash ./deploy.sh` as root from that checkout. It tests in a
+fresh private temporary directory (including when sudo/su retains another
+username), installs only after the tests pass, then restarts the collector.
+Uninstall (stops collector and agents, removes
 services, data, install dir):
 
 ```bash
@@ -252,13 +326,19 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/uninstal
 |----------|---------|-------------|
 | `SLURM_GPU_TUI_REFRESH_SEC` | `3` | TUI refresh interval |
 | `SLURM_GPU_TUI_COLLECTOR_SEC` | `3` | Collector cycle interval |
+| `SLURM_GPU_TUI_SCHEDULER_SEC` | collector interval | Min pause after a completed scheduler generation |
+| `SLURM_GPU_TUI_SCHEDULER_MAX_AGE_SEC` | `30` | Scheduler freshness limit (at least scheduler interval) |
+| `SLURM_GPU_TUI_MEM_REFRESH_SEC` | `15` | AllocMem query interval in daemon mode |
 | `SLURM_GPU_TUI_NODE_TIMEOUT_SEC` | `30` | SSH timeout per node |
 | `SLURM_GPU_TUI_MAX_WORKERS` | `8` | Parallel SSH workers (fallback mode) |
+| `SLURM_GPU_TUI_MAX_PENDING_POLLS` | `2 × workers` | Cap on running/queued SSH polls (at least worker count) |
 | `SLURM_GPU_TUI_DATA_DIR` | `/tmp/slurm-gpu-tui` | Daemon JSON output dir |
 | `SLURM_GPU_TUI_STATE_DIR` | `~/.sgpu/state` | Persistent state (usage, waste, inventory) |
 | `SLURM_GPU_TUI_AGENT_DIR` | `~/.sgpu/nodes` | Push-agent payload dir (shared FS for push) |
 | `SLURM_GPU_TUI_AGENT_SEC` | `3` | GPU agent interval |
 | `SLURM_GPU_TUI_CPU_AGENT_SEC` | `20` | CPU-only agent interval |
+| `SLURM_GPU_TUI_TELEMETRY_SEC` | `10` | Local CPU/PSI/job sample interval |
+| `SLURM_GPU_TUI_TELEMETRY_MAX_JOBS` | `256` | Per-node cgroup job scan limit |
 | `SLURM_GPU_TUI_GPU_TOPOLOGY_TTL_SEC` | `300` | Static GPU PCI/minor/slot refresh interval |
 | `SLURM_GPU_TUI_AGENT_MAX_AGE_SEC` | `45` | Agent payload freshness limit |
 | `SLURM_GPU_TUI_AGENT_REPAIR_SEC` | `180` | Min interval between agent repairs per node |
@@ -268,6 +348,7 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/uninstal
 | `SLURM_GPU_TUI_USAGE_SAVE_SEC` | `30` | Durable usage-history checkpoint interval |
 | `SLURM_GPU_TUI_SACCT_SEC` | `3600` | slurmdbd backfill interval; `0` disables |
 | `SLURM_GPU_TUI_METRICS_SEC` | `15` | Prometheus textfile refresh interval |
+| `SLURM_GPU_TUI_METRICS_PENDING_MAX` | `100` | Per-job pending series in the textfile (`sgpu_jobs_pending` stays exact) |
 | `SLURM_GPU_TUI_METRICS_FILE` | `<data>/metrics.prom` | Prometheus textfile output path |
 | `SLURM_GPU_TUI_SLACK_BOT_TOKEN` | (unset) | Slack bot token (channel remains in `~/.sgpu/slack.json`) |
 | `SLURM_GPU_TUI_SLACK_DEBOUNCE_SEC` | `1800` | Min interval between repeated alerts |
@@ -276,7 +357,8 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/uninstal
 | `SLURM_GPU_TUI_SHARE_SCRIPTS` | (unset) | Show every job's batch script to all users — **shares script contents (and secrets)** |
 | `SLURM_GPU_TUI_SHARE_LOGS` | (unset) | Mirror every job's log tail for all users — **shares runtime output (and secrets)** |
 | `SLURM_GPU_TUI_SHARE_JOB_DETAILS` | (unset) | Publish sanitized scheduler details for all running/pending jobs |
-| `SLURM_GPU_TUI_LOG_MIRROR_SEC` | `10` | Shared-log scan interval |
+| `SLURM_GPU_TUI_LOG_MIRROR_SEC` | `10` | Base shared-log scan interval |
+| `SLURM_GPU_TUI_LOG_MIRROR_MAX_SEC` | `60` | Max interval after repeated unchanged scans |
 
 Install-time only: `SGPU_INSTALL_DIR`, `SGPU_ENABLE_PERSISTENCE` (`0` skips
 GPU-node persistence), `SGPU_ENABLE_CPU_PUSH` (`0` keeps CPU telemetry on SSH

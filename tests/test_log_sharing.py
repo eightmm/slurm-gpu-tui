@@ -22,16 +22,20 @@ def test_real_file_wins_when_readable(tmp_path):
     assert "live and complete" in text and used == str(real)
 
 
-def test_falls_back_to_the_mirror_when_unreadable(tmp_path):
+def test_falls_back_to_the_mirror_when_unreadable(tmp_path, monkeypatch):
     real, shared = tmp_path / "job.out", tmp_path / "job.out.shared"
     real.write_text("secret\n")
-    real.chmod(0o000)
     shared.write_text("mirrored tail\n")
-    try:
-        text, used = read_job_log(str(real), str(shared))
-        assert "mirrored tail" in text and used == str(shared)
-    finally:
-        real.chmod(0o600)
+    access = os.access
+
+    def denied(path, mode, *args, **kwargs):
+        if os.fspath(path) == str(real) and mode == os.R_OK:
+            return False
+        return access(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "access", denied)
+    text, used = read_job_log(str(real), str(shared))
+    assert "mirrored tail" in text and used == str(shared)
 
 
 def test_reports_the_real_error_when_neither_is_readable(tmp_path):
@@ -66,6 +70,7 @@ def spool(tmp_path, monkeypatch):
     monkeypatch.setattr(collector, "_log_status", {})
     monkeypatch.setattr(collector, "_log_seed_tokens", {})
     monkeypatch.setattr(collector, "_log_next_check", {})
+    monkeypatch.setattr(collector, "_log_unchanged", {})
     monkeypatch.setattr(collector, "_log_live", {"42"})
     monkeypatch.setattr(collector, "_log_inflight", set())
     return d
@@ -117,6 +122,29 @@ def test_growing_source_is_recopied(spool, tmp_path, monkeypatch):
     src.write_text("one\ntwo\n")
     collector._mirror_one_job_log("42")
     assert (spool / "42.out").read_text() == "one\ntwo\n"
+
+
+def test_unchanged_mirrors_back_off_and_changes_reset_cadence(spool, tmp_path, monkeypatch):
+    source = tmp_path / "job.out"
+    source.write_text("one")
+    monkeypatch.setattr(collector, "_log_paths", {"42": (str(source), "")})
+    monkeypatch.setattr(collector, "_log_unchanged", {})
+    monkeypatch.setattr(collector.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(collector, "LOG_MIRROR_SEC", 10)
+    monkeypatch.setattr(collector, "LOG_MIRROR_MAX_SEC", 60)
+    collector._mirror_one_job_log("42")
+    assert collector._log_next_check["42"] == 110
+    for expected in (120, 140, 160, 160):
+        collector._mirror_one_job_log("42")
+        assert collector._log_next_check["42"] == expected
+    source.write_text("changed")
+    collector._mirror_one_job_log("42")
+    assert collector._log_next_check["42"] == 110
+    assert (spool / "42.out").read_text() == "changed"
+    source.unlink()
+    collector._mirror_one_job_log("42")
+    assert not (spool / "42.out").exists()
+    assert collector._log_status["42"]["out"] == "waiting"
 
 
 def test_stderr_is_mirrored_separately(spool, tmp_path, monkeypatch):

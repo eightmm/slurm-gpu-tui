@@ -87,6 +87,13 @@ def render_usage(days: int = 7) -> Text:
                     f"\nsampling-based (collector observed {covered / 3600:.1f}h of this window)",
                     style="dim",
                 )
+    raw = _read_usage_raw() or {}
+    cutoff = _window_cutoff(days)
+    coverage = [value for day, value in raw.get("telemetry", {}).items() if day >= cutoff]
+    fresh = sum(value.get("fresh_gpu_sec", 0) for value in coverage)
+    stale = sum(value.get("stale_gpu_sec", 0) for value in coverage)
+    if fresh + stale:
+        body.append(f"\ntelemetry: {fresh / (fresh + stale):.0%} fresh · {stale / 3600:.1f} GPU-h unobserved (excluded from busy/eff)", style="dim")
     _usage_render_cache = (cache_key, body.copy())
     return body
 
@@ -142,7 +149,9 @@ def merge_usage_window(raw: dict, keep) -> Tuple[Dict[str, List[float]], Dict[st
     alloc per user-day = max(sampled, slurmdbd/sacct): sacct survives collector
     downtime, sampling covers jobs slurmdbd has not flushed yet. busy and waste
     exist only in sampling, so efficiency must be computed against
-    sampled_alloc — the same observation window as busy — not merged alloc.
+    sampled_alloc — allocation during fresh telemetry observations, the same
+    window as busy — not merged alloc. Older files have no observed_alloc
+    field and retain their original sampled denominator.
 
     Returns ({user: [alloc, busy, sampled_alloc, waste]}, {day: [alloc, busy]}).
     This is the one implementation: the totals view, the daily view, and the
@@ -164,7 +173,7 @@ def merge_usage_window(raw: dict, keep) -> Tuple[Dict[str, List[float]], Dict[st
             t = users.setdefault(user, [0.0, 0.0, 0.0, 0.0])
             t[0] += alloc
             t[1] += su.get("busy", 0)
-            t[2] += su.get("alloc", 0)
+            t[2] += su.get("observed_alloc", su.get("alloc", 0))
             t[3] += su.get("waste", 0)
             d[0] += alloc
             d[1] += su.get("busy", 0)

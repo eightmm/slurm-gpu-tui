@@ -104,3 +104,20 @@ def test_tui_source_counts_do_not_call_cpu_poll_gpu_fallback():
     ])
 
     assert counts == (1, 1, 1, 1, 1)
+
+
+def test_fit_checks_scheduler_resources_model_and_reasons(monkeypatch, capsys):
+    from dataclasses import replace
+    from sgpu.common import GpuInfo
+    node = NodeInfo(name="gpu1", state="idle", partition="gpu", gres="gpu:h100:2",
+                    cpus="64", cpu_alloc="48", mem_total="999999", scheduler_mem_total="131072", mem_alloc="65536",
+                    gpus=[GpuInfo(index=str(i), name="H100", util="0", mem_used="0", mem_total="81920") for i in range(2)])
+    monkeypatch.setattr(cli, "_snapshot_nodes", lambda: [node, replace(node, name="gpu2", stale=True)])
+    assert cli._cli_fit(2, model="h100", cpus=16, ram_gb=64, explain=True) == 0
+    output = capsys.readouterr().out
+    assert "--gres=gpu:h100:2" in output and "--cpus-per-task=16" in output
+    assert "--mem=65536M" in output and "skip gpu2: stale data" in output
+    assert cli._cli_fit(2, model="h100", ram_gb=65) == 1
+    assert "scheduler RAM insufficient" in capsys.readouterr().out
+    assert cli._cli_fit(1, model="a100") == 1
+    assert "matching GPUs 0/1" in capsys.readouterr().out

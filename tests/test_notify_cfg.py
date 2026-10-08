@@ -6,6 +6,7 @@ never open — and the failure mode is alerts that silently never fire.
 """
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -91,13 +92,18 @@ def test_notifier_reads_a_config_found_by_search(monkeypatch, tmp_path):
 
 
 def test_unreadable_config_leaves_the_notifier_inert(tmp_path, monkeypatch):
-    # 0600 by design; doctor must distinguish this from "not configured"
-    monkeypatch.setattr(os, "geteuid", lambda: 1000)
     cfg = tmp_path / "home" / ".sgpu" / "slack.json"
     cfg.parent.mkdir(parents=True)
     cfg.write_text(json.dumps({"bot_token": "xoxb-x", "channel": "#gpu"}))
-    cfg.chmod(0o000)
-    try:
-        assert not Notifier(tmp_path, cfg_path=cfg).enabled
-    finally:
-        cfg.chmod(0o600)
+    read_text = Path.read_text
+
+    def denied(path, *args, **kwargs):
+        if path == cfg:
+            raise PermissionError("config access denied")
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", denied)
+    monkeypatch.delenv("SLURM_GPU_TUI_SLACK_BOT_TOKEN", raising=False)
+    notifier = Notifier(tmp_path, cfg_path=cfg)
+    assert not notifier.enabled
+    assert notifier._cfg_mtime is None

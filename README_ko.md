@@ -30,6 +30,9 @@
 </tr>
 </table>
 
+<p align="center"><img src="docs/tab-jobs.svg" alt="Jobs 탭: 요청·실사용 자원, OOM, 관측률" width="100%"><br>
+<sub><b>Jobs 탭 (4)</b> — GPU·CPU 작업과 대기 작업; 화면은 합성 데이터 예시다.</sub></p>
+
 ## 기능
 
 - 노드별 GPU 상태(사용률, VRAM, 온도, 전력)와 CPU/RAM — 드라이버 probe
@@ -111,7 +114,9 @@ sgpu        # 모니터 실행
 
 | 키 | 동작 |
 |----|------|
-| `1` `2` `3` | 탭: GPU / CPU / Usage |
+| `1` `2` `3` `4` | GPU / CPU / Usage / Jobs 탭 |
+| `v` / `t` | 대기 목록 펼치기 / 클러스터 추세 표시 (기본 접힘·숨김) |
+| `f` | GPU 모델·VRAM별 FREE, 단일 노드 최대 수량과 노드 목록 |
 | `r` / `s` | 새로고침 / 정렬 순환(노드 → 사용률 → 유저 → 빈 GPU) |
 | `u` / `i` | 유저 필터(내가 첫 항목) / 빈 GPU 필터 |
 | `p` / `m` | 파티션 필터 순환 / 내 잡만 보기 |
@@ -139,33 +144,95 @@ sgpu --jobs [일수] [--user U]          # 잡 히스토리: 결과, GPU-hours, 
 sgpu logs JOBID [-f] [-e]              # 잡 stdout 꼬리 보기 (-e: stderr, -f: 따라가기)
 sgpu --report [YYYY-MM]                # 월간 리포트(마크다운)
 sgpu --wait-free 2 --partition heavy   # 빈 GPU 2개 생길 때까지 대기
-sgpu fit 2 [--vram 40] [--partition P] # 지금 GPU 2장 들어갈 노드 + sbatch 예시
+sgpu fit 2 --vram 40 --model h100 --cpus 16 --ram 64 --partition P --explain
+                                     # 자원 조건 + 탈락 사유 + sbatch 예시
+sgpu bench --nodes 128 --repeat 5      # 오프라인 합성 TUI 갱신 벤치마크
+sgpu bench --replay snapshot.json     # 내보낸 스냅샷의 오프라인 재생
 sgpu me              # 내 잡 · 내 낭비 GPU · 최근 7일 (낭비 있으면 exit 1)
 chkgpu               # 원샷 유저×노드 매트릭스 + next-free 예상시각
 ```
 
+`fit` 옵션은 모두 선택 사항이며 VRAM·RAM 단위는 GiB다. `--model`에는
+Slurm GRES의 정확한 타입(예: `h100`)을 넣는다. CPU·RAM은 실제 프로세스
+사용량 대신 스케줄러 할당량을 사용하고 오래된 텔레메트리는 제외한다.
+결과는 용량 추정이며 예약·QOS·스케줄러 정책이 최종 실행 여부를 결정한다.
+`bench`는 Slurm·SSH·네트워크를 호출하지 않는다. 재생 입력은 내보낸 스냅샷
+한 개, JSON 배열, `{"snapshots": [...]}` 중 하나이며 최대 64 MiB다.
+결측값이나 stale 노드가 포함된 스냅샷도 재생할 수 있다. 시간은 `_apply`만
+측정하고 JSON 해석·비동기 화면 그리기는 제외한다. clear 횟수로 테이블
+재구축 여부를 확인할 수 있다.
+
 ### 화면 구성
 
 ```
-▼ node01   ● idle   gpu_short   32/64   ████░░░░ 128/256G
-               0   A100    ████████░  85%   █████░░  40/80G   72C   280W   eightmm  12345   2:30h
-               1   A100    ░░░░░░░░░   0%   ░░░░░░░   0/80G   35C    45W
+Node / GPU   Util    VRAM       User / job         Left     Health
+▼ node01     mix    █▁         A100               free 1
+  GPU0       85%    40.0/80G   alice #12345       2.3h      OK
+  GPU1        0%     0.0/80G                             OK
+▶ Pending 12 · Resources 8 · Priority 4 [v]
 ```
 
-- **노드 헤더**: 노드명, 상태(`●` idle · `◐` mixed · `○` alloc · `✖` drain),
-  파티션, CPU 할당, RAM 바, GPU당 글리프 스트립
-  (`█` 사용 중 · `▅` parked · `▂` 예약-유휴 · `▁` 빈 GPU · `!` rogue)
-- **`user !gres` / `user !slurm`(빨강)**: rogue — 해당 GPU에 SLURM 할당 없이
-  프로세스 실행 중
-- **`user idle 3.2h`**: 할당됐지만 프로세스 없음, 1h 넘으면 노란 강조
-- **오류 노드**: `~timeout`, `~unreachable`, `~smi_err`
+- **반응형 화면**: 130열 미만에서는 사용률·VRAM을 숫자로 표시하고 모델을
+  노드 헤더로 옮긴다. Enter에서 CPU/RAM·파티션·하드웨어 상태·프로세스를
+  확인한다. 대기 목록은 기본 접힘이며 `v`로 펼친다. 정상은 차분한 색,
+  주의는 노랑, 오류는 빨강, 내 작업은 하나의 강조색을 사용한다.
+- **FREE**: 신선한 관측과 스케줄러 정보가 있는 가용 노드만 계산하고 복구·
+  thermal action 상태인 GPU는 제외한다. 두 줄 요약은 현재 GPU 필터 범위이며
+  `f`에서 모델·VRAM별 총수, 단일 노드 최대 수량, 노드 목록 전체를 확인한다.
+  source·stale 표시는 전체 클러스터 범위를 명시한다. 가용량 관측은 예약이나
+  스케줄러의 제출 승인을 보장하지 않는다.
+- **GPU health**: HOT, 누적 uncorrectable ECC, 지원되는 드라이버의 power-cap·
+  thermal·slowdown 이벤트와 복구 액션. CAP만으로는 오류가 아니며 낮은 클럭도
+  단독으로 오류 판정하지 않는다. Enter에서 전체 수치를 확인한다.
+- **Jobs (4)**: 실행 중인 GPU·CPU 작업과 대기 작업, 요청 CPU/RAM, 실제 CPU
+  코어·cgroup RAM, PID에 귀속된 VRAM, 남은 시간·대기 시간, OOM kill과 관측률.
+  `?`는 결측, `~`는 일부 노드만 관측한 값이다. 요청 RAM은 Slurm 원래 단위
+  (`c`: CPU당, `n`: 노드당)를 유지한다. Enter에서 RAM peak·유한 limit·지표별
+  관측률을 본다. 노드별 peak 합은 같은 시각의 전체 작업 peak와 다를 수 있으며
+  cgroup RAM에는 cache·하위 cgroup이 포함된다. 상세·watch·본인 작업 취소도
+  이 탭에서 사용할 수 있다.
+- **대기 목록**: 제출 이후 대기 시간, dependency·QOS를 포함한 정확한 사유,
+  상세의 eligible time, 추정임을 명시한 시작 시간. priority로 큐 순서를 추정하지
+  않는다. 사용자·파티션·검색 필터가 대기 목록에도 적용된다.
+- **CPU (2)**: 할당 코어, 실제 CPU busy %, load, RAM, CPU/memory/I/O PSI의
+  `some avg10` stall %. PSI는 자원 압력의 신호이며 원인을 확정하지 않는다.
+- **클러스터 추세 (`t`)**: 최근 최대 5분의 GPU 사용률·VRAM·총 GPU 전력.
+  결측·stale은 `·`, 사용률은 0–100%, 전력은 구간 최댓값 기준으로 표시한다.
+- **Usage 관측률**: stale 구간은 busy·waste·효율 분모에서 제외하고 할당
+  GPU-hours는 유지한다. 신선한 관측률과 미관측 GPU-hours를 표시한다.
+
+CPU·PSI·작업 실사용은 기존 agent에서 로컬로 수집하고 10초간 캐시한다
+(`SLURM_GPU_TUI_TELEMETRY_SEC`). 노드당 Slurm 작업 탐색 한도는 256개다
+(`SLURM_GPU_TUI_TELEMETRY_MAX_JOBS`). CPU는 두 번째 샘플부터 계산하며 작업
+지표에는 읽을 수 있는 cgroup v2가 필요하다. v1·없는 파일·무제한 메모리·권한
+부족·검증되지 않은 SLUID 연결은 결측으로 남긴다. 읽기 크기를 제한하고
+symlink를 따라가지 않는다. collector는 검증된 작업·할당 노드에 연결되는
+숫자 필드만 공개한다. SSH fallback은 PSI를 제공하지만 작업 cgroup·CPU delta는
+제공하지 않는다. GPU health는 지원 기능을 확인하고 최소 10초간 캐시한다.
+반복적인 `sstat` 호출이나 Slurm 설정 변경은 필요 없다.
+지원 경로와 탐색 한도는 [docs/PUSH.md](docs/PUSH.md)에 정리했다.
 
 ## Slack 알림
 
 설정은 `~/.sgpu/slack.json`(핫 리로드); 설치 스크립트가 세팅하고
 `sgpu doctor`가 현재 모드 표시. 전체 설정: **[docs/ALERTS.md](docs/ALERTS.md)**
 
+종료 작업의 상태 조회는 크기가 제한된 백그라운드 큐에서 처리한다. 실패
+로그는 마지막으로 검증된 스케줄러 UID·비공개 경로와 공유 로그의 안전한
+reader를 사용해 소유자의 설정된 DM에만 보낸다. 재시작이나 메타데이터
+유실 후에는 로그 없이 요약 알림만 보낼 수 있다.
+
 ## 운영
+
+collector는 하나의 백그라운드 Slurm 조회와 독립적으로 텔레메트리를
+발행한다. AllocMem 조회 주기를 늘리고 SSH 대기열을 제한하며 대상 노드를
+순환한다. SSH 캐시는 에이전트 신선도 한계와 노드 확인 간격+SSH 타임아웃 중
+큰 값을 넘으면 stale로 표시한다. 스케줄러 조회가 실패하거나 오래되면
+마지막 노드 목록을 유지하되
+작업의 권한 메타데이터와 GPU 할당 연결은 무효화하고 종료 알림 비교도
+중단한다. 공유 로그가 계속 같으면 확인 간격을 최댓값까지 늘리고 변경을
+발견하면 기본 간격으로 돌아간다. 주기·단계·RPC·대기열 지표는
+[docs/GRAFANA.md](docs/GRAFANA.md)에 정리했다.
 
 ```bash
 systemctl status|restart sgpu-collector          # root 설치
@@ -230,7 +297,10 @@ sudo grafana/install.sh       # Grafana + Prometheus + alertmanager + 대시보�
 ```
 
 깨끗한 재설치는 한 줄 설치 명령 재실행. 개발 체크아웃을 별도 prod venv로
-배포하려면 `deploy.sh` 참고. 제거(collector·에이전트 중지, 서비스·데이터·설치
+배포하려면 체크아웃에서 root로 `bash ./deploy.sh`를 실행한다. 테스트는
+실행마다 새 전용 임시 디렉터리에서 수행해 sudo/su가 기존 사용자 이름을
+유지해도 충돌하지 않는다. 테스트 통과 후에만 설치하고 collector를 재시작한다.
+제거(collector·에이전트 중지, 서비스·데이터·설치
 디렉토리 삭제):
 
 ```bash
@@ -246,13 +316,19 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/uninstal
 |------|--------|------|
 | `SLURM_GPU_TUI_REFRESH_SEC` | `3` | TUI 갱신 주기 |
 | `SLURM_GPU_TUI_COLLECTOR_SEC` | `3` | Collector 수집 주기 |
+| `SLURM_GPU_TUI_SCHEDULER_SEC` | collector 주기 | 스케줄러 조회 완료 후 최소 대기 |
+| `SLURM_GPU_TUI_SCHEDULER_MAX_AGE_SEC` | `30` | 스케줄러 신선도 한계(조회 주기 이상) |
+| `SLURM_GPU_TUI_MEM_REFRESH_SEC` | `15` | 데몬의 AllocMem 조회 주기 |
 | `SLURM_GPU_TUI_NODE_TIMEOUT_SEC` | `30` | 노드 SSH 타임아웃 |
 | `SLURM_GPU_TUI_MAX_WORKERS` | `8` | 병렬 SSH 워커(폴백 모드) |
+| `SLURM_GPU_TUI_MAX_PENDING_POLLS` | `워커 × 2` | 실행·대기 SSH 상한(워커 수 이상) |
 | `SLURM_GPU_TUI_DATA_DIR` | `/tmp/slurm-gpu-tui` | 데몬 JSON 출력 경로 |
 | `SLURM_GPU_TUI_STATE_DIR` | `~/.sgpu/state` | 영속 상태(usage, 낭비, 인벤토리) |
 | `SLURM_GPU_TUI_AGENT_DIR` | `~/.sgpu/nodes` | push 에이전트 데이터 경로(push 모드는 공유 FS) |
 | `SLURM_GPU_TUI_AGENT_SEC` | `3` | GPU 에이전트 주기 |
 | `SLURM_GPU_TUI_CPU_AGENT_SEC` | `20` | CPU 전용 에이전트 주기 |
+| `SLURM_GPU_TUI_TELEMETRY_SEC` | `10` | 로컬 CPU·PSI·작업 지표 샘플 간격 |
+| `SLURM_GPU_TUI_TELEMETRY_MAX_JOBS` | `256` | 노드당 cgroup 작업 탐색 한도 |
 | `SLURM_GPU_TUI_AGENT_MAX_AGE_SEC` | `45` | 에이전트 데이터 신선도 한계 |
 | `SLURM_GPU_TUI_AGENT_REPAIR_SEC` | `180` | 노드당 에이전트 수리 최소 간격 |
 | `SLURM_GPU_TUI_AGENT_DISABLE` | (없음) | push 에이전트 완전 비활성화 |
@@ -266,7 +342,8 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/uninstal
 | `SLURM_GPU_TUI_SHARE_SCRIPTS` | (없음) | 전체 잡 batch script를 모든 유저에게 공개 — **스크립트 내용(비밀키 포함) 전원 공개** |
 | `SLURM_GPU_TUI_SHARE_LOGS` | (없음) | 모든 작업의 log tail을 전체 사용자에게 공개 — **런타임 출력(비밀 포함 가능) 공개** |
 | `SLURM_GPU_TUI_SHARE_JOB_DETAILS` | (없음) | 실행/대기 작업의 정제된 Slurm 상세를 전체 사용자에게 공개 |
-| `SLURM_GPU_TUI_LOG_MIRROR_SEC` | `10` | 공유 로그 갱신 주기 |
+| `SLURM_GPU_TUI_LOG_MIRROR_SEC` | `10` | 공유 로그 기본 확인 간격 |
+| `SLURM_GPU_TUI_LOG_MIRROR_MAX_SEC` | `60` | 변경 없는 로그의 최대 확인 간격 |
 
 설치 시에만: `SGPU_INSTALL_DIR`, `SGPU_ENABLE_PERSISTENCE`(`0`이면 GPU 노드
 persistence 생략), `SGPU_ENABLE_CPU_PUSH`(`0`이면 CPU telemetry를 SSH polling

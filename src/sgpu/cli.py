@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import shlex
 import os
 import re
 import sys
@@ -15,14 +17,16 @@ from typing import Dict, List, Optional, Tuple
 
 from . import __build__, __version__
 from .cells import (
-    WASTE_MIN_SEC, _waste_thr, classify_gpu, collect_waste, fmt_idle_age,
+    WASTE_MIN_SEC, _waste_thr, collect_waste, fmt_idle_age,
     fmt_span, fmt_start_time, mb_to_gb,
+    node_schedulable, node_gpu_classes,
 )
 from .common import (
-    GpuInfo, NodeInfo, apply_gpu_alloc, build_nodes, cleanup_ssh_pool,
+    NodeInfo, apply_gpu_alloc, build_nodes, cleanup_ssh_pool,
     collect_basic, collect_node_data_parallel, job_log_spec, node_from_dict,
     read_job_log, run_cmd, ssh_cmd,
 )
+from .telemetry import metric_number
 from .runtime import state_dir_candidates
 from .tui import _DAEMON_DATA_FILE, _DAEMON_MAX_AGE, SlurmGpuTui
 from .usage import (
@@ -66,7 +70,8 @@ def _oneshot_snapshot() -> dict:
     ) = collect_basic()
     node_names = [n["name"] for n in nodes_raw]
     ssh_results, stale_nodes, ssh_errors = collect_node_data_parallel(node_names)
-    nodes = build_nodes(nodes_raw, node_jobs, ssh_results, stale_nodes)
+    nodes = build_nodes(nodes_raw, node_jobs, ssh_results, stale_nodes,
+                        scheduler_status=scheduler_status, scheduler_error=err)
     apply_gpu_alloc(nodes, gpu_alloc, jobs, alloc_user_map)
     return {
         "version": 1,
@@ -142,42 +147,69 @@ def _cli_waste(verbose: bool = False) -> int:
     return 1  # non-zero so cron/scripts can alert on it
 
 
-def _cli_fit(want: int, vram_gb: float = 0, partition: str = "") -> int:
-    """Where can a job run right now: nodes with >= N free GPUs (optionally
-    with >= vram_gb per GPU), plus a ready-to-paste sbatch line."""
-    nodes = _snapshot_nodes()
-    hits: List[Tuple[str, str, int, List[GpuInfo]]] = []
-    for n in nodes:
-        parts = [p for p in (n.partition or "").split(",") if p]
+def _cli_fit(want: int, vram_gb: float = 0, partition: str = "", *,
+             model: str = "", cpus: int = 0, ram_gb: float = 0,
+             explain: bool = False) -> int:
+    hits, rejected = [], []
+    for node in _snapshot_nodes():
+        reasons = []
+        parts = [part for part in (node.partition or "").split(",") if part]
         if partition and partition not in parts:
-            continue
-        if any(s in n.state.lower() for s in ("down", "drain", "fail")):
-            continue
-        free = [g for g in n.gpus if classify_gpu(g) == "free"]
-        if vram_gb > 0:
-            free = [g for g in free
-                    if g.mem_total.isdigit() and float(g.mem_total) / 1024 >= vram_gb]
-        if len(free) >= want:
-            hits.append((n.name, parts[0] if parts else "", len(free), free))
+            reasons.append("partition")
+        if not node_schedulable(node) and not node.stale and node.scheduler_available and node.scheduler_age_sec <= _DAEMON_MAX_AGE:
+            reasons.append("node unavailable")
+        if node.stale or (node.scheduler_age_sec > _DAEMON_MAX_AGE) or not node.scheduler_available:
+            reasons.append("stale data")
+        free = [gpu for gpu, kind in zip(node.gpus, node_gpu_classes(node), strict=True) if kind == "free"]
+        gres_model = ""
+        if model:
+            labels = re.findall(r"(?:^|,)gpu:([A-Za-z0-9_.-]+):[0-9]+", node.gres)
+            gres_model = next((label for label in labels if label.casefold() == model.casefold()), "")
+            def normalize(value: str) -> str:
+                return re.sub(r"[^a-z0-9]", "", value.casefold())
+            free = [gpu for gpu in free if normalize(model) in normalize(gpu.name)] if gres_model else []
+        if vram_gb:
+            free = [gpu for gpu in free if (metric_number(gpu.mem_total) or 0) >= vram_gb * 1024]
+        if len(free) < want:
+            reasons.append(f"matching GPUs {len(free)}/{want}")
+        total_cpu, allocated_cpu = metric_number(node.cpus), metric_number(node.cpu_alloc)
+        if cpus and (total_cpu is None or allocated_cpu is None or total_cpu - allocated_cpu < cpus):
+            reasons.append("free CPU cores insufficient/unknown")
+        total_ram = metric_number(node.scheduler_mem_total or node.mem_total)
+        allocated_ram = metric_number(node.mem_alloc)
+        if ram_gb and (total_ram is None or allocated_ram is None or total_ram - allocated_ram < math.ceil(ram_gb * 1024)):
+            reasons.append("scheduler RAM insufficient/unknown")
+        if reasons:
+            if node.has_gpu:
+                rejected.append((node.name, reasons))
+        else:
+            hits.append((node, partition or (parts[0] if parts else ""), free, gres_model))
+    if explain or not hits:
+        for name, reasons in rejected:
+            print(f"skip {name}: {', '.join(reasons)}")
     if not hits:
-        where = f" in partition {partition}" if partition else ""
-        vr = f" with ≥{vram_gb:.0f}G VRAM" if vram_gb else ""
-        print(f"no node has {want} free GPU(s){vr}{where} right now")
-        print("tip: sgpu --wait-free N blocks until enough GPUs free up")
+        print(f"no node fits {want} GPU(s) and the requested resources right now")
         return 1
-    hits.sort(key=lambda h: h[2])  # tightest fit first: leave big nodes free
+    hits.sort(key=lambda hit: (len(hit[2]), hit[0].name))
     print(f"{'node':<10}{'partition':<14}{'free':>5}  models (VRAM)")
-    for name, part, nfree, free in hits:
-        models: Dict[str, int] = {}
-        for g in free:
-            vr = f"{float(g.mem_total) / 1024:.0f}G" if g.mem_total.isdigit() else "?"
-            key = f"{g.name} ({vr})"
+    for node, part, free, _gres_model in hits:
+        models = {}
+        for gpu in free:
+            total = metric_number(gpu.mem_total)
+            key = f"{gpu.name} ({total / 1024:.0f}G)" if total is not None else f"{gpu.name} (?G)"
             models[key] = models.get(key, 0) + 1
-        desc = ", ".join(f"{c}x {m}" for m, c in models.items())
-        print(f"{name:<10}{part:<14}{nfree:>5}  {desc}")
-    name, part, _, _ = hits[0]
-    part_arg = f" -p {part}" if part else ""
-    print(f"\nsbatch{part_arg} --gres=gpu:{want} -w {name} your_job.sh")
+        print(f"{node.name:<10}{part:<14}{len(free):>5}  " + ", ".join(f"{count}x {name}" for name, count in models.items()))
+    node, part, _free, gres_model = hits[0]
+    args = ["sbatch"]
+    if part:
+        args += ["-p", part]
+    args += [f"--gres=gpu:{gres_model + ':' if gres_model else ''}{want}", "-w", node.name]
+    if cpus:
+        args.append(f"--cpus-per-task={cpus}")
+    if ram_gb:
+        args.append(f"--mem={math.ceil(ram_gb * 1024)}M")
+    print("\n" + shlex.join(args + ["your_job.sh"]))
+    print("Current capacity estimate; reservations, QoS and other jobs may affect scheduling.")
     return 0
 
 
@@ -385,7 +417,7 @@ def _cli_wait_free(want: int, partition: str, interval: int) -> int:
         for n in _snapshot_nodes():
             if partition and partition not in n.partition.split(","):
                 continue
-            free += sum(1 for g in n.gpus if classify_gpu(g) == "free")
+            free += node_gpu_classes(n).count("free")
         if free >= want:
             print(f"{free} free GPU(s) available" + (f" in {partition}" if partition else ""))
             return 0
@@ -1077,6 +1109,23 @@ def _normalize_argv(argv: List[str]) -> List[str]:
     return out
 
 
+def _positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+def _resource_float(value: str) -> float:
+    number = metric_number(value)
+    if number is None or number < 0 or not math.isfinite(number * 1024):
+        raise argparse.ArgumentTypeError("must be finite and non-negative when converted to MiB")
+    return number
+
+
 def _build_parser() -> "argparse.ArgumentParser":
     p = argparse.ArgumentParser(
         prog="sgpu", description="SLURM GPU operations monitor. No arguments: interactive TUI.",
@@ -1116,9 +1165,18 @@ def _build_parser() -> "argparse.ArgumentParser":
     s.add_argument("--interval", type=int, default=10, help="seconds between polls")
 
     s = add("fit", "nodes that fit N free GPUs now, plus an sbatch line")
-    s.add_argument("count", nargs="?", type=int, default=1)
-    s.add_argument("--vram", type=float, default=0, help="minimum VRAM per GPU, in GB")
+    s.add_argument("count", nargs="?", type=_positive_int, default=1)
+    s.add_argument("--vram", type=_resource_float, default=0, help="minimum VRAM per GPU, in GiB")
     s.add_argument("--partition", default="")
+    s.add_argument("--model", default="", help="Slurm GPU GRES subtype (e.g. h100)")
+    s.add_argument("--cpus", type=_positive_int, default=0, help="required free CPU cores")
+    s.add_argument("--ram", type=_resource_float, default=0, help="required scheduler RAM in GiB")
+    s.add_argument("--explain", action="store_true", help="show why other nodes were excluded")
+
+    s = add("bench", "offline synthetic/replay TUI benchmark; no cluster calls")
+    s.add_argument("--nodes", type=_positive_int, default=128)
+    s.add_argument("--repeat", type=_positive_int, default=5)
+    s.add_argument("--replay", default="", help="snapshot JSON or list of snapshots")
 
     s = add("logs", "tail a job's stdout (last 64KB)")
     s.add_argument("jobid")
@@ -1147,6 +1205,14 @@ def main():
             else:
                 _print_once(data)
             return
+        if args.cmd == "bench":
+            from .benchmark import run_benchmark
+            try:
+                print(json.dumps(run_benchmark(args.nodes, args.repeat, args.replay), indent=2))
+            except (OSError, ValueError) as exc:
+                print(f"benchmark: {exc}", file=sys.stderr)
+                sys.exit(2)
+            return
         code = {
             "doctor": lambda: _cli_doctor(),
             "me": lambda: _cli_me(),
@@ -1155,7 +1221,8 @@ def main():
             "jobs": lambda: _cli_jobs(args.days, user=args.user),
             "report": lambda: _cli_report(args.month),
             "fit": lambda: _cli_fit(args.count, vram_gb=args.vram,
-                                    partition=args.partition),
+                                    partition=args.partition, model=args.model, cpus=args.cpus,
+                                    ram_gb=args.ram, explain=args.explain),
             "logs": lambda: _cli_logs(args.jobid, follow=args.follow,
                                       want_err=args.err),
             "wait-free": lambda: _cli_wait_free(args.count, args.partition,

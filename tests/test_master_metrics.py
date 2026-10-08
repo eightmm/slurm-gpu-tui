@@ -50,8 +50,10 @@ def _fake_sys(tmp_path):
 
 
 def test_master_host_lines(tmp_path):
-    lines = _master_host_lines(proc=str(_fake_proc(tmp_path)),
-                               sys_dir=str(_fake_sys(tmp_path)))
+    fixture = tmp_path / "deploy-loop0-sda1"
+    fixture.mkdir()
+    lines = _master_host_lines(proc=str(_fake_proc(fixture)),
+                               sys_dir=str(_fake_sys(fixture)))
     text = "\n".join(lines)
     assert 'sgpu_master_cpu_seconds_total{cpu="0",mode="idle"} 45.00' in text
     assert 'sgpu_master_cpu_seconds_total{cpu="1",mode="idle"} 46.00' in text
@@ -61,19 +63,32 @@ def test_master_host_lines(tmp_path):
     assert "sgpu_master_load1 1.25" in text
     assert 'sgpu_master_network_receive_bytes_total{device="eth0"} 5000' in text
     assert 'sgpu_master_network_transmit_bytes_total{device="eth0"} 7000' in text
-    assert "lo" not in text.replace("load1", "").replace("loop0", "")
+    assert 'device="lo"' not in text
     assert 'sgpu_master_disk_read_bytes_total{device="sda"} 1048576' in text
     assert 'sgpu_master_disk_written_bytes_total{device="sda"} 2097152' in text
-    assert "sda1" not in text and "loop0" not in text  # whole disks only
+    assert 'device="sda1"' not in text and 'device="loop0"' not in text
     assert 'sgpu_master_hwmon_temp_celsius{chip="platform_coretemp.0",sensor="temp1"} 43.5' in text
     assert "filesystem_size_bytes" in text  # tmp_path mount via statvfs
 
 
 def test_master_host_lines_no_duplicate_series(tmp_path):
-    lines = _master_host_lines(proc=str(_fake_proc(tmp_path)),
-                               sys_dir=str(_fake_sys(tmp_path)))
+    sysd = _fake_sys(tmp_path)
+    # dual-socket host: a second coretemp hwmon with the same sensor names,
+    # both linked to their platform devices like real sysfs
+    for idx in (0, 1):
+        dev = sysd / "devices" / "platform" / f"coretemp.{idx}"
+        dev.mkdir(parents=True)
+        hw = sysd / "class" / "hwmon" / f"hwmon{idx}"
+        hw.mkdir(exist_ok=True)
+        (hw / "name").write_text("coretemp\n")
+        (hw / "temp1_input").write_text(f"{40 + idx}000\n")
+        (hw / "device").symlink_to(dev)
+    lines = _master_host_lines(proc=str(_fake_proc(tmp_path)), sys_dir=str(sysd))
     keys = [ln.rsplit(" ", 1)[0] for ln in lines]
     assert len(keys) == len(set(keys))  # node_exporter rejects duplicates
+    text = "\n".join(lines)
+    assert 'chip="platform_coretemp.0",sensor="temp1"} 40.0' in text
+    assert 'chip="platform_coretemp.1",sensor="temp1"} 41.0' in text
 
 
 def test_master_host_lines_missing_proc_is_empty(tmp_path):

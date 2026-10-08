@@ -58,6 +58,19 @@ def test_fit_parses_vram_and_partition():
     assert (args.count, args.vram, args.partition) == (2, 40.0, "gpu")
 
 
+def test_fit_extended_resources_and_benchmark():
+    args = parse("fit", "2", "--model", "h100", "--cpus", "16", "--ram", "64", "--explain")
+    assert (args.model, args.cpus, args.ram, args.explain) == ("h100", 16, 64, True)
+    args = parse("bench", "--nodes", "32", "--repeat", "3", "--replay", "fixture.json")
+    assert (args.nodes, args.repeat, args.replay) == (32, 3, "fixture.json")
+
+
+@pytest.mark.parametrize("argv", [("fit", "0"), ("fit", "--ram", "nan"), ("fit", "--ram", "1e308"), ("fit", "--vram", "-1"), ("fit", "--cpus", "0"), ("bench", "--repeat", "0")])
+def test_resource_arguments_reject_invalid_values(argv):
+    with pytest.raises(SystemExit):
+        parse(*argv)
+
+
 def test_wait_free_defaults():
     args = parse("wait-free", "3")
     assert (args.count, args.interval, args.partition) == (3, 10, "")

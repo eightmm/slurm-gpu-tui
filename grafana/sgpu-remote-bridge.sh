@@ -67,10 +67,12 @@ awk '$3 ~ /^(sd[a-z]+|vd[a-z]+|nvme[0-9]+n[0-9]+)$/ {
 for h in /sys/class/hwmon/hwmon*; do
     [ -r "$h/name" ] || continue
     [ "$(cat "$h/name")" = "coretemp" ] || continue
+    chip=$(basename "$(readlink -f "$h/device")")
+    case $chip in coretemp*) ;; *) chip=coretemp.${h##*hwmon} ;; esac
     for t in "$h"/temp*_input; do
         [ -r "$t" ] || continue
         s=${t##*/}; s=${s%_input}
-        awk -v s="$s" '{printf "node_hwmon_temp_celsius{chip=\"platform_coretemp.0\",sensor=\"%s\"} %.1f\n", s, $1/1000}' "$t"
+        awk -v s="$s" -v c="$chip" '{printf "node_hwmon_temp_celsius{chip=\"platform_%s\",sensor=\"%s\"} %.1f\n", c, s, $1/1000}' "$t"
     done
 done
 RSH

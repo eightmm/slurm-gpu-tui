@@ -1,5 +1,6 @@
 """Job log helpers: path resolution, tail reading, error highlighting."""
 import os
+import time
 
 from sgpu.common import JobInfo, job_log_paths, job_log_spec, tail_file
 from sgpu.screens import DetailScreen, _LOG_ERR_RE, _fmt_sacct_detail
@@ -106,6 +107,7 @@ def test_detail_log_poll_skips_unchanged_files(tmp_path, monkeypatch):
     assert len(detail._collect_log_updates()) == 1
     assert detail._collect_log_updates() == []
     before = log.stat()
+    time.sleep(0.01)  # ensure ctime advances on coarse timestamp filesystems
     log.write_text("step 2\n")  # same size
     os.utime(log, ns=(before.st_atime_ns, before.st_mtime_ns))
     assert len(detail._collect_log_updates()) == 1
@@ -295,35 +297,32 @@ def test_fmt_sacct_detail_passthrough_on_junk():
 
 # ── notify: failed-job stderr tail ────────────────────────────────────────
 
-def test_fail_log_tail_from_scontrol(monkeypatch, tmp_path):
+def test_fail_log_tail_uses_validated_owner_metadata(monkeypatch, tmp_path):
+    from types import SimpleNamespace
     import sgpu.notify as notify
     err = tmp_path / "e.log"
     err.write_text("line\n" * 30 + "RuntimeError: boom\n")
-
-    def fake_run_cmd(cmd, timeout=10):
-        if cmd.startswith("scontrol"):
-            return True, f"JobId=5 WorkDir={tmp_path} StdOut={tmp_path}/o.log StdErr={err}"
-        raise AssertionError(f"unexpected cmd {cmd}")
-
-    monkeypatch.setattr(notify, "run_cmd", fake_run_cmd)
-    tail = notify.Notifier._fail_log_tail(None, "5")
+    reader = SimpleNamespace(_finished_sources={"5": (os.geteuid(), ("", str(err)))})
+    monkeypatch.setattr(notify, "run_cmd", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("path rediscovery")))
+    tail = notify.Notifier._fail_log_tail(reader, "5")
     assert tail.endswith("RuntimeError: boom")
-    assert len(tail.splitlines()) == 15  # capped
+    assert len(tail.splitlines()) == 15
 
 
-def test_fail_log_tail_workdir_fallback(monkeypatch, tmp_path):
+def test_fail_log_tail_rejects_symlink_owner_fifo_and_missing_metadata(monkeypatch, tmp_path):
+    from types import SimpleNamespace
     import sgpu.notify as notify
-    (tmp_path / "slurm-7.out").write_text("srun: error: died\n")
-
-    def fake_run_cmd(cmd, timeout=10):
-        if cmd.startswith("scontrol"):
-            return False, "Invalid job id"
-        if cmd.startswith("sacct"):
-            return True, str(tmp_path)
-        raise AssertionError(cmd)
-
-    monkeypatch.setattr(notify, "run_cmd", fake_run_cmd)
-    assert notify.Notifier._fail_log_tail(None, "7") == "srun: error: died"
+    target = tmp_path / "target"
+    target.write_text("synthetic canary")
+    link = tmp_path / "job.err"
+    link.symlink_to(target)
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    for uid, path in ((os.geteuid(), link), (os.geteuid() + 1, target), (os.geteuid(), fifo)):
+        reader = SimpleNamespace(_finished_sources={"7": (uid, ("", str(path)))})
+        assert notify.Notifier._fail_log_tail(reader, "7") == ""
+    monkeypatch.setattr(notify, "run_cmd", lambda *a, **kw: (True, f"JobId=7 WorkDir={tmp_path} StdErr={target}"))
+    assert notify.Notifier._fail_log_tail(None, "7") == ""
 
 
 def test_fail_log_tail_nothing_readable(monkeypatch, tmp_path):
@@ -354,6 +353,7 @@ def test_fail_tail_dm_only(monkeypatch, tmp_path):
     n.process(dict(base, jobs=[{"jobid": "9", "user": "bob",
                                 "jobname": "t", "elapsed": "1:00"}]))
     n.process(dict(base, jobs=[]))
+    n._outcome_queue.join()
 
     channel_msgs = [t for c, t in posts if not c]
     dm_msgs = [t for c, t in posts if c == "U01"]
@@ -384,3 +384,4 @@ def test_fail_tail_skipped_without_dm_target(monkeypatch, tmp_path):
     n.process(dict(base, jobs=[{"jobid": "9", "user": "bob",
                                 "jobname": "t", "elapsed": "1:00"}]))
     n.process(dict(base, jobs=[]))
+    n._outcome_queue.join()
