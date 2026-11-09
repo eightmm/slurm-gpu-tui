@@ -758,9 +758,8 @@ def _cli_doctor() -> int:
                 unit_text += "\n" + dropin.read_text()
             except OSError:
                 pass
-        restart = next((ln.split("=", 1)[1].strip()
-                        for ln in unit_text.splitlines()
-                        if ln.startswith("Restart=")), "unset")
+        restart_values = _unit_values(unit_text, "Restart")
+        restart = restart_values[-1] if restart_values else "unset"
         if restart == "always":
             report(True, "collector unit", f"{unit} Restart=always")
         else:
@@ -1046,13 +1045,34 @@ def _cli_doctor() -> int:
     return 0 if problems == 0 else 1
 
 
-def _unit_env_enabled(unit_text: str, name: str) -> bool:
-    # last assignment wins (fragment first, then drop-ins in order)
-    value = ""
+def _unit_values(unit_text: str, name: str) -> List[str]:
+    section = ""
+    values = []
     for line in unit_text.splitlines():
         line = line.strip()
-        if line.startswith(f"Environment={name}="):
-            value = line.split("=", 2)[2]
+        if line.startswith("[") and line.endswith("]"):
+            section = line
+        elif section == "[Service]":
+            key, separator, value = line.partition("=")
+            if separator and key.strip() == name:
+                values.append(value.strip())
+    return values
+
+
+def _unit_env_enabled(unit_text: str, name: str) -> bool:
+    value = ""
+    for setting in _unit_values(unit_text, "Environment"):
+        if not setting:
+            value = ""
+            continue
+        try:
+            assignments = shlex.split(setting)
+        except ValueError:
+            continue  # systemd ignores assignments with unmatched quotes
+        for assignment in assignments:
+            key, separator, assigned = assignment.partition("=")
+            if separator and key == name:
+                value = assigned
     return value == "1"
 
 

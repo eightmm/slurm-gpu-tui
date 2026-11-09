@@ -1,5 +1,9 @@
 """Small CLI contract tests."""
 import sys
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
 
 from sgpu import __build__, __version__
 from sgpu import cli
@@ -19,6 +23,64 @@ def test_unit_env_enabled():
     unit = "[Service]\nEnvironment=OTHER=1\nEnvironment=SLURM_GPU_TUI_SHARE_SCRIPTS=1\n"
     assert cli._unit_env_enabled(unit, "SLURM_GPU_TUI_SHARE_SCRIPTS")
     assert not cli._unit_env_enabled(unit, "MISSING")
+
+
+@pytest.mark.parametrize(("override", "enabled"), [
+    ('Environment="SLURM_GPU_TUI_SHARE_LOGS=0"', False),
+    ("Environment='SLURM_GPU_TUI_SHARE_LOGS=0'", False),
+    ("Environment=OTHER=1 SLURM_GPU_TUI_SHARE_LOGS=0", False),
+    ("Environment=SLURM_GPU_TUI_SHARE_LOGS=0 OTHER=1", False),
+    ("Environment=", False),
+    ("Environment=\nEnvironment=SLURM_GPU_TUI_SHARE_LOGS=1", True),
+    ("Environment=SLURM_GPU_TUI_SHARE_LOGS=0 SLURM_GPU_TUI_SHARE_LOGS=1", True),
+    ("Environment=OTHER=0", True),
+    (" Environment = SLURM_GPU_TUI_SHARE_LOGS=0 ", False),
+    ('Environment="unterminated', True),
+    ("[Unit]\nEnvironment=SLURM_GPU_TUI_SHARE_LOGS=0", True),
+])
+def test_unit_env_enabled_applies_overrides(override, enabled):
+    unit = "[Service]\nEnvironment=SLURM_GPU_TUI_SHARE_LOGS=1\n"
+
+    assert cli._unit_env_enabled(unit + override + "\n", "SLURM_GPU_TUI_SHARE_LOGS") is enabled
+
+
+@pytest.mark.parametrize(("restart", "environment", "enabled"), [
+    ("no", 'Environment="SLURM_GPU_TUI_SHARE_LOGS=0"', False),
+    ("always", "Environment=SLURM_GPU_TUI_SHARE_LOGS=0 SLURM_GPU_TUI_SHARE_LOGS=1", True),
+    ("no", "Environment=", False),
+])
+def test_doctor_applies_dropins_in_order(monkeypatch, tmp_path, capsys,
+                                       restart, environment, enabled):
+    from sgpu import notify
+
+    data = tmp_path / "data.json"
+    data.write_text('{"nodes": [], "jobs": [], "scheduler": {"job_backend": "structured-json"}}')
+    unit = tmp_path / "sgpu-collector.service"
+    unit.write_text("[Service]\nRestart=on-failure\nEnvironment=SLURM_GPU_TUI_SHARE_LOGS=1\n")
+    dropins = tmp_path / "sgpu-collector.service.d"
+    dropins.mkdir()
+    (dropins / "90-override.conf").write_text(
+        f"[Service]\nRestart={restart}\n{environment}\n")
+    (dropins / "10-defaults.conf").write_text(
+        "[Service]\nRestart=always\nEnvironment=SLURM_GPU_TUI_SHARE_LOGS=1\n")
+    real_path = cli.Path
+    paths = Mock(side_effect=lambda value: unit if value ==
+                 "/etc/systemd/system/sgpu-collector.service" else real_path(value))
+    paths.home.return_value = tmp_path
+    monkeypatch.setattr(cli, "Path", paths)
+    monkeypatch.setattr(cli, "_DAEMON_DATA_FILE", data)
+    monkeypatch.setattr(cli, "state_dir_candidates", lambda: [tmp_path])
+    monkeypatch.setattr(cli, "run_cmd", lambda *_a, **_kw: (True, "stubbed"))
+    monkeypatch.setattr(notify, "cfg_search_paths", lambda: [tmp_path / "slack.json"])
+    monkeypatch.setattr(notify, "Notifier", lambda *_a, **_kw: SimpleNamespace(enabled=False))
+
+    assert cli._cli_doctor() == 0
+
+    lines = capsys.readouterr().out.splitlines()
+    unit_line = next(line for line in lines if "collector unit" in line)
+    logs_line = next(line for line in lines if "job log sharing" in line)
+    assert unit_line.split(" — ", 1)[0].endswith(f" Restart={restart}")
+    assert ("enabled in unit" if enabled else "off —") in logs_line
 
 
 def test_parse_persistence_status():
