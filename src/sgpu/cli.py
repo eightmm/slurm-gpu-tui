@@ -752,9 +752,14 @@ def _cli_doctor() -> int:
     unit_text = ""
     try:
         unit_text = unit.read_text()
-        restart = next((ln.split("=", 1)[1].strip()
-                        for ln in unit_text.splitlines()
-                        if ln.startswith("Restart=")), "unset")
+        # drop-ins (<unit>.d/*.conf) override the fragment, as systemd applies them
+        for dropin in sorted(Path(str(unit) + ".d").glob("*.conf")):
+            try:
+                unit_text += "\n" + dropin.read_text()
+            except OSError:
+                pass
+        restart_values = _unit_values(unit_text, "Restart")
+        restart = restart_values[-1] if restart_values else "unset"
         if restart == "always":
             report(True, "collector unit", f"{unit} Restart=always")
         else:
@@ -1040,11 +1045,35 @@ def _cli_doctor() -> int:
     return 0 if problems == 0 else 1
 
 
+def _unit_values(unit_text: str, name: str) -> List[str]:
+    section = ""
+    values = []
+    for line in unit_text.splitlines():
+        line = line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            section = line
+        elif section == "[Service]":
+            key, separator, value = line.partition("=")
+            if separator and key.strip() == name:
+                values.append(value.strip())
+    return values
+
+
 def _unit_env_enabled(unit_text: str, name: str) -> bool:
-    return any(
-        line.strip() == f"Environment={name}=1"
-        for line in unit_text.splitlines()
-    )
+    value = ""
+    for setting in _unit_values(unit_text, "Environment"):
+        if not setting:
+            value = ""
+            continue
+        try:
+            assignments = shlex.split(setting)
+        except ValueError:
+            continue  # systemd ignores assignments with unmatched quotes
+        for assignment in assignments:
+            key, separator, assigned = assignment.partition("=")
+            if separator and key == name:
+                value = assigned
+    return value == "1"
 
 
 def _split_node_sources(nodes: List[dict]) -> Tuple[Dict[str, int], Dict[str, int]]:
