@@ -752,6 +752,12 @@ def _cli_doctor() -> int:
     unit_text = ""
     try:
         unit_text = unit.read_text()
+        # drop-ins (<unit>.d/*.conf) override the fragment, as systemd applies them
+        for dropin in sorted(Path(str(unit) + ".d").glob("*.conf")):
+            try:
+                unit_text += "\n" + dropin.read_text()
+            except OSError:
+                pass
         restart = next((ln.split("=", 1)[1].strip()
                         for ln in unit_text.splitlines()
                         if ln.startswith("Restart=")), "unset")
@@ -1041,10 +1047,13 @@ def _cli_doctor() -> int:
 
 
 def _unit_env_enabled(unit_text: str, name: str) -> bool:
-    return any(
-        line.strip() == f"Environment={name}=1"
-        for line in unit_text.splitlines()
-    )
+    # last assignment wins (fragment first, then drop-ins in order)
+    value = ""
+    for line in unit_text.splitlines():
+        line = line.strip()
+        if line.startswith(f"Environment={name}="):
+            value = line.split("=", 2)[2]
+    return value == "1"
 
 
 def _split_node_sources(nodes: List[dict]) -> Tuple[Dict[str, int], Dict[str, int]]:

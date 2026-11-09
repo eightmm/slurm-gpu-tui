@@ -108,10 +108,10 @@ def init_ssh_pool() -> None:
     if _SSH_CONTROL_DIR:
         return
     _SSH_CONTROL_DIR = tempfile.mkdtemp(prefix="sgpu-ssh-")
-    # %h only: the check path below must match what ssh resolves, and %r
-    # (remote user) is not knowable here when USER differs from it
+    # %n = host alias as given on the command line (e.g. server1); %h would be
+    # the HostName from ssh_config (an IP) and never match the check path below.
     _SSH_BASE_OPTS = (
-        f"-o ControlPath={_SSH_CONTROL_DIR}/%h "
+        f"-o ControlPath={_SSH_CONTROL_DIR}/%n "
         "-o StrictHostKeyChecking=no -o BatchMode=yes"
     )
     atexit.register(cleanup_ssh_pool)
@@ -1051,9 +1051,19 @@ def parse_job_json(
         allocated_nodes = resources.get("allocated_nodes") \
             if isinstance(resources, dict) else None
         node_names = []
+        name_key = "nodename"
+        if not isinstance(allocated_nodes, list) and isinstance(resources, dict):
+            # newer Slurm (observed on 25.11): job_resources.nodes.allocation[].name
+            nodes_obj = resources.get("nodes")
+            allocation = nodes_obj.get("allocation") if isinstance(nodes_obj, dict) else None
+            if isinstance(allocation, list):
+                allocated_nodes = sorted(
+                    (n for n in allocation if isinstance(n, dict)),
+                    key=lambda n: n.get("index", 0) if isinstance(n.get("index"), int) else 0)
+                name_key = "name"
         if isinstance(allocated_nodes, list):
             for node in allocated_nodes:
-                name = node.get("nodename") if isinstance(node, dict) else ""
+                name = node.get(name_key) if isinstance(node, dict) else ""
                 if isinstance(name, str) and 0 < len(name) <= 255 \
                         and re.fullmatch(r"[A-Za-z0-9_.-]+", name):
                     node_names.append(name)
