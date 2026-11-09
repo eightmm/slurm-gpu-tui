@@ -147,3 +147,32 @@ def test_cpu_threads_accumulate_across_jobs():
 def test_non_numeric_cpu_field_is_skipped():
     _u, node_used, _t = compute_thread_usage([row(cpus="N/A", nodelist="gpu1")])
     assert node_used == {}
+
+
+def test_sinfo_gpu_node_in_default_cpu_partition_is_labelled_gpu():
+    # GPU nodes also sit in the default CPU partition, which sinfo lists
+    # first; the GPU table must not label every GPU column "cpu".
+    _status, partitions, nodes, _counts = parse_sinfo_nodes(
+        "master|idle|(null)|cpu*\n"
+        "gpu1|mixed|gpu:a:2|cpu*\n"
+        "gpu1|mixed|gpu:a:2|gpu\n"
+        "gpu2|idle|gpu:b:2|cpu*\n"
+        "gpu2|idle|gpu:b:2|gpu\n"
+    )
+
+    assert nodes == ["gpu1", "gpu2"]
+    assert partitions["gpu1"] == "gpu"
+    assert partitions["gpu2"] == "gpu"
+    assert partitions["master"] == "cpu"
+
+
+def test_sinfo_partition_label_falls_back_to_first_listed():
+    # no GPU-only partition: keep the historical first-listed behaviour
+    _status, partitions, _nodes, _counts = parse_sinfo_nodes(
+        "cpu1|idle|(null)|all*\n"
+        "gpu1|idle|gpu:2|all*\n"
+        "gpu1|idle|gpu:2|mixed\n"
+        "cpu1|idle|(null)|mixed\n"
+    )
+
+    assert partitions["gpu1"] == "all"

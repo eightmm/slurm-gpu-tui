@@ -97,7 +97,8 @@ def parse_sinfo_nodes(sinfo_out):
     so a host named ``master`` can be both slurmctld and a GPU slurmd node.
     """
     node_status = {}
-    node_partition = {}
+    node_partitions = {}   # node -> partitions in sinfo order
+    partition_nodes = {}   # partition -> member nodes
     gpu_counts = {}
     for line in sinfo_out.splitlines():
         parts = line.strip().split('|')
@@ -107,12 +108,26 @@ def parse_sinfo_nodes(sinfo_out):
         if not node:
             continue
         node = node.split('.')[0]
+        partition = partition.rstrip('*')
         node_status.setdefault(node, state.lower())
-        node_partition.setdefault(node, partition.rstrip('*'))
+        if partition not in node_partitions.setdefault(node, []):
+            node_partitions[node].append(partition)
+        partition_nodes.setdefault(partition, set()).add(node)
         gpu_count = extract_gpu_count(gres)
         if gpu_count > 0:
             gpu_counts[node] = max(gpu_counts.get(node, 0), gpu_count)
     gpu_nodes = sorted(gpu_counts, key=natural_sort_key)
+    # A GPU node is often also in a CPU (often the default) partition, which
+    # sinfo lists first; label it with the first partition made only of GPU
+    # nodes, falling back to the first one listed.
+    gpu_only = {
+        part for part, members in partition_nodes.items()
+        if members and all(gpu_counts.get(n, 0) > 0 for n in members)
+    }
+    node_partition = {
+        node: next((p for p in parts if p in gpu_only), parts[0])
+        for node, parts in node_partitions.items()
+    }
     return node_status, node_partition, gpu_nodes, [
         gpu_counts[node] for node in gpu_nodes
     ]
