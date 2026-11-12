@@ -50,6 +50,22 @@ terminal TUI · collector daemon · push agents · usage/waste accounting · Sla
   multi-cluster bridging, and an all-clusters overview —
   **[docs/GRAFANA.md](docs/GRAFANA.md)**
 
+## GPU capacity audit (read-only)
+
+Generate an offline historical audit of allocation, sampled busy time,
+idle/parked waste and collection coverage. **Cost is not assumed**, and
+any capacity-value estimate requires explicit operator inputs:
+
+```bash
+sgpu audit --days 30
+sgpu audit --days 30 --rate 2 --reclaimable 0.25 --currency USD
+sgpu audit --input /path/to/usage.json --format json
+```
+
+The report excludes usernames by default and never changes cluster state.
+Monetary scenarios are not realized savings. See
+[GPU audit pilot and caveats](docs/GPU-AUDIT-PILOT.md).
+
 ## How It Works
 
 Runs on a SLURM login/master node (Python 3.10+, `sinfo`/`squeue`, optionally
