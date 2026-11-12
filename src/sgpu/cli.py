@@ -1117,7 +1117,7 @@ _LEGACY_FLAGS = {
     "--version": "version", "--json": "json", "--once": "once",
     "--doctor": "doctor", "--waste": "waste", "--usage": "usage",
     "--report": "report", "--jobs": "jobs", "--fit": "fit", "--me": "me",
-    "--logs": "logs", "--wait-free": "wait-free",
+    "--logs": "logs", "--wait-free": "wait-free", "--audit": "audit",
 }
 
 
@@ -1180,6 +1180,20 @@ def _build_parser() -> "argparse.ArgumentParser":
     s.add_argument("days", nargs="?", type=int, default=7)
     s.add_argument("--daily", action="store_true", help="add a per-day cluster trend")
 
+    s = add("audit", "read-only GPU utilization & capacity-value audit")
+    s.add_argument("--input", type=Path, default=None,
+                   help="usage.json file; default: freshest local collector state")
+    s.add_argument("--days", type=_positive_int, default=30,
+                   help="report window in days (1-366, default: 30)")
+    s.add_argument("--rate", type=_resource_float, default=None,
+                   help="user-supplied value per GPU-hour in --currency units")
+    s.add_argument("--reclaimable", type=float, default=None,
+                   help="operator-assumed reclaimable fraction from 0 to 1")
+    s.add_argument("--currency", default="USD", help="3-letter currency code, default USD")
+    s.add_argument("--format", choices=("markdown", "json"), default="markdown")
+    s.add_argument("--include-users", action="store_true",
+                   help="explicitly include potentially sensitive usernames")
+
     s = add("jobs", "job history from slurmdbd: outcomes, queue waits")
     s.add_argument("days", nargs="?", type=int, default=7)
     s.add_argument("--user", default="", help="filter to one user")
@@ -1241,6 +1255,27 @@ def main():
             except (OSError, ValueError) as exc:
                 print(f"benchmark: {exc}", file=sys.stderr)
                 sys.exit(2)
+            return
+        if args.cmd == "audit":
+            from .audit import build_audit, render_audit_markdown
+            try:
+                raw = (json.loads(args.input.read_text(encoding="utf-8"))
+                       if args.input is not None else _read_usage_raw())
+                if raw is None:
+                    raise ValueError("no usage.json found; provide --input or run sgpu collector")
+                report = build_audit(
+                    raw, days=args.days, rate=args.rate,
+                    reclaimable=args.reclaimable, currency=args.currency,
+                    include_users=args.include_users,
+                )
+            except (OSError, ValueError, TypeError) as exc:
+                print(f"audit: {exc}", file=sys.stderr)
+                sys.exit(2)
+            print(
+                json.dumps(report, indent=2, ensure_ascii=False)
+                if args.format == "json" else render_audit_markdown(report),
+                end="\n" if args.format == "json" else "",
+            )
             return
         code = {
             "doctor": lambda: _cli_doctor(),
