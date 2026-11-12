@@ -66,7 +66,8 @@ def build_audit(
     through = as_of or date.today()
     start = through - timedelta(days=days - 1)
     lower, upper = start.isoformat(), through.isoformat()
-    keep = lambda day: _valid_day(day, lower, upper)
+    def keep(day: str) -> bool:
+        return _valid_day(day, lower, upper)
 
     # Reuse sgpu's canonical per-user/day merge rule, preserving sacct
     # allocation backfill without treating non-observed hours as idle.
