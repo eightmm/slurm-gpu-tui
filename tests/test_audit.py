@@ -62,7 +62,7 @@ def test_no_default_cost_assumption_or_user_identifiers():
 
 
 def test_explicit_user_details_dont_leak_outside_window():
-    report = build_audit(_sample(), days=1, as_of=AS_OF, include_users=True)
+    report = build_audit(_sample(), days=2, as_of=AS_OF, include_users=True)
     assert [x["user"] for x in report["users"]] == ["alice", "bob", "charlie"]
     assert "old_user" not in render_audit_markdown(report)
 
