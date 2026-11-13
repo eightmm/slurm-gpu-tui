@@ -938,17 +938,17 @@ pub fn run(args: Args) -> Result<()> {
             eprintln!("[collector] notification state failed: {error}");
         }
         phases.insert("notify", start.elapsed().as_secs_f64());
-        diagnostics = json!({"phase_seconds":phases,"cycle_seconds":cycle.elapsed().as_secs_f64(),"interval_seconds":last_cycle.map(|last:Instant|cycle.duration_since(last).as_secs_f64()).unwrap_or(0.0),"log_inflight":mirror.inflight(),"script_inflight":scripts.inflight(),"notify_backlog":notifier.backlog(),"rpc":crate::process::stats()});
-        last_cycle = Some(cycle);
-        if args.once {
-            println!("{}", serde_json::to_string(&snapshot)?);
-            break;
-        }
         let interval = Duration::from_secs_f64(runtime::env_seconds(
             "SLURM_GPU_TUI_COLLECTOR_SEC",
             3.0,
             0.1,
         ));
+        diagnostics = json!({"phase_seconds":phases,"cycle_seconds":cycle.elapsed().as_secs_f64(),"interval_seconds":last_cycle.map(|last:Instant|cycle.duration_since(last).as_secs_f64()).unwrap_or(0.0),"target_interval_seconds":interval.as_secs_f64(),"log_inflight":mirror.inflight(),"script_inflight":scripts.inflight(),"notify_backlog":notifier.backlog(),"rpc":crate::process::stats()});
+        last_cycle = Some(cycle);
+        if args.once {
+            println!("{}", serde_json::to_string(&snapshot)?);
+            break;
+        }
         while cycle.elapsed() < interval && !stopped.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(100));
         }

@@ -99,6 +99,7 @@ fn column_alignment(tab: usize, compact: bool, column: usize) -> Alignment {
         3 => column == 0 || matches!(column, 3..=8),
         4 => matches!(column, 1..=5),
         5 => matches!(column, 1..=9),
+        6 => matches!(column, 1 | 2),
         _ => false,
     };
     if numeric {
@@ -137,21 +138,6 @@ fn mini_meter(value: Option<f64>) -> String {
         "━".repeat(filled),
         "·".repeat(10 - filled)
     )
-}
-fn throughput(value: Option<f64>) -> String {
-    let Some(value) = value.filter(|v| v.is_finite() && *v >= 0.0) else {
-        return "?".into();
-    };
-    for (scale, unit) in [
-        (1073741824.0, "GiB/s"),
-        (1048576.0, "MiB/s"),
-        (1024.0, "KiB/s"),
-    ] {
-        if value >= scale {
-            return format!("{:.1} {unit}", value / scale);
-        }
-    }
-    format!("{value:.1} B/s")
 }
 
 #[derive(Default)]
@@ -491,6 +477,7 @@ pub struct App {
     down_baseline: BTreeSet<String>,
     observations: VecDeque<(f64, [Option<f64>; 3])>,
     last_observation: Vec<(String, u64, bool)>,
+    host_history: crate::host_view::History,
     popup_sequence: u64,
 }
 impl Default for App {
@@ -537,11 +524,13 @@ impl App {
             down_baseline: BTreeSet::new(),
             observations: VecDeque::new(),
             last_observation: Vec::new(),
+            host_history: crate::host_view::History::default(),
             popup_sequence: 0,
         }
     }
     pub fn apply(&mut self, data: Snapshot) {
         let now = runtime::now();
+        self.host_history.observe(&data.controller, now);
         if data.errors.is_empty() {
             let current: BTreeSet<_> = data.jobs.iter().map(|j| j.jobid.clone()).collect();
             if let Some(previous) = &self.job_baseline {
@@ -616,7 +605,7 @@ impl App {
         {
             self.observations.pop_front();
         }
-        if !self.initialized && !data.nodes.is_empty() {
+        if !self.initialized && (!data.nodes.is_empty() || data.controller.is_object()) {
             self.initialized = true;
             self.status = "Snapshot loaded · ↑/↓ select · Space fold · t trend".into();
             if data.nodes.iter().filter(|n| n.has_gpu).count()
@@ -1389,163 +1378,52 @@ impl App {
                 }
             }
             _ => {
-                self.headers = ["Resource", "Value", "Context"]
-                    .map(str::to_string)
-                    .to_vec();
-                let host = &self.data.controller;
-                if crate::model::json_number(&host["observed_at"])
-                    .is_some_and(|t| rules::telemetry_fresh(t, now))
-                {
-                    let mut add = |key: String,
-                                   resource: String,
-                                   value: String,
-                                   context: String,
-                                   color: Color| {
-                        rows.push(ViewRow {
-                            key,
-                            node: String::new(),
-                            job: None,
-                            cells: vec![resource, value, context],
-                            focus: None,
-                            accents: vec![(1, Style::default().fg(color))],
-                            style: Style::default().fg(TEXT),
-                        })
-                    };
-                    let hostname = host["hostname"].as_str().unwrap_or("controller");
-                    let cpu = crate::model::json_number(&host["cpu_util"]);
-                    add(
-                        "host:cpu".into(),
-                        "CPU busy".into(),
-                        mini_meter(cpu),
-                        hostname.into(),
-                        MetricKind::Activity.color(cpu),
-                    );
-                    let ram = crate::model::json_number(&host["mem_used_bytes"])
-                        .zip(crate::model::json_number(&host["mem_total_bytes"]))
-                        .filter(|(_, t)| *t > 0.0);
-                    let pct = ram.map(|(u, t)| u / t * 100.0);
-                    add(
-                        "host:ram".into(),
-                        "RAM".into(),
-                        format!(
-                            "{} {}",
-                            mini_meter(pct),
-                            ram.map(|(u, t)| format!(
-                                "{:.1}/{:.1} GiB",
-                                u / 1073741824.0,
-                                t / 1073741824.0
-                            ))
-                            .unwrap_or_default()
-                        ),
-                        "Observed host memory".into(),
-                        MetricKind::Memory.color(pct),
-                    );
-                    let load = ["load1", "load5", "load15"]
-                        .map(|key| {
-                            crate::model::json_number(&host[key])
-                                .map(|v| format!("{v:.2}"))
-                                .unwrap_or_else(|| "?".into())
-                        })
-                        .join(" / ");
-                    add(
-                        "host:load".into(),
-                        "Load average".into(),
-                        load,
-                        "1 / 5 / 15 minutes; shared host".into(),
-                        Color::Blue,
-                    );
-                    for (key, label, unit) in [
-                        ("cycle_seconds", "Collector cycle", "s"),
-                        ("interval_seconds", "Refresh interval", "s"),
-                        ("log_inflight", "Log queue", "items"),
-                        ("notify_backlog", "Slack queue", "items"),
-                    ] {
-                        if let Some(value) = crate::model::json_number(&self.data.collector[key]) {
-                            add(
-                                format!("service:{key}"),
-                                label.into(),
-                                format!("{value:.2} {unit}"),
-                                "Collector diagnostics".into(),
-                                MUTED,
-                            );
-                        }
-                    }
-                    for disk in host["disks"].as_array().into_iter().flatten() {
-                        let name = disk["name"].as_str().unwrap_or("?");
-                        let rate = |key: &str| throughput(crate::model::json_number(&disk[key]));
-                        add(
-                            format!("disk:{name}"),
-                            format!("Disk {name}"),
-                            format!("R {} / W {}", rate("read_bps"), rate("write_bps")),
-                            "Physical device; two samples".into(),
-                            TEXT,
-                        );
-                    }
-                    for net in host["interfaces"].as_array().into_iter().flatten() {
-                        let name = net["name"].as_str().unwrap_or("?");
-                        let rate = |key: &str| throughput(crate::model::json_number(&net[key]));
-                        add(
-                            format!("net:{name}"),
-                            format!("Net {name}"),
-                            format!("RX {} / TX {}", rate("rx_bps"), rate("tx_bps")),
-                            "Physical interface; shared host".into(),
-                            Color::Blue,
-                        );
-                    }
-                    let storage_fresh = crate::users::storage_fresh(host, now);
-                    if !storage_fresh {
-                        add(
-                            "fs:pending".into(),
-                            "Filesystems".into(),
-                            "?".into(),
-                            "Background sample pending or stale".into(),
-                            MUTED,
-                        );
-                    }
-                    if host["storage_truncated"] == true {
-                        add(
-                            "fs:partial".into(),
-                            "Storage coverage".into(),
-                            "~ partial".into(),
-                            "Filesystem/account sampling limit".into(),
-                            Color::Yellow,
-                        );
-                    }
-                    for fs in host["filesystems"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter(|_| storage_fresh)
+                self.headers = [
+                    "Resource",
+                    "Now / R / RX",
+                    "Total/W/TX",
+                    "Fill / 15m",
+                    "Guide",
+                ]
+                .map(str::to_string)
+                .to_vec();
+                for row in crate::host_view::rows(
+                    &self.data.controller,
+                    &self.data.collector,
+                    &self.host_history,
+                    now,
+                ) {
+                    if !self.search.is_empty()
+                        && !row.key.to_lowercase().contains(&self.search.to_lowercase())
+                        && !row
+                            .cells
+                            .iter()
+                            .any(|c| c.to_lowercase().contains(&self.search.to_lowercase()))
                     {
-                        let mount = fs["mount"].as_str().unwrap_or("?");
-                        let used = crate::model::json_number(&fs["used_bytes"]);
-                        let total = crate::model::json_number(&fs["total_bytes"]);
-                        let pct = used
-                            .zip(total)
-                            .filter(|(_, t)| *t > 0.0)
-                            .map(|(u, t)| u / t * 100.0);
-                        let value = used
-                            .zip(total)
-                            .map(|(u, t)| {
-                                format!(
-                                    "{} {:.1}/{:.1} GiB",
-                                    mini_meter(pct),
-                                    u / 1073741824.0,
-                                    t / 1073741824.0
-                                )
-                            })
-                            .unwrap_or_else(|| "?".into());
-                        let available = crate::model::json_number(&fs["available_bytes"])
-                            .map(|n| format!("{:.1} GiB free", n / 1073741824.0))
-                            .unwrap_or_else(|| "?".into());
-                        add(
-                            format!("fs:{mount}"),
-                            format!("FS {mount}"),
-                            value,
-                            available,
-                            MetricKind::Memory.color(pct),
-                        );
+                        continue;
                     }
+                    let color = match row.level {
+                        crate::host_view::Level::Info => Color::Cyan,
+                        crate::host_view::Level::Good => Color::Green,
+                        crate::host_view::Level::Watch => Color::Yellow,
+                        crate::host_view::Level::High => Color::Rgb(255, 166, 87),
+                        crate::host_view::Level::Critical => Color::Red,
+                        crate::host_view::Level::Unknown => MUTED,
+                    };
+                    rows.push(ViewRow {
+                        key: row.key,
+                        node: String::new(),
+                        job: None,
+                        cells: row.cells,
+                        focus: None,
+                        accents: vec![
+                            (1, Style::default().add_modifier(Modifier::BOLD)),
+                            (2, Style::default().add_modifier(Modifier::BOLD)),
+                            (3, Style::default().fg(color)),
+                            (4, Style::default().fg(color)),
+                        ],
+                        style: Style::default().fg(TEXT),
+                    });
                 }
             }
         }
@@ -1749,7 +1627,13 @@ impl App {
         let areas = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(dashboard_height),
-            Constraint::Length(if self.trend { 7 } else { 4 }),
+            Constraint::Length(if self.tab == 6 {
+                3
+            } else if self.trend {
+                7
+            } else {
+                4
+            }),
             Constraint::Min(3),
             Constraint::Length(2),
         ])
@@ -1943,6 +1827,36 @@ impl App {
                 ),
             ]);
         }
+        if self.tab == 6 {
+            let host = &self.data.controller;
+            let now = runtime::now();
+            let age = crate::model::json_number(&host["observed_at"])
+                .map(|t| format!("{:.0}s ago", (now - t).max(0.0)))
+                .unwrap_or_else(|| "?".into());
+            let fresh = crate::model::json_number(&host["observed_at"])
+                .is_some_and(|t| rules::telemetry_fresh(t, now));
+            summary = vec![
+                Line::styled(
+                    format!(
+                        "Host {} · {age} · {}",
+                        cli::terminal_safe(host["hostname"].as_str().unwrap_or("controller")),
+                        if fresh { "LIVE" } else { "STALE / UNAVAILABLE" }
+                    ),
+                    Style::default().fg(if fresh { Color::Cyan } else { Color::Yellow }),
+                ),
+                Line::styled(
+                    "Capacity 80/90/97% · PSI 1/10% · link 80%: review hints, not diagnoses",
+                    Style::default().fg(MUTED),
+                ),
+                Line::styled(
+                    format!(
+                        "/ search:{} · Enter full values, guides + recent trends · 0 reset",
+                        cli::terminal_safe(&self.search)
+                    ),
+                    Style::default().fg(MUTED),
+                ),
+            ];
+        }
         frame.render_widget(Paragraph::new(summary), areas[2]);
         if self.tab == 2 {
             let body = self
@@ -2045,8 +1959,9 @@ impl App {
                     },
                     _ => match i {
                         0 => Constraint::Length(if self.narrow { 16 } else { 24 }),
-                        1 => Constraint::Length(if self.narrow { 34 } else { 48 }),
-                        _ => Constraint::Min(20),
+                        1 | 2 => Constraint::Length(12),
+                        3 => Constraint::Length(15),
+                        _ => Constraint::Min(15),
                     },
                 })
                 .collect();
@@ -2135,7 +2050,7 @@ impl App {
                     3 => " Jobs · ? unavailable · ~ partial coverage ",
                     4 => " Attention · sustained idle / parked allocations; unallocated processes ",
                     5 => " Users · job CPU/RAM/IO; node network/load are SHARED ",
-                    _ => " Controller · live host resources and local filesystems ",
+                    _ => " Host · R/W disk · RX/TX net · Enter: guide + 5m trend ",
                 }));
             frame.render_stateful_widget(table, areas[3], &mut self.table);
             if self.rows.is_empty() && areas[3].height > 3 {
@@ -2176,11 +2091,18 @@ impl App {
                 ("m", "Mine"),
                 ("0", "Reset"),
             ];
+            if self.tab == 6 {
+                bindings.retain(|(key, _)| *key != "m");
+                bindings.push(("PgUp/Dn", "Page"));
+            }
             if self.tab < 2 {
                 bindings.push(("[]", "Node"));
             }
             if frame.area().width >= 110 {
-                bindings.extend([("s", "Sort"), ("p", "Part"), ("r", "Refresh")]);
+                if self.tab != 6 {
+                    bindings.extend([("s", "Sort"), ("p", "Part")]);
+                }
+                bindings.push(("r", "Refresh"));
             }
             bindings.push(("q", "Quit"));
             for (key, label) in bindings {
@@ -2536,6 +2458,18 @@ impl App {
                         .map(|(h, c)| format!("{h}: {c}"))
                         .collect::<Vec<_>>()
                         .join("\n");
+                    if self.tab == 6
+                        && let Some(host_row) = crate::host_view::rows(
+                            &self.data.controller,
+                            &self.data.collector,
+                            &self.host_history,
+                            runtime::now(),
+                        )
+                        .into_iter()
+                        .find(|r| r.key == key)
+                    {
+                        body.push_str(&format!("\n\n{}", host_row.detail));
+                    }
                     if let Some(user) = key.strip_prefix("attention:")
                         && let Some(group) = crate::users::attention_in_partition(
                             &self.data,
@@ -3006,6 +2940,9 @@ const HELP: &str = concat!(
     "Timer age includes observation gaps; inspect evidence before acting.\n",
     "Users: job CPU/RAM/block I/O; node network and load are SHARED.\n",
     "Controller: local resources, physical device rates, filesystems and available quotas.\n",
+    "Host: R/W disk, RX/TX network; bytes scale through TiB, link speed uses bits/s.\n",
+    "Host guide colors are review hints: capacity 80/90/97%, PSI 1/10%, link 80%.\n",
+    "Enter Host rows for definitions and five-minute trends; high throughput is not a fault.\n",
     "Unknown/stale data is never free capacity. ? unavailable; ~ partial.\n",
     "GPU/VRAM meters sample GPUs; CPU/RAM meters sample nodes. CPU is node-wide.\n",
     "Job RAM includes cgroup cache. Summed peaks are not simultaneous whole-job peaks.\n",
@@ -3021,6 +2958,54 @@ mod tests {
     use super::*;
     use crate::model::Gpu;
     use ratatui::{Terminal, backend::TestBackend};
+    #[test]
+    fn host_columns_units_guides_and_details_survive_resize_and_search() {
+        let now = runtime::now();
+        let mut app = App::for_user("viewer".into());
+        app.tab = 6;
+        app.apply(Snapshot { controller:serde_json::json!({"hostname":"controller","observed_at":now,"storage_observed_at":now,
+            "cpu_util":30,"cpu_online":16,"load1":8,"load5":7,"load15":6,"memory_some_pct":0,
+            "disks":[{"name":"nvme0n1","read_bps":1048576,"write_bps":0,"busy_pct":12,"await_ms":0.2}],
+            "interfaces":[{"name":"eth0","rx_bps":1024,"tx_bps":1048576,"speed_mbps":10000,"link_pct":0.084,"state":"up"}],
+            "filesystems":[{"mount":"/work","used_bytes":2748779069440_u64,"total_bytes":4398046511104_u64,"available_bytes":1649267441664_u64,"files_total":1000,"files_free":800,"files_available":700}]}), ..Default::default() });
+        app.search = "/work".into();
+        app.rebuild();
+        let key = app.selected().unwrap().key.clone();
+        for width in [80, 120, 160] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+            terminal.draw(|f| app.draw(f)).unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(text.contains("2.5 TiB"));
+            assert!(text.contains("4.0 TiB"));
+            assert!(text.contains("Now / R / RX"));
+            assert!(text.contains("Total/W/TX"));
+            assert!(text.contains("review hints"));
+            assert!(!text.contains("GPU 0/0 FREE"));
+            assert_eq!(app.selected().unwrap().key, key);
+        }
+        let worker = Worker::new();
+        app.key(KeyCode::Enter, &worker);
+        assert!(
+            app.popup.as_ref().unwrap().panes[0]
+                .body
+                .contains("df-style")
+        );
+        app.popup = None;
+        app.search = "nvme0n1".into();
+        app.rebuild();
+        assert_eq!(app.rows.len(), 2);
+        app.key(KeyCode::Enter, &worker);
+        let body = &app.popup.as_ref().unwrap().panes[0].body;
+        assert!(body.contains("await"));
+        assert!(body.contains("5m trend"));
+        assert!(body.contains("not percent of maximum"));
+    }
     #[test]
     fn user_details_expire_quota_with_the_table_even_without_a_new_snapshot() {
         let now = runtime::now();

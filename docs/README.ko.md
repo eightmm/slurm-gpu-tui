@@ -35,7 +35,7 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/refs/heads/ma
 마스터에 root 권한으로 설치합니다. Linux·git·C 컴파일러가 필요하며, Rust가
 없으면 설치기가 준비합니다. 첫 빌드는 수 분 걸릴 수 있습니다. 다시 실행하면
 업그레이드하며, 기존 설치 경로·서비스 설정·상태·Slack 설정은 유지합니다.
-설치 후 `sgpu --version`으로 **2.2.0**인지 확인할 수 있습니다. 일반 사용자는
+설치 후 `sgpu --version`으로 **2.3.0**인지 확인할 수 있습니다. 일반 사용자는
 `sgpu`만 실행하면 됩니다.
 
 각 노드의 publisher와 공유 디렉터리는 [노드 설정](PUSH.md)을 따릅니다.
@@ -84,7 +84,11 @@ Users는 작업에 귀속되는 CPU·RAM·block I/O와 노드 공용 네트워�
 Controller는 컨트롤러의 CPU·RAM·load·물리 디스크·NIC·파일시스템과 사용 가능한
 사용자 quota를 표시합니다. Attention은 현재 관측으로 확인한 idle·parked·미할당
 GPU를 사용자별로 모으고 근거를 제공합니다. Slack 알림은 기존 임계값을 유지합니다.
-새 노드 I/O 항목은 각 노드의 publisher를 현지에서 업데이트한 뒤 표시됩니다.
+Host 탭은 R/W·RX/TX를 정렬하고 용량을 TiB까지 자동 변환합니다. PSI·디스크
+대기시간/큐·링크 용량·inode를 함께 표시하며, Enter로 해석 기준과 최근 5분
+추이를 확인합니다. 색상 임계값은 점검을 돕는 기준이며 높은 처리량만으로
+이상을 판정하지 않습니다. 자동 업데이트를 준비한 노드는 업그레이드를 받고,
+이전 publisher는 안내에 따라 한 번 현지에서 업데이트해야 합니다.
 [수집 범위와 귀속 기준](PUSH.md#resource-views)을 함께 확인하세요.
 
 `?`는 결측, `~`는 부분 관측입니다. 오래된 데이터는 빈 GPU로 계산하지 않으며,

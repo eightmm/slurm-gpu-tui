@@ -172,7 +172,7 @@ Python installation's directory and service settings. A fresh installation uses
 `/opt/sgpu`; `SGPU_INSTALL_DIR` overrides it. Explicit settings in the installing
 environment override inherited service settings. Existing Slack configuration,
 state and the old environment are retained. Check `sgpu --version` to confirm
-that the native command is active (currently **2.2.0**).
+that the native command is active (currently **2.3.0**).
 
 Source and prebuilt binaries must match the host architecture and C library.
 Upgrades keep previous releases and persistent state; failed activation attempts
@@ -214,7 +214,7 @@ quota backends and missing records remain unavailable. Network mounts and
 filesystem tree scans are excluded from capacity/quota sampling. No site paths,
 module lists or policy limits are embedded in the application.
 
-Update agents locally to publish these optional fields. Payload v9 and snapshot
+Bootstrapped agents pull upgrades; older agents need one local upgrade. Payload v9 and snapshot
 v1 remain compatible; older agents show unavailable new metrics. Controller
 telemetry comes from the collector host, not from the workstation running the UI.
 
@@ -228,3 +228,36 @@ Kernel references: [block counters](https://docs.kernel.org/block/stat.html),
 [interface counters](https://docs.kernel.org/networking/statistics.html),
 [cgroup v2 I/O](https://docs.kernel.org/admin-guide/cgroup-v2.html),
 [quota queries](https://man7.org/linux/man-pages/man2/quotactl.2.html).
+
+### Host display and interpretation
+
+`7 Host` separates read/RX from write/TX, right-aligns values and uses binary
+capacity/rate units (KiB through TiB and beyond). Link speeds use decimal bits/s.
+Search matches device names and paths; PageUp/Down scrolls. Enter shows full
+values, definitions and five-minute trends gathered while the UI is open.
+Trends use ten-second bins; gaps stay missing and reopening starts a new history.
+`—` means no meaningful percentage is available for that row. Collector cycle
+duration is compared with the configured target, separately from measured spacing.
+
+The guide colors are **sgpu review hints**, not universal health thresholds:
+
+| Indicator | Guide and limits |
+|---|---|
+| RAM / filesystem / inode fullness | <80% headroom, 80% watch, 90% high, 97% critical; filesystem use is `used / (used + available)` and excludes reserved blocks |
+| CPU / load | Busy CPU may be productive; compare 1/5/15-minute load with online logical CPU count and PSI. Load/CPU >1 can include I/O wait; container CPU quotas are not the denominator |
+| PSI | `some avg10` is stalled-task time over ten seconds: 1% review, 10% high; `full` measures all non-idle tasks stalled together. System CPU full is undefined |
+| Disk | Read/write IOPS and await, activity time and average queue depth give context. High busy is not maximum SSD/NVMe throughput; no universal normal MiB/s or latency is assumed |
+| Disk latency trend | Current await >=1ms and >2× the median of at least six prior observations is marked for review; this detects change, not hardware failure |
+| Network | At 80% of reported link capacity review demand; full duplex compares the busier direction, half duplex combines directions. Speed/duplex/state changes rebase rates |
+| Errors / drops / swap | Error/drop increments merit inspection; a down unused port or occupied swap alone is not a fault. Check sustained behavior and workload expectations |
+
+Disk await and IOPS cover completed reads/writes; busy and queue accounting can
+also include other I/O. With no completed requests, await is unavailable. First
+samples, resets, unsupported counters and unknown link speed remain `?`.
+Host PSI and link details are optional; old snapshots still render available data.
+Filesystem byte/inode samples keep their separate 300-second expiry. Nothing in
+this view changes scheduler jobs, quotas, service configuration or Slack delivery.
+
+References: [I/O accounting and limits](https://docs.kernel.org/admin-guide/iostats.html),
+[PSI definitions](https://docs.kernel.org/accounting/psi.html),
+[network link ABI](https://www.kernel.org/doc/Documentation/ABI/testing/sysfs-class-net).

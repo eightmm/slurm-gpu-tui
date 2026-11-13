@@ -36,6 +36,22 @@ fn label(name: &str) -> bool {
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
 }
+fn sys_text(path: &Path) -> Option<String> {
+    runtime::read_regular(path, 4096, None)
+        .ok()
+        .and_then(|(b, _)| String::from_utf8(b).ok())
+        .map(|s| s.trim().into())
+}
+fn online_cpus(raw: &str) -> Option<u64> {
+    raw.trim()
+        .split(',')
+        .try_fold(0u64, |sum, range| {
+            let (first, last) = range.split_once('-').unwrap_or((range, range));
+            let (first, last) = (first.parse::<u64>().ok()?, last.parse::<u64>().ok()?);
+            sum.checked_add(last.checked_sub(first)?.checked_add(1)?)
+        })
+        .filter(|n| *n > 0 && *n <= 1_048_576)
+}
 
 pub struct Sampler {
     proc_root: PathBuf,
@@ -44,6 +60,7 @@ pub struct Sampler {
     pub disks: BTreeSet<(u32, u32)>,
     next: f64,
     interval: f64,
+    last_sample: Option<f64>,
     cache: Value,
 }
 impl Default for Sampler {
@@ -60,6 +77,7 @@ impl Sampler {
             disks: BTreeSet::new(),
             next: 0.0,
             interval: interval.max(1.0),
+            last_sample: None,
             cache: Value::Null,
         }
     }
@@ -100,6 +118,41 @@ impl Sampler {
             return self.cache.clone();
         }
         let mut out = json!({"observed_at":wall,"disks":[],"interfaces":[]});
+        out["cpu_online"] = json!(
+            sys_text(&self.sys_root.join("devices/system/cpu/online"))
+                .and_then(|s| online_cpus(&s))
+        );
+        out["uptime_seconds"] = json!(
+            self.text("uptime")
+                .and_then(|s| s.split_whitespace().next().and_then(crate::model::number))
+        );
+        if let Some(previous) = self.last_sample.filter(|p| monotonic > *p) {
+            out["sample_seconds"] = json!(monotonic - previous);
+        }
+        self.last_sample = Some(monotonic);
+        if let Ok(proc) = runtime::open_dir(&self.proc_root)
+            && let Ok(pressure) = runtime::open_dir_at(&proc, "pressure".as_ref())
+        {
+            for kind in ["cpu", "memory", "io"] {
+                if let Ok(raw) = runtime::read_at(&pressure, kind, 4096) {
+                    for line in String::from_utf8_lossy(&raw).lines() {
+                        if let Some(scope) = line
+                            .split_whitespace()
+                            .next()
+                            .filter(|s| matches!(*s, "some" | "full"))
+                            && let Some(value) = line
+                                .split_whitespace()
+                                .find_map(|v| {
+                                    v.strip_prefix("avg10=").and_then(crate::model::number)
+                                })
+                                .filter(|v| (0.0..=100.0).contains(v))
+                        {
+                            out[format!("{kind}_{scope}_pct")] = json!(value);
+                        }
+                    }
+                }
+            }
+        }
         let mut seen = BTreeSet::new();
         if let Some(raw) = runtime::open_dir(&self.proc_root)
             .ok()
@@ -122,6 +175,7 @@ impl Sampler {
                 let total: f64 = delta.iter().sum();
                 if total > 0.0 {
                     out["cpu_util"] = json!(100.0 * (total - delta[3] - delta[4]) / total);
+                    out["cpu_iowait_pct"] = json!(100.0 * delta[4] / total);
                 }
             }
         }
@@ -150,6 +204,12 @@ impl Sampler {
                 && available <= total
             {
                 out["mem_used_bytes"] = json!((total - available) as f64 * 1024.0);
+            }
+            if let Some((total, free)) = fields.get("SwapTotal").zip(fields.get("SwapFree"))
+                && free <= total
+            {
+                out["swap_total_bytes"] = json!(*total as f64 * 1024.0);
+                out["swap_used_bytes"] = json!((total - free) as f64 * 1024.0);
             }
         }
         self.disks.clear();
@@ -186,7 +246,29 @@ impl Sampler {
                     monotonic,
                     &mut seen,
                 );
-                disk_rows.push(json!({"name":p[2],"read_bps":delta.as_ref().map(|v| v[0]*512.0),"write_bps":delta.as_ref().map(|v|v[1]*512.0)}));
+                let mut row = json!({"name":p[2],"read_bps":delta.as_ref().map(|v| v[0]*512.0),"write_bps":delta.as_ref().map(|v|v[1]*512.0)});
+                if p.len() >= 14
+                    && let Ok(counters) = [p[3], p[6], p[7], p[10], p[12], p[13]]
+                        .map(str::parse::<u64>)
+                        .into_iter()
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                {
+                    row["inflight"] = json!(p[11].parse::<u64>().ok());
+                    if let Some(detail) = self.delta(
+                        format!("disk-detail:{major}:{minor}:{}", p[2]),
+                        counters,
+                        monotonic,
+                        &mut seen,
+                    ) {
+                        let iops = detail[0] + detail[2];
+                        row["iops"] = json!(iops);
+                        row["await_ms"] =
+                            json!((iops > 0.0).then(|| (detail[1] + detail[3]) / iops));
+                        row["busy_pct"] = json!(detail[4] / 10.0);
+                        row["queue_depth"] = json!(detail[5] / 1000.0);
+                    }
+                }
+                disk_rows.push(row);
             }
         }
         for (key, field) in [
@@ -234,8 +316,50 @@ impl Sampler {
                     network_truncated = true;
                     continue;
                 }
-                let delta = self.delta(format!("net:{name}"), vec![rx, tx], monotonic, &mut seen);
-                net_rows.push(json!({"name":name,"rx_bps":delta.as_ref().map(|v|v[0]),"tx_bps":delta.as_ref().map(|v|v[1])}));
+                let sys = self.sys_root.join("class/net").join(name);
+                let speed = sys_text(&sys.join("speed"))
+                    .and_then(|v| crate::model::number(&v))
+                    .filter(|v| *v > 0.0 && *v < 4_294_967_295.0);
+                let duplex =
+                    sys_text(&sys.join("duplex")).filter(|v| matches!(v.as_str(), "full" | "half"));
+                let state = sys_text(&sys.join("operstate")).filter(|v| {
+                    matches!(
+                        v.as_str(),
+                        "up" | "down"
+                            | "unknown"
+                            | "dormant"
+                            | "lowerlayerdown"
+                            | "notpresent"
+                            | "testing"
+                    )
+                });
+                let identity = format!(
+                    "net:{name}:{}:{speed:?}:{duplex:?}:{state:?}",
+                    sys_text(&sys.join("ifindex")).unwrap_or_default()
+                );
+                let delta = self.delta(identity.clone(), vec![rx, tx], monotonic, &mut seen);
+                let mut row = json!({"name":name,"rx_bps":delta.as_ref().map(|v|v[0]),"tx_bps":delta.as_ref().map(|v|v[1]),"speed_mbps":speed,"duplex":duplex,"state":state});
+                if state.as_deref() == Some("up")
+                    && let Some(speed) = speed
+                    && let Some(delta) = &delta
+                {
+                    row["link_pct"] = json!(match duplex.as_deref() {
+                        Some("full") => Some(delta[0].max(delta[1]) * 8.0 / (speed * 1e6) * 100.0),
+                        Some("half") => Some((delta[0] + delta[1]) * 8.0 / (speed * 1e6) * 100.0),
+                        _ => None,
+                    });
+                }
+                if let Ok(counters) = [p[2], p[3], p[10], p[11]]
+                    .map(str::parse::<u64>)
+                    .into_iter()
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    && let Some(delta) =
+                        self.delta(format!("{identity}:errors"), counters, monotonic, &mut seen)
+                {
+                    row["errors_ps"] = json!(delta[0] + delta[2]);
+                    row["drops_ps"] = json!(delta[1] + delta[3]);
+                }
+                net_rows.push(row);
             }
         }
         for (key, field) in [("net_rx_bps", "rx_bps"), ("net_tx_bps", "tx_bps")] {
@@ -359,7 +483,7 @@ pub fn storage(users: &BTreeMap<String, u32>) -> Value {
                 }
             }
         }
-        out.push(json!({"mount":mount,"filesystem":p[2],"total_bytes":stats.f_blocks as f64*stats.f_frsize as f64,"used_bytes":stats.f_blocks.saturating_sub(stats.f_bfree) as f64*stats.f_frsize as f64,"available_bytes":stats.f_bavail as f64*stats.f_frsize as f64,"files_total":stats.f_files,"files_available":stats.f_favail,"quotas":quotas}));
+        out.push(json!({"mount":mount,"filesystem":p[2],"total_bytes":stats.f_blocks as f64*stats.f_frsize as f64,"used_bytes":stats.f_blocks.saturating_sub(stats.f_bfree) as f64*stats.f_frsize as f64,"available_bytes":stats.f_bavail as f64*stats.f_frsize as f64,"files_total":stats.f_files,"files_free":stats.f_ffree,"files_available":stats.f_favail,"quotas":quotas}));
     }
     json!({"filesystems":out,"truncated":truncated,"accounts":users.len().min(128)})
 }
@@ -367,6 +491,103 @@ pub fn storage(users: &BTreeMap<String, u32>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn disk_latency_busy_and_queue_have_independent_counter_baselines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proc = tmp.path().join("proc");
+        let sys = tmp.path().join("sys");
+        std::fs::create_dir_all(&proc).unwrap();
+        std::fs::create_dir_all(sys.join("class/block/sda/device")).unwrap();
+        let write = |s| std::fs::write(proc.join("diskstats"), s).unwrap();
+        let mut sampler = Sampler::new(proc.clone(), sys, 1.0);
+        write("8 0 sda 100 0 1000 500 50 0 2000 250 0 1000 1500\n");
+        assert!(sampler.sample(0.0, 100.0)["disks"][0]["busy_pct"].is_null());
+        write("8 0 sda 104 0 1020 520 52 0 2040 260 2 2000 3500\n");
+        let data = sampler.sample(2.0, 102.0);
+        let disk = &data["disks"][0];
+        assert_eq!(disk["read_bps"], 5120.0);
+        assert_eq!(disk["iops"], 3.0);
+        assert_eq!(disk["await_ms"], 5.0);
+        assert_eq!(disk["busy_pct"], 50.0);
+        assert_eq!(disk["queue_depth"], 1.0);
+        assert_eq!(disk["inflight"], 2);
+        let data = sampler.sample(4.0, 99.0);
+        assert_eq!(data["sample_seconds"], 2.0);
+        assert_eq!(data["disks"][0]["iops"], 0.0);
+        assert!(data["disks"][0]["await_ms"].is_null());
+        write("8 0 sda 104 0 1020 520 52 0 2040 260 0 1 1\n");
+        let data = sampler.sample(6.0, 106.0);
+        assert_eq!(data["disks"][0]["read_bps"], 0.0);
+        assert!(data["disks"][0]["busy_pct"].is_null());
+    }
+    #[test]
+    fn link_capacity_uses_duplex_and_rebases_when_the_link_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proc = tmp.path().join("proc");
+        let sys = tmp.path().join("sys");
+        let net = sys.join("class/net/eth0");
+        std::fs::create_dir_all(proc.join("net")).unwrap();
+        std::fs::create_dir_all(net.join("device")).unwrap();
+        for (file, value) in [
+            ("speed", "100"),
+            ("duplex", "full"),
+            ("operstate", "up"),
+            ("ifindex", "2"),
+        ] {
+            std::fs::write(net.join(file), value).unwrap();
+        }
+        let write = |rx, tx, errors| {
+            std::fs::write(
+                proc.join("net/dev"),
+                format!("eth0: {rx} 0 {errors} 0 0 0 0 0 {tx} 0 0 0 0 0 0 0\n"),
+            )
+            .unwrap()
+        };
+        let mut sampler = Sampler::new(proc.clone(), sys, 1.0);
+        write(100, 200, 0);
+        assert!(sampler.sample(0.0, 100.0)["interfaces"][0]["rx_bps"].is_null());
+        write(12_500_100, 12_500_200, 2);
+        let data = sampler.sample(2.0, 102.0);
+        assert_eq!(data["interfaces"][0]["link_pct"], 50.0);
+        assert_eq!(data["interfaces"][0]["errors_ps"], 1.0);
+        std::fs::write(net.join("duplex"), "half").unwrap();
+        assert!(sampler.sample(4.0, 104.0)["interfaces"][0]["link_pct"].is_null());
+        write(25_000_100, 25_000_200, 2);
+        assert_eq!(
+            sampler.sample(6.0, 106.0)["interfaces"][0]["link_pct"],
+            100.0
+        );
+        std::fs::write(net.join("speed"), "-1").unwrap();
+        assert!(sampler.sample(8.0, 108.0)["interfaces"][0]["link_pct"].is_null());
+    }
+    #[test]
+    fn host_capacity_pressure_and_swap_are_observed_without_inventing_missing_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proc = tmp.path().join("proc");
+        let sys = tmp.path().join("sys");
+        std::fs::create_dir_all(proc.join("pressure")).unwrap();
+        std::fs::create_dir_all(sys.join("devices/system/cpu")).unwrap();
+        std::fs::write(sys.join("devices/system/cpu/online"), "0-3,8-11").unwrap();
+        std::fs::write(
+            proc.join("pressure/memory"),
+            "some avg10=2.50 avg60=0.1\nfull avg10=0.50\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proc.join("meminfo"),
+            "MemTotal: 1024 kB\nMemAvailable: 512 kB\nSwapTotal: 100 kB\nSwapFree: 75 kB\n",
+        )
+        .unwrap();
+        let mut sampler = Sampler::new(proc, sys, 1.0);
+        let data = sampler.sample(0.0, 100.0);
+        assert_eq!(data["cpu_online"], 8);
+        assert_eq!(data["memory_some_pct"], 2.5);
+        assert_eq!(data["memory_full_pct"], 0.5);
+        assert_eq!(data["swap_used_bytes"], 25600.0);
+        assert!(data["io_some_pct"].is_null());
+        assert_eq!(online_cpus("3-2"), None);
+        assert_eq!(online_cpus(""), None);
+    }
     #[test]
     fn rates_need_two_samples_and_skip_partitions_and_virtual_interfaces() {
         let tmp = tempfile::tempdir().unwrap();

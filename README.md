@@ -36,7 +36,7 @@ Install on the master as root. Linux, git and a C compiler are required; the
 installer prepares Rust when needed. The first build may take several minutes.
 Run the same command to upgrade. Existing installation paths, service settings,
 state and Slack configuration are preserved. Check `sgpu --version` after
-installation; the current version is **2.2.0**. Users simply run `sgpu`.
+installation; the current version is **2.3.0**. Users simply run `sgpu`.
 
 Configure each node's publisher and the shared directory using the
 [node setup guide](docs/PUSH.md). Nodes publish results to a shared filesystem;
@@ -84,10 +84,15 @@ cancellation and private logs still use the executing account.
 **Users** separates attributed job CPU/RAM/block I/O from shared-node network
 and load. **Controller** shows local CPU/RAM, load, physical disk/NIC rates and
 filesystem capacity; user-quota records appear when the filesystem exposes them.
+The **Host** tab aligns read/write and RX/TX columns, scales capacity through
+TiB, and adds pressure, disk latency/queue, link capacity and inode indicators.
+Enter opens interpretation guides and recent five-minute trends. Colored
+thresholds are review hints; high throughput alone is not a fault.
 **Attention** groups current idle/parked and unallocated GPU observations by user
 and shows the evidence. Existing Slack thresholds continue to control delivery.
 See [sampling and attribution](docs/PUSH.md#resource-views) before interpreting
-shared counters. Update each node publisher locally to enable its new I/O fields.
+shared counters. Bootstrapped agents receive upgrades automatically; older node
+publishers need the one-time local upgrade described in the setup guide.
 
 `?` means unavailable and `~` means partial coverage. Stale data never counts
 as free GPUs. Capacity and estimated start times do not guarantee admission
