@@ -8,7 +8,7 @@ opens a master-to-node session or repairs a publisher when data stops.
 
 Choose one absolute shared `SLURM_GPU_TUI_AGENT_DIR`, visible at the same path
 on the master and every node. Binaries may be installed on local disks; only
-the published JSON files need the shared filesystem.
+the published JSON files and automatic-update channel need the shared filesystem.
 
 ```bash
 # Master host
@@ -53,8 +53,45 @@ cryptographic authentication. Do not trust accounts that untrusted users can use
 
 Missing, invalid, rejected or stale files retain known inventory with explicit
 unavailable status. They do not count as free GPUs and never cause a node request.
-Build timestamps do not trigger publisher updates. Update each node service
-locally when upgrading the agent schema.
+Automatic updates use the separate administrator-owned channel below, not
+untrusted telemetry or build timestamps.
+
+## Automatic agent updates
+
+Install **2.2.0 or later once on each node** using the node commands above.
+Earlier agents cannot acquire this capability from a master upgrade alone.
+After bootstrap, a successful master installation publishes its native agent
+under `<AGENT_DIR>/.sgpu-updates/<architecture>`. The node supervisor checks
+every 60 seconds, copies a newer version to local storage and checks its loader
+and version before switching workers. GPU/CPU mode and the service environment
+are retained. There is no node build, Internet download or master-to-node session.
+
+The candidate must successfully collect and publish telemetry. Failure to start,
+exit after activation or no successful publication for 120 seconds restores the
+previous worker. A failed version is blocked until a newer version is published.
+The installed agent remains the supervisor and baseline fallback; telemetry's
+`release` identifies the running worker, while `sgpu-agent --version` at the
+installed path identifies the baseline. Restarting the service retains the
+last activated worker. `--stop` stops both supervisor and worker. `--once` and
+non-root agents never apply updates. `--no-service` does not publish a release.
+
+Executable updates require **root-owned files and directories**, without group
+or other write access. Root-owned sticky shared ancestors are permitted, but
+symlinks, wrong ownership, incompatible architectures, malformed manifests,
+oversized executables and version downgrades are rejected. This code trust is
+stricter than telemetry UID trust: UID 65534 is never accepted for code. NFS
+root-squash or writable ancestors may therefore prevent publication/activation;
+the master prints a warning and existing telemetry continues. Use a shared
+path with administrator-controlled ownership for automatic updates. A C-library
+incompatibility fails the loader check and leaves the current worker running.
+
+Local releases and state use `/var/lib/sgpu-agent`, or `updates/` inside an
+explicit `AGENT_RUNTIME_DIR`. `AGENT_UPDATE_STATE_DIR` overrides this location;
+choose node-local storage. Baseline, current, previous and the last failed
+release are retained; older local versions are pruned. Node logs include
+`[update]` activation/rejection/rollback messages. To disable automatic updates,
+set `SLURM_GPU_TUI_AGENT_AUTO_UPDATE=0` when installing. Existing Slack settings
+and running Slurm jobs are unaffected.
 
 ## Sampling
 
@@ -107,6 +144,9 @@ unit. Credentials stay in the private Slack configuration.
 | `AGENT_DIR` | `~/.sgpu/nodes` | Shared publisher directory; set explicitly across hosts |
 | `AGENT_TRUSTED_UIDS` | root, own UID, directory owner, 65534 | Override accepted file authors with comma-separated numeric UIDs |
 | `AGENT_RUNTIME_DIR` | `/run` | Optional private local agent lock/log directory |
+| `AGENT_AUTO_UPDATE` | `1` | Publish/apply administrator-owned agent updates |
+| `AGENT_UPDATE_SEC` / `AGENT_UPDATE_STARTUP_SEC` | `60` / `120` | Update check cadence / maximum gap in candidate publications |
+| `AGENT_UPDATE_STATE_DIR` | `/var/lib/sgpu-agent` | Local release cache and rollback state; explicit runtime directory takes precedence over default |
 | `REFRESH_SEC` / `COLLECTOR_SEC` | `3` / `3` | UI / collector cadence |
 | `SCHEDULER_SEC` / `SCHEDULER_MAX_AGE_SEC` | collector cadence / `30` | Background scheduler cadence / maximum age |
 | `MEM_REFRESH_SEC` | `15` | Scheduler AllocMem query cadence |
@@ -132,7 +172,7 @@ Python installation's directory and service settings. A fresh installation uses
 `/opt/sgpu`; `SGPU_INSTALL_DIR` overrides it. Explicit settings in the installing
 environment override inherited service settings. Existing Slack configuration,
 state and the old environment are retained. Check `sgpu --version` to confirm
-that the native command is active (currently **2.1.0**).
+that the native command is active (currently **2.2.0**).
 
 Source and prebuilt binaries must match the host architecture and C library.
 Upgrades keep previous releases and persistent state; failed activation attempts

@@ -34,6 +34,8 @@ pub struct Args {
     pub daemon: bool,
     #[arg(long)]
     pub stop: bool,
+    #[arg(long, hide = true)]
+    pub worker: bool,
 }
 
 pub fn parse_csv(line: &str) -> Vec<String> {
@@ -542,7 +544,37 @@ pub fn run(args: Args) -> Result<()> {
     let stopped = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGTERM, stopped.clone())?;
     signal_hook::flag::register(signal_hook::consts::SIGINT, stopped.clone())?;
-    let _lock = runtime::Lock::acquire(&runtime::agent_runtime("lock"), Duration::from_secs(5))?;
+    process::stop_with(stopped.clone());
+    let _lock = if args.worker {
+        let flags = unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_GETFL) };
+        if flags < 0
+            || unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                < 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let parent = unsafe { libc::getppid() };
+        if parent <= 1
+            || unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) } != 0
+            || unsafe { libc::getppid() } != parent
+        {
+            return Err("agent worker lost its supervisor".into());
+        }
+        None
+    } else {
+        Some(runtime::Lock::acquire(
+            &runtime::agent_runtime("lock"),
+            Duration::from_secs(5),
+        )?)
+    };
+    if !args.worker && !args.once && runtime::euid() == 0 && crate::update::enabled() {
+        match crate::update::supervise(args.mode, stopped.clone()) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                eprintln!("[update] supervisor unavailable; continuing installed agent: {error}")
+            }
+        }
+    }
     let directory = runtime::agent_dir();
     fs::create_dir_all(&directory)?;
     let destination = directory.join(format!("{}.json", runtime::hostname()?));
@@ -563,6 +595,9 @@ pub fn run(args: Args) -> Result<()> {
             });
         match result {
             Ok(()) => {
+                if args.worker {
+                    crate::update::ready()?;
+                }
                 if failures > 0 {
                     eprintln!("[agent] recovered after {failures} failures");
                 }

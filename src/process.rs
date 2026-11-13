@@ -45,6 +45,11 @@ pub struct CommandStats {
     pub last_seconds: f64,
 }
 static STATS: OnceLock<Mutex<BTreeMap<String, CommandStats>>> = OnceLock::new();
+static STOPPED: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+pub fn stop_with(flag: Arc<AtomicBool>) {
+    let _ = STOPPED.set(flag);
+}
 
 pub fn stats() -> BTreeMap<String, CommandStats> {
     STATS
@@ -80,6 +85,18 @@ pub fn run(program: Program, args: &[&str], timeout: Duration) -> Result<String>
 }
 
 pub fn capture(command: &mut Command, timeout: Duration, limit: usize) -> Result<Vec<u8>> {
+    capture_until(command, timeout, limit, STOPPED.get().map(Arc::as_ref))
+}
+fn capture_until(
+    command: &mut Command,
+    timeout: Duration,
+    limit: usize,
+    stopped: Option<&AtomicBool>,
+) -> Result<Vec<u8>> {
+    let cancelled = || stopped.is_some_and(|flag| flag.load(Ordering::Relaxed));
+    if cancelled() {
+        return Err("command cancelled during shutdown".into());
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -135,9 +152,11 @@ pub fn capture(command: &mut Command, timeout: Duration, limit: usize) -> Result
         if status.is_some() && stdout.is_finished() && stderr.is_finished() {
             break;
         }
-        if start.elapsed() >= timeout || overflow.load(Ordering::Relaxed) {
+        if start.elapsed() >= timeout || overflow.load(Ordering::Relaxed) || cancelled() {
             failure = Some(
-                if overflow.load(Ordering::Relaxed) {
+                if cancelled() {
+                    "command cancelled during shutdown"
+                } else if overflow.load(Ordering::Relaxed) {
                     "command output exceeded limit"
                 } else {
                     "command timed out"
@@ -172,6 +191,37 @@ pub fn capture(command: &mut Command, timeout: Duration, limit: usize) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_cancels_the_command_group_and_prevents_new_commands() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let flag = stopped.clone();
+        let signal = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let start = Instant::now();
+        let result = capture_until(
+            Command::new("sh").args(["-c", "sleep 30 & wait"]),
+            Duration::from_secs(30),
+            1024,
+            Some(&stopped),
+        );
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        signal.join().unwrap();
+        assert!(
+            capture_until(
+                &mut Command::new("a-command-that-must-never-start"),
+                Duration::from_secs(1),
+                1024,
+                Some(&stopped)
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled")
+        );
+    }
 
     #[test]
     fn timeout_kills_and_reaps_the_child() {

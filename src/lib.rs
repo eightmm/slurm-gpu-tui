@@ -19,6 +19,7 @@ pub mod rules;
 pub mod runtime;
 pub mod scheduler;
 pub mod ui;
+pub mod update;
 pub mod usage;
 pub mod users;
 

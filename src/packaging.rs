@@ -37,6 +37,10 @@ const BINARIES: &[&str] = &[
 // Only public, implemented settings may enter the world-readable unit.
 const PUBLIC_ENV: &[&str] = &[
     "AGENT_RUNTIME_DIR",
+    "AGENT_AUTO_UPDATE",
+    "AGENT_UPDATE_SEC",
+    "AGENT_UPDATE_STARTUP_SEC",
+    "AGENT_UPDATE_STATE_DIR",
     "AGENT_SEC",
     "CPU_AGENT_SEC",
     "TELEMETRY_SEC",
@@ -905,6 +909,19 @@ fn install(
     );
     if !no_service {
         println!("Active native command: /usr/local/bin/sgpu (verify with sgpu --version)");
+        if role == Role::Master {
+            // Advertise only after the local installation and service succeeded.
+            let agent = fs::canonicalize(prefix.join("bin/sgpu-agent"))?;
+            match crate::update::publish(&agent) {
+                Ok(()) if crate::update::enabled() => {
+                    println!("Node update published; bootstrapped agents check within 60 seconds.")
+                }
+                Ok(()) => println!("Node automatic updates disabled by configuration."),
+                Err(error) => eprintln!(
+                    "WARNING: local install succeeded, but node update was not published: {error}"
+                ),
+            }
+        }
     }
     Ok(())
 }

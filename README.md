@@ -36,12 +36,14 @@ Install on the master as root. Linux, git and a C compiler are required; the
 installer prepares Rust when needed. The first build may take several minutes.
 Run the same command to upgrade. Existing installation paths, service settings,
 state and Slack configuration are preserved. Check `sgpu --version` after
-installation; the current version is **2.1.0**. Users simply run `sgpu`.
+installation; the current version is **2.2.0**. Users simply run `sgpu`.
 
 Configure each node's publisher and the shared directory using the
 [node setup guide](docs/PUSH.md). Nodes publish results to a shared filesystem;
-the master reads those files. It never requests node collection, installation
-or repair.
+the master reads those files. Master upgrades also publish an agent release;
+nodes installed with 2.2.0 or later pull and activate newer compatible versions
+automatically, with rollback on failure. Older agents need one local upgrade.
+See [automatic updates](docs/PUSH.md#automatic-agent-updates) for requirements.
 
 ## Usage
 

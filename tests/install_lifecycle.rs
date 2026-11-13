@@ -57,6 +57,177 @@ fn success(output: Output) {
 
 #[test]
 #[ignore = "requires root; scripts/check.sh runs these with sudo when available"]
+fn automatic_agent_updates_activate_and_roll_back_without_losing_cpu_mode_or_stop() {
+    use std::{
+        io::Write,
+        process::Stdio,
+        time::{Duration, Instant},
+    };
+    let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let agents = root.path().join("agents");
+    let runtime_dir = root.path().join("runtime");
+    let cache = runtime_dir.join("updates");
+    let channel = agents.join(".sgpu-updates").join(std::env::consts::ARCH);
+    fs::create_dir_all(&channel).unwrap();
+    for path in [&agents, &agents.join(".sgpu-updates"), &channel] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let publish = |release: &str, action: &str| {
+        let executable = channel.join(format!("{release}.elf"));
+        let mut compiler = Command::new("cc")
+            .args(["-x", "c", "-O0", "-o"])
+            .arg(&executable)
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let code = format!(
+            r#"#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/prctl.h>
+int main(int argc, char **argv) {{
+ prctl(PR_SET_PDEATHSIG, SIGTERM);
+ if (argc == 2 && !strcmp(argv[1], "--version")) {{ puts("sgpu {release}"); return 0; }}
+ if (argc != 4 || strcmp(argv[1], "--worker") || strcmp(argv[2], "--mode") || strcmp(argv[3], "cpu")) return 44;
+ {action}
+}}
+"#
+        );
+        compiler
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(code.as_bytes())
+            .unwrap();
+        let output = compiler.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let metadata = serde_json::json!({"protocol":1,"version":release,"arch":std::env::consts::ARCH,"bytes":fs::metadata(&executable).unwrap().len()});
+        runtime::atomic_write(
+            &channel.join("latest.json"),
+            &serde_json::to_vec(&metadata).unwrap(),
+            0o644,
+            true,
+        )
+        .unwrap();
+    };
+    publish(
+        "99.0.0",
+        "execl(getenv(\"SGPU_TEST_REAL_AGENT\"), \"sgpu-agent\", \"--worker\", \"--mode\", \"cpu\", (char*)0); return 9;",
+    );
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sgpu-agent"));
+        command
+            .env("SLURM_GPU_TUI_AGENT_DIR", &agents)
+            .env("SLURM_GPU_TUI_AGENT_RUNTIME_DIR", &runtime_dir)
+            .env("SLURM_GPU_TUI_AGENT_AUTO_UPDATE", "1")
+            .env("SLURM_GPU_TUI_AGENT_UPDATE_SEC", "1")
+            .env("SLURM_GPU_TUI_AGENT_UPDATE_STARTUP_SEC", "1")
+            .env("SLURM_GPU_TUI_CPU_AGENT_SEC", "0.1")
+            .env("SGPU_TEST_REAL_AGENT", env!("CARGO_BIN_EXE_sgpu-agent"));
+        command
+    };
+    struct Guard(std::process::Child);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = Guard(
+        command()
+            .args(["--mode", "cpu"])
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(root.path().join("update.log")).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let wait = |current: &str, blocked: &str| {
+        let start = Instant::now();
+        loop {
+            let state: serde_json::Value = fs::read(cache.join("state.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default();
+            if state["current"] == current && state["blocked"] == blocked {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "state {state}; {}",
+                fs::read_to_string(root.path().join("update.log")).unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait("99.0.0", "");
+    let payload = agents.join(format!("{}.json", runtime::hostname().unwrap()));
+    let first: serde_json::Value = serde_json::from_slice(&fs::read(&payload).unwrap()).unwrap();
+    assert_eq!(first["node_kind"], "cpu");
+    publish("99.0.1", "return 42;");
+    wait("99.0.0", "99.0.1");
+    publish("99.0.2", "for (;;) pause();");
+    wait("99.0.0", "99.0.2");
+    publish("99.0.3", "write(1, \"R\", 1); sleep(1); return 42;");
+    wait("99.0.3", "99.0.2");
+    wait("99.0.0", "99.0.3");
+    let start = Instant::now();
+    loop {
+        let latest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&payload).unwrap()).unwrap();
+        if latest["ts"].as_f64().unwrap() > first["ts"].as_f64().unwrap() {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(command().arg("--stop").status().unwrap().success());
+    assert!(child.0.wait().unwrap().success());
+    let mut restarted = Guard(
+        command()
+            .args(["--mode", "cpu"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(restarted.0.try_wait().unwrap().is_none());
+    assert!(command().arg("--stop").status().unwrap().success());
+    assert!(restarted.0.wait().unwrap().success());
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(cache.join("state.json")).unwrap()).unwrap();
+    assert_eq!(state["current"], "99.0.0");
+    assert_eq!(state["previous"], sgpu::VERSION);
+    fs::set_permissions(
+        cache.join("99.0.0/sgpu-agent"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    let mut cached_failure = Guard(
+        command()
+            .args(["--mode", "cpu"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait(sgpu::VERSION, "99.0.3");
+    assert!(command().arg("--stop").status().unwrap().success());
+    assert!(cached_failure.0.wait().unwrap().success());
+}
+
+#[test]
+#[ignore = "requires root; scripts/check.sh runs these with sudo when available"]
 fn native_upgrades_role_removal_and_missing_artifacts_preserve_data() {
     let root = tempfile::tempdir().unwrap();
     runtime::secure_dir(root.path(), 0o700).unwrap();
