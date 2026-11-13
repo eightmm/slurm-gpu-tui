@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Report swap usage on the current host: total, per-user totals, and the
-# heaviest processes. Run it directly on a node (e.g. after `ssh gpu3`).
+# heaviest processes. Run it locally on the node being inspected.
 set -u
 
 free -h | awk '/Swap/{print "SWAP: "$3" / "$2}'

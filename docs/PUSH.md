@@ -1,178 +1,97 @@
-# Node Delivery: Push vs SSH-pull
+# Autonomous node publication
 
-`sgpu doctor` shows which mode is active (`node delivery`). Both are fine —
-push just scales better and keeps SSH out of the hot path.
+The only telemetry transport is node → shared filesystem → collector.
+Install a supervised publisher locally on every node. The application never
+opens a master-to-node session or repairs a publisher when data stops.
 
-- **Push mode:** GPU agents write `nvidia-smi` stats every 3 seconds and
-  CPU-only agents write `/proc/meminfo` every 20 seconds to a shared-filesystem
-  directory; the collector reads those files locally. No SSH in the hot path.
-- **SSH-pull:** the collector SSHes into each node per cycle. Automatic
-  fallback when push isn't possible — a valid mode, not an error.
+## Local setup
 
-GPU agents are launched and repaired by the collector. A root/shared-FS
-install provisions CPU-only agents as `sgpu-cpu-agent.service` with
-`Restart=always`, so an overloaded node does not need to accept a new SSH
-session to keep publishing RAM telemetry. Either kind falls back to SSH when
-its payload is missing or stale.
-
-## Push turns on automatically when two conditions hold
-
-1. The **install directory is on a shared filesystem** that compute nodes
-   mount at the same path (so they can execute the venv directly).
-2. The **agent output directory** (`SLURM_GPU_TUI_AGENT_DIR`) is on that shared
-   filesystem too (so agents write and the collector reads the same files).
-
-If the install lives on the master's local disk (e.g. `/opt/sgpu`), nodes can't
-see the venv → SSH-pull is used automatically.
-
-## Enabling push mode
-
-A **root install picks push-friendly defaults by itself**: when `/home/shared`
-exists, the installer uses `/home/shared/sgpu` as the install dir and
-`/home/shared/sgpu-nodes` as the agent dir (pre-created mode 1777), so
+Choose one absolute shared `SLURM_GPU_TUI_AGENT_DIR`, visible at the same path
+on the master and every node. Binaries may be installed on local disks; only
+the published JSON files need the shared filesystem.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstrap.sh | sudo bash
+# Master host
+SLURM_GPU_TUI_AGENT_DIR=/nfs/sgpu-nodes bash install.sh --role master
+
+# Each GPU node, locally
+SLURM_GPU_TUI_AGENT_DIR=/nfs/sgpu-nodes bash install.sh --role node --mode gpu
+
+# Each CPU-only node, locally
+SLURM_GPU_TUI_AGENT_DIR=/nfs/sgpu-nodes bash install.sh --role node --mode cpu
 ```
 
-is all it takes. For a different shared-FS layout, point both paths there —
-they must be visible to master and every compute node at the same location:
+Use `--no-build` and `SGPU_BIN_DIR` for prebuilt binaries. Match the node's
+architecture and C library. Root system units and nonroot user units use
+`sgpu-agent.service`; systems without a service manager use `--daemon`.
+The service waits for network/shared mounts, restarts after failure, and receives
+60 seconds to stop. `sgpu-agent --stop` stops only the current user's local
+publisher validated against its lock holder. Configure agent runtime files on
+local storage with `SLURM_GPU_TUI_AGENT_RUNTIME_DIR` when needed.
 
-```bash
-SGPU_INSTALL_DIR=/nfs/apps/sgpu \
-SLURM_GPU_TUI_AGENT_DIR=/nfs/apps/sgpu-nodes \
-  bash <(curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstrap.sh)
-```
+The installer creates a missing publication directory mode 1777; an existing
+directory retains its site-managed permissions. The sticky bit prevents one
+writer from replacing another writer's file. Provision the directory and its
+ACLs explicitly when NFS `root_squash` prevents directory creation. A malicious
+first writer can block a node's filename; it cannot impersonate a trusted author.
+Resolve such a collision as the directory owner or site administrator.
 
-Set both variables **on the same command line** as the installer — a systemd
-service doesn't inherit your shell's environment, so the installer bakes these
-paths into the unit for you. After ~2 collector cycles:
+## Payload validation
 
-```bash
-sgpu doctor        # node delivery → "push mode (N nodes via agent)"
-```
+Nodes atomically publish `<hostname>.json` (schema v9). The collector checks:
 
-## Requirements & gotchas
+- bounded regular files, no final symlink, expected hostname and GPU/CPU kind;
+- supported version, required fields, unique GPU indices and bounded lists;
+- modification time (default maximum age 45s; at most 5s into the future);
+- file author in the trusted numeric UID set.
 
-- Master needs **passwordless SSH to every compute node** (the collector
-  launches agents over SSH). As a root system service that means root SSH.
-- If the shared FS is exported with **NFS `root_squash`** and the collector
-  runs as root, node-side agents (also root) write as `nobody`. The installer
-  pre-creates the agent dir mode 1777 so this works out of the box; if you
-  created the dir by hand, `chmod 1777` it (or export `no_root_squash`).
-- CPU-only nodes use the systemd push agent after a root/shared-FS install.
-  Set `SGPU_ENABLE_CPU_PUSH=0` to keep them SSH-pull-only.
+Default trusted UIDs: root, collector UID, directory owner and 65534 (common
+root-squash identity). Narrow this set for the site's actual publisher account:
+`SLURM_GPU_TUI_AGENT_TRUSTED_UIDS=1234,5678` replaces defaults. Trust applies
+to every node filename in this directory; filesystem identity is not per-node
+cryptographic authentication. Do not trust accounts that untrusted users can use.
 
-## Who is allowed to publish a payload
+Missing, invalid, rejected or stale files retain known inventory with explicit
+unavailable status. They do not count as free GPUs and never cause a node request.
+Build timestamps do not trigger publisher updates. Update each node service
+locally when upgrading the agent schema.
 
-The agent dir is mode 1777, so any user on the shared FS can create a
-`<node>.json`. Shape validation cannot tell a real agent from a forgery, and a
-forged payload feeds Slack alerts, the waste view, and per-user GPU-hour
-accounting — so the collector also checks **who wrote the file** and ignores
-payloads from anyone else, falling back to SSH polling for that node.
+## Sampling
 
-Trusted by default: `root`, the collector's own uid, the agent dir's owner, and
-`nobody` (the `root_squash` case above). If your agents run under some other
-account, list its uid:
+GPU publishers sample at 3s; CPU publishers at 20s. CPU/RAM, PSI and bounded
+cgroup v2 job data are cached for 10s by default. CPU deltas need two samples.
+`SLURM_GPU_TUI_TELEMETRY_MAX_JOBS` defaults to 256, clamped to 1–4096.
 
-```bash
-SLURM_GPU_TUI_AGENT_TRUSTED_UIDS=1234,5678   # replaces the default set
-```
+The cgroup scan examines Slurm-managed `slurm` or `[node_]slurmstepd.scope`
+under the root or `system.slice`, including optional `uid_<id>` wrappers.
+Numeric `job_<id>` paths are supported; SLUID directories require a root-owned
+`slurmstepd: [job.step]` process. Unresolved/duplicate IDs are omitted. The scan
+does not traverse `user.slice`, follow symlinks or read more than 8 KiB per
+kernel record. Scan limits produce `jobs_truncated`.
 
-Rejections are logged once per node and reported by `sgpu doctor` under
-`agent payload trust`.
+CPU counter resets, unavailable cgroup v2 files, permissions and unlimited
+memory produce missing values. `memory.current` includes descendants and cache;
+`memory.peak` is node-local; `oom_kill` is cumulative. The collector attaches
+finite numeric values only to validated scheduler jobs on allocated nodes.
+GPU PID-attributed VRAM is reported separately, with per-metric coverage.
 
-Sticky-bit side effect worth knowing: because nobody can replace a file they
-do not own, a user who creates `<node>.json` first *blocks* the real agent
-instead of impersonating it. The agent says so explicitly in its log
-(`cannot publish ... push mode is blocked for this node`) rather than
-degrading silently to SSH.
+GPU health is capability-gated and cached for at least 10s; topology is cached
+for 300s. Power uses local RAPL and optional `ipmitool`. Run
+`setup-node-power.sh --check` locally for a read-only check, or `--apply` as root
+for local package/module setup. Missing hardware stays unavailable.
 
-## Optional node and job telemetry
+## Diagnosis and removal
 
-Payload v9 adds CPU counter deltas, `/proc/pressure/{cpu,memory,io}` `some`
-`avg10`, and numeric per-job cgroup-v2 values. GPU health probes first check
-`nvidia-smi --help-query-gpu`, support both `clocks_event_reasons.active` and
-the older `clocks_throttle_reasons.active`, and tolerate missing recovery action.
+Run `sgpu doctor` on the master. On a stale node, locally inspect
+`systemctl status sgpu-agent`, its journal, mount visibility and write permissions.
+For user units add `--user`. Restart or reinstall on that node after fixing the
+cause. The collector does not coordinate recovery.
 
-`SLURM_GPU_TUI_TELEMETRY_SEC` defaults to 10s; sampling runs only when the
-existing agent next collects, so CPU-only agents retain their 20s push cadence.
-`SLURM_GPU_TUI_TELEMETRY_MAX_JOBS` defaults to 256 (clamped to 1–4096). Configure
-these in the agent's environment; matching telemetry intervals on readers keep
-freshness consistent (the greater of 30s or twice the configured interval).
+Uninstall the local role with `uninstall.sh --role node`; remove the collector
+separately with `--role master`. Usage, shared payloads and previous releases
+remain. Do not delete shared binaries still used by another host's service.
 
-The bounded scan examines Slurm-managed `slurm` or `[node_]slurmstepd.scope`
-directories under the cgroup root or `system.slice`, including optional
-`uid_<id>` wrappers. Numeric `job_<id>` paths are supported. Newer Slurm's
-SLUID directories are mapped only via a root-owned `slurmstepd: [job.step]`
-process in the step's `slurm/cgroup.procs`; unresolved or duplicate IDs are
-omitted. No user environment variables or arbitrary process titles establish
-job identity. The scan never traverses `user.slice`, follows symlinks, or reads
-more than 8 KiB per kernel record. Reaching the scan limit is published as
-`jobs_truncated`; unsupported cgroup v1, missing files and permission failures
-leave metrics absent. No Slurm configuration or privilege change is needed.
-
-`memory.current` includes descendants and cache, `memory.peak` is node-local,
-`memory.max=max` has no finite limit, and `memory.events` supplies cumulative
-`oom_kill`. CPU cores use `cpu.stat` deltas; first samples and counter resets
-are unknown. The collector checks trusted payload authorship, finite numeric
-fields, sample age and validated scheduler job/node membership. GPU process
-VRAM is attributed separately. The TUI shows per-metric coverage and partial
-values, and SSH fallback contributes only PSI to this optional telemetry.
-
-Semantics: [Linux cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html),
-[Linux PSI](https://docs.kernel.org/accounting/psi.html),
-[Slurm cgroup v2 paths](https://slurm.schedmd.com/cgroup_v2.html),
-[NVIDIA SMI queries](https://docs.nvidia.com/deploy/nvidia-smi/index.html).
-
-## Operational checks
-
-```bash
-sgpu doctor
-systemctl status sgpu-collector          # system service
-systemctl --user status sgpu-collector   # user service
-ssh <cpu-node> systemctl status sgpu-cpu-agent
-```
-
-Healthy push mode usually shows:
-
-- fresh collector data
-- `node delivery -> GPU push mode (...)` with `CPU push: ...`, or a mixed
-  push/SSH fallback state
-- writable `SLURM_GPU_TUI_AGENT_DIR`
-- no stale agent payloads older than `SLURM_GPU_TUI_AGENT_MAX_AGE_SEC`
-
-If a node is stale, wait one repair interval
-(`SLURM_GPU_TUI_AGENT_REPAIR_SEC`, default 180s) before assuming manual repair
-is needed. The collector rate-limits per-node relaunches.
-
-## Wiping and reinstalling (shared FS)
-
-Files on a shared FS are held open by the collector **and by every node's
-agent** — a plain `rm -rf` will hang or leave `.nfsXXXX` files. Stop the
-holders first:
-
-```bash
-# 1. stop the collector
-sudo systemctl stop sgpu-collector
-
-# 2. kill agents on every node (they hold the shared venv open over NFS)
-for n in $(sinfo -h -N -o %N | sort -u); do
-  timeout 8 ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$n" \
-    'sudo systemctl stop sgpu-cpu-agent 2>/dev/null || true;
-     pkill -f "bin/[s]gpu-agent"' 2>/dev/null
-done
-sleep 2
-
-# 3. now the directory deletes cleanly
-sudo rm -rf /home/shared/sgpu /home/shared/sgpu-nodes
-
-# 4. reinstall (do NOT ^C mid-build — a half-built venv breaks the interpreter)
-SGPU_INSTALL_DIR=/home/shared/sgpu \
-SLURM_GPU_TUI_AGENT_DIR=/home/shared/sgpu-nodes \
-  bash <(curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstrap.sh)
-```
-
-If `rm` still hangs, something still holds the files — check `fuser -v
-/home/shared/sgpu` and confirm `systemctl status sgpu-collector` is stopped.
-Leftover `.nfs*` files clear themselves once the open handles close.
+References: [cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html),
+[PSI](https://docs.kernel.org/accounting/psi.html),
+[Slurm cgroup paths](https://slurm.schedmd.com/cgroup_v2.html),
+[NVIDIA SMI](https://docs.nvidia.com/deploy/nvidia-smi/index.html).

@@ -1,368 +1,204 @@
-<div align="center">
-
 # sgpu
 
-**Real-time SLURM GPU operations monitor**
-terminal TUI · collector daemon · push agents · usage/waste accounting · Slack alerts
+Slurm GPU operations monitor written in Rust: terminal UI, autonomous node
+publishers, collector, usage accounting, Slack alerts and Prometheus textfiles.
 
-![CI](https://github.com/eightmm/slurm-gpu-tui/actions/workflows/test.yml/badge.svg)
-![Python](https://img.shields.io/badge/python-3.10+-blue)
-![License](https://img.shields.io/badge/license-MIT-green)
+[한국어](README_ko.md) · [Node setup](docs/PUSH.md) · [Slack](docs/ALERTS.md) · [Metrics](docs/METRICS.md)
 
-[한국어 README](README_ko.md)
+![GPU view with synthetic data](docs/tab-gpu.svg)
 
-</div>
+## Data flow
 
-<p align="center"><img src="docs/tab-gpu.svg" alt="sgpu GPU tab" width="100%"></p>
-
-<table>
-<tr>
-<td width="50%" align="center"><img src="docs/waste.svg" alt="waste popup"><br>
-<sub><b>Wasted GPUs (w)</b> — idle / parked / rogue, worst first</sub></td>
-<td width="50%" align="center"><img src="docs/tab-cpu.svg" alt="CPU tab"><br>
-<sub><b>CPU tab (2)</b> — every node incl. CPU-only, per-user cores</sub></td>
-</tr>
-<tr>
-<td width="50%" align="center"><img src="docs/tab-usage.svg" alt="usage tab"><br>
-<sub><b>GPU-hours by user (3)</b> — allocation vs compute, efficiency %</sub></td>
-<td width="50%" align="center"><img src="docs/tab-gpu-details.svg" alt="detail columns"><br>
-<sub><b>Detail columns (d)</b> — temperature, power, JobID, job name</sub></td>
-</tr>
-</table>
-
-<p align="center"><img src="docs/tab-jobs.svg" alt="Jobs tab: requested and actual resources, OOM and coverage" width="100%"><br>
-<sub><b>Jobs tab (4)</b> — GPU/CPU jobs and pending work; screenshots use synthetic data.</sub></p>
-
-## Features
-
-- Per-node GPU status (utilization, VRAM, temp, power) and CPU/RAM — GPUs
-  matched to SLURM jobs even when driver probe order differs from `/dev/nvidiaN`
-- Idle / parked / rogue GPU detection, pending queue with reasons and start estimates
-- Per-user GPU-hours, efficiency, and wasted hours, backfilled from slurmdbd
-- Job introspection: batch script + stdout/stderr tabs (error lines
-  highlighted, live tail), `sgpu logs` from the CLI, sacct history with
-  exit codes (`h`), watch any job for start/end toasts (`n`)
-- Slack alerts (node down/recovered, GPU health, waste/rogue, job failures
-  with a stderr tail DM, RAM-over-fair-share) in a daily thread,
-  with one parent posted every day even when there are no alerts —
-  **[docs/ALERTS.md](docs/ALERTS.md)**
-- Prometheus metrics + Grafana dashboards, including node wall-power,
-  multi-cluster bridging, and an all-clusters overview —
-  **[docs/GRAFANA.md](docs/GRAFANA.md)**
-
-## How It Works
-
-Runs on a SLURM login/master node (Python 3.10+, `sinfo`/`squeue`, optionally
-`sacct`) with passwordless SSH to compute nodes; GPU nodes need `nvidia-smi`.
-
-```
-[sgpu-agent @ each node] ──3/20s─→ <AGENT_DIR>/<node>.json   (shared FS push)
-                                          │
-[sgpu-collector @ master] ──merge──→  /tmp/slurm-gpu-tui/data.json
-                                          ↑
-[sgpu TUI]                ──reads──┘   (instant, no SSH on launch)
+```text
+node: sgpu-agent --mode gpu   ── every 3s ──┐
+node: sgpu-agent --mode cpu   ── every 20s ─┴─> shared <AGENT_DIR>/<hostname>.json
+                                                        ↓
+master: local Slurm CLI + shared files ──> sgpu-collector ──> data.json / metrics.prom
+                                                              ↓
+                                                         sgpu terminal UI
 ```
 
-- **Push mode (preferred):** GPU agents push `nvidia-smi` data every 3s,
-  CPU-only agents RAM/CPU/PSI data every 20s — no SSH in the hot path.
-- **SSH-pull fallback:** nodes without a live agent are polled over SSH
-  (ControlMaster-pooled, async). Modes mix freely; stale CPU payloads fall
-  back to low-frequency SSH polling (`cpu-poll`).
-- The TUI reads the merged JSON, so startup is instant at any cluster size.
-- `sgpu doctor` is the first check after install or when data looks wrong.
+Each node runs its own service and publishes results independently. Missing,
+untrusted or stale results remain unavailable; the collector keeps inventory
+without inferring free capacity. Node installation, restart and power setup
+are performed locally on that node. The master reads shared files and queries
+its local Slurm tools. Job cancellation is routed through the Slurm controller.
 
-## Installation
+## Build and install
 
-> **Already installed? Just run `sgpu`.**
-
-One line to install or upgrade in place:
+Install the Rust version from `main` with curl:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstrap.sh | bash
-```
-
-Run as **root/sudo** for a system service and `/usr/local/bin/sgpu` for every
-user; a non-root install sets up only your own user. Root installs also enable
-and actively reapply NVIDIA persistence mode on GPU nodes on every install
-(`SGPU_ENABLE_PERSISTENCE=0` to skip), enable cross-user job-log tails
-and sanitized scheduler details (`SGPU_SHARE_LOGS=0` and
-`SGPU_SHARE_JOB_DETAILS=0` opt out), and provision CPU-only push agents on
-shared-FS setups (`SGPU_ENABLE_CPU_PUSH=0` to skip).
-
-**Install location** (`SGPU_INSTALL_DIR`): `~/.sgpu/app` for user installs; as
-root, `/home/shared/sgpu` when `/home/shared` exists (shared FS → push mode
-out of the box), else `/opt/sgpu` (SSH-pull). Override on the **`bash` side**
-of the pipe — for push mode both paths must be on a shared FS mounted at the
-same path on compute nodes:
-
-```bash
+# On the master, with a publication directory shared by every node:
 curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstrap.sh \
-  | SGPU_INSTALL_DIR=/nfs/apps/sgpu SLURM_GPU_TUI_AGENT_DIR=/nfs/apps/sgpu-nodes bash
+  | SLURM_GPU_TUI_AGENT_DIR=/nfs/sgpu-nodes bash -s -- --role master
+
+# Run locally on each GPU node:
+curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstrap.sh \
+  | SLURM_GPU_TUI_AGENT_DIR=/nfs/sgpu-nodes bash -s -- --role node --mode gpu
+# CPU-only nodes use --mode cpu. Run the bash side as root for system services.
 ```
 
-| Environment | Service |
-|-------------|---------|
-| root / sudo | system service + `/usr/local/bin/sgpu` for all users |
-| no sudo, systemd `--user` | user service (auto-starts on login) + PATH line |
-| no sudo, no systemd | background process + PATH line |
+The bootstrap requires Linux, git and a C compiler/linker. It installs a minimal
+Rust 1.93.0 toolchain through [official rustup](https://rust-lang.github.io/rustup/installation/index.html)
+when a suitable Rust compiler is unavailable, then builds locked dependencies
+and installs native executables. The first build can take several minutes.
+`SGPU_INSTALL_RUST=0` disables automatic Rust setup. `SGPU_SOURCE_DIR` selects
+the source checkout (default `~/.sgpu/source`); dirty checkouts are preserved
+unless `SGPU_FORCE_UPDATE=1` explicitly permits discarding tracked edits.
+Existing checkout updates must fast-forward. Re-run the same curl command to
+upgrade the local role. Build-only tools are not required for `--no-build`
+with `SGPU_BIN_DIR` pointing to compatible prebuilt binaries.
 
-> Push mode details (root→node SSH, `root_squash` NFS): **[docs/PUSH.md](docs/PUSH.md)**
-
-## Usage
+To build from an existing checkout, use Rust 1.93 or newer. The master needs `sinfo`, `squeue`
+and `scontrol`; `sacct` supplies history and accounting. GPU nodes need
+`nvidia-smi`. Rust is needed only on the build host. Prebuilt executables must
+match the target architecture and system C library.
 
 ```bash
-sgpu        # launch the monitor
+cargo build --release --locked --bins -j 2
+
+# On the master; select a directory mounted by every publisher and the master.
+SLURM_GPU_TUI_AGENT_DIR=/nfs/sgpu-nodes bash install.sh --no-build --role master
+
+# Run locally on EACH GPU node, using binaries available on that host.
+SLURM_GPU_TUI_AGENT_DIR=/nfs/sgpu-nodes bash install.sh --no-build --role node --mode gpu
+# For CPU-only nodes, use --mode cpu.
 ```
 
-| Key | Action |
-|-----|--------|
-| `1` `2` `3` `4` | Tabs: GPU / CPU / Usage / Jobs |
-| `v` / `t` | Expand pending queue / show cluster trend (both initially hidden) |
-| `f` | Free capacity by GPU model/VRAM, single-node maximum and node list |
-| `r` / `s` | Refresh / cycle sort (Node → Util → User → Free) |
-| `u` / `i` | Filter by user (me first) / free-GPU filter |
-| `p` / `m` | Cycle partition filter / my jobs only |
-| `d` | Detail columns (Temp / Power / JobID / JobName) |
-| `Space` / `j` `k` | Collapse node / move cursor |
-| `/` | Search node or username (`Esc` clears) |
-| `Enter` | Job / node details (`scontrol show`) — `Tab` cycles Info / Script / StdOut / StdErr |
-| `w` | Wasted GPUs popup |
-| `h` | My job history (7d, sacct) — `Enter`: state, exit code, logs |
-| `n` | Watch job under cursor — toast when it starts/ends |
-| `x` | Cancel job under cursor (own jobs, asks first) |
-| `e` | Export snapshot as JSON |
-| `?` / `q` | Help / quit |
+`SGPU_BIN_DIR` selects a directory containing all five native binaries:
+`sgpu`, `sgpu-agent`, `sgpu-collector`, `chkgpu`, `sgpu-install`.
+The installer defaults to `/opt/sgpu` for root and `~/.sgpu/app` otherwise;
+override with `--prefix` or `SGPU_INSTALL_DIR`. Root installs a system service
+and links under `/usr/local/bin`; other users get a user service when available,
+otherwise a background daemon, plus a PATH line in `~/.profile`. User services
+follow the site's login/linger policy. `--no-service` installs files and rendered
+units without changing services, PATH or shared directories.
 
-The TUI pops toasts while open: your jobs starting/finishing, nodes going
-down or recovering.
+Upgrades create a versioned release and atomically switch `current`. On failure,
+the installer attempts to restore previous files and service state and reports
+any restoration error. Previous releases and persistent data are retained.
+When upgrading an existing installation, explicitly reuse its prefix and data,
+state and agent directories. Node services must be upgraded locally as well.
+`bash deploy.sh [install options]` runs the required checks before building
+and installing on the current host.
 
-### One-shot CLI
+Root master installs default to sharing log tails and sanitized job details;
+set `SGPU_SHARE_LOGS=0` / `SGPU_SHARE_JOB_DETAILS=0` to disable them. Script
+sharing is opt-in (`SGPU_SHARE_SCRIPTS=1`). Shared scripts and runtime logs may
+contain secrets: enable these only where all users may read that content.
+Private source log paths are never serialized into snapshots. Reads validate
+scheduler numeric UID and regular-file identity; a root reader drops privileges
+to the owner, including on root-squashed home directories.
+
+Root GPU-node installation also enables local NVIDIA persistence mode;
+`SGPU_ENABLE_PERSISTENCE=0` skips it. Optional local power setup:
+`bash setup-node-power.sh --check` or, as root on that node,
+`bash setup-node-power.sh --apply`.
+
+Uninstall the role on its own host:
 
 ```bash
-sgpu --once          # plain-text snapshot (--json for JSON)
-sgpu --waste [-v]    # idle/parked/rogue GPUs; exit 1 if any
-sgpu doctor          # self-diagnosis: data, agents, slurm, sacct, Slack
-sgpu --usage [days] [--daily]          # per-user GPU-hours + efficiency + waste
-sgpu --jobs [days] [--user U]          # job history: outcomes, GPU-hours, waits
-sgpu logs JOBID [-f] [-e]              # tail a job's stdout (-e: stderr, -f: follow)
-sgpu --report [YYYY-MM]                # markdown monthly report
-sgpu --wait-free 2 --partition heavy   # block until 2 GPUs free
-sgpu fit 2 --vram 40 --model h100 --cpus 16 --ram 64 --partition P --explain
-                                     # resource fit + exclusion reasons + sbatch line
-sgpu bench --nodes 128 --repeat 5      # offline synthetic TUI update timings
-sgpu bench --replay snapshot.json     # offline replay of exported snapshots
-sgpu me              # my jobs, my wasted GPUs, my week (exit 1 if wasting)
-chkgpu               # one-shot user × node matrix with next-free ETA
+bash uninstall.sh --role master
+bash uninstall.sh --role node
 ```
 
-`fit` options are optional; VRAM and RAM are in GiB. `--model` takes an exact
-Slurm GRES type (for example `h100`); CPU/RAM use scheduler allocation rather
-than observed process usage. Stale telemetry is excluded. Results estimate
-capacity; reservations, QOS and scheduler policy still decide admission.
-`bench` makes no Slurm, SSH or network calls. Replay accepts one exported
-snapshot, a JSON list, or `{"snapshots": [...]}` (up to 64 MiB), including
-snapshots with missing metrics or stale nodes. Timings cover `_apply`, excluding
-JSON decoding and asynchronous screen painting; clear counts expose table rebuilds.
+Uninstall preserves usage, configuration, exports, shared payloads and previous
+releases. Files-only installations can be removed with `--no-service`.
 
-### Reading the Display
+## Use
 
-```
-Node / GPU   Util    VRAM       User / job         Left     Health
-▼ node01     mix    █▁         A100               free 1
-  GPU0       85%    40.0/80G   alice #12345       2.3h      OK
-  GPU1        0%     0.0/80G                             OK
-▶ Pending 12 · Resources 8 · Priority 4 [v]
-```
+`sgpu` opens the UI. Screenshots under `docs/` show synthetic data and illustrate
+the views; exact terminal layout varies with width.
 
-- **Responsive layout**: below 130 columns, GPU rows use numeric utilization
-  and VRAM and omit the model column. Node headers carry the model; Enter shows
-  CPU/RAM, partition, hardware health and process details. Pending rows start
-  folded; `v` expands them. Normal states are muted, caution yellow, failures
-  red, and your jobs use one accent.
-- **FREE**: counts only fresh, schedulable nodes and GPUs without recovery or
-  thermal action flags. The two-line summary applies the current GPU filters;
-  `f` lists every model/VRAM group, its largest single-node fit and node counts.
-  Source/stale status explicitly covers the whole cluster. Capacity is an
-  observation, not a reservation or scheduler admission guarantee.
-- **GPU health**: HOT, aggregate uncorrectable ECC, power-cap/thermal/slowdown
-  clock events and recovery action when the driver supports them. CAP alone
-  is informational; low clocks alone are not a fault. Enter shows full values.
-- **Jobs (4)**: running GPU and CPU jobs plus pending jobs, requested CPU/RAM,
-  actual CPU cores and cgroup RAM, PID-attributed VRAM, remaining time or wait,
-  OOM kills and node coverage. `?` means unavailable; `~` means partial coverage.
-  RAM requests keep Slurm's raw units (`c` per CPU, `n` per node). Enter shows
-  RAM peak, finite limit and coverage for each metric. Summed node-local peaks
-  are not necessarily a simultaneous whole-job peak; cgroup memory includes
-  cache and descendants. Watch, detail and own-job cancellation work here too.
-- **Pending**: wait since submission, exact reasons with dependencies/QOS,
-  eligible time in details, and an explicitly estimated start. No queue position
-  is inferred from priority. User/partition/search filters also apply here.
-- **CPU (2)**: allocated cores, actual CPU busy %, load, RAM and PSI CPU/memory/
-  I/O `some avg10` stall %. PSI is a pressure indicator, not a causal diagnosis.
-- **Cluster trend (`t`)**: up to five minutes of GPU utilization, VRAM and total
-  GPU power. Unknown/stale observations are gaps (`·`); utilization/VRAM use a
-  0–100% scale and power uses the window peak.
-- **Usage coverage**: stale telemetry contributes no busy/waste samples or
-  efficiency denominator; allocated GPU-hours remain counted. The Usage tab
-  shows fresh coverage over assigned GPUs and unobserved GPU-hours.
-
-Optional CPU/PSI/job sampling is local to the existing agent, cached for 10s
-(`SLURM_GPU_TUI_TELEMETRY_SEC`), and scans at most 256 Slurm jobs per node
-(`SLURM_GPU_TUI_TELEMETRY_MAX_JOBS`). CPU counters need a second sample. Job
-metrics require accessible cgroup v2; v1, missing files, unlimited memory,
-permissions or unverified SLUID mappings produce missing values. Reads are
-bounded and do not follow symlinks. The collector publishes only numeric
-allowlisted fields tied to validated jobs and their allocated nodes. SSH
-fallback supplies PSI, but not cgroup job or CPU-delta measurements.
-GPU health sampling is capability-gated and cached for at least 10s.
-No repeated `sstat` polling or Slurm configuration changes are required.
-See [docs/PUSH.md](docs/PUSH.md) for supported paths and collection limits.
-
-## Slack Alerts
-
-Config is `~/.sgpu/slack.json` (hot-reloaded); the installer sets it up and
-`sgpu doctor` shows the active mode. Full setup: **[docs/ALERTS.md](docs/ALERTS.md)**
-
-Finished-job state lookups run in a bounded background queue. Failure log tails
-go only to the owner's configured DM, using the last validated scheduler UID
-and private paths with the same safe reader as log sharing. After a restart
-or metadata loss, the summary can be sent without a log tail.
-
-## Operations
-
-The collector publishes telemetry independently of a single background Slurm
-generation. It polls AllocMem less often, bounds SSH admission and rotates
-through eligible nodes. Cached SSH results become stale after the greater of
-the agent freshness limit and the node's polling interval plus SSH timeout.
-Failed/over-age scheduler generations keep the last
-node roster but invalidate privileged job metadata and allocation mappings;
-they never trigger a finished-job diff. Shared logs with unchanged content
-back off from the base scan interval to the configured maximum and reset
-after changes. Cycle, phase, RPC and queue metrics are documented in
-[docs/GRAFANA.md](docs/GRAFANA.md).
-
-```bash
-systemctl status|restart sgpu-collector          # root install
-systemctl --user status|restart sgpu-collector   # user install
-journalctl -u sgpu-collector -f                  # logs (nohup: <DATA_DIR>/collector.log)
-ssh <node> cat /run/sgpu-agent.log               # node agent (root; else /tmp/sgpu-agent-<uid>.log)
-```
-
-| Symptom | Check |
-|---------|-------|
-| `sgpu` not found | `export PATH="$HOME/.sgpu/app/bin:$PATH"` |
-| Slow startup every launch | collector not running |
-| Node `~timeout` / `~unreachable` | `ssh <node>` from master fails |
-| Node `~smi_err` / `~no_smi` | `ssh <node> nvidia-smi` |
-| Usage tab stale / empty | `sgpu doctor` → `usage history` names the file it read |
-| Node stuck on SSH despite an agent | `sgpu doctor` → `agent payload trust` |
-| Other users' log tabs empty | `sgpu doctor` → `job log sharing`; rerun the root installer |
-| Other users' job details denied | `sgpu doctor` → `job detail sharing`; rerun the root installer |
-| GPU/job binding or every shared detail is empty | `sgpu doctor` → `scheduler jobs`; modern Slurm uses JSON and older Slurm automatically uses the validated compatibility backend |
-| Anything else | `sgpu doctor` |
-
-### Sharing other users' jobs
-
-These features need a root collector. Script sharing is chosen at install time;
-log and scheduler-detail sharing default to **on** for root installs
-(`SGPU_SHARE_LOGS=0` / `SGPU_SHARE_JOB_DETAILS=0` opt out):
-
-| Env in the unit | What every user can then see |
+| Keys | Action |
 |---|---|
-| `SLURM_GPU_TUI_SHARE_SCRIPTS=1` | every job's batch script in the detail popup |
-| `SLURM_GPU_TUI_SHARE_LOGS=1` | every job's stdout/stderr (last 64KB, mirrored to `<state>/logs`) |
-| `SLURM_GPU_TUI_SHARE_JOB_DETAILS=1` | sanitized running/pending state, timing, placement, and requested/allocated resources |
-
-> **Log sharing publishes runtime output.** A batch script is text its author
-> wrote; a log is whatever the job printed — tokens a framework echoed,
-> connection strings, environment dumps inside tracebacks. Turn it on only
-> where every cluster user is entitled to see every other user's job output.
-> `SLURM_GPU_TUI_LOG_TAIL_BYTES` caps how much is mirrored per stream. The
-> collector mirrors only regular, non-symlink files owned by the job's
-> numeric UID reported by the scheduler. Modern Slurm uses structured
-> `scontrol --json`; releases without that option automatically use a hardened
-> text compatibility backend whose UID, state, and node placement must match
-> numeric-UID `squeue` snapshots taken immediately before and after the query.
-> Ambiguous or changed records are rejected. On root-squashed NFS homes the
-> collector reads in a short-lived process dropped to that UID; no collector
-> environment is passed. `sgpu doctor` shows the selected backend under
-> `scheduler jobs`.
->
-> Legacy mode is intentionally fail-closed: because old one-line output has
-> no unforgeable record boundary, an ambiguous/duplicate physical `JobId`
-> suppresses the affected record (and its allocation) for that cycle. Doctor
-> reports the count instead of risking attribution or log access to the wrong
-> user.
-
-Job-detail sharing deliberately excludes free-form comments, mail addresses,
-commands, working directories, and input/output paths. Private log paths stay
-inside the collector and are never written to `data.json`.
-
-One-shot extras (root, run once per cluster):
+| `1` / `2` / `3` / `4` | GPU / CPU / Usage / Jobs |
+| `j` / `k`, arrows, PageUp / PageDown | Navigate or scroll |
+| `s` / `S` | Cycle sort / reverse sort |
+| `u` / `p` / `m` / `i` | User / partition / mine / free GPU filters |
+| `/`, `Esc` | Search / clear |
+| Space / `z` | Collapse one node / all nodes |
+| `d` / `v` / `t` | Detail columns / pending list / five-minute trend |
+| Enter, Tab / Shift+Tab | Open details; cycle Info / Script / StdOut / StdErr |
+| `w` / `f` / `h` | Waste / free capacity / own job history |
+| `n` / `x` | Watch job transitions / confirm cancellation of own job |
+| `e` / `r` / `?` / `q` | Export JSON / refresh / help / quit |
 
 ```bash
-sudo ./setup-node-power.sh    # node wall-power/RAPL telemetry — pushes ipmitool
-                              # to internet-less nodes, persists kernel modules
-sudo grafana/install.sh       # Grafana + Prometheus + alertmanager + dashboards
+sgpu once                       # legacy --once also works
+sgpu json
+sgpu waste -v                   # exit 1 if wasted GPUs exist
+sgpu me                         # own running/pending jobs, waste and week
+sgpu usage 7 --daily
+sgpu jobs 7 --user alice
+sgpu report 2026-11
+sgpu logs 12345 -e -f            # stderr, follow
+sgpu wait-free 2 --partition gpu
+sgpu fit 2 --model h100 --vram 40 --cpus 16 --ram 64 --explain
+sgpu doctor
+chkgpu                          # user × node allocation matrix and next-free ETA
+sgpu bench --nodes 128 --repeat 5
+sgpu bench --replay snapshot.json
 ```
 
-Reinstall cleanly by re-running the one-line install. Deploying from a dev
-checkout? Run `bash ./deploy.sh` as root from that checkout. It tests in a
-fresh private temporary directory (including when sudo/su retains another
-username), installs only after the tests pass, then restarts the collector.
-Uninstall (stops collector and agents, removes
-services, data, install dir):
+VRAM/RAM inputs use GiB. Fit matches exact Slurm GRES type and normalized hardware
+name, scheduler CPU/RAM allocations and fresh GPU observations. Reservations,
+QOS and scheduling policy still control admission. `?` denotes missing values,
+`~` partial coverage; unsupported metrics stay absent. GPU-hours use
+`max(sampled allocation, sacct)`; efficiency uses only observed allocation.
+Summed cgroup memory peaks need not be simultaneous; memory includes cache
+and descendants. Pending start times are scheduler estimates.
+
+The offline benchmark measures model update **and terminal-buffer rendering**,
+excluding JSON decoding. It accepts one snapshot, a list, or
+`{"snapshots": [...]}` up to 64 MiB, and makes no scheduler or network calls.
+Its timings are not directly comparable to the former UI's update-only timings.
+
+## Configuration and operations
+
+Set variables at installation so supported public settings enter the local unit.
+Credentials stay in the private Slack config; see [Slack setup](docs/ALERTS.md).
+
+| `SLURM_GPU_TUI_` suffix | Default | Purpose |
+|---|---|---|
+| `DATA_DIR` | `/tmp/slurm-gpu-tui` | Merged snapshot, metrics and collector runtime |
+| `STATE_DIR` | root `/var/lib/sgpu`; user `~/.sgpu/state` | Usage, inventory, idle and notification state |
+| `AGENT_DIR` | `~/.sgpu/nodes` | Shared publisher directory; set explicitly across hosts |
+| `AGENT_TRUSTED_UIDS` | root, own UID, directory owner, 65534 | Override accepted file authors with comma-separated numeric UIDs |
+| `AGENT_RUNTIME_DIR` | root `/run`; user temporary dir | Optional private local agent lock/log directory |
+| `REFRESH_SEC` / `COLLECTOR_SEC` | `3` / `3` | UI / collector cadence |
+| `SCHEDULER_SEC` / `SCHEDULER_MAX_AGE_SEC` | collector cadence / `30` | Background scheduler cadence / maximum age |
+| `MEM_REFRESH_SEC` | `15` | Scheduler AllocMem query cadence |
+| `AGENT_SEC` / `CPU_AGENT_SEC` | `3` / `20` | GPU / CPU publisher cadence |
+| `AGENT_MAX_AGE_SEC` / `AGENT_MAX_BYTES` | `45` / `1048576` | Payload freshness / byte limit |
+| `AGENT_CMD_TIMEOUT_SEC` | `40` | Local agent command timeout |
+| `TELEMETRY_SEC` / `TELEMETRY_MAX_JOBS` | `10` / `256` | CPU/PSI/cgroup sampling interval / job scan cap |
+| `GPU_TOPOLOGY_TTL_SEC` | `300` | GPU identity cache |
+| `WASTE_MIN_SEC` / `ROGUE_IGNORE` | `600` / `root,gdm,xdm` | Waste threshold / ignored process users |
+| `USAGE_KEEP_DAYS` / `USAGE_SAVE_SEC` | `30` / `30` | Retention / durable checkpoint cadence |
+| `SACCT_SEC` | `3600` | Usage backfill (`0` disables) |
+| `METRICS_SEC` / `METRICS_PENDING_MAX` | `15` / `100` | Textfile cadence / per-job pending-series cap |
+| `METRICS_FILE` | `<data>/metrics.prom` | Textfile path |
+| `SHARE_LOGS` / `SHARE_JOB_DETAILS` / `SHARE_SCRIPTS` | off before installer defaults | Publish selected content to every snapshot reader |
+| `LOG_TAIL_BYTES` / `LOG_MIRROR_SEC` / `LOG_MIRROR_MAX_SEC` | `65536` / `10` / `60` | Shared tail cap / scan and unchanged-file backoff |
+| `SLACK_CONFIG` | root `/etc/sgpu/slack.json`; user `~/.sgpu/slack.json` | Explicit override; legacy paths are also searched |
+| `SLACK_DEBOUNCE_SEC` / `SLACK_NAG_SEC` | `1800` / `21600` | Event / standing-condition debounce |
+
+Run `sgpu doctor` for snapshot, scheduler, publisher-trust and Slack status.
+On the master, use `systemctl status sgpu-collector` and
+`journalctl -u sgpu-collector -f`; on a node, use `systemctl status sgpu-agent`
+and `journalctl -u sgpu-agent -f`. Add `--user` for user units. Background-mode
+logs are `<DATA_DIR>/collector.log` and the agent runtime `.log` file. A stale
+node needs a local service/shared-mount/permission check on that node.
+
+## Development
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/uninstall.sh | bash
+bash scripts/check.sh
 ```
 
-## Configuration
-
-<details>
-<summary><b>Environment variables</b> (defaults work out of the box)</summary>
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SLURM_GPU_TUI_REFRESH_SEC` | `3` | TUI refresh interval |
-| `SLURM_GPU_TUI_COLLECTOR_SEC` | `3` | Collector cycle interval |
-| `SLURM_GPU_TUI_SCHEDULER_SEC` | collector interval | Min pause after a completed scheduler generation |
-| `SLURM_GPU_TUI_SCHEDULER_MAX_AGE_SEC` | `30` | Scheduler freshness limit (at least scheduler interval) |
-| `SLURM_GPU_TUI_MEM_REFRESH_SEC` | `15` | AllocMem query interval in daemon mode |
-| `SLURM_GPU_TUI_NODE_TIMEOUT_SEC` | `30` | SSH timeout per node |
-| `SLURM_GPU_TUI_MAX_WORKERS` | `8` | Parallel SSH workers (fallback mode) |
-| `SLURM_GPU_TUI_MAX_PENDING_POLLS` | `2 × workers` | Cap on running/queued SSH polls (at least worker count) |
-| `SLURM_GPU_TUI_DATA_DIR` | `/tmp/slurm-gpu-tui` | Daemon JSON output dir |
-| `SLURM_GPU_TUI_STATE_DIR` | `~/.sgpu/state` | Persistent state (usage, waste, inventory) |
-| `SLURM_GPU_TUI_AGENT_DIR` | `~/.sgpu/nodes` | Push-agent payload dir (shared FS for push) |
-| `SLURM_GPU_TUI_AGENT_SEC` | `3` | GPU agent interval |
-| `SLURM_GPU_TUI_CPU_AGENT_SEC` | `20` | CPU-only agent interval |
-| `SLURM_GPU_TUI_TELEMETRY_SEC` | `10` | Local CPU/PSI/job sample interval |
-| `SLURM_GPU_TUI_TELEMETRY_MAX_JOBS` | `256` | Per-node cgroup job scan limit |
-| `SLURM_GPU_TUI_GPU_TOPOLOGY_TTL_SEC` | `300` | Static GPU PCI/minor/slot refresh interval |
-| `SLURM_GPU_TUI_AGENT_MAX_AGE_SEC` | `45` | Agent payload freshness limit |
-| `SLURM_GPU_TUI_AGENT_REPAIR_SEC` | `180` | Min interval between agent repairs per node |
-| `SLURM_GPU_TUI_AGENT_DISABLE` | (unset) | Disable push agents entirely |
-| `SLURM_GPU_TUI_WASTE_MIN_SEC` | `600` | Threshold for waste view / `--waste` |
-| `SLURM_GPU_TUI_USAGE_KEEP_DAYS` | `30` | GPU-hour history retention |
-| `SLURM_GPU_TUI_USAGE_SAVE_SEC` | `30` | Durable usage-history checkpoint interval |
-| `SLURM_GPU_TUI_SACCT_SEC` | `3600` | slurmdbd backfill interval; `0` disables |
-| `SLURM_GPU_TUI_METRICS_SEC` | `15` | Prometheus textfile refresh interval |
-| `SLURM_GPU_TUI_METRICS_PENDING_MAX` | `100` | Per-job pending series in the textfile (`sgpu_jobs_pending` stays exact) |
-| `SLURM_GPU_TUI_METRICS_FILE` | `<data>/metrics.prom` | Prometheus textfile output path |
-| `SLURM_GPU_TUI_SLACK_BOT_TOKEN` | (unset) | Slack bot token (channel remains in `~/.sgpu/slack.json`) |
-| `SLURM_GPU_TUI_SLACK_DEBOUNCE_SEC` | `1800` | Min interval between repeated alerts |
-| `SLURM_GPU_TUI_SLACK_NAG_SEC` | `21600` | Re-alert interval for standing conditions |
-| `SLURM_GPU_TUI_ROGUE_IGNORE` | `root,gdm,xdm` | Users never flagged as rogue |
-| `SLURM_GPU_TUI_SHARE_SCRIPTS` | (unset) | Show every job's batch script to all users — **shares script contents (and secrets)** |
-| `SLURM_GPU_TUI_SHARE_LOGS` | (unset) | Mirror every job's log tail for all users — **shares runtime output (and secrets)** |
-| `SLURM_GPU_TUI_SHARE_JOB_DETAILS` | (unset) | Publish sanitized scheduler details for all running/pending jobs |
-| `SLURM_GPU_TUI_LOG_MIRROR_SEC` | `10` | Base shared-log scan interval |
-| `SLURM_GPU_TUI_LOG_MIRROR_MAX_SEC` | `60` | Max interval after repeated unchanged scans |
-
-Install-time only: `SGPU_INSTALL_DIR`, `SGPU_ENABLE_PERSISTENCE` (`0` skips
-GPU-node persistence), `SGPU_ENABLE_CPU_PUSH` (`0` keeps CPU telemetry on SSH
-polling), `SGPU_SHARE_SCRIPTS`, `SGPU_SHARE_LOGS`,
-`SGPU_SHARE_JOB_DETAILS` (`0` disables the respective root-install default).
-
-</details>
+The required gate runs rustfmt, strict clippy, unit/integration tests, Bash syntax,
+ShellCheck and an offline benchmark. Tests isolate data/state/runtime paths and
+mock scheduler commands. CI runs one Linux Rust 1.93 job on PRs or manual dispatch.
+GPU hardware, live Slack, root services and production NFS need site validation.
