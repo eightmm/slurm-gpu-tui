@@ -13,7 +13,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver},
+        mpsc::{self, Receiver, SyncSender},
     },
     time::{Duration, Instant},
 };
@@ -52,6 +52,49 @@ impl Default for Config {
 struct Observation {
     payload: AgentPayload,
     stamp: f64,
+}
+
+struct StoragePump {
+    requests: SyncSender<BTreeMap<String, u32>>,
+    results: Receiver<(Value, f64)>,
+    inflight: bool,
+    next: f64,
+    value: Value,
+    observed_at: f64,
+}
+impl StoragePump {
+    fn new() -> Self {
+        let (requests, work) = mpsc::sync_channel(1);
+        let (finished, results) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            while let Ok(users) = work.recv() {
+                let observed_at = runtime::now();
+                let value = crate::host::storage(&users);
+                if finished.send((value, observed_at)).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            requests,
+            results,
+            inflight: false,
+            next: 0.0,
+            value: Value::Null,
+            observed_at: 0.0,
+        }
+    }
+    fn poll(&mut self, users: BTreeMap<String, u32>, monotonic: f64) {
+        if let Ok((value, stamp)) = self.results.try_recv() {
+            self.value = value;
+            self.observed_at = stamp;
+            self.inflight = false;
+            self.next = monotonic + 120.0;
+        }
+        if !self.inflight && monotonic >= self.next && self.requests.try_send(users).is_ok() {
+            self.inflight = true;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -274,6 +317,13 @@ impl Collector {
                     node.telemetry_observed_at =
                         json_number(&telemetry["observed_at"]).unwrap_or(0.0);
                     node.cpu_util = telemetry["cpu_util"].as_str().unwrap_or("").into();
+                    node.host_io = crate::host::KEYS
+                        .iter()
+                        .filter_map(|key| {
+                            json_number(&telemetry["host_io"][key])
+                                .map(|v| (key.to_string(), v.to_string()))
+                        })
+                        .collect();
                     node.pressure =
                         serde_json::from_value(telemetry["pressure"].clone()).unwrap_or_default();
                     node.jobs_truncated = telemetry["jobs_truncated"] == true;
@@ -776,6 +826,8 @@ pub fn run(args: Args) -> Result<()> {
     signal_hook::flag::register(signal_hook::consts::SIGTERM, stopped.clone())?;
     signal_hook::flag::register(signal_hook::consts::SIGINT, stopped.clone())?;
     let mut collector = Collector::new(config.clone());
+    let mut controller = crate::host::Sampler::default();
+    let mut storage = StoragePump::new();
     let mut mirror = crate::logs::Mirror::new(&config.state, config.share_logs)?;
     let mut scripts = crate::batch::Fetcher::new(config.share_scripts);
     let mut notifier = crate::notify::Notifier::new(&config.state)?;
@@ -827,6 +879,20 @@ pub fn run(args: Args) -> Result<()> {
             })
             .collect();
         let mut snapshot = collector.fold(sample, runtime::now());
+        let monotonic = epoch.elapsed().as_secs_f64();
+        snapshot.controller = controller.sample(monotonic, runtime::now());
+        snapshot.controller["hostname"] =
+            json!(runtime::hostname().unwrap_or_else(|_| "controller".into()));
+        let users = snapshot
+            .jobs
+            .iter()
+            .filter(|j| j.uid >= 0 && j.uid <= u32::MAX as i64)
+            .map(|j| (j.user.clone(), j.uid as u32))
+            .collect();
+        storage.poll(users, monotonic);
+        snapshot.controller["filesystems"] = storage.value["filesystems"].clone();
+        snapshot.controller["storage_truncated"] = storage.value["truncated"].clone();
+        snapshot.controller["storage_observed_at"] = json!(storage.observed_at);
         scripts.update(&mut snapshot.jobs, snapshot.errors.is_empty());
         phases.insert("collect", cycle.elapsed().as_secs_f64());
         let start = Instant::now();

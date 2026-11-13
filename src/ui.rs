@@ -8,7 +8,7 @@ use crate::{
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
@@ -23,12 +23,90 @@ use std::{
     sync::mpsc::{self, Receiver, SyncSender},
     time::{Duration, Instant},
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const BACKGROUND: Color = Color::Rgb(13, 17, 23);
 const PANEL: Color = Color::Rgb(22, 27, 34);
 const BORDER: Color = Color::Rgb(48, 58, 70);
 const TEXT: Color = Color::Rgb(220, 225, 232);
 const MUTED: Color = Color::Rgb(145, 155, 170);
+const FOCUS: Color = Color::Rgb(99, 230, 232);
+const FOCUS_BG: Color = Color::Rgb(18, 58, 63);
+
+#[derive(Clone, Copy)]
+enum MetricKind {
+    Activity,
+    Memory,
+}
+impl MetricKind {
+    fn color(self, value: Option<f64>) -> Color {
+        let Some(value) = value.filter(|v| v.is_finite() && *v >= 0.0) else {
+            return MUTED;
+        };
+        match self {
+            Self::Activity if value <= 5.0 => MUTED,
+            Self::Activity if value < 30.0 => Color::Blue,
+            Self::Activity if value < 70.0 => Color::Cyan,
+            Self::Activity => Color::Green,
+            Self::Memory if value < 50.0 => Color::Blue,
+            Self::Memory if value < 80.0 => Color::Cyan,
+            Self::Memory if value < 90.0 => Color::Yellow,
+            Self::Memory if value < 97.0 => Color::Rgb(255, 166, 87),
+            Self::Memory => Color::Red,
+        }
+    }
+}
+
+fn memory_percent(node: &Node) -> Option<f64> {
+    if node.stale {
+        return None;
+    }
+    let total = number(&node.mem_total).filter(|t| *t > 0.0)?;
+    let used = number(&node.mem_used).or_else(|| {
+        number(&node.mem_avail)
+            .or_else(|| number(&node.mem_free))
+            .map(|a| total - a)
+    })?;
+    (used >= 0.0)
+        .then_some(used / total * 100.0)
+        .filter(|v| v.is_finite())
+}
+
+fn clipped(raw: &str, width: u16) -> String {
+    let safe = cli::terminal_safe(raw).replace(['\n', '\t'], " ");
+    if safe.width() <= width as usize {
+        return safe;
+    }
+    let mut left = (width as usize).saturating_sub(1);
+    let mut text = String::new();
+    for c in safe.chars() {
+        let size = c.width().unwrap_or(0);
+        if size > left {
+            break;
+        }
+        text.push(c);
+        left -= size;
+    }
+    if width > 0 {
+        text.push('…');
+    }
+    text
+}
+fn column_alignment(tab: usize, compact: bool, column: usize) -> Alignment {
+    let numeric = match tab {
+        0 => (compact && column == 4) || (!compact && column == 5),
+        1 => matches!(column, 2 | 4 | 5),
+        3 => column == 0 || matches!(column, 3..=8),
+        4 => matches!(column, 1..=5),
+        5 => matches!(column, 1..=9),
+        _ => false,
+    };
+    if numeric {
+        Alignment::Right
+    } else {
+        Alignment::Left
+    }
+}
 
 fn panel(title: &str) -> Block<'_> {
     Block::default()
@@ -53,12 +131,27 @@ fn mini_meter(value: Option<f64>) -> String {
     let Some(value) = value.filter(|v| v.is_finite() && *v >= 0.0) else {
         return "?".into();
     };
-    let filled = (value.clamp(0.0, 100.0) / 20.0).round() as usize;
+    let filled = (value.clamp(0.0, 100.0) / 10.0).round() as usize;
     format!(
         "{}{} {value:>3.0}%",
         "━".repeat(filled),
-        "·".repeat(5 - filled)
+        "·".repeat(10 - filled)
     )
+}
+fn throughput(value: Option<f64>) -> String {
+    let Some(value) = value.filter(|v| v.is_finite() && *v >= 0.0) else {
+        return "?".into();
+    };
+    for (scale, unit) in [
+        (1073741824.0, "GiB/s"),
+        (1048576.0, "MiB/s"),
+        (1024.0, "KiB/s"),
+    ] {
+        if value >= scale {
+            return format!("{:.1} {unit}", value / scale);
+        }
+    }
+    format!("{value:.1} B/s")
 }
 
 #[derive(Default)]
@@ -96,22 +189,23 @@ impl Meter {
             })
             .unwrap_or_else(|| "? unavailable".into())
     }
-    fn draw(&self, frame: &mut Frame, area: Rect, name: &str, color: Color) {
+    fn draw(&self, frame: &mut Frame, area: Rect, name: &str, kind: MetricKind) {
         let columns = Layout::horizontal([Constraint::Length(9), Constraint::Min(1)]).split(area);
         frame.render_widget(
             Paragraph::new(name).style(Style::default().fg(MUTED)),
-            columns[0],
+            Rect::new(
+                columns[0].x,
+                columns[0].y + columns[0].height / 2,
+                columns[0].width,
+                u16::from(columns[0].height > 0),
+            ),
         );
         frame.render_widget(
             Gauge::default()
                 .ratio(self.value().unwrap_or(0.0).clamp(0.0, 100.0) / 100.0)
                 .label(self.label())
                 .use_unicode(true)
-                .gauge_style(
-                    Style::default()
-                        .fg(if self.value().is_some() { color } else { MUTED })
-                        .bg(BACKGROUND),
-                ),
+                .gauge_style(Style::default().fg(kind.color(self.value())).bg(BACKGROUND)),
             columns[1],
         );
     }
@@ -360,6 +454,8 @@ struct ViewRow {
     job: Option<String>,
     cells: Vec<String>,
     style: Style,
+    focus: Option<usize>,
+    accents: Vec<(usize, Style)>,
 }
 pub struct App {
     pub data: Snapshot,
@@ -367,6 +463,7 @@ pub struct App {
     pub tab: usize,
     pub collapsed: BTreeSet<String>,
     pub compact: bool,
+    narrow: bool,
     rows: Vec<ViewRow>,
     table: TableState,
     headers: Vec<String>,
@@ -383,11 +480,13 @@ pub struct App {
     trend: bool,
     initialized: bool,
     current_user: String,
+    highlight_user: String,
     pub popup: Option<Popup>,
     status: String,
     watched: BTreeMap<String, bool>,
     job_baseline: Option<BTreeSet<String>>,
     own_baseline: BTreeSet<String>,
+    attention_keys: BTreeSet<String>,
     usage_scroll: u16,
     down_baseline: BTreeSet<String>,
     observations: VecDeque<(f64, [Option<f64>; 3])>,
@@ -410,6 +509,7 @@ impl App {
             tab: 0,
             collapsed: BTreeSet::new(),
             compact: false,
+            narrow: false,
             rows: Vec::new(),
             table: TableState::default(),
             headers: Vec::new(),
@@ -425,12 +525,14 @@ impl App {
             pending: false,
             trend: false,
             initialized: false,
+            highlight_user: current_user.clone(),
             current_user,
             popup: None,
             status: "Loading published telemetry…".into(),
             watched: BTreeMap::new(),
             job_baseline: None,
             own_baseline: BTreeSet::new(),
+            attention_keys: BTreeSet::new(),
             usage_scroll: 0,
             down_baseline: BTreeSet::new(),
             observations: VecDeque::new(),
@@ -530,16 +632,42 @@ impl App {
         }
         self.data = data;
         self.rebuild();
+        let attention = crate::users::attention(
+            &self.data,
+            runtime::env_seconds("SLURM_GPU_TUI_WASTE_MIN_SEC", 600.0, 0.0) as u64,
+            now,
+        );
+        let keys: BTreeSet<_> = attention
+            .iter()
+            .flat_map(|a| {
+                a.details
+                    .iter()
+                    .map(|line| line.split(" · ").take(2).collect::<Vec<_>>().join(" · "))
+            })
+            .collect();
+        if keys.difference(&self.attention_keys).next().is_some()
+            && !self.status.starts_with("Cancel")
+        {
+            self.status = format!(
+                "! {} GPUs need attention · 5 Attention for users and evidence",
+                keys.len()
+            );
+        }
+        self.attention_keys = keys;
     }
     fn selected(&self) -> Option<&ViewRow> {
         self.table.selected().and_then(|i| self.rows.get(i))
     }
     fn user_filter(&self) -> &str {
         if self.mine {
-            &self.current_user
+            &self.highlight_user
         } else {
             &self.filter_user
         }
+    }
+    pub fn set_highlight_user(&mut self, user: String) {
+        self.highlight_user = user;
+        self.rebuild();
     }
     fn node_visible(&self, node: &Node) -> bool {
         (self.partition.is_empty() || node.partition.split(',').any(|p| p == self.partition))
@@ -609,8 +737,8 @@ impl App {
                         2 => {
                             let own = |n: &Node| {
                                 n.gpus.iter().any(|g| {
-                                    g.alloc_user == self.current_user
-                                        || g.users.contains(&self.current_user)
+                                    g.alloc_user == self.highlight_user
+                                        || g.users.contains(&self.highlight_user)
                                 })
                             };
                             own(b).cmp(&own(a))
@@ -687,17 +815,25 @@ impl App {
                     };
                     let vram = group_vram
                         .value()
-                        .map(|_| {
-                            format!(
-                                "{}{:.0}/{:.0}G",
+                        .map(|pct| {
+                            let bar = format!(
+                                "{}{}",
                                 if group_vram.samples < group_vram.total {
                                     "~"
                                 } else {
                                     ""
                                 },
-                                group_vram.used / 1024.0,
-                                group_vram.capacity / 1024.0
-                            )
+                                mini_meter(Some(pct))
+                            );
+                            if self.narrow {
+                                bar
+                            } else {
+                                format!(
+                                    "{bar} {:.0}/{:.0}G",
+                                    group_vram.used / 1024.0,
+                                    group_vram.capacity / 1024.0
+                                )
+                            }
                         })
                         .unwrap_or_else(|| "?".into());
                     let resources = format!(
@@ -742,7 +878,29 @@ impl App {
                         node: node.name.clone(),
                         job: None,
                         cells: header,
+                        focus: node
+                            .gpus
+                            .iter()
+                            .zip(&classes)
+                            .any(|(g, c)| {
+                                self.gpu_visible(node, g, *c)
+                                    && (g.alloc_user == self.highlight_user
+                                        || (g.alloc_user.is_empty()
+                                            && g.users.contains(&self.highlight_user)))
+                            })
+                            .then_some(0),
+                        accents: vec![
+                            (
+                                if self.compact { 1 } else { 2 },
+                                Style::default().fg(MetricKind::Activity.color(group_util.value())),
+                            ),
+                            (
+                                if self.compact { 2 } else { 3 },
+                                Style::default().fg(MetricKind::Memory.color(group_vram.value())),
+                            ),
+                        ],
                         style: Style::default()
+                            .bg(Color::Rgb(30, 44, 61))
                             .fg(if node.stale {
                                 Color::Yellow
                             } else {
@@ -767,7 +925,14 @@ impl App {
                         let vram = number(&gpu.mem_used)
                             .zip(number(&gpu.mem_total))
                             .filter(|(u, t)| !node.stale && *u >= 0.0 && *t > 0.0)
-                            .map(|(u, t)| format!("{:.1}/{:.0}G", u / 1024.0, t / 1024.0))
+                            .map(|(u, t)| {
+                                let bar = mini_meter(Some(u / t * 100.0));
+                                if self.narrow {
+                                    bar
+                                } else {
+                                    format!("{bar} {:.0}/{:.0}G", u / 1024.0, t / 1024.0)
+                                }
+                            })
                             .unwrap_or_else(|| "?".into());
                         let left = job
                             .and_then(|j| {
@@ -829,8 +994,9 @@ impl App {
                             Class::Free => Color::Green,
                             _ => Color::White,
                         });
-                        let style = if gpu.alloc_user == self.current_user
-                            || gpu.users.contains(&self.current_user)
+                        let style = if gpu.alloc_user == self.highlight_user
+                            || (gpu.alloc_user.is_empty()
+                                && gpu.users.contains(&self.highlight_user))
                         {
                             style.bg(Color::Rgb(22, 35, 50)).fg(gpu_mark(class).2)
                         } else {
@@ -841,6 +1007,40 @@ impl App {
                             node: node.name.clone(),
                             job: (!gpu.alloc_jobid.is_empty()).then(|| gpu.alloc_jobid.clone()),
                             cells,
+                            focus: (gpu.alloc_user == self.highlight_user
+                                || (gpu.alloc_user.is_empty()
+                                    && gpu.users.contains(&self.highlight_user)))
+                            .then_some(if self.compact { 3 } else { 4 }),
+                            accents: vec![
+                                (
+                                    if self.compact { 1 } else { 2 },
+                                    Style::default().fg(MetricKind::Activity
+                                        .color((!node.stale).then(|| number(&gpu.util)).flatten())),
+                                ),
+                                (
+                                    if self.compact { 2 } else { 3 },
+                                    Style::default().fg(MetricKind::Memory.color(
+                                        (!node.stale)
+                                            .then(|| {
+                                                number(&gpu.mem_used)
+                                                    .zip(number(&gpu.mem_total))
+                                                    .filter(|(u, t)| *u >= 0.0 && *t > 0.0)
+                                                    .map(|(u, t)| u / t * 100.0)
+                                            })
+                                            .flatten(),
+                                    )),
+                                ),
+                                (
+                                    if self.compact { 5 } else { 6 },
+                                    Style::default().fg(if node.stale {
+                                        Color::Yellow
+                                    } else if rules::health(gpu, now).1 > 0 {
+                                        Color::Red
+                                    } else {
+                                        MUTED
+                                    }),
+                                ),
+                            ],
                             style,
                         });
                     }
@@ -880,6 +1080,8 @@ impl App {
                                 node: String::new(),
                                 job: Some(job.jobid.clone()),
                                 cells,
+                                focus: (job.user == self.highlight_user).then_some(1),
+                                accents: Vec::new(),
                                 style: Style::default().fg(Color::Yellow),
                             });
                         }
@@ -943,6 +1145,22 @@ impl App {
                             psi,
                             node.partition.clone(),
                         ],
+                        focus: node
+                            .jobs
+                            .iter()
+                            .any(|j| j.user == self.highlight_user)
+                            .then_some(0),
+                        accents: vec![
+                            (
+                                3,
+                                Style::default().fg(MetricKind::Activity
+                                    .color(fresh.then(|| number(&node.cpu_util)).flatten())),
+                            ),
+                            (
+                                4,
+                                Style::default().fg(MetricKind::Memory.color(memory_percent(node))),
+                            ),
+                        ],
                         style: Style::default().fg(if node.stale {
                             Color::Yellow
                         } else {
@@ -954,7 +1172,7 @@ impl App {
             2 => {
                 self.headers.clear();
             }
-            _ => {
+            3 => {
                 self.headers = [
                     "JobID",
                     "User",
@@ -1020,11 +1238,21 @@ impl App {
                             ),
                             job.jobname.clone(),
                         ],
-                        style: Style::default().fg(if job.user == self.current_user {
-                            Color::Cyan
-                        } else {
-                            Color::White
-                        }),
+                        focus: (job.user == self.highlight_user).then_some(1),
+                        accents: vec![
+                            (2, Style::default().fg(Color::Green)),
+                            (
+                                8,
+                                Style::default().fg(
+                                    if metrics.get("oom_kill").is_some_and(|n| *n > 0.0) {
+                                        Color::Red
+                                    } else {
+                                        MUTED
+                                    },
+                                ),
+                            ),
+                        ],
+                        style: Style::default().fg(TEXT),
                     });
                 }
                 for job in &self.data.pending {
@@ -1051,8 +1279,272 @@ impl App {
                                 rules::pending_reason(job),
                                 job.jobname.clone(),
                             ],
-                            style: Style::default().fg(Color::Yellow),
+                            focus: (job.user == self.highlight_user).then_some(1),
+                            accents: vec![(2, Style::default().fg(Color::Yellow))],
+                            style: Style::default().fg(TEXT),
                         });
+                    }
+                }
+            }
+            4 => {
+                self.headers = [
+                    "User", "GPUs", "Idle", "Parked", "Rogue", "Longest", "Jobs", "Nodes",
+                ]
+                .map(str::to_string)
+                .to_vec();
+                for group in crate::users::attention_in_partition(
+                    &self.data,
+                    runtime::env_seconds("SLURM_GPU_TUI_WASTE_MIN_SEC", 600.0, 0.0) as u64,
+                    now,
+                    &self.partition,
+                ) {
+                    if !self.user_filter().is_empty() && group.user != self.user_filter() {
+                        continue;
+                    }
+                    if !self.search.is_empty()
+                        && !group
+                            .user
+                            .to_lowercase()
+                            .contains(&self.search.to_lowercase())
+                        && !group
+                            .nodes
+                            .iter()
+                            .any(|n| n.to_lowercase().contains(&self.search.to_lowercase()))
+                    {
+                        continue;
+                    }
+                    rows.push(ViewRow {
+                        key: format!("attention:{}", group.user),
+                        node: String::new(),
+                        job: None,
+                        focus: (group.user == self.highlight_user).then_some(0),
+                        accents: vec![(
+                            4,
+                            Style::default().fg(if group.rogue > 0 { Color::Red } else { MUTED }),
+                        )],
+                        style: Style::default().fg(if group.rogue > 0 {
+                            Color::Red
+                        } else {
+                            Color::Yellow
+                        }),
+                        cells: group.cells(),
+                    });
+                }
+            }
+            5 => {
+                self.headers = [
+                    "User",
+                    "Run/PD",
+                    "GPU",
+                    "CPU cores",
+                    "RAM GiB",
+                    "IO R/W MiB/s",
+                    "Node net MiB/s",
+                    "Load1 max",
+                    "Quota GiB",
+                    "Files",
+                    "Nodes",
+                ]
+                .map(str::to_string)
+                .to_vec();
+                let mut people =
+                    crate::users::summarize(&self.data, now, self.user_filter(), &self.partition);
+                people.sort_by(|a, b| {
+                    match self.sort {
+                        1 => b.cpu.value.total_cmp(&a.cpu.value),
+                        2 => (b.name == self.highlight_user).cmp(&(a.name == self.highlight_user)),
+                        3 => b.quota.value.total_cmp(&a.quota.value),
+                        _ => b.gpus.cmp(&a.gpus),
+                    }
+                    .then(a.name.cmp(&b.name))
+                });
+                if self.reverse {
+                    people.reverse();
+                }
+                for person in people {
+                    if !self.search.is_empty()
+                        && !person
+                            .name
+                            .to_lowercase()
+                            .contains(&self.search.to_lowercase())
+                        && !person
+                            .nodes
+                            .iter()
+                            .any(|n| n.to_lowercase().contains(&self.search.to_lowercase()))
+                    {
+                        continue;
+                    }
+                    rows.push(ViewRow {
+                        key: format!("user:{}", person.name),
+                        node: String::new(),
+                        job: None,
+                        focus: (person.name == self.highlight_user).then_some(0),
+                        accents: vec![
+                            (6, Style::default().fg(Color::Blue)),
+                            (7, Style::default().fg(Color::Blue)),
+                        ],
+                        style: Style::default().fg(TEXT),
+                        cells: person.cells(),
+                    });
+                }
+            }
+            _ => {
+                self.headers = ["Resource", "Value", "Context"]
+                    .map(str::to_string)
+                    .to_vec();
+                let host = &self.data.controller;
+                if crate::model::json_number(&host["observed_at"])
+                    .is_some_and(|t| rules::telemetry_fresh(t, now))
+                {
+                    let mut add = |key: String,
+                                   resource: String,
+                                   value: String,
+                                   context: String,
+                                   color: Color| {
+                        rows.push(ViewRow {
+                            key,
+                            node: String::new(),
+                            job: None,
+                            cells: vec![resource, value, context],
+                            focus: None,
+                            accents: vec![(1, Style::default().fg(color))],
+                            style: Style::default().fg(TEXT),
+                        })
+                    };
+                    let hostname = host["hostname"].as_str().unwrap_or("controller");
+                    let cpu = crate::model::json_number(&host["cpu_util"]);
+                    add(
+                        "host:cpu".into(),
+                        "CPU busy".into(),
+                        mini_meter(cpu),
+                        hostname.into(),
+                        MetricKind::Activity.color(cpu),
+                    );
+                    let ram = crate::model::json_number(&host["mem_used_bytes"])
+                        .zip(crate::model::json_number(&host["mem_total_bytes"]))
+                        .filter(|(_, t)| *t > 0.0);
+                    let pct = ram.map(|(u, t)| u / t * 100.0);
+                    add(
+                        "host:ram".into(),
+                        "RAM".into(),
+                        format!(
+                            "{} {}",
+                            mini_meter(pct),
+                            ram.map(|(u, t)| format!(
+                                "{:.1}/{:.1} GiB",
+                                u / 1073741824.0,
+                                t / 1073741824.0
+                            ))
+                            .unwrap_or_default()
+                        ),
+                        "Observed host memory".into(),
+                        MetricKind::Memory.color(pct),
+                    );
+                    let load = ["load1", "load5", "load15"]
+                        .map(|key| {
+                            crate::model::json_number(&host[key])
+                                .map(|v| format!("{v:.2}"))
+                                .unwrap_or_else(|| "?".into())
+                        })
+                        .join(" / ");
+                    add(
+                        "host:load".into(),
+                        "Load average".into(),
+                        load,
+                        "1 / 5 / 15 minutes; shared host".into(),
+                        Color::Blue,
+                    );
+                    for (key, label, unit) in [
+                        ("cycle_seconds", "Collector cycle", "s"),
+                        ("interval_seconds", "Refresh interval", "s"),
+                        ("log_inflight", "Log queue", "items"),
+                        ("notify_backlog", "Slack queue", "items"),
+                    ] {
+                        if let Some(value) = crate::model::json_number(&self.data.collector[key]) {
+                            add(
+                                format!("service:{key}"),
+                                label.into(),
+                                format!("{value:.2} {unit}"),
+                                "Collector diagnostics".into(),
+                                MUTED,
+                            );
+                        }
+                    }
+                    for disk in host["disks"].as_array().into_iter().flatten() {
+                        let name = disk["name"].as_str().unwrap_or("?");
+                        let rate = |key: &str| throughput(crate::model::json_number(&disk[key]));
+                        add(
+                            format!("disk:{name}"),
+                            format!("Disk {name}"),
+                            format!("R {} / W {}", rate("read_bps"), rate("write_bps")),
+                            "Physical device; two samples".into(),
+                            TEXT,
+                        );
+                    }
+                    for net in host["interfaces"].as_array().into_iter().flatten() {
+                        let name = net["name"].as_str().unwrap_or("?");
+                        let rate = |key: &str| throughput(crate::model::json_number(&net[key]));
+                        add(
+                            format!("net:{name}"),
+                            format!("Net {name}"),
+                            format!("RX {} / TX {}", rate("rx_bps"), rate("tx_bps")),
+                            "Physical interface; shared host".into(),
+                            Color::Blue,
+                        );
+                    }
+                    let storage_fresh = crate::users::storage_fresh(host, now);
+                    if !storage_fresh {
+                        add(
+                            "fs:pending".into(),
+                            "Filesystems".into(),
+                            "?".into(),
+                            "Background sample pending or stale".into(),
+                            MUTED,
+                        );
+                    }
+                    if host["storage_truncated"] == true {
+                        add(
+                            "fs:partial".into(),
+                            "Storage coverage".into(),
+                            "~ partial".into(),
+                            "Filesystem/account sampling limit".into(),
+                            Color::Yellow,
+                        );
+                    }
+                    for fs in host["filesystems"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|_| storage_fresh)
+                    {
+                        let mount = fs["mount"].as_str().unwrap_or("?");
+                        let used = crate::model::json_number(&fs["used_bytes"]);
+                        let total = crate::model::json_number(&fs["total_bytes"]);
+                        let pct = used
+                            .zip(total)
+                            .filter(|(_, t)| *t > 0.0)
+                            .map(|(u, t)| u / t * 100.0);
+                        let value = used
+                            .zip(total)
+                            .map(|(u, t)| {
+                                format!(
+                                    "{} {:.1}/{:.1} GiB",
+                                    mini_meter(pct),
+                                    u / 1073741824.0,
+                                    t / 1073741824.0
+                                )
+                            })
+                            .unwrap_or_else(|| "?".into());
+                        let available = crate::model::json_number(&fs["available_bytes"])
+                            .map(|n| format!("{:.1} GiB free", n / 1073741824.0))
+                            .unwrap_or_else(|| "?".into());
+                        add(
+                            format!("fs:{mount}"),
+                            format!("FS {mount}"),
+                            value,
+                            available,
+                            MetricKind::Memory.color(pct),
+                        );
                     }
                 }
             }
@@ -1162,12 +1654,12 @@ impl App {
         let resources = panel(" Resources · visible / ~ partial ");
         let inner = resources.inner(columns[0]);
         frame.render_widget(resources, columns[0]);
-        let meters = Layout::vertical([Constraint::Length(1); 4]).split(inner);
+        let meters = Layout::vertical([Constraint::Ratio(1, 4); 4]).split(inner);
         for (index, (name, meter, color)) in [
-            ("GPU util", &gpu_util, Color::Cyan),
-            ("VRAM", &vram, Color::Magenta),
-            ("CPU busy", &cpu, Color::Green),
-            ("RAM used", &memory, Color::Blue),
+            ("GPU util", &gpu_util, MetricKind::Activity),
+            ("VRAM", &vram, MetricKind::Memory),
+            ("CPU busy", &cpu, MetricKind::Activity),
+            ("RAM used", &memory, MetricKind::Memory),
         ]
         .into_iter()
         .enumerate()
@@ -1238,23 +1730,26 @@ impl App {
     }
     pub fn draw(&mut self, frame: &mut Frame) {
         let compact = frame.area().width < 130;
-        if compact != self.compact {
+        let narrow = frame.area().width < 100;
+        if compact != self.compact || narrow != self.narrow {
             self.compact = compact;
+            self.narrow = narrow;
             self.rebuild();
         }
         frame.render_widget(
             Block::default().style(Style::default().fg(TEXT).bg(BACKGROUND)),
             frame.area(),
         );
-        let dashboard_height = if frame.area().height >= 20 && frame.area().width >= 70 {
-            6
-        } else {
-            0
-        };
+        let dashboard_height =
+            if frame.area().height >= 20 && frame.area().width >= 70 && self.tab != 6 {
+                if frame.area().height >= 30 { 10 } else { 6 }
+            } else {
+                0
+            };
         let areas = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(dashboard_height),
-            Constraint::Length(if self.trend { 6 } else { 3 }),
+            Constraint::Length(if self.trend { 7 } else { 4 }),
             Constraint::Min(3),
             Constraint::Length(2),
         ])
@@ -1270,16 +1765,18 @@ impl App {
             heading[0],
         );
         frame.render_widget(
-            Tabs::new(["1 GPU", "2 CPU", "3 Usage", "4 Jobs"])
-                .select(self.tab)
-                .style(Style::default().fg(MUTED))
-                .divider(Span::styled(" │ ", Style::default().fg(BORDER)))
-                .highlight_style(
-                    Style::default()
-                        .fg(BACKGROUND)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
+            Tabs::new([
+                "1 GPU", "2 CPU", "3 Use", "4 Jobs", "5 Attn", "6 Users", "7 Host",
+            ])
+            .select(self.tab)
+            .style(Style::default().fg(MUTED))
+            .divider(Span::styled("│", Style::default().fg(BORDER)))
+            .highlight_style(
+                Style::default()
+                    .fg(BACKGROUND)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             heading[1],
         );
         self.draw_dashboard(frame, areas[1]);
@@ -1302,28 +1799,116 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(
-                " · cluster: {} running · {} pending · {fresh}/{} nodes fresh",
+                " · cluster: {} run / {} pd · fresh {fresh}/{}",
                 self.data.jobs.len(),
                 self.data.pending.len(),
                 self.data.nodes.len()
             )),
         ])];
-        let scope = format!(
-            "user={} partition={} sort={}{}",
-            if self.user_filter().is_empty() {
-                "all"
-            } else {
-                self.user_filter()
-            },
-            if self.partition.is_empty() {
-                "all"
-            } else {
-                &self.partition
-            },
-            ["node", "util", "user", "free"][self.sort],
-            if self.reverse { " ↓" } else { "" }
+        let sort_label = match self.tab {
+            1 => "node",
+            2 => "GPU-hours",
+            3 => "scheduler",
+            4 => "priority",
+            5 => ["GPU", "CPU", "focus", "quota"][self.sort],
+            6 => "resource",
+            _ => ["node", "util", "focus", "free"][self.sort],
+        };
+        let mut chips = vec![Span::styled(
+            format!(
+                " sort:{sort_label}{} ",
+                if self.reverse ^ (self.tab == 5 || (self.tab == 0 && self.sort > 0)) {
+                    "↓"
+                } else {
+                    "↑"
+                }
+            ),
+            Style::default().fg(MUTED),
+        )];
+        for (text, active) in [
+            (
+                format!(
+                    "user:{}",
+                    if self.user_filter().is_empty() {
+                        "all"
+                    } else {
+                        self.user_filter()
+                    }
+                ),
+                !self.user_filter().is_empty(),
+            ),
+            (
+                format!(
+                    "part:{}",
+                    if self.partition.is_empty() {
+                        "all"
+                    } else {
+                        &self.partition
+                    }
+                ),
+                !self.partition.is_empty(),
+            ),
+            ("MINE".into(), self.mine),
+            ("FREE".into(), self.free_only),
+            (format!("search:{}", self.search), !self.search.is_empty()),
+        ] {
+            if active || text.starts_with("user:") || text.starts_with("part:") {
+                chips.push(Span::styled(
+                    format!(" {text} "),
+                    Style::default()
+                        .fg(if active { BACKGROUND } else { MUTED })
+                        .bg(if active { FOCUS } else { BACKGROUND }),
+                ));
+            }
+        }
+        chips.push(Span::styled(" 0 reset", Style::default().fg(MUTED)));
+        summary.push(Line::from(chips));
+        let own_gpu = self
+            .data
+            .nodes
+            .iter()
+            .flat_map(|n| &n.gpus)
+            .filter(|g| g.alloc_user == self.highlight_user)
+            .count();
+        let own_run = self
+            .data
+            .jobs
+            .iter()
+            .filter(|j| j.user == self.highlight_user)
+            .count();
+        let own_pending = self
+            .data
+            .pending
+            .iter()
+            .filter(|j| j.user == self.highlight_user)
+            .count();
+        let attention = crate::users::attention(
+            &self.data,
+            runtime::env_seconds("SLURM_GPU_TUI_WASTE_MIN_SEC", 600.0, 0.0) as u64,
+            runtime::now(),
         );
-        summary.push(Line::styled(scope, Style::default().fg(MUTED)));
+        let attention_count: usize = attention.iter().map(|r| r.total()).sum();
+        summary[0].spans.push(Span::styled(
+            format!(" · ! {attention_count} [5]"),
+            Style::default().fg(if attention_count > 0 {
+                Color::Yellow
+            } else {
+                MUTED
+            }),
+        ));
+        summary.push(Line::from(vec![
+            Span::styled(
+                format!(
+                    "◆ {}: {own_gpu} GPUs · {own_run} run · {own_pending} pending",
+                    clipped(&self.highlight_user, 16)
+                ),
+                Style::default().fg(FOCUS),
+            ),
+            Span::styled(
+                format!(" · viewer {}", clipped(&self.current_user, 12)),
+                Style::default().fg(MUTED),
+            ),
+        ]));
         if self.data.errors.is_empty() {
             summary.push(Line::from(vec![
                 Span::styled("● busy ", Style::default().fg(Color::Cyan)),
@@ -1378,12 +1963,16 @@ impl App {
             frame.render_widget(paragraph.scroll((self.usage_scroll, 0)), areas[3]);
         } else {
             let visible_columns: Vec<usize> = match self.tab {
+                0 if self.narrow => vec![0, 1, 2, 3, 5],
                 1 if frame.area().width < 110 => vec![0, 1, 2, 3, 4, 7],
                 3 if frame.area().width < 110 => vec![0, 1, 2, 3, 7, 9],
                 3 if frame.area().width < 140 => vec![0, 1, 2, 3, 4, 5, 7, 9],
+                4 if self.narrow => vec![0, 1, 2, 3, 4, 5, 7],
+                5 if frame.area().width < 110 => vec![0, 3, 4, 5, 6, 7],
+                5 if frame.area().width < 150 => vec![0, 1, 2, 3, 4, 5, 6, 7, 10],
                 0 if self.details => {
                     let base = if self.compact { 6 } else { 7 };
-                    let reserve = if self.compact { 78 } else { 112 };
+                    let reserve = if self.compact { 110 } else { 140 };
                     let extra = (frame.area().width.saturating_sub(reserve) / 13).min(4) as usize;
                     (0..(base + extra)).collect()
                 }
@@ -1391,72 +1980,140 @@ impl App {
             };
             let widths: Vec<_> = visible_columns
                 .iter()
-                .copied()
-                .map(|i| {
-                    if self.tab == 0 {
-                        if self.compact {
-                            match i {
-                                0 => Constraint::Length(12),
-                                1 => Constraint::Length(10),
-                                2 => Constraint::Length(12),
-                                3 => Constraint::Min(12),
-                                4 => Constraint::Length(7),
-                                _ => Constraint::Length(10),
-                            }
-                        } else {
-                            match i {
-                                0 => Constraint::Length(15),
-                                1 => Constraint::Length(20),
-                                2 => Constraint::Length(10),
-                                3 => Constraint::Length(14),
-                                4 => Constraint::Min(18),
-                                5 => Constraint::Length(8),
-                                _ => Constraint::Length(12),
-                            }
-                        }
-                    } else if self.tab == 1 {
-                        match i {
-                            0 => Constraint::Length(12),
-                            1 => Constraint::Length(9),
-                            2 => Constraint::Length(10),
-                            3 => Constraint::Length(10),
-                            4 => Constraint::Length(13),
-                            _ => Constraint::Min(8),
-                        }
-                    } else {
-                        match i {
-                            0 => Constraint::Length(10),
-                            1 => Constraint::Length(12),
-                            2 => Constraint::Length(8),
-                            3 => Constraint::Length(15),
-                            4..=6 => Constraint::Length(9),
-                            7 => Constraint::Length(10),
-                            8 => Constraint::Length(15),
-                            _ => Constraint::Min(12),
-                        }
-                    }
+                .map(|i| match self.tab {
+                    0 if self.compact => match i {
+                        0 => Constraint::Length(11),
+                        1 => Constraint::Length(15),
+                        2 => Constraint::Length(if self.narrow { 16 } else { 28 }),
+                        3 => Constraint::Min(15),
+                        4 => Constraint::Length(7),
+                        _ => Constraint::Length(9),
+                    },
+                    0 => match i {
+                        0 => Constraint::Length(15),
+                        1 => Constraint::Length(18),
+                        2 => Constraint::Length(15),
+                        3 => Constraint::Length(28),
+                        4 => Constraint::Min(20),
+                        5 => Constraint::Length(8),
+                        _ => Constraint::Length(12),
+                    },
+                    1 => match i {
+                        0 => Constraint::Length(11),
+                        1 => Constraint::Length(8),
+                        2 => Constraint::Length(9),
+                        3 => Constraint::Length(15),
+                        4 => Constraint::Length(11),
+                        _ => Constraint::Min(9),
+                    },
+                    3 => match i {
+                        0 => Constraint::Length(10),
+                        1 => Constraint::Length(12),
+                        2 => Constraint::Length(8),
+                        3 => Constraint::Length(15),
+                        4..=6 => Constraint::Length(9),
+                        7 => Constraint::Length(10),
+                        8 => Constraint::Length(15),
+                        _ => Constraint::Min(12),
+                    },
+                    4 => match i {
+                        0 => Constraint::Length(15),
+                        1..=4 => Constraint::Length(6),
+                        5 => Constraint::Length(9),
+                        _ => Constraint::Min(12),
+                    },
+                    5 if self.narrow => match i {
+                        0 => Constraint::Length(12),
+                        3 => Constraint::Length(9),
+                        4 => Constraint::Length(8),
+                        5 => Constraint::Length(13),
+                        6 => Constraint::Length(15),
+                        _ => Constraint::Min(8),
+                    },
+                    5 => match i {
+                        0 => Constraint::Length(14),
+                        1 => Constraint::Length(7),
+                        2 => Constraint::Length(5),
+                        3 => Constraint::Length(9),
+                        4 => Constraint::Length(9),
+                        5 => Constraint::Length(13),
+                        6 => Constraint::Length(16),
+                        7 => Constraint::Length(10),
+                        8 => Constraint::Length(10),
+                        9 => Constraint::Length(10),
+                        _ => Constraint::Min(12),
+                    },
+                    _ => match i {
+                        0 => Constraint::Length(if self.narrow { 16 } else { 24 }),
+                        1 => Constraint::Length(if self.narrow { 34 } else { 48 }),
+                        _ => Constraint::Min(20),
+                    },
                 })
                 .collect();
+            let inner_width = areas[3].width.saturating_sub(4);
+            let cell_areas = Layout::horizontal(widths.clone())
+                .spacing(1)
+                .split(Rect::new(0, 0, inner_width, 1));
             let rows = self.rows.iter().enumerate().map(|(index, row)| {
-                Row::new(
-                    visible_columns
-                        .iter()
-                        .filter_map(|i| row.cells.get(*i))
-                        .map(|s| Cell::from(cli::terminal_safe(s).replace('\n', " "))),
-                )
-                .style(
-                    Style::default()
-                        .bg(if index % 2 == 0 { BACKGROUND } else { PANEL })
-                        .patch(row.style),
-                )
+                let cells = visible_columns
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(position, column)| {
+                        let text = row.cells.get(*column)?;
+                        let focused = row.focus == Some(*column);
+                        let text = if focused {
+                            format!("◆ {}", cli::terminal_safe(text))
+                        } else {
+                            cli::terminal_safe(text)
+                        }
+                        .replace('\n', " ");
+                        let mut style = if focused {
+                            Style::default().fg(FOCUS).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default()
+                        };
+                        if let Some((_, accent)) = row.accents.iter().find(|(i, _)| i == column) {
+                            style = style.patch(*accent);
+                        }
+                        Some(
+                            Cell::from(
+                                Line::from(clipped(&text, cell_areas[position].width))
+                                    .alignment(column_alignment(self.tab, self.compact, *column)),
+                            )
+                            .style(style),
+                        )
+                    });
+                let style = Style::default()
+                    .bg(if index % 2 == 0 { BACKGROUND } else { PANEL })
+                    .patch(row.style);
+                Row::new(cells)
+                    .style(if row.focus.is_some() {
+                        style.bg(FOCUS_BG)
+                    } else {
+                        style
+                    })
+                    .top_margin(u16::from(
+                        self.tab == 0 && index > 0 && row.key.starts_with("node:"),
+                    ))
             });
             let table = Table::new(rows, widths)
                 .header(
                     Row::new(
                         visible_columns
                             .iter()
-                            .filter_map(|i| self.headers.get(*i))
-                            .cloned(),
+                            .enumerate()
+                            .filter_map(|(position, i)| {
+                                self.headers.get(*i).map(|text| {
+                                    Cell::from(
+                                        Line::from(clipped(text, cell_areas[position].width))
+                                            .alignment(column_alignment(
+                                                self.tab,
+                                                self.compact,
+                                                *i,
+                                            )),
+                                    )
+                                })
+                            }),
                     )
                     .style(
                         Style::default()
@@ -1475,9 +2132,32 @@ impl App {
                 .block(panel(match self.tab {
                     0 => " GPUs · Space fold · Enter inspect ",
                     1 => " Nodes · measured CPU / RAM ",
-                    _ => " Jobs · ? unavailable · ~ partial coverage ",
+                    3 => " Jobs · ? unavailable · ~ partial coverage ",
+                    4 => " Attention · sustained idle / parked allocations; unallocated processes ",
+                    5 => " Users · job CPU/RAM/IO; node network/load are SHARED ",
+                    _ => " Controller · live host resources and local filesystems ",
                 }));
             frame.render_stateful_widget(table, areas[3], &mut self.table);
+            if self.rows.is_empty() && areas[3].height > 3 {
+                let message = match self.tab {
+                    4 => "No confirmed sustained waste matches these filters",
+                    6 => {
+                        "Controller telemetry unavailable; update/start the collector on the controller"
+                    }
+                    _ => "No matching items · 0 reset filters",
+                };
+                frame.render_widget(
+                    Paragraph::new(message)
+                        .style(Style::default().fg(MUTED))
+                        .wrap(Wrap { trim: false }),
+                    Rect::new(
+                        areas[3].x + 2,
+                        areas[3].y + 2,
+                        areas[3].width.saturating_sub(4),
+                        areas[3].height.saturating_sub(3),
+                    ),
+                );
+            }
         }
         let footer = if self.searching {
             vec![
@@ -1489,16 +2169,21 @@ impl App {
             ]
         } else {
             let mut keys = Vec::new();
-            for (key, label) in [
+            let mut bindings = vec![
                 ("?", "Help"),
                 ("/", "Search"),
                 ("↵", "Detail"),
-                ("s", "Sort"),
-                ("u", "User"),
-                ("p", "Part"),
-                ("r", "Refresh"),
-                ("q", "Quit"),
-            ] {
+                ("m", "Mine"),
+                ("0", "Reset"),
+            ];
+            if self.tab < 2 {
+                bindings.push(("[]", "Node"));
+            }
+            if frame.area().width >= 110 {
+                bindings.extend([("s", "Sort"), ("p", "Part"), ("r", "Refresh")]);
+            }
+            bindings.push(("q", "Quit"));
+            for (key, label) in bindings {
                 keys.push(Span::styled(
                     format!(" {key} "),
                     Style::default()
@@ -1509,7 +2194,15 @@ impl App {
                 keys.push(Span::styled(format!("{label} "), Style::default().fg(TEXT)));
             }
             vec![
-                Line::styled(cli::terminal_safe(&self.status), Style::default().fg(MUTED)),
+                Line::styled(
+                    format!(
+                        "{} · row {}/{}",
+                        cli::terminal_safe(&self.status),
+                        self.table.selected().map_or(0, |i| i + 1),
+                        self.rows.len()
+                    ),
+                    Style::default().fg(MUTED),
+                ),
                 Line::from(keys),
             ]
         };
@@ -1540,6 +2233,29 @@ impl App {
         if let Some(i) = self.table.selected() {
             self.table
                 .select(Some(i.min(self.rows.len().saturating_sub(1))));
+        }
+    }
+    fn jump_node(&mut self, forward: bool) {
+        if self.tab > 1 {
+            return;
+        }
+        let current = self.table.selected().unwrap_or(0);
+        let index = if forward {
+            self.rows
+                .iter()
+                .enumerate()
+                .find(|(i, r)| *i > current && r.key.starts_with("node:"))
+                .map(|(i, _)| i)
+        } else {
+            self.rows
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(i, r)| *i < current && r.key.starts_with("node:"))
+                .map(|(i, _)| i)
+        };
+        if let Some(index) = index {
+            self.table.select(Some(index));
         }
     }
     fn key(&mut self, key: KeyCode, worker: &Worker) -> bool {
@@ -1610,6 +2326,19 @@ impl App {
                         popup.selected = popup.selected.saturating_sub(1);
                     }
                 }
+                KeyCode::PageDown if !popup.history.is_empty() => {
+                    popup.selected = popup
+                        .selected
+                        .saturating_add(20)
+                        .min(popup.history.len() - 1)
+                }
+                KeyCode::PageUp if !popup.history.is_empty() => {
+                    popup.selected = popup.selected.saturating_sub(20)
+                }
+                KeyCode::End if !popup.history.is_empty() => {
+                    popup.selected = popup.history.len() - 1
+                }
+                KeyCode::Home if !popup.history.is_empty() => popup.selected = 0,
                 KeyCode::PageDown => {
                     popup.scroll = popup.scroll.saturating_add(20);
                     popup.follow = false;
@@ -1640,11 +2369,27 @@ impl App {
         }
         match key {
             KeyCode::Char('q') => return true,
-            KeyCode::Char(c @ '1'..='4') => {
+            KeyCode::Char(c @ '1'..='7') => {
                 self.tab = (c as u8 - b'1') as usize;
                 self.table = TableState::default();
             }
             KeyCode::Char('g') => self.tab = 2,
+            KeyCode::Char(']') => self.jump_node(true),
+            KeyCode::Char('[') => self.jump_node(false),
+            KeyCode::Char('0') | KeyCode::Backspace => {
+                self.filter_user.clear();
+                self.partition.clear();
+                self.mine = false;
+                self.free_only = false;
+                self.search.clear();
+                self.status = "Filters cleared".into();
+            }
+            KeyCode::Home if self.tab != 2 => {
+                self.table.select((!self.rows.is_empty()).then_some(0))
+            }
+            KeyCode::End if self.tab != 2 => self
+                .table
+                .select((!self.rows.is_empty()).then_some(self.rows.len().saturating_sub(1))),
             KeyCode::Home if self.tab == 2 => self.usage_scroll = 0,
             KeyCode::End if self.tab == 2 => self.usage_scroll = u16::MAX,
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(true),
@@ -1661,8 +2406,11 @@ impl App {
             }
             KeyCode::Char('/') => self.searching = true,
             KeyCode::Esc => self.search.clear(),
-            KeyCode::Char('s') => self.sort = (self.sort + 1) % 4,
-            KeyCode::Char('S') => self.reverse = !self.reverse,
+            KeyCode::Char('s') if matches!(self.tab, 0 | 5) => self.sort = (self.sort + 1) % 4,
+            KeyCode::Char('S') if matches!(self.tab, 0 | 5) => self.reverse = !self.reverse,
+            KeyCode::Char('s' | 'S') => {
+                self.status = "Interactive sorting is available in GPU and Users".into()
+            }
             KeyCode::Char('i') => self.free_only = !self.free_only,
             KeyCode::Char('m') => self.mine = !self.mine,
             KeyCode::Char('d') => self.details = !self.details,
@@ -1676,9 +2424,9 @@ impl App {
                     .map(|j| j.user.clone())
                     .chain(self.data.pending.iter().map(|j| j.user.clone()))
                     .collect();
-                users.remove(&self.current_user);
+                users.remove(&self.highlight_user);
                 let list = std::iter::once(String::new())
-                    .chain(std::iter::once(self.current_user.clone()))
+                    .chain(std::iter::once(self.highlight_user.clone()))
                     .chain(users)
                     .collect::<Vec<_>>();
                 let i = list
@@ -1773,6 +2521,94 @@ impl App {
                 }
             }
             KeyCode::Enter => {
+                if self.tab >= 4 {
+                    self.rebuild();
+                }
+                if let Some(row) = self.selected()
+                    && self.tab >= 4
+                {
+                    let key = row.key.clone();
+                    let title = row.cells.first().cloned().unwrap_or_default();
+                    let mut body = self
+                        .headers
+                        .iter()
+                        .zip(&row.cells)
+                        .map(|(h, c)| format!("{h}: {c}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if let Some(user) = key.strip_prefix("attention:")
+                        && let Some(group) = crate::users::attention_in_partition(
+                            &self.data,
+                            runtime::env_seconds("SLURM_GPU_TUI_WASTE_MIN_SEC", 600.0, 0.0) as u64,
+                            runtime::now(),
+                            &self.partition,
+                        )
+                        .iter()
+                        .find(|g| g.user == user)
+                    {
+                        body.push_str(&format!("\n\n{}\n\nIdle/parked timers require current valid observations. Missing telemetry is not classified as waste.\nSlack alerts use the existing waste_alert_hours setting.",group.details.join("\n")));
+                    }
+                    if let Some(user) = key.strip_prefix("user:") {
+                        body.push_str("\n\nCPU/RAM/block I/O: attributed job cgroups.\nNetwork/load: entire assigned nodes, shared with other users; nodes counted once per user.\nLoad1 is the maximum host load among these nodes.\n? unavailable; ~ partial observations. Block I/O excludes cached and network-filesystem traffic.");
+                        if let Some(person) = crate::users::summarize(
+                            &self.data,
+                            runtime::now(),
+                            user,
+                            &self.partition,
+                        )
+                        .first()
+                        {
+                            for name in &person.nodes {
+                                if let Some(node) = self.data.nodes.iter().find(|n| n.name == *name)
+                                {
+                                    let fresh = !node.stale
+                                        && rules::telemetry_fresh(
+                                            node.telemetry_observed_at,
+                                            runtime::now(),
+                                        );
+                                    let value = |key: &str, scale: f64| {
+                                        if fresh {
+                                            node.host_io
+                                                .get(key)
+                                                .and_then(|v| number(v))
+                                                .map(|v| format!("{:.2}", v / scale))
+                                                .unwrap_or_else(|| "?".into())
+                                        } else {
+                                            "?".into()
+                                        }
+                                    };
+                                    body.push_str(&format!("\n\n{name} (SHARED node):\n  load 1/5/15m: {} / {} / {}\n  network RX/TX: {} / {} MiB/s\n  physical disk R/W: {} / {} MiB/s",value("load1",1.0),value("load5",1.0),value("load15",1.0),value("net_rx_bps",1048576.0),value("net_tx_bps",1048576.0),value("disk_read_bps",1048576.0),value("disk_write_bps",1048576.0)));
+                                }
+                            }
+                        }
+                        let storage_fresh =
+                            crate::users::storage_fresh(&self.data.controller, runtime::now());
+                        if !storage_fresh {
+                            body.push_str("\n\nQuota sample unavailable or older than 5 minutes.");
+                        }
+                        for fs in self.data.controller["filesystems"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter(|_| storage_fresh)
+                        {
+                            let q = &fs["quotas"][user];
+                            if let Some(used) = crate::model::json_number(&q["used_bytes"]) {
+                                let soft = crate::model::json_number(&q["soft_bytes"])
+                                    .filter(|n| *n > 0.0)
+                                    .map(|n| format!("{:.1} GiB", n / 1073741824.0))
+                                    .unwrap_or_else(|| "not set".into());
+                                let hard = crate::model::json_number(&q["hard_bytes"])
+                                    .filter(|n| *n > 0.0)
+                                    .map(|n| format!("{:.1} GiB", n / 1073741824.0))
+                                    .unwrap_or_else(|| "not set".into());
+                                body.push_str(&format!("\n\n{}: {:.2} GiB, {} files\nsoft limit {soft}; hard limit {hard}",fs["mount"].as_str().unwrap_or("?"),used/1073741824.0,q["files"]));
+                            }
+                        }
+                    }
+                    self.open(Popup::text(&title, body));
+                    return false;
+                }
                 if let Some(row) = self.selected() {
                     let job = row
                         .job
@@ -2024,13 +2860,16 @@ fn ime(key: KeyCode) -> KeyCode {
     }
 }
 
-pub fn run() -> Result<i32> {
+pub fn run(highlight_user: Option<String>) -> Result<i32> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err("interactive mode requires a terminal; use sgpu once or sgpu json".into());
     }
     let mut terminal = ratatui::try_init()?;
     let result = (|| -> Result<i32> {
         let mut app = App::new();
+        if let Some(user) = highlight_user {
+            app.set_highlight_user(user);
+        }
         let worker = Worker::new();
         worker.send(Task::Refresh);
         let mut next = Instant::now()
@@ -2149,13 +2988,232 @@ pub fn run() -> Result<i32> {
     result
 }
 
-const HELP: &str = "1/2/3/4  GPU / CPU / Usage / Jobs\ng Usage · v pending · t 5-minute trend\nr refresh published data\ns sort: node → utilization → user → free · S reverse\nu user filter (me first) · p partition · m my jobs · i free GPUs\nd detail columns · Space fold node · z fold/unfold all\n/ search node/user/job · Esc clear search\nj/k or arrows move cursor\nEnter job/node detail · Tab info/script/stdout/stderr\nw wasted GPUs · f free capacity by model/VRAM\nh my recent job history · Enter history details\nn watch any job for start/end\nx cancel my own job (confirmation required)\ne export JSON · ? help · q quit\n\nUnknown/stale observations are not free capacity.\nMeters show measured usage: GPU/VRAM sample GPUs; CPU/RAM sample nodes.\n~ means partial sampling; ? means no fresh observation. CPU is node-wide.\nJobs: ? unavailable; ~ partial coverage. RAM includes cgroup cache.\nSummed per-node memory peaks are not a simultaneous whole-job peak.\nPending start times and capacity are estimates, not scheduler guarantees.\nPSI is pressure, not a diagnosis. GPU power caps alone are informational.\n\nNode results are push-only. Missing agents stay stale; the master never polls or repairs nodes.";
+const HELP: &str = concat!(
+    "1/2/3/4  GPU / CPU / Usage / Jobs\n5/6/7  Attention / Users / Controller\n",
+    "g Usage · v pending · t 5-minute cluster trend\nr refresh published data\n",
+    "s sort · S reverse · [ / ] previous/next node · Home/End first/last row\n",
+    "u user filter (highlight first) · p partition · m highlighted user's jobs\n",
+    "i free GPUs · 0 reset all filters · / search · Esc clear search\n",
+    "d detail columns · Space fold node · z fold/unfold all\nj/k or arrows move\n",
+    "Enter full values or job/node detail · Tab info/script/stdout/stderr\n",
+    "w wasted GPUs · f free capacity · h my job history (PageUp/Down supported)\n",
+    "n watch job · x cancel my own job (confirmation required)\ne export JSON · ? help · q quit\n\n",
+    "◆ + teal background: highlighted account. Cursor selection is separate.\n",
+    "--highlight-user changes display/filtering; OS ownership still controls cancel/private logs.\n",
+    "Util: dim → blue → cyan → green as activity rises.\n",
+    "VRAM/RAM: blue → cyan → yellow → orange → red as memory fills.\n",
+    "Attention groups current idle/parked allocations and unallocated GPU processes.\n",
+    "Timer age includes observation gaps; inspect evidence before acting.\n",
+    "Users: job CPU/RAM/block I/O; node network and load are SHARED.\n",
+    "Controller: local resources, physical device rates, filesystems and available quotas.\n",
+    "Unknown/stale data is never free capacity. ? unavailable; ~ partial.\n",
+    "GPU/VRAM meters sample GPUs; CPU/RAM meters sample nodes. CPU is node-wide.\n",
+    "Job RAM includes cgroup cache. Summed peaks are not simultaneous whole-job peaks.\n",
+    "Block I/O excludes cached and network-filesystem traffic; rates need two samples.\n",
+    "Network/load are not attributed to individual users. Storage queries run in the background.\n",
+    "Pending start and capacity are estimates, not scheduler guarantees.\n",
+    "PSI is pressure, not a diagnosis. GPU power caps alone are informational.\n\n",
+    "Node results are push-only; missing agents stay stale without master-to-node requests."
+);
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::Gpu;
     use ratatui::{Terminal, backend::TestBackend};
+    #[test]
+    fn user_details_expire_quota_with_the_table_even_without_a_new_snapshot() {
+        let now = runtime::now();
+        let mut app = App::for_user("alice".into());
+        app.tab = 5;
+        app.apply(Snapshot {
+            jobs: vec![Job {
+                jobid: "42".into(),
+                user: "alice".into(),
+                node: "gpu1".into(),
+                ..Default::default()
+            }],
+            controller: serde_json::json!({
+                "observed_at": now,
+                "storage_observed_at": now,
+                "filesystems": [{
+                    "mount": "/fixture-storage",
+                    "quotas": {"alice": {
+                        "used_bytes": 1073741824,
+                        "files": 12,
+                        "soft_bytes": 2147483648_u64,
+                        "hard_bytes": 3221225472_u64
+                    }}
+                }]
+            }),
+            ..Default::default()
+        });
+        let worker = Worker::new();
+        assert_eq!(app.rows[0].cells[8], "1.0");
+        app.key(KeyCode::Enter, &worker);
+        let body = &app.popup.as_ref().unwrap().panes[0].body;
+        assert!(body.contains("soft limit 2.0 GiB"));
+        app.popup = None;
+        app.data.controller["storage_observed_at"] = serde_json::json!(now - 400.0);
+        app.key(KeyCode::Enter, &worker);
+        assert_eq!(app.rows[0].cells[8], "?");
+        let body = &app.popup.as_ref().unwrap().panes[0].body;
+        assert!(body.contains("Quota sample unavailable or older than 5 minutes"));
+        assert!(!body.contains("soft limit"));
+        assert!(!body.contains("/fixture-storage"));
+    }
+    #[test]
+    fn focus_colors_node_spacing_and_navigation_preserve_real_rows_and_permissions() {
+        let now = runtime::now();
+        let mut app = App::for_user("root".into());
+        app.set_highlight_user("alice".into());
+        let owned = Gpu {
+            index: "0".into(),
+            alloc_user: "alice".into(),
+            alloc_jobid: "42".into(),
+            users: vec!["alice".into()],
+            util: "80".into(),
+            mem_used: "95".into(),
+            mem_total: "100".into(),
+            temp: "90".into(),
+            health_observed_at: now,
+            ..Default::default()
+        };
+        app.apply(Snapshot {
+            nodes: vec![
+                Node {
+                    name: "gpu1".into(),
+                    state: "allocated".into(),
+                    observed_at: now,
+                    gpus: vec![owned],
+                    ..Default::default()
+                },
+                Node {
+                    name: "gpu2".into(),
+                    state: "idle".into(),
+                    observed_at: now,
+                    gpus: vec![Gpu {
+                        index: "0".into(),
+                        util: "0".into(),
+                        mem_used: "0".into(),
+                        mem_total: "100".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+            jobs: vec![Job {
+                jobid: "42".into(),
+                user: "alice".into(),
+                node: "gpu1".into(),
+                ..Default::default()
+            }],
+            pending: vec![PendingJob {
+                jobid: "43".into(),
+                user: "alice".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let worker = Worker::new();
+        app.table.select(Some(1));
+        let before = app.rows.iter().map(|r| r.key.clone()).collect::<Vec<_>>();
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        assert_eq!(
+            before,
+            app.rows.iter().map(|r| r.key.clone()).collect::<Vec<_>>()
+        );
+        let buffer = terminal.backend().buffer();
+        assert!(
+            buffer
+                .content
+                .iter()
+                .any(|c| c.symbol() == "◆" && c.fg == FOCUS)
+        );
+        assert!(
+            buffer
+                .content
+                .iter()
+                .any(|c| c.symbol() == "━" && c.fg == Color::Green)
+        );
+        assert!(
+            buffer
+                .content
+                .iter()
+                .any(|c| c.symbol() == "━" && c.fg == Color::Rgb(255, 166, 87))
+        );
+        let lines = buffer
+            .content
+            .chunks(160)
+            .map(|r| r.iter().map(|c| c.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        let second = lines
+            .iter()
+            .position(|line| line.contains("▼ gpu2"))
+            .unwrap();
+        assert!(lines[second - 1].trim_matches(['│', ' ']).is_empty());
+        let hot = lines
+            .iter()
+            .position(|line| line.contains("HOT") && line.contains("#42"))
+            .unwrap();
+        let x = lines[hot].chars().position(|c| c == 'H').unwrap();
+        assert_eq!(buffer[(x as u16, hot as u16)].fg, Color::Red);
+        app.key(KeyCode::Char('x'), &worker);
+        assert!(app.popup.is_none());
+        assert_eq!(app.current_user, "root");
+        app.key(KeyCode::Char(']'), &worker);
+        assert_eq!(app.selected().unwrap().key, "node:gpu2");
+        app.key(KeyCode::Char('['), &worker);
+        assert_eq!(app.selected().unwrap().key, "node:gpu1");
+        app.filter_user = "alice".into();
+        app.partition = "gpu".into();
+        app.search = "x".into();
+        app.mine = true;
+        app.free_only = true;
+        app.sort = 2;
+        app.collapsed.insert("gpu2".into());
+        app.key(KeyCode::Char('0'), &worker);
+        assert!(
+            app.filter_user.is_empty()
+                && app.partition.is_empty()
+                && app.search.is_empty()
+                && !app.mine
+                && !app.free_only
+        );
+        assert_eq!(app.sort, 2);
+        assert!(app.collapsed.contains("gpu2"));
+        app.tab = 3;
+        app.rebuild();
+        assert!(app.rows.iter().all(|r| r.focus == Some(1)));
+    }
+    #[test]
+    fn history_pagination_moves_selection_and_color_ranges_keep_unknown_distinct() {
+        let mut app = App::for_user("alice".into());
+        let mut popup = Popup::text("History", String::new());
+        popup.history = (0..45)
+            .map(|id| history::Record {
+                jobid: id.to_string(),
+                ..Default::default()
+            })
+            .collect();
+        app.open(popup);
+        let worker = Worker::new();
+        app.key(KeyCode::PageDown, &worker);
+        assert_eq!(app.popup.as_ref().unwrap().selected, 20);
+        app.key(KeyCode::End, &worker);
+        assert_eq!(app.popup.as_ref().unwrap().selected, 44);
+        app.key(KeyCode::PageUp, &worker);
+        assert_eq!(app.popup.as_ref().unwrap().selected, 24);
+        app.key(KeyCode::Home, &worker);
+        assert_eq!(app.popup.as_ref().unwrap().selected, 0);
+        assert_eq!(MetricKind::Activity.color(Some(80.0)), Color::Green);
+        assert_eq!(MetricKind::Activity.color(Some(0.0)), MUTED);
+        assert_eq!(MetricKind::Memory.color(Some(98.0)), Color::Red);
+        assert_eq!(MetricKind::Memory.color(None), MUTED);
+        assert_eq!(MetricKind::Memory.color(Some(f64::NAN)), MUTED);
+        assert_eq!(clipped("가나다라마바사", 5).width(), 5);
+    }
     #[test]
     fn meters_keep_unknown_distinct_from_zero_and_bound_only_the_graph() {
         let mut meter = Meter::default();
@@ -2172,7 +3230,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(40, 1)).unwrap();
         meter.push(Some((250.0, 100.0)));
         terminal
-            .draw(|frame| meter.draw(frame, frame.area(), "GPU", Color::Cyan))
+            .draw(|frame| meter.draw(frame, frame.area(), "GPU", MetricKind::Activity))
             .unwrap();
     }
     #[test]
@@ -2229,7 +3287,7 @@ mod tests {
         }
     }
     #[test]
-    fn all_four_tabs_render_at_narrow_and_wide_widths() {
+    fn all_tabs_render_at_narrow_and_wide_widths() {
         let mut app = App::new();
         app.apply(Snapshot {
             nodes: vec![Node {
@@ -2247,7 +3305,7 @@ mod tests {
         });
         for width in [80, 120, 160] {
             let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
-            for tab in [0, 1, 2, 3] {
+            for tab in 0..=6 {
                 app.tab = tab;
                 app.rebuild();
                 terminal.draw(|f| app.draw(f)).unwrap();
@@ -2266,9 +3324,17 @@ mod tests {
                     .iter()
                     .map(|c| c.symbol())
                     .collect::<String>();
-                assert!(
-                    text.contains(["Node / GPU", "CPU alloc", "GPU-hours", "Req GPU/CPU/RAM"][tab])
-                );
+                assert!(text.contains(
+                    [
+                        "Node / GPU",
+                        "CPU alloc",
+                        "GPU-hours",
+                        "Req GPU/CPU/RAM",
+                        "User",
+                        "User",
+                        "Resource"
+                    ][tab]
+                ));
             }
         }
     }

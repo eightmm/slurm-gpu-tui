@@ -306,6 +306,8 @@ pub fn resource_summary(job: &Job, nodes: &[Node], now: f64) -> BTreeMap<String,
             "mem_limit_mib",
             "oom_kill",
             "vram_mib",
+            "io_read_bps",
+            "io_write_bps",
         ] {
             if let Some(v) = json_number(&sample[key]) {
                 *out.entry(key.into()).or_default() += v;

@@ -43,6 +43,8 @@ pub fn clean_sample(raw: &Value) -> Value {
         "mem_limit_mib",
         "oom_kill",
         "vram_mib",
+        "io_read_bps",
+        "io_write_bps",
     ] {
         if let Some(number) = json_number(&raw[key]).filter(|n| *n >= 0.0) {
             out.insert(key.into(), json!(number));
@@ -56,6 +58,7 @@ pub fn clean_telemetry(raw: &Value) -> Value {
     if let Some(n) = json_number(&raw["cpu_util"]).filter(|n| (0.0..=100.0).contains(n)) {
         out["cpu_util"] = json!(format!("{n:.1}"));
     }
+    out["host_io"] = crate::host::clean(&raw["host_io"]);
     out["pressure"] = json!({});
     for key in ["cpu", "memory", "io"] {
         if let Some(n) = json_number(&raw["pressure"][key]).filter(|n| (0.0..=100.0).contains(n)) {
@@ -94,6 +97,8 @@ fn children(dir: &File, limit: usize) -> Vec<std::ffi::OsString> {
     names
 }
 
+type IoCounters = BTreeMap<String, [u64; 2]>;
+
 pub struct NodeSampler {
     proc_root: PathBuf,
     cgroup_root: PathBuf,
@@ -102,6 +107,8 @@ pub struct NodeSampler {
     next: f64,
     cache: Value,
     cpu_previous: Option<[u64; 8]>,
+    host: crate::host::Sampler,
+    io_previous: BTreeMap<(u64, u64), (f64, IoCounters)>,
     job_previous: BTreeMap<(u64, u64), (f64, u64)>,
 }
 
@@ -119,6 +126,8 @@ impl Default for NodeSampler {
 impl NodeSampler {
     pub fn new(proc_root: PathBuf, cgroup_root: PathBuf, interval: f64, max_jobs: usize) -> Self {
         Self {
+            host: crate::host::Sampler::new(proc_root.clone(), "/sys".into(), interval),
+            io_previous: BTreeMap::new(),
             proc_root,
             cgroup_root,
             interval: interval.max(1.0),
@@ -163,6 +172,7 @@ impl NodeSampler {
             }
         }
         self.cpu_previous = counters;
+        out["host_io"] = crate::host::clean(&self.host.sample(monotonic, wall));
         let (jobs, truncated) = self.jobs(monotonic, wall);
         out["jobs"] = json!(jobs);
         out["jobs_truncated"] = json!(truncated);
@@ -244,6 +254,50 @@ impl NodeSampler {
         } else {
             self.job_previous.remove(&identity);
         }
+        let io = text_at(dir, "io.stat").ok().and_then(|raw| {
+            let mut devices = BTreeMap::new();
+            for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+                let mut fields = line.split_whitespace();
+                let device = fields.next()?;
+                let (major, minor) = device.split_once(':')?;
+                let id = (major.parse::<u32>().ok()?, minor.parse::<u32>().ok()?);
+                if !self.host.disks.contains(&id) {
+                    continue;
+                }
+                let values: BTreeMap<_, _> = fields.filter_map(|v| v.split_once('=')).collect();
+                let read = values.get("rbytes")?.parse::<u64>().ok()?;
+                let write = values.get("wbytes")?.parse::<u64>().ok()?;
+                if devices.insert(device.to_string(), [read, write]).is_some() {
+                    return None;
+                }
+            }
+            if !raw.trim().is_empty() && devices.is_empty() {
+                None
+            } else {
+                Some(devices)
+            }
+        });
+        if let Some(current) = io {
+            if let Some((time, previous)) = self
+                .io_previous
+                .insert(identity, (monotonic, current.clone()))
+                && monotonic > time
+                && current.keys().eq(previous.keys())
+            {
+                let rates = current.iter().try_fold([0u64; 2], |sum, (device, values)| {
+                    Some([
+                        sum[0].checked_add(values[0].checked_sub(previous[device][0])?)?,
+                        sum[1].checked_add(values[1].checked_sub(previous[device][1])?)?,
+                    ])
+                });
+                if let Some(rates) = rates {
+                    out["io_read_bps"] = json!(rates[0] as f64 / (monotonic - time));
+                    out["io_write_bps"] = json!(rates[1] as f64 / (monotonic - time));
+                }
+            }
+        } else {
+            self.io_previous.remove(&identity);
+        }
         for (file, key) in [
             ("memory.current", "mem_current_mib"),
             ("memory.peak", "mem_peak_mib"),
@@ -276,10 +330,12 @@ impl NodeSampler {
         let mut count = 0;
         let Ok(root) = runtime::open_dir(&self.cgroup_root) else {
             self.job_previous.clear();
+            self.io_previous.clear();
             return (jobs, false);
         };
         if text_at(&root, "cgroup.controllers").is_err() {
             self.job_previous.clear();
+            self.io_previous.clear();
             return (jobs, false);
         }
         let parents = [Some(&root), None];
@@ -365,6 +421,8 @@ impl NodeSampler {
         }
         self.job_previous
             .retain(|identity, _| identities.contains(identity));
+        self.io_previous
+            .retain(|identity, _| identities.contains(identity));
         (jobs, truncated)
     }
 }
@@ -373,6 +431,42 @@ impl NodeSampler {
 mod tests {
     use super::*;
     use std::{fs, os::unix::fs::symlink};
+
+    #[test]
+    fn job_io_uses_physical_byte_counters_and_handles_empty_reset_and_symlink_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proc = tmp.path().join("proc");
+        let sys = tmp.path().join("sys");
+        let cgroup = tmp.path().join("cgroup");
+        let job = cgroup.join("slurm/job_42");
+        for dir in [&proc, &job, &sys.join("class/block/sda/device")] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(proc.join("diskstats"), "8 0 sda 0 0 100 0 0 0 100 0\n").unwrap();
+        fs::write(cgroup.join("cgroup.controllers"), "cpu memory io").unwrap();
+        fs::write(
+            job.join("io.stat"),
+            "8:0 rbytes=100 wbytes=200 rios=1 wios=1\n",
+        )
+        .unwrap();
+        let mut sampler = NodeSampler::new(proc.clone(), cgroup, 1.0, 256);
+        sampler.host = crate::host::Sampler::new(proc, sys, 1.0);
+        assert!(sampler.sample(0.0, 100.0)["jobs"]["42"]["io_read_bps"].is_null());
+        fs::write(job.join("io.stat"), "8:0 rbytes=104 wbytes=208\n").unwrap();
+        let data = sampler.sample(2.0, 102.0);
+        assert_eq!(data["jobs"]["42"]["io_read_bps"], 2.0);
+        assert_eq!(data["jobs"]["42"]["io_write_bps"], 4.0);
+        fs::write(job.join("io.stat"), "").unwrap();
+        assert!(sampler.sample(4.0, 104.0)["jobs"]["42"]["io_read_bps"].is_null());
+        assert_eq!(sampler.sample(6.0, 106.0)["jobs"]["42"]["io_read_bps"], 0.0);
+        fs::write(job.join("io.stat"), "8:0 rbytes=bad wbytes=0\n").unwrap();
+        assert!(sampler.sample(8.0, 108.0)["jobs"]["42"]["io_read_bps"].is_null());
+        fs::remove_file(job.join("io.stat")).unwrap();
+        let other = tmp.path().join("other-counter");
+        fs::write(&other, "8:0 rbytes=999 wbytes=999").unwrap();
+        symlink(other, job.join("io.stat")).unwrap();
+        assert!(sampler.sample(10.0, 110.0)["jobs"]["42"]["io_read_bps"].is_null());
+    }
 
     #[test]
     fn cpu_needs_two_samples_and_counter_resets_are_unknown() {

@@ -6,6 +6,7 @@ pub mod benchmark;
 pub mod cli;
 pub mod collector;
 pub mod history;
+pub mod host;
 pub mod logs;
 pub mod metrics;
 pub mod model;
@@ -19,6 +20,7 @@ pub mod runtime;
 pub mod scheduler;
 pub mod ui;
 pub mod usage;
+pub mod users;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;

@@ -84,7 +84,8 @@ model!(Node {
     data_age_sec: f64 = -1.0, scheduler_age_sec: f64 = -1.0,
     scheduler_mem_total: String = String::new(), scheduler_available: bool = true,
     cpu_util: String = String::new(), pressure: BTreeMap<String, String> = BTreeMap::new(),
-    telemetry_observed_at: f64 = 0.0, jobs_truncated: bool = false
+    telemetry_observed_at: f64 = 0.0, jobs_truncated: bool = false,
+    host_io: BTreeMap<String, String> = BTreeMap::new()
 });
 
 model!(SchedulerStatus {
@@ -102,7 +103,7 @@ model!(Snapshot {
     pending: Vec<PendingJob> = Vec::new(), stale_nodes: Vec<String> = Vec::new(),
     untrusted_payloads: BTreeMap<String, u32> = BTreeMap::new(),
     scheduler: SchedulerStatus = SchedulerStatus::default(), errors: String = String::new(),
-    collector: Value = Value::Null
+    collector: Value = Value::Null, controller: Value = Value::Null
 });
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

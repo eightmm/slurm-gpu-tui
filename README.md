@@ -20,6 +20,7 @@ A Rust terminal monitor for jobs, GPU waste, usage and alerts.
 | Feature | What you get |
 |---|---|
 | **Cluster visibility** | Live GPU/CPU/RAM meters, per-node GPU state maps and keyboard-driven job tables |
+| **People and controller** | Per-user job resources, sustained-waste groups, controller I/O and storage quotas when available |
 | **Less wasted capacity** | Idle, parked and rogue GPU detection, plus per-user GPU-hours |
 | **Job inspection** | History, scripts, log tails and confirmed cancellation of your own jobs |
 | **Alerts and metrics** | Slack daily threads, owner-only failure DMs and Prometheus textfiles |
@@ -35,7 +36,7 @@ Install on the master as root. Linux, git and a C compiler are required; the
 installer prepares Rust when needed. The first build may take several minutes.
 Run the same command to upgrade. Existing installation paths, service settings,
 state and Slack configuration are preserved. Check `sgpu --version` after
-installation; the current version is **2.0.2**. Users simply run `sgpu`.
+installation; the current version is **2.1.0**. Users simply run `sgpu`.
 
 Configure each node's publisher and the shared directory using the
 [node setup guide](docs/PUSH.md). Nodes publish results to a shared filesystem;
@@ -45,7 +46,8 @@ or repair.
 ## Usage
 
 ```bash
-sgpu                    # GPU / CPU / Usage / Jobs tabs
+sgpu                    # GPU / CPU / Usage / Jobs / Attention / Users / Controller
+sgpu --highlight-user alice  # Highlight an account while viewing as an administrator
 sgpu once               # Current snapshot
 sgpu me                 # My jobs, waste and usage
 sgpu waste -v           # Wasted GPUs
@@ -58,8 +60,9 @@ chkgpu                  # Colored user × node allocation matrix
 
 | Key | Action |
 |---|---|
-| `1`–`4` | GPU / CPU / Usage / Jobs |
-| `u` / `p` / `m` / `i` | User / partition / mine / free GPU filters |
+| `1`–`7` | GPU / CPU / Usage / Jobs / Attention / Users / Controller |
+| `u` / `p` / `m` / `i` | User / partition / highlighted user / free GPU filters |
+| `[` / `]` / `0` | Previous node / next node / reset filters |
 | `/` / `s` / `S` | Search / sort / reverse |
 | Enter / Tab | Details / switch information, script and log tabs |
 | `w` / `f` / `h` | Waste / capacity / job history |
@@ -69,6 +72,20 @@ chkgpu                  # Colored user × node allocation matrix
 `sgpu` opens a live dashboard with resource meters, GPU state symbols and sortable
 tables. `chkgpu` automatically uses color in terminals; pipes stay plain. Use
 `chkgpu --color always` or `--color never` to override, or set `NO_COLOR`.
+
+Your rows use a teal background and `◆`, separate from the selection cursor.
+Utilization goes from dim through blue/cyan to green as activity increases;
+VRAM goes through blue/cyan/yellow/orange/red as it fills. Large terminals use
+thicker resource bars. The highlight override changes display and filtering;
+cancellation and private logs still use the executing account.
+
+**Users** separates attributed job CPU/RAM/block I/O from shared-node network
+and load. **Controller** shows local CPU/RAM, load, physical disk/NIC rates and
+filesystem capacity; user-quota records appear when the filesystem exposes them.
+**Attention** groups current idle/parked and unallocated GPU observations by user
+and shows the evidence. Existing Slack thresholds continue to control delivery.
+See [sampling and attribution](docs/PUSH.md#resource-views) before interpreting
+shared counters. Update each node publisher locally to enable its new I/O fields.
 
 `?` means unavailable and `~` means partial coverage. Stale data never counts
 as free GPUs. Capacity and estimated start times do not guarantee admission

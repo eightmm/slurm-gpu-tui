@@ -132,9 +132,59 @@ Python installation's directory and service settings. A fresh installation uses
 `/opt/sgpu`; `SGPU_INSTALL_DIR` overrides it. Explicit settings in the installing
 environment override inherited service settings. Existing Slack configuration,
 state and the old environment are retained. Check `sgpu --version` to confirm
-that the native command is active (currently **2.0.2**).
+that the native command is active (currently **2.1.0**).
 
 Source and prebuilt binaries must match the host architecture and C library.
 Upgrades keep previous releases and persistent state; failed activation attempts
 roll back the current release and service configuration. `--no-service` prepares
 files only and still requires root.
+
+## Resource views
+
+The TUI adds Attention, Users and Controller tabs (`5`, `6`, `7`). Nodes are
+spaced without inserting selectable blank rows. `◆` and a teal background mark
+the highlighted account; `--highlight-user USER` sets that display preference
+for an administrator. It does not change the OS identity used for cancellation
+or private logs. `[`/`]` jump between nodes and `0` clears filters. Enter opens
+full values when narrow tables hide auxiliary columns or abbreviate long names.
+
+Users sums fresh, scheduler-validated job cgroup CPU cores, current RAM and
+physical block read/write bytes per second. Block I/O comes from `io.stat`,
+not filesystem ownership scans; cache hits and network-filesystem traffic are
+outside that counter. Each metric keeps its own sampling coverage (`?` missing,
+`~` partial). A readable empty `io.stat` can report a measured zero after two
+samples. Missing files, counter resets and first samples remain unavailable.
+
+Node network and load are **shared host values**, never divided into estimated
+per-user traffic. An assigned node is counted once per user even when that user
+has several jobs on it. Network is the sum of physical NIC counters; virtual
+bridge/bond/VLAN interfaces are excluded to avoid double counting. These are
+interface byte counters, not a complete accounting of offloaded RDMA traffic.
+Load1 is the maximum 1-minute host load over the user's assigned nodes. Enter
+shows per-node disk/network rates and 1/5/15-minute load values.
+
+The controller samples its own `/proc` and `/sys` locally at 10-second intervals.
+Disk counters use whole physical devices, excluding partitions and virtual
+device stacks. Filesystem capacity and available VFS user-quota records are
+refreshed by one background worker every 120 seconds, bounded to 16 local
+filesystems and 128 known active/local accounts. Slow storage queries do not
+block snapshot publication. Samples older than 300 seconds are unavailable;
+sampling limits are marked partial. Quota limits are read, never configured. Unsupported
+quota backends and missing records remain unavailable. Network mounts and
+filesystem tree scans are excluded from capacity/quota sampling. No site paths,
+module lists or policy limits are embedded in the application.
+
+Update agents locally to publish these optional fields. Payload v9 and snapshot
+v1 remain compatible; older agents show unavailable new metrics. Controller
+telemetry comes from the collector host, not from the workstation running the UI.
+
+Attention uses the configured `WASTE_MIN_SEC` threshold for current idle/parked
+allocation evidence and separately shows unallocated processes. Timer age is
+elapsed time, not proof of continuous observation through stale gaps. Inspect
+the job before acting. New confirmed groups produce an in-app notice; existing
+`waste_alert_hours` and Slack debounce settings still control Slack alerts.
+
+Kernel references: [block counters](https://docs.kernel.org/block/stat.html),
+[interface counters](https://docs.kernel.org/networking/statistics.html),
+[cgroup v2 I/O](https://docs.kernel.org/admin-guide/cgroup-v2.html),
+[quota queries](https://man7.org/linux/man-pages/man2/quotactl.2.html).

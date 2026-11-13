@@ -116,7 +116,7 @@ fn collector_merges_push_payload_without_a_node_request_and_preserves_inventory_
             used: "1024".into(),
             avail: "64512".into(),
         },
-        telemetry: serde_json::json!({}),
+        telemetry: serde_json::json!({"observed_at":runtime::now(),"host_io":{"net_rx_bps":2048,"net_tx_bps":0,"load1":1.5,"private":"NEVER_EXPORTED"},"jobs":{"42":{"observed_at":runtime::now(),"cpu_cores":1,"io_read_bps":1048576,"io_write_bps":0}}}),
         power: BTreeMap::new(),
     };
     fs::write(
@@ -134,6 +134,14 @@ fn collector_merges_push_payload_without_a_node_request_and_preserves_inventory_
     assert_eq!(snapshot.nodes[0].source, "agent");
     assert!(!snapshot.nodes[0].stale);
     assert_eq!(snapshot.nodes[0].gpus[0].alloc_jobid, "42");
+    assert_eq!(
+        sgpu::model::number(&snapshot.nodes[0].host_io["net_rx_bps"]),
+        Some(2048.0)
+    );
+    assert_eq!(snapshot.jobs[0].telemetry["gpu1"]["io_read_bps"], 1048576.0);
+    assert_eq!(snapshot.jobs[0].telemetry["gpu1"]["io_write_bps"], 0.0);
+    assert!(snapshot.controller["observed_at"].as_f64().is_some());
+    assert!(!String::from_utf8_lossy(&first.stdout).contains("NEVER_EXPORTED"));
     assert!(snapshot.jobs[0].detail.is_empty());
     assert!(!String::from_utf8_lossy(&first.stdout).contains("/private/owner"));
     fs::remove_file(cluster.agents.join("gpu1.json")).unwrap();
@@ -145,6 +153,7 @@ fn collector_merges_push_payload_without_a_node_request_and_preserves_inventory_
     );
     let snapshot: Snapshot = serde_json::from_slice(&second.stdout).unwrap();
     assert!(snapshot.nodes[0].stale);
+    assert!(snapshot.nodes[0].host_io.is_empty());
     assert_eq!(snapshot.nodes[0].gpus[0].name, "H100");
     let text = fs::read_to_string(cluster.data.join("metrics.prom")).unwrap();
     assert!(text.contains("sgpu_gpus_free 0\n"));

@@ -46,11 +46,21 @@ fn positive(raw: &str) -> std::result::Result<usize, String> {
 #[command(
     name = "sgpu",
     about = "Push-only Slurm GPU operations monitor. No arguments: interactive TUI.",
-    disable_version_flag = true
+    disable_version_flag = true,
+    args_conflicts_with_subcommands = true
 )]
 pub struct Args {
+    #[arg(long, value_name = "USER", value_parser = highlight_user, help = "Highlight this user's jobs in the TUI; permissions stay with the executing account")]
+    pub highlight_user: Option<String>,
     #[command(subcommand)]
     pub command: Option<Command>,
+}
+fn highlight_user(value: &str) -> std::result::Result<String, String> {
+    if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+        Err("user must be nonempty, at most 256 bytes and contain no control characters".into())
+    } else {
+        Ok(value.into())
+    }
 }
 #[derive(Subcommand)]
 pub enum Command {
@@ -164,6 +174,7 @@ pub fn normalize(mut args: Vec<String>) -> Vec<String> {
             "--nodes",
             "--repeat",
             "--replay",
+            "--highlight-user",
         ]
         .contains(&arg.as_str())
         {
@@ -694,7 +705,7 @@ fn report(month: &str) -> Result<i32> {
 
 pub fn run(args: Args) -> Result<i32> {
     match args.command {
-        None => crate::ui::run(),
+        None => crate::ui::run(args.highlight_user),
         Some(Command::Version) => {
             println!("sgpu {} (build {})", crate::VERSION, crate::VERSION);
             Ok(0)
@@ -910,6 +921,21 @@ pub fn run(args: Args) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn highlight_user_is_display_only_and_does_not_turn_names_into_subcommands() {
+        let args = Args::try_parse_from(normalize(
+            ["sgpu", "--highlight-user", "once"]
+                .map(str::to_string)
+                .to_vec(),
+        ))
+        .unwrap();
+        assert!(args.command.is_none());
+        assert_eq!(args.highlight_user.as_deref(), Some("once"));
+        assert!(Args::try_parse_from(["sgpu", "--highlight-user", "alice", "once"]).is_err());
+        for value in ["", "a\nb", "\u{1b}[31malice"] {
+            assert!(highlight_user(value).is_err());
+        }
+    }
     #[test]
     fn aliases_move_after_options_and_conflicts_fail() {
         let normalized = normalize(

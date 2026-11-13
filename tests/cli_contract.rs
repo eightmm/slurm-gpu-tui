@@ -289,6 +289,7 @@ fn interactive_terminal_opens_handles_tabs_and_restores_terminal_mode() {
     unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
     let mut command = fixture.command();
     command
+        .args(["--highlight-user", &fixture.user])
         .env("TERM", "xterm-256color")
         .stdin(Stdio::from(slave.try_clone().unwrap()))
         .stdout(Stdio::from(slave.try_clone().unwrap()))
