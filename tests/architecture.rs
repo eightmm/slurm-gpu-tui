@@ -81,6 +81,7 @@ fn maintained_docs_have_resolvable_local_links_and_no_removed_setup() {
     let pattern = regex::Regex::new(r"\[[^\]]*\]\(([^)]+)\)").unwrap();
     for name in [
         "README.md",
+        "docs/README.ko.md",
         "docs/PUSH.md",
         "docs/ALERTS.md",
         "docs/METRICS.md",
