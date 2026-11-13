@@ -1,9 +1,29 @@
+<div align="center">
+
 # sgpu
 
-[English](../README.md)
+**Slurm GPU 클러스터를 터미널에서 한눈에.**
 
-Rust로 구현한 Slurm GPU 운영 모니터입니다. GPU·CPU·작업·사용량을 터미널에서
-확인하고, 낭비 GPU 탐지와 Slack 알림, Prometheus 메트릭을 제공합니다.
+작업·GPU 낭비·사용량·알림을 함께 확인하는 Rust 모니터입니다.
+
+[![CI](https://github.com/eightmm/slurm-gpu-tui/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/eightmm/slurm-gpu-tui/actions/workflows/test.yml)
+[![Rust](https://img.shields.io/badge/Rust-1.93%2B-CE422B?logo=rust)](https://github.com/eightmm/slurm-gpu-tui/blob/main/Cargo.toml)
+[![Linux](https://img.shields.io/badge/platform-Linux-2D6A4F?logo=linux&logoColor=white)](https://github.com/eightmm/slurm-gpu-tui#build-and-install)
+[![GitHub stars](https://img.shields.io/github/stars/eightmm/slurm-gpu-tui?style=social)](https://github.com/eightmm/slurm-gpu-tui/stargazers)
+
+[설치](#build-and-install) · [사용법](#사용법) · [Slack 알림](ALERTS.md) · [English](../README.md)
+
+</div>
+
+## 주요 기능
+
+| 기능 | 제공 내용 |
+|---|---|
+| **클러스터 상태** | GPU·CPU 텔레메트리, 실행·대기 작업, 하드웨어 상태 |
+| **낭비 탐지와 집계** | idle·parked·rogue GPU 탐지와 사용자별 GPU-hours |
+| **작업 들여다보기** | 이력·스크립트·로그와 본인 작업 취소 확인 |
+| **화면 밖에서도 알림** | Slack 일별 스레드, 소유자 전용 실패 DM, Prometheus textfile |
+| **노드가 결과 게시** | 독립 publisher로 수집하며, 결측·stale을 가용량과 구분 |
 
 ## Build and install
 
@@ -13,7 +33,8 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/refs/heads/ma
 
 마스터에 root 권한으로 설치합니다. Linux·git·C 컴파일러가 필요하며, Rust가
 없으면 설치기가 준비합니다. 첫 빌드는 수 분 걸릴 수 있습니다. 다시 실행하면
-업그레이드하며, 기존 상태와 Slack 설정은 유지합니다. 일반 사용자는 설치 후
+업그레이드하며, 기존 설치 경로·서비스 설정·상태·Slack 설정은 유지합니다.
+설치 후 `sgpu --version`으로 **2.0.1**인지 확인할 수 있습니다. 일반 사용자는
 `sgpu`만 실행하면 됩니다.
 
 각 노드의 publisher와 공유 디렉터리는 [노드 설정](PUSH.md)을 따릅니다.
@@ -64,3 +85,9 @@ root collector는 작업 로그와 정제된 상세를 기본 공개합니다. �
 
 운영 스크립트는 `scripts/`, 구현은 `src/`, 검증은 `tests/`에 모았습니다.
 `bash scripts/check.sh`로 형식·clippy·테스트·쉘 검사를 실행합니다.
+
+## 프로젝트 응원하기
+
+클러스터 운영에 도움이 됐다면 [Star](https://github.com/eightmm/slurm-gpu-tui)를
+눌러 저장해 두세요. 버그 제보는 [Issues](https://github.com/eightmm/slurm-gpu-tui/issues),
+개선 사항은 [Pull requests](https://github.com/eightmm/slurm-gpu-tui/pulls)로 받습니다.

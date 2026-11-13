@@ -117,7 +117,202 @@ struct Manifest {
 }
 
 fn default_prefix() -> PathBuf {
-    "/opt/sgpu".into()
+    discover_prefix(Path::new("/usr/local/bin")).unwrap_or_else(|| "/opt/sgpu".into())
+}
+
+fn discover_prefix(bin: &Path) -> Option<PathBuf> {
+    ["sgpu", "sgpu-collector", "chkgpu"]
+        .iter()
+        .find_map(|name| installed_prefix(&bin.join(name), name))
+}
+
+fn installed_prefix(entry: &Path, name: &str) -> Option<PathBuf> {
+    let link = fs::symlink_metadata(entry).ok()?;
+    if link.uid() != runtime::euid() || (!link.is_file() && !link.file_type().is_symlink()) {
+        return None;
+    }
+    let target = if link.file_type().is_symlink() {
+        let path = fs::read_link(entry).ok()?;
+        if path.is_absolute() {
+            path
+        } else {
+            entry.parent()?.join(path)
+        }
+    } else {
+        entry.to_path_buf()
+    };
+    let resolved = fs::canonicalize(&target).ok()?;
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&resolved)
+        .ok()?;
+    let st = file.metadata().ok()?;
+    if !st.is_file() || st.uid() != runtime::euid() || st.mode() & 0o022 != 0 {
+        return None;
+    }
+    let mut magic = [0; 4];
+    file.read_exact(&mut magic).ok()?;
+    if let Some(root) = target
+        .parent()
+        .filter(|p| p.file_name().is_some_and(|s| s == "bin"))
+        .and_then(Path::parent)
+        && let Ok(record) = manifest(root)
+        && !record.roles.is_empty()
+        && magic == *b"\x7fELF"
+    {
+        return Some(root.to_path_buf());
+    }
+    let (bytes, _) = runtime::read_regular(&resolved, 1024 * 1024, Some(runtime::euid())).ok()?;
+    let body = std::str::from_utf8(&bytes).ok()?.trim_end();
+    if let Some(executable) = body
+        .strip_prefix("#!/bin/bash\nexec \"")
+        .and_then(|s| s.strip_suffix("\" \"$@\""))
+    {
+        let suffix = format!("/.venv/bin/{name}");
+        let root = PathBuf::from(executable.strip_suffix(&suffix)?);
+        if prefix_path(Some(root.clone())).is_ok()
+            && fs::metadata(&root).is_ok_and(|s| s.is_dir() && s.uid() == runtime::euid())
+        {
+            return Some(root);
+        }
+    }
+    let module = match name {
+        "sgpu" => "sgpu.cli",
+        "sgpu-collector" => "sgpu.collector",
+        "chkgpu" => "sgpu.quickview",
+        _ => return None,
+    };
+    let bin = target.parent()?;
+    let venv = bin.parent()?;
+    if bin.file_name().is_some_and(|s| s == "bin")
+        && venv.file_name().is_some_and(|s| s == ".venv")
+        && body
+            .lines()
+            .any(|line| line == format!("from {module} import main"))
+        && runtime::read_regular(&venv.join("pyvenv.cfg"), 65536, Some(runtime::euid())).is_ok()
+    {
+        return venv.parent().map(Path::to_path_buf);
+    }
+    None
+}
+
+fn inherited_settings(unit: &str, role: Role) -> Result<Vec<(String, String)>> {
+    let mut settings = std::collections::BTreeMap::new();
+    for line in unit
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("Environment="))
+    {
+        if line.trim().is_empty() {
+            settings.clear();
+            continue;
+        }
+        let mut words = Vec::new();
+        let mut word = String::new();
+        let mut quote = None;
+        let mut escaped = false;
+        for c in line.chars() {
+            if escaped {
+                match c {
+                    '\\' | '\'' | '"' => word.push(c),
+                    's' => word.push(' '),
+                    _ => return Err("unsupported escape in previous service environment".into()),
+                };
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if quote == Some(c) {
+                quote = None;
+            } else if quote.is_none() && matches!(c, '\'' | '"') {
+                quote = Some(c);
+            } else if quote.is_none() && c.is_whitespace() {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            } else {
+                word.push(c);
+            }
+        }
+        if escaped || quote.is_some() {
+            return Err("invalid previous service environment".into());
+        }
+        if !word.is_empty() {
+            words.push(word);
+        }
+        for word in words {
+            let Some((name, value)) = word.split_once('=') else {
+                continue;
+            };
+            let Some(suffix) = name.strip_prefix("SLURM_GPU_TUI_") else {
+                continue;
+            };
+            if !PUBLIC_ENV.contains(&suffix)
+                && !matches!(
+                    suffix,
+                    "AGENT_DIR"
+                        | "DATA_DIR"
+                        | "STATE_DIR"
+                        | "SHARE_LOGS"
+                        | "SHARE_JOB_DETAILS"
+                        | "SHARE_SCRIPTS"
+                )
+            {
+                continue;
+            }
+            let mut decoded = String::new();
+            let mut chars = value.chars();
+            while let Some(c) = chars.next() {
+                if c == '%' && chars.next() != Some('%') {
+                    return Err("previous service uses unsupported environment specifiers".into());
+                }
+                decoded.push(c);
+            }
+            let value = decoded;
+            if value.chars().any(char::is_control) {
+                return Err("control character in previous service environment".into());
+            }
+            settings.insert(name.to_string(), value);
+        }
+    }
+    if role == Role::Master {
+        for suffix in ["SHARE_LOGS", "SHARE_JOB_DETAILS", "SHARE_SCRIPTS"] {
+            settings
+                .entry(format!("SLURM_GPU_TUI_{suffix}"))
+                .or_insert_with(|| "0".into());
+        }
+    }
+    Ok(settings.into_iter().collect())
+}
+
+fn preserve_service_settings(prefix: &Path, role: Role) -> Result<()> {
+    let path = service_dir().join(unit_name(role));
+    let (bytes, st) = match runtime::read_regular(&path, 1024 * 1024, Some(runtime::euid())) {
+        Ok(value) => value,
+        Err(_)
+            if fs::symlink_metadata(&path)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    if st.mode() & 0o022 != 0 {
+        return Err("previous service is writable by other users".into());
+    }
+    let unit = std::str::from_utf8(&bytes)?;
+    if !unit.contains(&escape(&prefix.to_string_lossy(), true)?) {
+        return Err("service belongs to another installation; select its existing prefix".into());
+    }
+    let previous = inherited_settings(unit, role)?;
+    for (name, value) in previous {
+        if std::env::var_os(&name).is_none() {
+            // The installer calls this at startup, before spawning any workers.
+            unsafe {
+                std::env::set_var(name, value);
+            }
+        }
+    }
+    Ok(())
 }
 fn prefix_path(path: Option<PathBuf>) -> Result<PathBuf> {
     let path = path.unwrap_or_else(default_prefix);
@@ -153,7 +348,10 @@ fn manifest(prefix: &Path) -> Result<Manifest> {
         }),
         Err(error) => Err(error.into()),
         Ok(_) => {
-            let (bytes, _) = runtime::read_regular(&path, 65536, Some(runtime::euid()))?;
+            let (bytes, st) = runtime::read_regular(&path, 65536, Some(runtime::euid()))?;
+            if st.mode() & 0o022 != 0 {
+                return Err("install manifest is writable by other users".into());
+            }
             let manifest: Manifest = serde_json::from_slice(&bytes)?;
             if manifest.version != 1 {
                 return Err("unsupported install manifest".into());
@@ -557,11 +755,18 @@ fn apply_service(
     Ok(())
 }
 fn path_link(prefix: &Path, transaction: &mut Transaction) -> Result<()> {
-    let bin = Path::new("/usr/local/bin");
+    path_links_in(Path::new("/usr/local/bin"), prefix, transaction)
+}
+fn path_links_in(bin: &Path, prefix: &Path, transaction: &mut Transaction) -> Result<()> {
+    let directory = fs::symlink_metadata(bin)?;
+    if !directory.is_dir() || directory.uid() != runtime::euid() || directory.mode() & 0o022 != 0 {
+        return Err("unsafe public executable directory".into());
+    }
     for name in BINARIES {
         let path = bin.join(name);
         if let Ok(st) = fs::symlink_metadata(&path)
-            && (!st.file_type().is_symlink() || !fs::read_link(&path)?.starts_with(prefix))
+            && (!(st.file_type().is_symlink() && fs::read_link(&path)?.starts_with(prefix))
+                && installed_prefix(&path, name).as_deref() != Some(prefix))
         {
             return Err(format!("refusing to replace unrelated {}", path.display()).into());
         }
@@ -698,6 +903,9 @@ fn install(
             ""
         }
     );
+    if !no_service {
+        println!("Active native command: /usr/local/bin/sgpu (verify with sgpu --version)");
+    }
     Ok(())
 }
 fn uninstall(prefix: &Path, role: Role, no_service: bool) -> Result<()> {
@@ -781,13 +989,20 @@ pub fn run(args: Args) -> Result<()> {
             prefix,
             bin_dir,
             no_service,
-        } => install(
-            &prefix_path(prefix)?,
-            &source_dir(bin_dir)?,
-            role,
-            mode,
-            no_service,
-        ),
+        } => {
+            let explicit = prefix.is_some();
+            let prefix = prefix_path(prefix)?;
+            if !no_service {
+                preserve_service_settings(&prefix, role)?;
+            }
+            if !explicit {
+                println!(
+                    "Install location: {} (existing sgpu installations are reused)",
+                    prefix.display()
+                );
+            }
+            install(&prefix, &source_dir(bin_dir)?, role, mode, no_service)
+        }
         Action::Uninstall {
             role,
             prefix,
@@ -806,6 +1021,144 @@ pub fn run(args: Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn write_owned(path: &Path, body: &[u8]) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    #[test]
+    fn previous_wrappers_are_discovered_for_symlink_and_regular_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("old install");
+        let bin = tmp.path().join("public-bin");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        let body = format!(
+            "#!/bin/bash\nexec \"{}/.venv/bin/sgpu\" \"$@\"\n",
+            root.display()
+        );
+        write_owned(&root.join("bin/sgpu"), body.as_bytes());
+        symlink(root.join("bin/sgpu"), bin.join("sgpu")).unwrap();
+        assert_eq!(discover_prefix(&bin), Some(root.clone()));
+        fs::remove_file(bin.join("sgpu")).unwrap();
+        write_owned(&bin.join("sgpu"), body.as_bytes());
+        assert_eq!(discover_prefix(&bin), Some(root.clone()));
+        write_owned(&bin.join("sgpu"), b"#!/bin/sh\necho unrelated\n");
+        assert_eq!(discover_prefix(&bin), None);
+        write_owned(&bin.join("sgpu"), body.as_bytes());
+        fs::set_permissions(bin.join("sgpu"), fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(discover_prefix(&bin), None);
+    }
+    #[test]
+    fn previous_console_scripts_and_owned_native_manifests_are_recognized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("old");
+        let bin = tmp.path().join("public-bin");
+        fs::create_dir_all(&bin).unwrap();
+        write_owned(
+            &root.join(".venv/bin/sgpu"),
+            b"#!/fixture\nfrom sgpu.cli import main\n",
+        );
+        write_owned(&root.join(".venv/pyvenv.cfg"), b"home = fixture");
+        symlink(root.join(".venv/bin/sgpu"), bin.join("sgpu")).unwrap();
+        assert_eq!(discover_prefix(&bin), Some(root.clone()));
+        fs::remove_file(bin.join("sgpu")).unwrap();
+        write_owned(&root.join("bin/sgpu"), b"\x7fELFfixture");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("bin/sgpu"))
+            .unwrap()
+            .set_len(2 * 1024 * 1024)
+            .unwrap();
+        symlink(root.join("bin/sgpu"), bin.join("sgpu")).unwrap();
+        assert_eq!(discover_prefix(&bin), None);
+        write_owned(
+            &root.join(".sgpu-native-install"),
+            br#"{"version":1,"roles":["master"]}"#,
+        );
+        assert_eq!(discover_prefix(&bin), Some(root));
+    }
+    #[test]
+    fn legacy_installation_upgrades_in_place_and_rolls_back_all_entrypoints() {
+        for regular in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            runtime::secure_dir(tmp.path(), 0o700).unwrap();
+            let root = tmp.path().join("legacy");
+            let public = tmp.path().join("public");
+            let source = tmp.path().join("source");
+            fs::create_dir_all(&public).unwrap();
+            runtime::secure_dir(&public, 0o755).unwrap();
+            fs::create_dir_all(root.join(".venv")).unwrap();
+            fs::write(root.join(".venv/preserve"), "old environment").unwrap();
+            for name in BINARIES {
+                write_owned(&source.join(name), b"\x7fELFfixture");
+            }
+            for name in ["sgpu", "sgpu-collector", "chkgpu"] {
+                let body = format!(
+                    "#!/bin/bash\nexec \"{}/.venv/bin/{name}\" \"$@\"\n",
+                    root.display()
+                );
+                write_owned(&root.join("bin").join(name), body.as_bytes());
+                if regular && name == "sgpu" {
+                    write_owned(&public.join(name), body.as_bytes());
+                } else {
+                    symlink(root.join("bin").join(name), public.join(name)).unwrap();
+                }
+            }
+            assert_eq!(discover_prefix(&public), Some(root.clone()));
+            let mut transaction = Transaction::default();
+            stage_files(
+                &root,
+                &source,
+                Role::Master,
+                NodeMode::Gpu,
+                &mut transaction,
+            )
+            .unwrap();
+            path_links_in(&public, &root, &mut transaction).unwrap();
+            assert!(
+                fs::read(public.join("sgpu"))
+                    .unwrap()
+                    .starts_with(b"\x7fELF")
+            );
+            transaction.rollback().unwrap();
+            assert!(
+                fs::read_to_string(public.join("sgpu"))
+                    .unwrap()
+                    .contains("/.venv/bin/sgpu")
+            );
+            assert_eq!(
+                fs::read_to_string(root.join(".venv/preserve")).unwrap(),
+                "old environment"
+            );
+            assert!(!root.join("current").exists());
+        }
+    }
+    #[test]
+    fn inherited_public_paths_flags_and_escaping_preserve_settings_without_tokens() {
+        let raw = "[Service]\nEnvironment=SLURM_GPU_TUI_AGENT_DIR=/shared/nodes\nEnvironment=SLURM_GPU_TUI_SHARE_LOGS=0\nEnvironment=\"SLURM_GPU_TUI_STATE_DIR=/state/a b%%q\"\nEnvironment=SLURM_GPU_TUI_SLACK_BOT_TOKEN=PRIVATE_TOKEN\n";
+        let values = inherited_settings(raw, Role::Master)
+            .unwrap()
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(values["SLURM_GPU_TUI_AGENT_DIR"], "/shared/nodes");
+        assert_eq!(values["SLURM_GPU_TUI_STATE_DIR"], "/state/a b%q");
+        assert_eq!(values["SLURM_GPU_TUI_SHARE_LOGS"], "0");
+        assert_eq!(values["SLURM_GPU_TUI_SHARE_JOB_DETAILS"], "0");
+        assert_eq!(values["SLURM_GPU_TUI_SHARE_SCRIPTS"], "0");
+        assert!(!values.keys().any(|k| k.contains("TOKEN")));
+        assert!(
+            inherited_settings(
+                "Environment=\"SLURM_GPU_TUI_DATA_DIR=unterminated",
+                Role::Master
+            )
+            .is_err()
+        );
+        assert!(
+            inherited_settings("Environment=SLURM_GPU_TUI_STATE_DIR=%h/state", Role::Master)
+                .is_err()
+        );
+    }
     #[test]
     fn units_use_native_paths_and_credential_free_environment() {
         let master = unit(Role::Master, NodeMode::Gpu, Path::new("/opt/sgpu test")).unwrap();

@@ -1,9 +1,29 @@
+<div align="center">
+
 # sgpu
 
-A Rust Slurm GPU operations monitor with a terminal UI, usage accounting,
-wasted-GPU detection, Slack alerts and Prometheus metrics.
+**Your Slurm GPU cluster, at a glance.**
 
-[한국어](docs/README.ko.md)
+A Rust terminal monitor for jobs, GPU waste, usage and alerts.
+
+[![CI](https://github.com/eightmm/slurm-gpu-tui/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/eightmm/slurm-gpu-tui/actions/workflows/test.yml)
+[![Rust](https://img.shields.io/badge/Rust-1.93%2B-CE422B?logo=rust)](https://github.com/eightmm/slurm-gpu-tui/blob/main/Cargo.toml)
+[![Linux](https://img.shields.io/badge/platform-Linux-2D6A4F?logo=linux&logoColor=white)](https://github.com/eightmm/slurm-gpu-tui#build-and-install)
+[![GitHub stars](https://img.shields.io/github/stars/eightmm/slurm-gpu-tui?style=social)](https://github.com/eightmm/slurm-gpu-tui/stargazers)
+
+[Install](#build-and-install) · [Usage](#usage) · [Slack alerts](docs/ALERTS.md) · [한국어](docs/README.ko.md)
+
+</div>
+
+## What you get
+
+| Feature | What you get |
+|---|---|
+| **Cluster visibility** | GPU/CPU telemetry, running jobs, pending work and hardware health |
+| **Less wasted capacity** | Idle, parked and rogue GPU detection, plus per-user GPU-hours |
+| **Job inspection** | History, scripts, log tails and confirmed cancellation of your own jobs |
+| **Alerts and metrics** | Slack daily threads, owner-only failure DMs and Prometheus textfiles |
+| **Push-only collection** | Independent node publishers; missing results stay visibly unavailable |
 
 ## Build and install
 
@@ -13,8 +33,9 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/refs/heads/ma
 
 Install on the master as root. Linux, git and a C compiler are required; the
 installer prepares Rust when needed. The first build may take several minutes.
-Run the same command to upgrade. Existing state and Slack configuration are
-preserved. After installation, users simply run `sgpu`.
+Run the same command to upgrade. Existing installation paths, service settings,
+state and Slack configuration are preserved. Check `sgpu --version` after
+installation; the current version is **2.0.1**. Users simply run `sgpu`.
 
 Configure each node's publisher and the shared directory using the
 [node setup guide](docs/PUSH.md). Nodes publish results to a shared filesystem;
@@ -67,3 +88,10 @@ sensitive output; confirm who may read them before enabling sharing.
 Operational scripts live in `scripts/`, implementation in `src/` and checks
 in `tests/`. Run `bash scripts/check.sh` for formatting, clippy, tests and
 shell checks.
+
+## Support sgpu
+
+If sgpu saves you time on your cluster, [give it a star](https://github.com/eightmm/slurm-gpu-tui)
+so you can find it again. Bug reports and focused improvements are welcome through
+[issues](https://github.com/eightmm/slurm-gpu-tui/issues) and
+[pull requests](https://github.com/eightmm/slurm-gpu-tui/pulls).

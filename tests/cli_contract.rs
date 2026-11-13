@@ -158,7 +158,7 @@ fn successful(output: Output) -> String {
 #[test]
 fn cli_commands_use_local_published_state_and_preserve_personal_cpu_jobs() {
     let fixture = Fixture::new();
-    assert!(successful(fixture.run(&["--version"])).contains("2.0.0"));
+    assert!(successful(fixture.run(&["--version"])).contains(sgpu::VERSION));
     assert!(successful(fixture.run(&["--once"])).contains("gpu1"));
     let snapshot: Snapshot = serde_json::from_str(&successful(fixture.run(&["--json"]))).unwrap();
     assert_eq!(snapshot.nodes.len(), 1);

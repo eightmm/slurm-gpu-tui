@@ -127,8 +127,14 @@ unit. Credentials stay in the private Slack configuration.
 
 For a source checkout, use `sudo bash scripts/install.sh`; `scripts/deploy.sh`
 runs the required gate before the local installation. Both require root.
-The default prefix is `/opt/sgpu`; `SGPU_INSTALL_DIR` overrides it. Source and
-prebuilt binaries must match the host architecture and C library. Upgrades
-keep previous releases and persistent state; failed activation attempts roll
-back the current release and service configuration. `--no-service` prepares
+The installer reuses a recognized existing installation, including the previous
+Python installation's directory and service settings. A fresh installation uses
+`/opt/sgpu`; `SGPU_INSTALL_DIR` overrides it. Explicit settings in the installing
+environment override inherited service settings. Existing Slack configuration,
+state and the old environment are retained. Check `sgpu --version` to confirm
+that the native command is active (currently **2.0.1**).
+
+Source and prebuilt binaries must match the host architecture and C library.
+Upgrades keep previous releases and persistent state; failed activation attempts
+roll back the current release and service configuration. `--no-service` prepares
 files only and still requires root.
