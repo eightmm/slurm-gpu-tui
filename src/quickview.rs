@@ -3,7 +3,32 @@ use crate::{
     process::{self, Program},
     rules, runtime, scheduler,
 };
-use std::{cmp::Ordering, collections::BTreeMap, path::PathBuf, time::Duration};
+use crossterm::style::Stylize;
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+    io::IsTerminal,
+    path::PathBuf,
+    time::Duration,
+};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+#[derive(Clone, Copy, Default, clap::ValueEnum)]
+pub enum ColorMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+impl ColorMode {
+    fn enabled(self, terminal: bool, no_color: bool, dumb: bool) -> bool {
+        match self {
+            Self::Auto => terminal && !no_color && !dumb,
+            Self::Always => true,
+            Self::Never => false,
+        }
+    }
+}
 
 #[derive(Clone, Default)]
 pub struct Inventory {
@@ -23,7 +48,7 @@ pub struct Allocation {
 pub fn parse_inventory(raw: &str, cpu: &str) -> BTreeMap<String, Inventory> {
     let mut out = BTreeMap::<String, Inventory>::new();
     let mut partitions = BTreeMap::<String, Vec<String>>::new();
-    let mut members = BTreeMap::<String, Vec<String>>::new();
+    let mut members = BTreeMap::<String, BTreeSet<String>>::new();
     for line in raw.lines() {
         let p: Vec<_> = line.split('|').map(str::trim).collect();
         if p.len() != 4 {
@@ -41,7 +66,7 @@ pub fn parse_inventory(raw: &str, cpu: &str) -> BTreeMap<String, Inventory> {
         if !parts.iter().any(|p| p == part) {
             parts.push(part.into());
         }
-        members.entry(part.into()).or_default().push(name.into());
+        members.entry(part.into()).or_default().insert(name.into());
     }
     let gpu_only: Vec<_> = members
         .iter()
@@ -51,7 +76,16 @@ pub fn parse_inventory(raw: &str, cpu: &str) -> BTreeMap<String, Inventory> {
     for (name, parts) in partitions {
         out.get_mut(&name).unwrap().partition = parts
             .iter()
-            .find(|p| gpu_only.contains(p))
+            .filter(|p| gpu_only.contains(p))
+            .min_by_key(|p| {
+                let lower = p.to_ascii_lowercase();
+                let cpu = lower == "cpu"
+                    || lower == "cpuonly"
+                    || lower.starts_with("cpu_")
+                    || lower.starts_with("cpu-");
+                // Prefer a dedicated GPU partition over a broad CPU/default alias.
+                (cpu, members[*p].len())
+            })
             .or_else(|| parts.first())
             .cloned()
             .unwrap_or_default();
@@ -198,11 +232,102 @@ fn sum(rows: &BTreeMap<String, BTreeMap<String, u32>>, node: &str) -> u64 {
         .map(|r| *r.get(node).unwrap_or(&0) as u64)
         .sum()
 }
+#[derive(Clone, Copy)]
+enum Tone {
+    Normal,
+    Muted,
+    Heading,
+    Mine,
+    Good,
+    Busy,
+    Alert,
+    Bold,
+}
+struct Presentation {
+    color: bool,
+    width: usize,
+    user: String,
+}
+impl Presentation {
+    fn paint(&self, text: &str, tone: Tone) -> String {
+        if !self.color {
+            return text.into();
+        }
+        match tone {
+            Tone::Normal => text.to_string(),
+            Tone::Muted => text.dark_grey().to_string(),
+            Tone::Heading => text.cyan().bold().to_string(),
+            Tone::Mine => text.green().bold().to_string(),
+            Tone::Good => text.green().to_string(),
+            Tone::Busy => text.yellow().to_string(),
+            Tone::Alert => text.red().bold().to_string(),
+            Tone::Bold => text.bold().to_string(),
+        }
+    }
+    fn user(&self, user: &str) -> (String, Tone) {
+        if user == self.user && !user.is_empty() {
+            (format!("{user} *"), Tone::Mine)
+        } else {
+            (user.into(), Tone::Normal)
+        }
+    }
+    fn resource(&self, label: &str, used: u64, total: u64) -> String {
+        let fraction = if total > 0 {
+            used as f64 / total as f64
+        } else {
+            0.0
+        };
+        let filled = (fraction.clamp(0.0, 1.0) * 12.0).round() as usize;
+        let tone = allocation_tone(used, total);
+        format!(
+            "{label} [{}{}]  {}\n",
+            self.paint(&"━".repeat(filled), tone),
+            self.paint(&"·".repeat(12 - filled), Tone::Muted),
+            self.paint(&format!("{used}/{total} ({:.0}%)", fraction * 100.0), tone)
+        )
+    }
+}
+fn allocation_tone(used: u64, total: u64) -> Tone {
+    if total == 0 {
+        Tone::Muted
+    } else if used >= total {
+        Tone::Alert
+    } else if used as f64 / total as f64 >= 0.75 {
+        Tone::Busy
+    } else {
+        Tone::Good
+    }
+}
+fn cell(raw: &str, width: usize, right: bool) -> String {
+    let safe: String = raw.chars().filter(|c| !c.is_control()).collect();
+    let mut text = String::new();
+    let clipped = safe.width() > width;
+    let mut remaining = width.saturating_sub(usize::from(clipped));
+    for c in safe.chars() {
+        let size = c.width().unwrap_or(0);
+        if size > remaining {
+            break;
+        }
+        text.push(c);
+        remaining -= size;
+    }
+    if clipped {
+        text.push('…');
+    }
+    let padding = " ".repeat(width.saturating_sub(text.width()));
+    if right {
+        format!("{padding}{text}")
+    } else {
+        format!("{text}{padding}")
+    }
+}
+#[derive(Clone, Copy)]
 struct TableContext<'a> {
     inventory: &'a BTreeMap<String, Inventory>,
     gpu: bool,
     ends: &'a BTreeMap<String, f64>,
     now: f64,
+    view: &'a Presentation,
 }
 fn table(
     out: &mut String,
@@ -217,102 +342,140 @@ fn table(
         gpu,
         ends,
         now,
+        view,
     } = context;
     if nodes.is_empty() {
         return;
     }
     let width = nodes
         .iter()
-        .map(|s| s.len() + 2)
+        .map(|s| s.width() + 2)
         .max()
         .unwrap_or(9)
-        .clamp(9, 40);
-    out.push_str(&format!("\n─── {title} ───\n{:>13}|", "Part"));
-    for node in nodes {
-        let partition = &inventory[node].partition;
-        let short = if partition.len() < width {
-            partition.clone()
+        .clamp(9, 24);
+    let columns = (view.width.saturating_sub(26) / (width + 3)).max(1);
+    let pages = nodes.len().div_ceil(columns);
+    for (page, nodes) in nodes.chunks(columns).enumerate() {
+        let label = if pages > 1 {
+            format!("{title} · {}/{pages}", page + 1)
         } else {
-            partition
-                .split('_')
-                .next()
-                .unwrap_or(partition)
-                .chars()
-                .take(width - 2)
-                .collect::<String>()
-        };
-        out.push_str(&format!("{short:>width$}|"));
-    }
-    out.push_str("     Total\n");
-    out.push_str(&format!("{:>13}|", "User"));
-    for node in nodes {
-        let mark = if ["down", "drain"]
-            .iter()
-            .any(|s| inventory[node].state.to_lowercase().contains(s))
-        {
-            "!"
-        } else {
-            ""
+            title.into()
         };
         out.push_str(&format!(
-            "{:>width$}|",
-            format!("{}{mark}", node.to_uppercase())
+            "\n{}\n",
+            view.paint(&format!("── {label}"), Tone::Heading)
         ));
-    }
-    out.push_str("     Total\n");
-    for user in users {
-        let total = rows
-            .get(user)
-            .map(|r| {
-                nodes
+        let separator = view.paint(" │ ", Tone::Muted);
+        let rule = view.paint(
+            &format!(
+                "{}─┼─{}─┼─{}\n",
+                "─".repeat(13),
+                vec!["─".repeat(width); nodes.len()].join("─┼─"),
+                "─".repeat(10)
+            ),
+            Tone::Muted,
+        );
+        for (label, partition) in [("Partition", true), ("User", false)] {
+            out.push_str(&view.paint(&cell(label, 13, false), Tone::Heading));
+            out.push_str(&separator);
+            for node in nodes {
+                let warning = ["down", "drain", "fail"]
                     .iter()
-                    .filter_map(|node| r.get(node))
-                    .map(|n| *n as u64)
-                    .sum::<u64>()
-            })
-            .unwrap_or(0);
-        if total == 0 {
-            continue;
+                    .any(|s| inventory[node].state.to_lowercase().contains(s));
+                let text = if partition {
+                    inventory[node].partition.clone()
+                } else {
+                    format!("{}{}", node.to_uppercase(), if warning { "!" } else { "" })
+                };
+                out.push_str(&view.paint(
+                    &cell(&text, width, true),
+                    if warning {
+                        Tone::Alert
+                    } else if partition {
+                        Tone::Muted
+                    } else {
+                        Tone::Heading
+                    },
+                ));
+                out.push_str(&separator);
+            }
+            out.push_str(&view.paint(
+                &cell(if partition { "" } else { "Total" }, 10, true),
+                Tone::Heading,
+            ));
+            out.push('\n');
         }
-        out.push_str(&format!("{:>13}|", cli::terminal_safe(user)));
-        for node in nodes {
-            let value = rows
+        out.push_str(&rule);
+        for user in users {
+            let total = rows
                 .get(user)
-                .and_then(|r| r.get(node))
-                .copied()
-                .filter(|v| *v > 0)
-                .map(|v| v.to_string())
-                .unwrap_or_default();
-            out.push_str(&format!("{value:>width$}|"));
+                .map(|r| {
+                    nodes
+                        .iter()
+                        .filter_map(|node| r.get(node))
+                        .map(|n| *n as u64)
+                        .sum::<u64>()
+                })
+                .unwrap_or(0);
+            if total == 0 {
+                continue;
+            }
+            let (label, tone) = view.user(user);
+            out.push_str(&view.paint(&cell(&label, 13, false), tone));
+            out.push_str(&separator);
+            for node in nodes {
+                let value = rows
+                    .get(user)
+                    .and_then(|r| r.get(node))
+                    .copied()
+                    .filter(|v| *v > 0)
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                out.push_str(&view.paint(&cell(&value, width, true), tone));
+                out.push_str(&separator);
+            }
+            out.push_str(&view.paint(&cell(&total.to_string(), 10, true), Tone::Bold));
+            out.push('\n');
         }
-        out.push_str(&format!("{total:>10}\n"));
-    }
-    out.push_str(&format!("{:>13}|", "Total"));
-    let mut used = 0;
-    let mut capacity = 0u64;
-    for node in nodes {
-        let allocated = sum(rows, node);
-        let total = if gpu {
-            inventory[node].gpus
-        } else {
-            inventory[node].cpus
-        };
-        used += allocated;
-        capacity += total as u64;
-        out.push_str(&format!("{:>width$}|", format!("{allocated}/{total}")));
-    }
-    out.push_str(&format!("{used}/{capacity}\n"));
-    if gpu && nodes.iter().any(|n| ends.contains_key(n)) {
-        out.push_str(&format!("{:>13}|", "Next free"));
+        out.push_str(&rule);
+        out.push_str(&view.paint(&cell("Allocated", 13, false), Tone::Bold));
+        out.push_str(&separator);
+        let (mut used, mut capacity) = (0, 0u64);
         for node in nodes {
-            let value = ends
-                .get(node)
-                .filter(|_| sum(rows, node) > 0)
-                .map(|end| eta(*end, now))
-                .unwrap_or_default();
-            out.push_str(&format!("{value:>width$}|"));
+            let allocated = sum(rows, node);
+            let total = if gpu {
+                inventory[node].gpus
+            } else {
+                inventory[node].cpus
+            } as u64;
+            used += allocated;
+            capacity += total;
+            out.push_str(&view.paint(
+                &cell(&format!("{allocated}/{total}"), width, true),
+                allocation_tone(allocated, total),
+            ));
+            out.push_str(&separator);
         }
+        out.push_str(&view.paint(
+            &cell(&format!("{used}/{capacity}"), 10, true),
+            allocation_tone(used, capacity),
+        ));
         out.push('\n');
+        if gpu && nodes.iter().any(|n| ends.contains_key(n)) {
+            out.push_str(&view.paint(&cell("Next free ~", 13, false), Tone::Muted));
+            out.push_str(&separator);
+            for node in nodes {
+                let value = ends
+                    .get(node)
+                    .filter(|_| sum(rows, node) > 0)
+                    .map(|end| eta(*end, now))
+                    .unwrap_or_default();
+                out.push_str(&view.paint(&cell(&value, width, true), Tone::Busy));
+                out.push_str(&separator);
+            }
+            out.push_str(&cell("", 10, true));
+            out.push('\n');
+        }
     }
 }
 
@@ -320,6 +483,23 @@ pub fn render(
     inventory: &BTreeMap<String, Inventory>,
     allocation: &Allocation,
     now: f64,
+) -> String {
+    render_with(
+        inventory,
+        allocation,
+        now,
+        &Presentation {
+            color: false,
+            width: 100,
+            user: String::new(),
+        },
+    )
+}
+fn render_with(
+    inventory: &BTreeMap<String, Inventory>,
+    allocation: &Allocation,
+    now: f64,
+    view: &Presentation,
 ) -> String {
     let mut gpu_nodes: Vec<_> = inventory
         .iter()
@@ -346,6 +526,7 @@ pub fn render(
             gpu: true,
             ends: &allocation.ends,
             now,
+            view,
         },
     );
     for (category, label) in [
@@ -377,15 +558,20 @@ pub fn render(
                 gpu: false,
                 ends: &BTreeMap::new(),
                 now,
+                view,
             },
         );
     }
     if !allocation.pending.is_empty() {
-        out.push_str("\n─── Pending jobs ───\n");
+        out.push_str(&format!(
+            "\n{}\n",
+            view.paint("── Pending jobs", Tone::Heading)
+        ));
         for user in ordered(&allocation.pending) {
             let row = &allocation.pending[&user];
             out.push_str(&format!(
-                "{user:>13}: {} ({})\n",
+                "{}: {} ({})\n",
+                view.paint(&cell(&view.user(&user).0, 13, false), view.user(&user).1),
                 row.values().map(|n| *n as u64).sum::<u64>(),
                 row.iter()
                     .map(|(p, n)| format!("{}:{n}", cli::terminal_safe(p)))
@@ -404,7 +590,30 @@ pub fn render(
         .map(|n| sum(&allocation.cpu, n))
         .sum::<u64>();
     let cpu_total = inventory.values().map(|n| n.cpus as u64).sum::<u64>();
-    out.push_str(&format!("\nGPU {gpu_used}/{gpu_total} ({:.0}%)   CPU {cpu_used}/{cpu_total} ({:.0}%)\nAllocation, not measured utilization. Next free is an estimated job end, not a reservation.\n",if gpu_total>0{gpu_used as f64/gpu_total as f64*100.0}else{0.0},if cpu_total>0{cpu_used as f64/cpu_total as f64*100.0}else{0.0}));
+    let timestamp = chrono::DateTime::from_timestamp(now as i64, 0)
+        .map(|t| {
+            t.with_timezone(&chrono::Local)
+                .format("%Y/%m/%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_default();
+    let mut header = format!(
+        "\n{}\n{}\n\n",
+        view.paint("sgpu · cluster allocation", Tone::Heading),
+        view.paint(&timestamp, Tone::Muted)
+    );
+    header.push_str(&view.resource("GPU", gpu_used, gpu_total));
+    header.push_str(&view.resource("CPU", cpu_used, cpu_total));
+    header.push_str(&out);
+    out = header;
+    for note in [
+        "Allocation, not measured utilization.",
+        "Next free ~ estimates a job end.",
+        "It is not a reservation. * marks your jobs.",
+    ] {
+        out.push_str(&view.paint(note, Tone::Muted));
+        out.push('\n');
+    }
     out
 }
 
@@ -479,7 +688,7 @@ fn conf_fallback(inventory: &mut BTreeMap<String, Inventory>) {
     }
 }
 
-pub fn run() -> Result<()> {
+pub fn run(color: ColorMode) -> Result<()> {
     let (queue, nodes, cpu) = std::thread::scope(|scope| {
         let queue = scope.spawn(|| {
             process::run(
@@ -518,9 +727,27 @@ pub fn run() -> Result<()> {
     if inventory.is_empty() {
         return Err("no scheduler nodes found".into());
     }
+    let color = color.enabled(
+        std::io::stdout().is_terminal(),
+        std::env::var_os("NO_COLOR").is_some(),
+        std::env::var("TERM").is_ok_and(|v| v == "dumb"),
+    );
+    crossterm::style::force_color_output(color);
     print!(
         "{}",
-        render(&inventory, &parse_allocations(&queue), runtime::now())
+        render_with(
+            &inventory,
+            &parse_allocations(&queue),
+            runtime::now(),
+            &Presentation {
+                color,
+                width: crossterm::terminal::size()
+                    .map(|s| s.0 as usize)
+                    .unwrap_or(100)
+                    .max(40),
+                user: cli::current_user(),
+            }
+        )
     );
     Ok(())
 }
@@ -528,6 +755,67 @@ pub fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gpu_partition_labels_prefer_dedicated_members_over_cpu_aliases() {
+        let lines = [
+            "gpu1|idle|gpu:8|cpu_only*",
+            "gpu2|idle|gpu:8|cpu_only*",
+            "gpu1|idle|gpu:8|heavy",
+            "gpu2|idle|gpu:8|heavy",
+            "gpu3|idle|gpu:4|heavy",
+            "gpu1|idle|gpu:8|6000ada",
+            "gpu2|idle|gpu:8|6000ada",
+        ];
+        for raw in [
+            lines.join("\n"),
+            lines.into_iter().rev().collect::<Vec<_>>().join("\n"),
+        ] {
+            let inventory = parse_inventory(&raw, "");
+            assert_eq!(inventory["gpu1"].partition, "6000ada");
+            assert_eq!(inventory["gpu2"].partition, "6000ada");
+            assert_eq!(inventory["gpu3"].partition, "heavy");
+        }
+    }
+    #[test]
+    fn terminal_colors_respect_pipes_opt_out_and_explicit_overrides() {
+        assert!(ColorMode::Auto.enabled(true, false, false));
+        assert!(!ColorMode::Auto.enabled(false, false, false));
+        assert!(!ColorMode::Auto.enabled(true, true, false));
+        assert!(!ColorMode::Auto.enabled(true, false, true));
+        assert!(ColorMode::Always.enabled(false, true, true));
+        assert!(!ColorMode::Never.enabled(true, false, false));
+    }
+    #[test]
+    fn narrow_matrices_keep_unicode_cells_aligned_and_never_emit_untrusted_controls() {
+        let inventory = parse_inventory(
+            "gpu[invalid]|idle|gpu:8|gpu\ngpu1|idle|gpu:8|long-partition\ngpu2|drain|gpu:8|gpu\ngpu3|idle|gpu:8|gpu",
+            "gpu1|0/64/0/64\ngpu2|0/64/0/64\ngpu3|0/64/0/64",
+        );
+        let allocation =
+            parse_allocations("42|gpu|사용자이름이매우김|RUNNING|00:01|64|gpu:4|N/A|gpu[1-3]");
+        let plain = render_with(
+            &inventory,
+            &allocation,
+            0.0,
+            &Presentation {
+                color: false,
+                width: 50,
+                user: String::new(),
+            },
+        );
+        assert!(!plain.contains('\x1b'));
+        assert!(plain.contains("GPU allocation · 1/"));
+        assert!(plain.contains("GPU2!"));
+        for line in plain
+            .lines()
+            .filter(|line| line.contains('│') || line.contains('┼'))
+        {
+            assert!(line.width() <= 50, "{}: {line}", line.width());
+            assert!([38, 50].contains(&line.width()));
+        }
+        assert_eq!(cell("가나다라마바사", 9, false).width(), 9);
+        assert_eq!(cell("bad\x1b\n\tname", 12, false), "badname     ");
+    }
     #[test]
     fn multi_node_gpu_counts_cpu_remainder_and_pending_are_distinct() {
         let allocation = parse_allocations(

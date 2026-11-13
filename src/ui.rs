@@ -11,7 +11,10 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Tabs, Wrap},
+    widgets::{
+        Block, BorderType, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, TableState, Tabs,
+        Wrap,
+    },
 };
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -20,6 +23,99 @@ use std::{
     sync::mpsc::{self, Receiver, SyncSender},
     time::{Duration, Instant},
 };
+
+const BACKGROUND: Color = Color::Rgb(13, 17, 23);
+const PANEL: Color = Color::Rgb(22, 27, 34);
+const BORDER: Color = Color::Rgb(48, 58, 70);
+const TEXT: Color = Color::Rgb(220, 225, 232);
+const MUTED: Color = Color::Rgb(145, 155, 170);
+
+fn panel(title: &str) -> Block<'_> {
+    Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(BORDER))
+        .title_style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(PANEL).fg(TEXT))
+}
+fn gpu_mark(class: Class) -> (&'static str, &'static str, Color) {
+    match class {
+        Class::Busy => ("●", "busy", Color::Cyan),
+        Class::Free => ("○", "free", Color::Green),
+        Class::Idle => ("!", "idle", Color::Yellow),
+        Class::Parked => ("◇", "parked", Color::Magenta),
+        Class::Rogue => ("×", "rogue", Color::Red),
+        Class::Unknown => ("?", "unknown", MUTED),
+    }
+}
+fn mini_meter(value: Option<f64>) -> String {
+    let Some(value) = value.filter(|v| v.is_finite() && *v >= 0.0) else {
+        return "?".into();
+    };
+    let filled = (value.clamp(0.0, 100.0) / 20.0).round() as usize;
+    format!(
+        "{}{} {value:>3.0}%",
+        "━".repeat(filled),
+        "·".repeat(5 - filled)
+    )
+}
+
+#[derive(Default)]
+struct Meter {
+    used: f64,
+    capacity: f64,
+    samples: usize,
+    total: usize,
+}
+impl Meter {
+    fn push(&mut self, reading: Option<(f64, f64)>) {
+        self.total += 1;
+        if let Some((used, capacity)) =
+            reading.filter(|(u, t)| u.is_finite() && *u >= 0.0 && t.is_finite() && *t > 0.0)
+        {
+            self.used += used;
+            self.capacity += capacity;
+            self.samples += 1;
+        }
+    }
+    fn value(&self) -> Option<f64> {
+        (self.samples > 0)
+            .then(|| self.used / self.capacity * 100.0)
+            .filter(|v| v.is_finite())
+    }
+    fn label(&self) -> String {
+        self.value()
+            .map(|value| {
+                format!(
+                    "{}{value:.0}% · {}/{}",
+                    if self.samples < self.total { "~" } else { "" },
+                    self.samples,
+                    self.total
+                )
+            })
+            .unwrap_or_else(|| "? unavailable".into())
+    }
+    fn draw(&self, frame: &mut Frame, area: Rect, name: &str, color: Color) {
+        let columns = Layout::horizontal([Constraint::Length(9), Constraint::Min(1)]).split(area);
+        frame.render_widget(
+            Paragraph::new(name).style(Style::default().fg(MUTED)),
+            columns[0],
+        );
+        frame.render_widget(
+            Gauge::default()
+                .ratio(self.value().unwrap_or(0.0).clamp(0.0, 100.0) / 100.0)
+                .label(self.label())
+                .use_unicode(true)
+                .gauge_style(
+                    Style::default()
+                        .fg(if self.value().is_some() { color } else { MUTED })
+                        .bg(BACKGROUND),
+                ),
+            columns[1],
+        );
+    }
+}
 
 #[derive(Clone)]
 pub struct Pane {
@@ -420,6 +516,7 @@ impl App {
         }
         if !self.initialized && !data.nodes.is_empty() {
             self.initialized = true;
+            self.status = "Snapshot loaded · ↑/↓ select · Space fold · t trend".into();
             if data.nodes.iter().filter(|n| n.has_gpu).count()
                 >= runtime::env_seconds("SLURM_GPU_TUI_AUTO_COLLAPSE_NODES", 12.0, 0.0) as usize
             {
@@ -564,26 +661,71 @@ impl App {
                     } else {
                         "▼"
                     };
+                    let mut group_util = Meter::default();
+                    let mut group_vram = Meter::default();
+                    for (gpu, class) in node.gpus.iter().zip(&classes) {
+                        if self.gpu_visible(node, gpu, *class) {
+                            group_util.push(
+                                (!node.stale)
+                                    .then(|| number(&gpu.util).map(|v| (v, 100.0)))
+                                    .flatten(),
+                            );
+                            group_vram.push(
+                                (!node.stale)
+                                    .then(|| number(&gpu.mem_used).zip(number(&gpu.mem_total)))
+                                    .flatten(),
+                            );
+                        }
+                    }
+                    let util = if group_util.samples < group_util.total {
+                        group_util
+                            .value()
+                            .map(|v| format!("~{v:.0}%"))
+                            .unwrap_or_else(|| "?".into())
+                    } else {
+                        mini_meter(group_util.value())
+                    };
+                    let vram = group_vram
+                        .value()
+                        .map(|_| {
+                            format!(
+                                "{}{:.0}/{:.0}G",
+                                if group_vram.samples < group_vram.total {
+                                    "~"
+                                } else {
+                                    ""
+                                },
+                                group_vram.used / 1024.0,
+                                group_vram.capacity / 1024.0
+                            )
+                        })
+                        .unwrap_or_else(|| "?".into());
+                    let resources = format!(
+                        "{model} · CPU {}/{} · RAM {}",
+                        node.cpu_alloc,
+                        node.cpus,
+                        if node.stale { "?".into() } else { ram(node) }
+                    );
                     let mut header = if self.compact {
                         vec![
                             format!("{fold} {}", node.name),
-                            state.into(),
-                            ram(node),
-                            model,
+                            util,
+                            vram,
+                            resources,
                             format!("free {free}"),
                             if node.stale {
                                 "STALE".into()
                             } else {
-                                String::new()
+                                state.into()
                             },
                         ]
                     } else {
                         vec![
                             format!("{fold} {}", node.name),
                             state.into(),
-                            format!("C {}/{}", node.cpu_alloc, node.cpus),
-                            ram(node),
-                            model,
+                            util,
+                            vram,
+                            resources,
                             format!("free {free}"),
                             if node.stale {
                                 "STALE".into()
@@ -621,11 +763,10 @@ impl App {
                         } else {
                             gpu.users.join(",")
                         };
-                        let util = number(&gpu.util)
-                            .map(|u| format!("{u:.0}%"))
-                            .unwrap_or_else(|| "?".into());
+                        let util = mini_meter((!node.stale).then(|| number(&gpu.util)).flatten());
                         let vram = number(&gpu.mem_used)
                             .zip(number(&gpu.mem_total))
+                            .filter(|(u, t)| !node.stale && *u >= 0.0 && *t > 0.0)
                             .map(|(u, t)| format!("{:.1}/{:.0}G", u / 1024.0, t / 1024.0))
                             .unwrap_or_else(|| "?".into());
                         let left = job
@@ -654,7 +795,7 @@ impl App {
                         };
                         let mut cells = if self.compact {
                             vec![
-                                format!("  GPU{}", gpu.index),
+                                format!(" {} GPU{}", gpu_mark(class).0, gpu.index),
                                 util,
                                 vram,
                                 label,
@@ -663,7 +804,7 @@ impl App {
                             ]
                         } else {
                             vec![
-                                format!("  GPU{}", gpu.index),
+                                format!(" {} GPU{}", gpu_mark(class).0, gpu.index),
                                 gpu.name.clone(),
                                 util,
                                 vram,
@@ -683,14 +824,15 @@ impl App {
                         let style = Style::default().fg(match class {
                             Class::Rogue => Color::Red,
                             Class::Idle => Color::Yellow,
-                            Class::Parked => Color::Blue,
-                            Class::Unknown => Color::DarkGray,
+                            Class::Parked => Color::Magenta,
+                            Class::Unknown => MUTED,
+                            Class::Free => Color::Green,
                             _ => Color::White,
                         });
                         let style = if gpu.alloc_user == self.current_user
                             || gpu.users.contains(&self.current_user)
                         {
-                            style.bg(Color::Rgb(26, 26, 58)).fg(Color::Cyan)
+                            style.bg(Color::Rgb(22, 35, 50)).fg(gpu_mark(class).2)
                         } else {
                             style
                         };
@@ -795,11 +937,7 @@ impl App {
                                 node.state.clone()
                             },
                             format!("{}/{}", node.cpu_alloc, node.cpus),
-                            if fresh && !node.cpu_util.is_empty() {
-                                format!("{}%", node.cpu_util)
-                            } else {
-                                "?".into()
-                            },
+                            mini_meter(fresh.then(|| number(&node.cpu_util)).flatten()),
                             ram(node),
                             node.cpu_load.clone(),
                             psi,
@@ -953,29 +1091,198 @@ impl App {
             })
             .collect()
     }
+    fn draw_dashboard(&self, frame: &mut Frame, area: Rect) {
+        if area.height < 3 || area.width < 50 {
+            return;
+        }
+        let now = runtime::now();
+        let mut gpu_util = Meter::default();
+        let mut vram = Meter::default();
+        let mut cpu = Meter::default();
+        let mut memory = Meter::default();
+        let mut mapped = Vec::new();
+        for node in &self.data.nodes {
+            let visible: Vec<_> = node
+                .gpus
+                .iter()
+                .zip(rules::classes(node, now))
+                .filter(|(gpu, class)| self.gpu_visible(node, gpu, *class))
+                .collect();
+            for (gpu, _) in &visible {
+                let fresh = !node.stale && node.observed_at > 0.0;
+                gpu_util.push(
+                    fresh
+                        .then(|| number(&gpu.util).map(|v| (v, 100.0)))
+                        .flatten(),
+                );
+                vram.push(
+                    fresh
+                        .then(|| number(&gpu.mem_used).zip(number(&gpu.mem_total)))
+                        .flatten(),
+                );
+            }
+            if node.has_gpu && !visible.is_empty() {
+                mapped.push((node, visible));
+            }
+            let included = if self.tab == 0 {
+                mapped.last().is_some_and(|(n, _)| n.name == node.name)
+            } else {
+                self.node_visible(node)
+                    && (self.user_filter().is_empty()
+                        || node.jobs.iter().any(|j| j.user == self.user_filter()))
+            };
+            if !included {
+                continue;
+            }
+            let fresh = !node.stale && rules::telemetry_fresh(node.telemetry_observed_at, now);
+            cpu.push(
+                fresh
+                    .then(|| {
+                        number(&node.cpu_util)
+                            .zip(number(&node.cpus))
+                            .map(|(u, c)| (u * c / 100.0, c))
+                    })
+                    .flatten(),
+            );
+            let ram = (!node.stale && node.observed_at > 0.0)
+                .then(|| {
+                    let total = number(&node.mem_total)?;
+                    let used = number(&node.mem_used).or_else(|| {
+                        number(&node.mem_avail)
+                            .or_else(|| number(&node.mem_free))
+                            .map(|v| (total - v).max(0.0))
+                    })?;
+                    Some((used, total))
+                })
+                .flatten();
+            memory.push(ram);
+        }
+        let columns =
+            Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).split(area);
+        let resources = panel(" Resources · visible / ~ partial ");
+        let inner = resources.inner(columns[0]);
+        frame.render_widget(resources, columns[0]);
+        let meters = Layout::vertical([Constraint::Length(1); 4]).split(inner);
+        for (index, (name, meter, color)) in [
+            ("GPU util", &gpu_util, Color::Cyan),
+            ("VRAM", &vram, Color::Magenta),
+            ("CPU busy", &cpu, Color::Green),
+            ("RAM used", &memory, Color::Blue),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            meter.draw(frame, meters[index], name, color);
+        }
+        let selected = self.selected().map(|r| r.node.as_str()).unwrap_or("");
+        let capacity = columns[1].height.saturating_sub(2) as usize;
+        let selected_index = mapped
+            .iter()
+            .position(|(n, _)| n.name == selected)
+            .unwrap_or(0);
+        let start = selected_index
+            .saturating_sub(capacity / 2)
+            .min(mapped.len().saturating_sub(capacity));
+        let title = format!(
+            " GPU map · {}–{}/{} nodes ",
+            if mapped.is_empty() { 0 } else { start + 1 },
+            (start + capacity).min(mapped.len()),
+            mapped.len()
+        );
+        let map = panel(&title);
+        let inner = map.inner(columns[1]);
+        frame.render_widget(map, columns[1]);
+        let lines = mapped
+            .iter()
+            .skip(start)
+            .take(capacity)
+            .map(|(node, gpus)| {
+                let name = cli::terminal_safe(&node.name)
+                    .chars()
+                    .take(10)
+                    .collect::<String>();
+                let mut spans = vec![Span::styled(
+                    format!(
+                        "{} {name:<10} ",
+                        if node.name == selected { "▸" } else { " " }
+                    ),
+                    Style::default().fg(if node.stale { Color::Yellow } else { TEXT }),
+                )];
+                let room = inner.width.saturating_sub(24) as usize;
+                for (_, class) in gpus.iter().take(room) {
+                    let (mark, _, color) = gpu_mark(*class);
+                    spans.push(Span::styled(
+                        mark,
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ));
+                }
+                if gpus.len() > room {
+                    spans.push(Span::styled("…", Style::default().fg(MUTED)));
+                }
+                let free = gpus.iter().filter(|(_, c)| *c == Class::Free).count();
+                spans.push(Span::styled(
+                    format!(" {free}/{} free", gpus.len()),
+                    Style::default().fg(if node.stale { Color::Yellow } else { MUTED }),
+                ));
+                Line::from(spans)
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(if lines.is_empty() {
+                vec![Line::from("No GPU matches these filters")]
+            } else {
+                lines
+            }),
+            inner,
+        );
+    }
     pub fn draw(&mut self, frame: &mut Frame) {
         let compact = frame.area().width < 130;
         if compact != self.compact {
             self.compact = compact;
             self.rebuild();
         }
+        frame.render_widget(
+            Block::default().style(Style::default().fg(TEXT).bg(BACKGROUND)),
+            frame.area(),
+        );
+        let dashboard_height = if frame.area().height >= 20 && frame.area().width >= 70 {
+            6
+        } else {
+            0
+        };
         let areas = Layout::vertical([
             Constraint::Length(1),
-            Constraint::Length(if self.trend { 4 } else { 2 }),
+            Constraint::Length(dashboard_height),
+            Constraint::Length(if self.trend { 6 } else { 3 }),
             Constraint::Min(3),
-            Constraint::Length(if self.searching { 3 } else { 2 }),
+            Constraint::Length(2),
         ])
         .split(frame.area());
+        let heading =
+            Layout::horizontal([Constraint::Length(9), Constraint::Min(1)]).split(areas[0]);
+        frame.render_widget(
+            Paragraph::new(" ▰ sgpu ").style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            heading[0],
+        );
         frame.render_widget(
             Tabs::new(["1 GPU", "2 CPU", "3 Usage", "4 Jobs"])
                 .select(self.tab)
+                .style(Style::default().fg(MUTED))
+                .divider(Span::styled(" │ ", Style::default().fg(BORDER)))
                 .highlight_style(
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(BACKGROUND)
+                        .bg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ),
-            areas[0],
+            heading[1],
         );
+        self.draw_dashboard(frame, areas[1]);
         let mut free = 0;
         let mut total = 0;
         for node in &self.data.nodes {
@@ -987,11 +1294,22 @@ impl App {
             }
         }
         let fresh = self.data.nodes.iter().filter(|n| !n.stale).count();
-        let summary = format!(
-            "GPU {free}/{total} FREE · jobs {} · pending {} · fresh {fresh}/{} · user={} partition={} sort={}{}\n{}{}",
-            self.data.jobs.len(),
-            self.data.pending.len(),
-            self.data.nodes.len(),
+        let mut summary = vec![Line::from(vec![
+            Span::styled(
+                format!("GPU {free}/{total} FREE"),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                " · cluster: {} running · {} pending · {fresh}/{} nodes fresh",
+                self.data.jobs.len(),
+                self.data.pending.len(),
+                self.data.nodes.len()
+            )),
+        ])];
+        let scope = format!(
+            "user={} partition={} sort={}{}",
             if self.user_filter().is_empty() {
                 "all"
             } else {
@@ -1003,27 +1321,44 @@ impl App {
                 &self.partition
             },
             ["node", "util", "user", "free"][self.sort],
-            if self.reverse { " ↓" } else { "" },
-            if self.data.errors.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "Scheduler unavailable: {} ",
-                    cli::terminal_safe(&self.data.errors)
-                )
-            },
-            if self.trend {
-                format!(
-                    "\n5m GPU% {} VRAM% {} W {} · = unknown",
-                    self.spark(0),
-                    self.spark(1),
-                    self.spark(2)
-                )
-            } else {
-                String::new()
-            }
+            if self.reverse { " ↓" } else { "" }
         );
-        frame.render_widget(Paragraph::new(summary).wrap(Wrap { trim: false }), areas[1]);
+        summary.push(Line::styled(scope, Style::default().fg(MUTED)));
+        if self.data.errors.is_empty() {
+            summary.push(Line::from(vec![
+                Span::styled("● busy ", Style::default().fg(Color::Cyan)),
+                Span::styled("○ free ", Style::default().fg(Color::Green)),
+                Span::styled("! idle ", Style::default().fg(Color::Yellow)),
+                Span::styled("◇ parked ", Style::default().fg(Color::Magenta)),
+                Span::styled("× rogue ", Style::default().fg(Color::Red)),
+                Span::styled("? unknown", Style::default().fg(MUTED)),
+            ]));
+        } else {
+            summary.push(Line::styled(
+                format!(
+                    "Scheduler unavailable: {}",
+                    cli::terminal_safe(&self.data.errors)
+                ),
+                Style::default().fg(Color::Red),
+            ));
+        }
+        if self.trend {
+            summary.extend([
+                Line::styled(
+                    format!("5m GPU% {}", self.spark(0)),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Line::styled(
+                    format!("VRAM% {}", self.spark(1)),
+                    Style::default().fg(Color::Magenta),
+                ),
+                Line::styled(
+                    format!("GPU W {} · = unknown", self.spark(2)),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]);
+        }
+        frame.render_widget(Paragraph::new(summary), areas[2]);
         if self.tab == 2 {
             let body = self
                 .usage
@@ -1033,72 +1368,152 @@ impl App {
                     "No usage data yet. Start the collector to record usage.".into()
                 });
             let paragraph = Paragraph::new(cli::terminal_safe(&body))
-                .block(
-                    Block::default()
-                        .title(" GPU-hours · observation coverage ")
-                        .borders(Borders::ALL),
-                )
+                .block(panel(" GPU-hours · observation coverage "))
                 .wrap(Wrap { trim: false });
             let max = paragraph
-                .line_count(areas[2].width)
-                .saturating_sub(areas[2].height as usize)
+                .line_count(areas[3].width)
+                .saturating_sub(areas[3].height as usize)
                 .min(u16::MAX as usize) as u16;
             self.usage_scroll = self.usage_scroll.min(max);
-            frame.render_widget(paragraph.scroll((self.usage_scroll, 0)), areas[2]);
+            frame.render_widget(paragraph.scroll((self.usage_scroll, 0)), areas[3]);
         } else {
-            let widths: Vec<_> = self
-                .headers
+            let visible_columns: Vec<usize> = match self.tab {
+                1 if frame.area().width < 110 => vec![0, 1, 2, 3, 4, 7],
+                3 if frame.area().width < 110 => vec![0, 1, 2, 3, 7, 9],
+                3 if frame.area().width < 140 => vec![0, 1, 2, 3, 4, 5, 7, 9],
+                0 if self.details => {
+                    let base = if self.compact { 6 } else { 7 };
+                    let reserve = if self.compact { 78 } else { 112 };
+                    let extra = (frame.area().width.saturating_sub(reserve) / 13).min(4) as usize;
+                    (0..(base + extra)).collect()
+                }
+                _ => (0..self.headers.len()).collect(),
+            };
+            let widths: Vec<_> = visible_columns
                 .iter()
-                .enumerate()
-                .map(|(i, _)| {
+                .copied()
+                .map(|i| {
                     if self.tab == 0 {
+                        if self.compact {
+                            match i {
+                                0 => Constraint::Length(12),
+                                1 => Constraint::Length(10),
+                                2 => Constraint::Length(12),
+                                3 => Constraint::Min(12),
+                                4 => Constraint::Length(7),
+                                _ => Constraint::Length(10),
+                            }
+                        } else {
+                            match i {
+                                0 => Constraint::Length(15),
+                                1 => Constraint::Length(20),
+                                2 => Constraint::Length(10),
+                                3 => Constraint::Length(14),
+                                4 => Constraint::Min(18),
+                                5 => Constraint::Length(8),
+                                _ => Constraint::Length(12),
+                            }
+                        }
+                    } else if self.tab == 1 {
                         match i {
-                            0 => Constraint::Length(17),
-                            1 if !self.compact => Constraint::Length(20),
-                            i if i == self.headers.len() - 1 => Constraint::Min(12),
-                            _ => Constraint::Length(if self.compact { 12 } else { 15 }),
+                            0 => Constraint::Length(12),
+                            1 => Constraint::Length(9),
+                            2 => Constraint::Length(10),
+                            3 => Constraint::Length(10),
+                            4 => Constraint::Length(13),
+                            _ => Constraint::Min(8),
                         }
                     } else {
-                        Constraint::Min(if i == 0 { 12 } else { 10 })
+                        match i {
+                            0 => Constraint::Length(10),
+                            1 => Constraint::Length(12),
+                            2 => Constraint::Length(8),
+                            3 => Constraint::Length(15),
+                            4..=6 => Constraint::Length(9),
+                            7 => Constraint::Length(10),
+                            8 => Constraint::Length(15),
+                            _ => Constraint::Min(12),
+                        }
                     }
                 })
                 .collect();
-            let rows = self.rows.iter().map(|row| {
+            let rows = self.rows.iter().enumerate().map(|(index, row)| {
                 Row::new(
-                    row.cells
+                    visible_columns
                         .iter()
+                        .filter_map(|i| row.cells.get(*i))
                         .map(|s| Cell::from(cli::terminal_safe(s).replace('\n', " "))),
                 )
-                .style(row.style)
+                .style(
+                    Style::default()
+                        .bg(if index % 2 == 0 { BACKGROUND } else { PANEL })
+                        .patch(row.style),
+                )
             });
             let table = Table::new(rows, widths)
                 .header(
-                    Row::new(self.headers.clone()).style(
+                    Row::new(
+                        visible_columns
+                            .iter()
+                            .filter_map(|i| self.headers.get(*i))
+                            .cloned(),
+                    )
+                    .style(
                         Style::default()
                             .fg(Color::Cyan)
+                            .bg(PANEL)
                             .add_modifier(Modifier::BOLD),
                     ),
                 )
                 .column_spacing(1)
-                .row_highlight_style(Style::default().bg(Color::Rgb(40, 50, 60)))
-                .block(Block::default().borders(Borders::TOP));
-            frame.render_stateful_widget(table, areas[2], &mut self.table);
+                .row_highlight_style(
+                    Style::default()
+                        .bg(Color::Rgb(36, 55, 76))
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol("▸ ")
+                .block(panel(match self.tab {
+                    0 => " GPUs · Space fold · Enter inspect ",
+                    1 => " Nodes · measured CPU / RAM ",
+                    _ => " Jobs · ? unavailable · ~ partial coverage ",
+                }));
+            frame.render_stateful_widget(table, areas[3], &mut self.table);
         }
         let footer = if self.searching {
-            format!(
-                "Search: {}▏\nEnter apply · Esc clear",
-                cli::terminal_safe(&self.search)
-            )
+            vec![
+                Line::styled(
+                    format!("Search: {}▏", cli::terminal_safe(&self.search)),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Line::from("Enter apply · Esc clear"),
+            ]
         } else {
-            format!(
-                "{}\n? help · / search · Enter detail · s sort · u user · p partition · r refresh · q quit",
-                cli::terminal_safe(&self.status)
-            )
+            let mut keys = Vec::new();
+            for (key, label) in [
+                ("?", "Help"),
+                ("/", "Search"),
+                ("↵", "Detail"),
+                ("s", "Sort"),
+                ("u", "User"),
+                ("p", "Part"),
+                ("r", "Refresh"),
+                ("q", "Quit"),
+            ] {
+                keys.push(Span::styled(
+                    format!(" {key} "),
+                    Style::default()
+                        .bg(BORDER)
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                keys.push(Span::styled(format!("{label} "), Style::default().fg(TEXT)));
+            }
+            vec![
+                Line::styled(cli::terminal_safe(&self.status), Style::default().fg(MUTED)),
+                Line::from(keys),
+            ]
         };
-        frame.render_widget(
-            Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
-            areas[3],
-        );
+        frame.render_widget(Paragraph::new(footer), areas[4]);
         if let Some(popup) = &mut self.popup {
             draw_popup(frame, popup);
         }
@@ -1734,13 +2149,85 @@ pub fn run() -> Result<i32> {
     result
 }
 
-const HELP: &str = "1/2/3/4  GPU / CPU / Usage / Jobs\ng Usage · v pending · t 5-minute trend\nr refresh published data\ns sort: node → utilization → user → free · S reverse\nu user filter (me first) · p partition · m my jobs · i free GPUs\nd detail columns · Space fold node · z fold/unfold all\n/ search node/user/job · Esc clear search\nj/k or arrows move cursor\nEnter job/node detail · Tab info/script/stdout/stderr\nw wasted GPUs · f free capacity by model/VRAM\nh my recent job history · Enter history details\nn watch any job for start/end\nx cancel my own job (confirmation required)\ne export JSON · ? help · q quit\n\nUnknown/stale observations are not free capacity.\nJobs: ? unavailable; ~ partial coverage. RAM includes cgroup cache.\nSummed per-node memory peaks are not a simultaneous whole-job peak.\nPending start times and capacity are estimates, not scheduler guarantees.\nPSI is pressure, not a diagnosis. GPU power caps alone are informational.\n\nNode results are push-only. Missing agents stay stale; the master never polls or repairs nodes.";
+const HELP: &str = "1/2/3/4  GPU / CPU / Usage / Jobs\ng Usage · v pending · t 5-minute trend\nr refresh published data\ns sort: node → utilization → user → free · S reverse\nu user filter (me first) · p partition · m my jobs · i free GPUs\nd detail columns · Space fold node · z fold/unfold all\n/ search node/user/job · Esc clear search\nj/k or arrows move cursor\nEnter job/node detail · Tab info/script/stdout/stderr\nw wasted GPUs · f free capacity by model/VRAM\nh my recent job history · Enter history details\nn watch any job for start/end\nx cancel my own job (confirmation required)\ne export JSON · ? help · q quit\n\nUnknown/stale observations are not free capacity.\nMeters show measured usage: GPU/VRAM sample GPUs; CPU/RAM sample nodes.\n~ means partial sampling; ? means no fresh observation. CPU is node-wide.\nJobs: ? unavailable; ~ partial coverage. RAM includes cgroup cache.\nSummed per-node memory peaks are not a simultaneous whole-job peak.\nPending start times and capacity are estimates, not scheduler guarantees.\nPSI is pressure, not a diagnosis. GPU power caps alone are informational.\n\nNode results are push-only. Missing agents stay stale; the master never polls or repairs nodes.";
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::Gpu;
     use ratatui::{Terminal, backend::TestBackend};
+    #[test]
+    fn meters_keep_unknown_distinct_from_zero_and_bound_only_the_graph() {
+        let mut meter = Meter::default();
+        meter.push(None);
+        assert_eq!(meter.value(), None);
+        assert_eq!(meter.label(), "? unavailable");
+        meter.push(Some((0.0, 100.0)));
+        assert_eq!(meter.value(), Some(0.0));
+        assert_eq!(meter.label(), "~0% · 1/2");
+        assert_eq!(mini_meter(None), "?");
+        assert_eq!(mini_meter(Some(f64::NAN)), "?");
+        assert!(mini_meter(Some(0.0)).contains("0%"));
+        assert!(mini_meter(Some(125.0)).contains("125%"));
+        let mut terminal = Terminal::new(TestBackend::new(40, 1)).unwrap();
+        meter.push(Some((250.0, 100.0)));
+        terminal
+            .draw(|frame| meter.draw(frame, frame.area(), "GPU", Color::Cyan))
+            .unwrap();
+    }
+    #[test]
+    fn dashboard_excludes_stale_samples_and_preserves_selection_on_resize() {
+        let now = runtime::now();
+        let fresh = Node {
+            name: "gpu1".into(),
+            state: "idle".into(),
+            observed_at: now,
+            telemetry_observed_at: now,
+            cpu_util: "20".into(),
+            cpus: "8".into(),
+            mem_total: "100".into(),
+            mem_used: "50".into(),
+            gpus: vec![Gpu {
+                index: "0".into(),
+                util: "0".into(),
+                mem_used: "0".into(),
+                mem_total: "100".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut stale = fresh.clone();
+        stale.name = "gpu2".into();
+        stale.stale = true;
+        stale.cpu_util = "100".into();
+        stale.mem_used = "100".into();
+        stale.gpus[0].util = "100".into();
+        stale.gpus[0].mem_used = "100".into();
+        let mut app = App::for_user("fixture".into());
+        app.apply(Snapshot {
+            nodes: vec![fresh, stale],
+            ..Default::default()
+        });
+        app.table.select(Some(1));
+        let selected = app.selected().unwrap().key.clone();
+        for width in [80, 160, 100] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+            terminal.draw(|f| app.draw(f)).unwrap();
+            assert_eq!(app.selected().unwrap().key, selected);
+            let text = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(text.contains("GPU 1/2 FREE"));
+            assert!(text.contains("~0% · 1/2"));
+            assert!(text.contains("~20% · 1/2"));
+            assert!(text.contains("~50% · 1/2"));
+            assert!(text.contains("? unknown"));
+        }
+    }
     #[test]
     fn all_four_tabs_render_at_narrow_and_wide_widths() {
         let mut app = App::new();
@@ -1758,7 +2245,7 @@ mod tests {
             }],
             ..Default::default()
         });
-        for width in [80, 160] {
+        for width in [80, 120, 160] {
             let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
             for tab in [0, 1, 2, 3] {
                 app.tab = tab;
@@ -1771,6 +2258,16 @@ mod tests {
                         .content
                         .iter()
                         .any(|c| c.symbol() == "G")
+                );
+                let text = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect::<String>();
+                assert!(
+                    text.contains(["Node / GPU", "CPU alloc", "GPU-hours", "Req GPU/CPU/RAM"][tab])
                 );
             }
         }

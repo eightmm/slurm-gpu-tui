@@ -19,7 +19,7 @@ A Rust terminal monitor for jobs, GPU waste, usage and alerts.
 
 | Feature | What you get |
 |---|---|
-| **Cluster visibility** | GPU/CPU telemetry, running jobs, pending work and hardware health |
+| **Cluster visibility** | Live GPU/CPU/RAM meters, per-node GPU state maps and keyboard-driven job tables |
 | **Less wasted capacity** | Idle, parked and rogue GPU detection, plus per-user GPU-hours |
 | **Job inspection** | History, scripts, log tails and confirmed cancellation of your own jobs |
 | **Alerts and metrics** | Slack daily threads, owner-only failure DMs and Prometheus textfiles |
@@ -35,7 +35,7 @@ Install on the master as root. Linux, git and a C compiler are required; the
 installer prepares Rust when needed. The first build may take several minutes.
 Run the same command to upgrade. Existing installation paths, service settings,
 state and Slack configuration are preserved. Check `sgpu --version` after
-installation; the current version is **2.0.1**. Users simply run `sgpu`.
+installation; the current version is **2.0.2**. Users simply run `sgpu`.
 
 Configure each node's publisher and the shared directory using the
 [node setup guide](docs/PUSH.md). Nodes publish results to a shared filesystem;
@@ -53,7 +53,7 @@ sgpu usage 7 --daily     # GPU-hours
 sgpu jobs 7              # Job history
 sgpu logs 12345 -e -f    # Follow stderr
 sgpu doctor             # Collection and configuration checks
-chkgpu                  # User × node allocations
+chkgpu                  # Colored user × node allocation matrix
 ```
 
 | Key | Action |
@@ -65,6 +65,10 @@ chkgpu                  # User × node allocations
 | `w` / `f` / `h` | Waste / capacity / job history |
 | `n` / `x` | Watch a job / confirm cancellation of my job |
 | `?` / `q` | Full help / quit |
+
+`sgpu` opens a live dashboard with resource meters, GPU state symbols and sortable
+tables. `chkgpu` automatically uses color in terminals; pipes stay plain. Use
+`chkgpu --color always` or `--color never` to override, or set `NO_COLOR`.
 
 `?` means unavailable and `~` means partial coverage. Stale data never counts
 as free GPUs. Capacity and estimated start times do not guarantee admission

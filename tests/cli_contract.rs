@@ -212,6 +212,42 @@ fn invalid_input_is_rejected_and_private_logs_cannot_follow_symlinks() {
     assert!(!fixture.run(&[]).status.success());
 }
 
+#[test]
+fn chkgpu_colors_are_opt_in_for_pipes_and_remain_explicitly_controllable() {
+    let fixture = Fixture::new();
+    for (name, body) in [
+        (
+            "squeue",
+            "echo '42|gpu|alice|RUNNING|00:01|8|gpu:2|N/A|gpu1'",
+        ),
+        (
+            "sinfo",
+            "case \"$*\" in *'%N|%C'*) echo 'gpu1|8/8/0/16';; *) echo 'gpu1|idle|gpu:4|gpu';; esac",
+        ),
+    ] {
+        let path = fixture.bin.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let run = |args: &[&str]| {
+        successful(
+            Command::new(env!("CARGO_BIN_EXE_chkgpu"))
+                .args(args)
+                .env("PATH", &fixture.bin)
+                .env("HOME", fixture.root.path())
+                .env("TERM", "xterm-256color")
+                .env("NO_COLOR", "1")
+                .output()
+                .unwrap(),
+        )
+    };
+    let plain = run(&[]);
+    assert!(!plain.contains('\x1b'));
+    assert!(plain.contains("GPU allocation") && plain.contains("2/4 (50%)"));
+    assert!(run(&["--color", "always"]).contains("\x1b[38;"));
+    assert!(!run(&["--color", "never"]).contains('\x1b'));
+}
+
 struct ChildGuard(Child);
 impl Drop for ChildGuard {
     fn drop(&mut self) {
