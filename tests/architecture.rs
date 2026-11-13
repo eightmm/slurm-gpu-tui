@@ -60,12 +60,11 @@ fn application_tree_has_no_python_runtime_or_node_request_entrypoint() {
         }
     }
     for name in [
-        "install.sh",
-        "deploy.sh",
+        "scripts/install.sh",
+        "scripts/deploy.sh",
         "bootstrap.sh",
-        "uninstall.sh",
-        "setup-node-power.sh",
-        "chkgpu",
+        "scripts/uninstall.sh",
+        "scripts/setup-node-power.sh",
     ] {
         let text = fs::read_to_string(root.join(name)).unwrap();
         for denied in [
@@ -82,7 +81,6 @@ fn maintained_docs_have_resolvable_local_links_and_no_removed_setup() {
     let pattern = regex::Regex::new(r"\[[^\]]*\]\(([^)]+)\)").unwrap();
     for name in [
         "README.md",
-        "README_ko.md",
         "docs/PUSH.md",
         "docs/ALERTS.md",
         "docs/METRICS.md",

@@ -9,12 +9,13 @@ for arg in "$@"; do
     case "$arg" in
         --no-build) BUILD=0 ;;
         -h|--help)
-            echo "usage: curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/main/bootstrap.sh | bash -s -- [install options]"
+            echo "usage: curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/refs/heads/main/bootstrap.sh | sudo bash -s -- [install options]"
             echo "Options: --role master|node --mode gpu|cpu --prefix PATH --no-service --no-build"
             echo "Requires Linux, git and a C compiler. Missing Rust is installed with rustup (SGPU_INSTALL_RUST=0 disables this)."
             exit 0 ;;
     esac
 done
+[ "$(id -u)" = 0 ] || { echo "Install as root: curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/refs/heads/main/bootstrap.sh | sudo bash" >&2; exit 1; }
 case "$SOURCE" in
     /|*/../*|*/..|../*|..|[!/]*) echo "SGPU_SOURCE_DIR must be an absolute dedicated directory" >&2; exit 1 ;;
 esac
@@ -68,4 +69,4 @@ if [ -d "$SOURCE/.git" ]; then
 else
     git clone --quiet --depth 1 --branch main --single-branch "$REPOSITORY" "$SOURCE" </dev/null
 fi
-exec bash "$SOURCE/install.sh" "$@"
+exec bash "$SOURCE/scripts/install.sh" "$@"

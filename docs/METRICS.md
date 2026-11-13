@@ -28,8 +28,46 @@ not converted to zero. GPU RAM/node RAM use MiB, power W, clocks MHz. The defaul
 per-job pending cap is 100 (`SLURM_GPU_TUI_METRICS_PENDING_MAX`); the aggregate
 pending count remains uncapped. Source log paths and credentials are excluded.
 
-Load [sgpu-alerts.yml](../prometheus/sgpu-alerts.yml) into the site's Prometheus
-configuration for stale/missing collector heartbeat and requested RAM exceeding
-GPU fair share. Validate with `promtool check rules prometheus/sgpu-alerts.yml`
-when promtool is installed. External heartbeat alerts complement collector Slack
-notifications because a stopped collector cannot notify about itself.
+An existing Prometheus can load these alert rules. External heartbeat alerts
+complement collector Slack notifications because a stopped collector cannot
+notify about itself. Validate the site's rule file with `promtool check rules`.
+
+```yaml
+groups:
+  - name: sgpu
+    rules:
+      - alert: SgpuCollectorStale
+        expr: time() - sgpu_collector_last_success_timestamp_seconds > 90
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: sgpu collector data is stale
+          description: >-
+            The sgpu collector has not published a successful snapshot for
+            more than 90 seconds. Check sgpu-collector and its journal.
+
+      - alert: SgpuCollectorMetricMissing
+        expr: absent(sgpu_collector_last_success_timestamp_seconds)
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: sgpu collector metric is missing
+          description: >-
+            Prometheus cannot see the sgpu collector heartbeat. Check the
+            node_exporter scrape target and its textfile collector path.
+
+      - alert: JobMemOverFairShare
+        expr: sgpu_job_mem_fair_ratio > 1.0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "job {{ $labels.jobid }} ({{ $labels.user }}) holds RAM beyond its GPU share"
+          description: >-
+            Job {{ $labels.jobid }} by {{ $labels.user }} on
+            {{ $labels.node }} requests {{ $value }}x the RAM its
+            {{ $labels.gpus }} GPU(s) entitle it to (node RAM divided by
+            node GPU count). Other GPU users on that node may be starved.
+```

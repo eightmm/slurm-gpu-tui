@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build and install native binaries on this host only.
 set -euo pipefail
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD=1
 ARGS=()
 for arg in "$@"; do
@@ -14,6 +14,7 @@ for arg in "$@"; do
         *) ARGS+=("$arg") ;;
     esac
 done
+[ "$(id -u)" = 0 ] || { echo "Run this installer as root (sudo bash scripts/install.sh)" >&2; exit 1; }
 BIN_DIR="${SGPU_BIN_DIR:-$REPO/target/release}"
 if [ "$BUILD" = 1 ]; then
     command -v cargo >/dev/null || { echo "Rust 1.93+ is required to build; use --no-build with SGPU_BIN_DIR for prebuilt binaries" >&2; exit 1; }

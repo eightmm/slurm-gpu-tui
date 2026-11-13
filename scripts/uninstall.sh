@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Remove only the selected local role; preserve data and shared payloads.
 set -euo pipefail
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ "$(id -u)" = 0 ] || { echo "Run this command as root" >&2; exit 1; }
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PREFIX="${SGPU_INSTALL_DIR:-}"
 if [ -n "$PREFIX" ] && [ -x "$PREFIX/bin/sgpu-install" ]; then
     INSTALLER="$PREFIX/bin/sgpu-install"

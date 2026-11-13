@@ -32,8 +32,8 @@ impl Fixture {
 case "$1" in
     clone)
         for destination do :; done
-        mkdir -p "$destination/.git"
-        cp "$BOOT_INSTALL_SCRIPT" "$destination/install.sh" ;;
+        mkdir -p "$destination/.git" "$destination/scripts"
+        cp "$BOOT_INSTALL_SCRIPT" "$destination/scripts/install.sh" ;;
     -C)
         case "$3" in
             status) if [ -f "$BOOT_TEST/dirty" ]; then echo ' M local-edit'; fi ;;
@@ -75,6 +75,16 @@ printf 'rustup <%s>\n' "$@" >> "$BOOT_TEST/calls"
 "#,
         )
         .unwrap();
+        fixture.program("id", "echo 0");
+        let binaries = fixture.root.path().join("prebuilt");
+        fs::create_dir(&binaries).unwrap();
+        let installer = binaries.join("sgpu-install");
+        fs::write(
+            &installer,
+            "#!/bin/sh\nprintf 'installer <%s>\\n' \"$@\" >> \"$BOOT_TEST/calls\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(installer, fs::Permissions::from_mode(0o755)).unwrap();
         fixture
     }
     fn program(&self, name: &str, body: &str) {
@@ -94,15 +104,10 @@ printf 'rustup <%s>\n' "$@" >> "$BOOT_TEST/calls"
             .env("BOOT_TEST", self.root.path())
             .env(
                 "BOOT_INSTALL_SCRIPT",
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"),
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh"),
             )
             .env("SGPU_SOURCE_DIR", &self.source)
-            .env(
-                "SGPU_BIN_DIR",
-                Path::new(env!("CARGO_BIN_EXE_sgpu-install"))
-                    .parent()
-                    .unwrap(),
-            )
+            .env("SGPU_BIN_DIR", self.root.path().join("prebuilt"))
             .env("SLURM_GPU_TUI_AGENT_DIR", self.root.path().join("agents"));
         command
     }
@@ -144,7 +149,7 @@ fn success(output: Output) {
 }
 
 #[test]
-fn piped_bootstrap_clones_main_builds_and_installs_native_files() {
+fn piped_bootstrap_clones_main_builds_and_invokes_the_installer() {
     let fixture = Fixture::new();
     success(fixture.run(&[], true));
     let calls = fixture.calls();
@@ -158,12 +163,14 @@ fn piped_bootstrap_clones_main_builds_and_installs_native_files() {
         assert!(calls.contains(flag), "missing {flag}: {calls}");
     }
     assert!(!calls.contains("curl "));
-    assert!(fixture.prefix.join("bin/sgpu-agent").is_file());
-    assert!(
-        fs::read_to_string(fixture.prefix.join("units/sgpu-agent.service"))
-            .unwrap()
-            .contains("--mode cpu")
-    );
+    for flag in [
+        "installer <install>",
+        "installer <--no-service>",
+        "installer <node>",
+        "installer <cpu>",
+    ] {
+        assert!(calls.contains(flag), "{calls}");
+    }
     assert!(!fixture.root.path().join("agents").exists());
     assert!(!fixture.root.path().join(".profile").exists());
 }
@@ -235,5 +242,20 @@ fn dirty_source_is_preserved_and_help_has_no_installation_side_effects() {
     assert!(!fixture.run(&["--no-build"], false).status.success());
     assert!(!fixture.calls().contains("git <reset>"));
     assert!(!fixture.calls().contains("git <merge>"));
+    assert!(!fixture.prefix.exists());
+}
+
+#[test]
+fn nonroot_bootstrap_fails_before_network_build_or_configuration() {
+    if runtime::euid() == 0 {
+        return;
+    }
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.commands.join("id")).unwrap();
+    let output = fixture.run(&[], true);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Install as root"));
+    assert!(fixture.calls().is_empty());
+    assert!(!fixture.source.exists());
     assert!(!fixture.prefix.exists());
 }

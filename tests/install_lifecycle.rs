@@ -56,6 +56,7 @@ fn success(output: Output) {
 }
 
 #[test]
+#[ignore = "requires root; scripts/check.sh runs these with sudo when available"]
 fn native_upgrades_role_removal_and_missing_artifacts_preserve_data() {
     let root = tempfile::tempdir().unwrap();
     runtime::secure_dir(root.path(), 0o700).unwrap();
@@ -117,6 +118,7 @@ fn native_upgrades_role_removal_and_missing_artifacts_preserve_data() {
     assert!(!root.path().join(".profile").exists());
 }
 #[test]
+#[ignore = "requires root; scripts/check.sh runs these with sudo when available"]
 fn failed_upgrade_rolls_back_partial_links_and_unit_changes() {
     let root = tempfile::tempdir().unwrap();
     runtime::secure_dir(root.path(), 0o700).unwrap();
@@ -145,6 +147,7 @@ fn failed_upgrade_rolls_back_partial_links_and_unit_changes() {
     );
 }
 #[test]
+#[ignore = "requires root; scripts/check.sh runs these with sudo when available"]
 fn installer_rejects_unsafe_prefixes_and_preserves_private_config_keys() {
     let root = tempfile::tempdir().unwrap();
     runtime::secure_dir(root.path(), 0o700).unwrap();
@@ -192,175 +195,25 @@ fn installer_rejects_unsafe_prefixes_and_preserves_private_config_keys() {
 }
 
 #[test]
-fn nonroot_background_install_starts_and_uninstalls_only_its_local_collector() {
+fn nonroot_installer_rejects_install_remove_and_slack_changes_before_writes() {
     if runtime::euid() == 0 {
-        eprintln!("background user-install test requires a nonroot account");
         return;
     }
     let root = tempfile::tempdir().unwrap();
-    runtime::secure_dir(root.path(), 0o700).unwrap();
     let prefix = root.path().join("app");
-    let commands = root.path().join("commands");
-    fs::create_dir(&commands).unwrap();
-    for (name, body) in [
-        ("systemctl", "exit 1"),
-        (
-            "sinfo",
-            "printf '%s\\n' 'cpu1|idle|8|0|65536|60000|(null)|0/0/8/8|cpu'",
-        ),
-        ("squeue", "exit 0"),
-        ("scontrol", "printf '%s\\n' '{\"jobs\":[]}'"),
-        ("ssh", "exit 97"),
-        ("scp", "exit 97"),
+    for args in [
+        vec![
+            "install",
+            "--no-service",
+            "--prefix",
+            prefix.to_str().unwrap(),
+        ],
+        vec!["uninstall"],
+        vec!["slack-config"],
     ] {
-        let path = commands.join(name);
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        let output = run(root.path(), &args);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("require root"));
     }
-    let invoke = |action: &str| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sgpu-install"));
-        command.args([
-            action,
-            "--prefix",
-            prefix.to_str().unwrap(),
-            "--role",
-            "master",
-        ]);
-        if action == "install" {
-            command.args(["--bin-dir", source().to_str().unwrap()]);
-        }
-        command
-            .env("HOME", root.path())
-            .env("PATH", &commands)
-            .env("SLURM_GPU_TUI_DATA_DIR", root.path().join("data"))
-            .env("SLURM_GPU_TUI_STATE_DIR", root.path().join("state"))
-            .env("SLURM_GPU_TUI_AGENT_DIR", root.path().join("agents"))
-            .env(
-                "SLURM_GPU_TUI_SLACK_CONFIG",
-                root.path().join("disabled.json"),
-            )
-            .env("SLURM_GPU_TUI_SACCT_SEC", "0")
-            .env("SGPU_SHARE_LOGS", "0")
-            .env("SGPU_SHARE_JOB_DETAILS", "0")
-            .env_remove("SGPU_SLACK_BOT_TOKEN");
-        command.output().unwrap()
-    };
-    struct Guard {
-        binary: PathBuf,
-        data: PathBuf,
-    }
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            let _ = Command::new(&self.binary)
-                .arg("--stop")
-                .env("SLURM_GPU_TUI_DATA_DIR", &self.data)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
-    }
-    let _guard = Guard {
-        binary: prefix.join("bin/sgpu-collector"),
-        data: root.path().join("data"),
-    };
-    success(invoke("install"));
-    assert!(runtime::lock_is_held(&root.path().join("data/collector.lock")).unwrap());
-    assert!(
-        fs::read_to_string(root.path().join(".profile"))
-            .unwrap()
-            .contains("# sgpu native")
-    );
-    success(invoke("uninstall"));
-    assert!(!runtime::lock_is_held(&root.path().join("data/collector.lock")).unwrap());
-    assert!(root.path().join("state").exists());
-    assert!(
-        !fs::read_to_string(root.path().join(".profile"))
-            .unwrap()
-            .contains("# sgpu native")
-    );
-}
-
-#[test]
-fn user_service_failure_restores_the_previous_release_unit_and_running_state() {
-    if runtime::euid() == 0 {
-        eprintln!("user-service test requires a nonroot account");
-        return;
-    }
-    let root = tempfile::tempdir().unwrap();
-    runtime::secure_dir(root.path(), 0o700).unwrap();
-    let prefix = root.path().join("app");
-    let commands = root.path().join("commands");
-    fs::create_dir(&commands).unwrap();
-    let script = r#"#!/bin/sh
-set -eu
-[ "${1:-}" != --user ] || shift
-printf '%s\n' "$*" >> "$SGPU_TEST_SYSTEMCTL/calls"
-case "$1" in
-    show-environment|daemon-reload) exit 0 ;;
-    is-enabled) [ -f "$SGPU_TEST_SYSTEMCTL/enabled" ] ;;
-    is-active) [ -f "$SGPU_TEST_SYSTEMCTL/active" ] ;;
-    enable) : > "$SGPU_TEST_SYSTEMCTL/enabled" ;;
-    restart)
-        if [ -f "$SGPU_TEST_SYSTEMCTL/fail-once" ]; then /bin/rm "$SGPU_TEST_SYSTEMCTL/fail-once"; exit 1; fi
-        : > "$SGPU_TEST_SYSTEMCTL/active" ;;
-    disable) /bin/rm -f "$SGPU_TEST_SYSTEMCTL/enabled"; case "$*" in *--now*) /bin/rm -f "$SGPU_TEST_SYSTEMCTL/active";; esac ;;
-    stop) /bin/rm -f "$SGPU_TEST_SYSTEMCTL/active" ;;
-    *) exit 99 ;;
-esac
-"#;
-    let systemctl = commands.join("systemctl");
-    fs::write(&systemctl, script).unwrap();
-    fs::set_permissions(systemctl, fs::Permissions::from_mode(0o755)).unwrap();
-    let invoke = |action: &str| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sgpu-install"));
-        command.args([
-            action,
-            "--role",
-            "master",
-            "--prefix",
-            prefix.to_str().unwrap(),
-        ]);
-        if action == "install" {
-            command.args(["--bin-dir", source().to_str().unwrap()]);
-        }
-        command
-            .env("HOME", root.path())
-            .env("PATH", &commands)
-            .env("SGPU_TEST_SYSTEMCTL", root.path())
-            .env("SLURM_GPU_TUI_DATA_DIR", root.path().join("data"))
-            .env("SLURM_GPU_TUI_STATE_DIR", root.path().join("state"))
-            .env("SLURM_GPU_TUI_AGENT_DIR", root.path().join("agents"))
-            .env(
-                "SLURM_GPU_TUI_SLACK_CONFIG",
-                root.path().join("disabled.json"),
-            )
-            .env_remove("SGPU_SLACK_BOT_TOKEN");
-        command.output().unwrap()
-    };
-    success(invoke("install"));
-    let unit = root
-        .path()
-        .join(".config/systemd/user/sgpu-collector.service");
-    let original = fs::read(&unit).unwrap();
-    assert_eq!(
-        fs::metadata(unit.parent().unwrap())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o755
-    );
-    let previous = fs::read_link(prefix.join("current")).unwrap();
-    fs::write(root.path().join("fail-once"), "").unwrap();
-    let failed = invoke("install");
-    assert!(!failed.status.success());
-    assert!(String::from_utf8_lossy(&failed.stderr).contains("previous files restored"));
-    assert_eq!(fs::read(&unit).unwrap(), original);
-    assert_eq!(fs::read_link(prefix.join("current")).unwrap(), previous);
-    assert!(root.path().join("active").is_file());
-    assert!(root.path().join("enabled").is_file());
-    success(invoke("uninstall"));
-    assert!(!unit.exists());
-    assert!(!root.path().join("active").exists());
-    assert!(root.path().join("state").is_dir());
+    assert!(fs::read_dir(root.path()).unwrap().next().is_none());
 }

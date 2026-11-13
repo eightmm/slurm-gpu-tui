@@ -12,6 +12,21 @@ use std::{
     time::Duration,
 };
 
+const PERSISTENCE_UNIT: &[u8] = br#"[Unit]
+Description=Enable NVIDIA GPU persistence mode for sgpu monitoring
+After=nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env nvidia-smi -pm 1
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+"#;
+
 const BINARIES: &[&str] = &[
     "sgpu",
     "sgpu-agent",
@@ -102,11 +117,7 @@ struct Manifest {
 }
 
 fn default_prefix() -> PathBuf {
-    if runtime::euid() == 0 {
-        "/opt/sgpu".into()
-    } else {
-        runtime::home().join(".sgpu/app")
-    }
+    "/opt/sgpu".into()
 }
 fn prefix_path(path: Option<PathBuf>) -> Result<PathBuf> {
     let path = path.unwrap_or_else(default_prefix);
@@ -186,8 +197,8 @@ fn settings(role: Role) -> Vec<(String, String)> {
             runtime::state_dir().to_string_lossy().into_owned(),
         ));
         for (name, default) in [
-            ("SHARE_LOGS", runtime::euid() == 0),
-            ("SHARE_JOB_DETAILS", runtime::euid() == 0),
+            ("SHARE_LOGS", true),
+            ("SHARE_JOB_DETAILS", true),
             ("SHARE_SCRIPTS", false),
         ] {
             let value = std::env::var(format!("SGPU_{name}"))
@@ -249,11 +260,7 @@ fn unit(role: Role, mode: NodeMode, prefix: &Path) -> Result<String> {
         } else {
             "node publisher"
         },
-        if runtime::euid() == 0 {
-            "multi-user.target"
-        } else {
-            "default.target"
-        }
+        "multi-user.target"
     ))
 }
 
@@ -422,26 +429,15 @@ fn stage_files(
 }
 fn systemctl(args: &[&str]) -> Result<()> {
     let mut command = Command::new("systemctl");
-    if runtime::euid() != 0 {
-        command.arg("--user");
-    }
     command.args(args);
     process::capture(&mut command, Duration::from_secs(75), 1024 * 1024)?;
     Ok(())
 }
 fn service_available() -> bool {
-    if runtime::euid() == 0 {
-        Path::new("/run/systemd/system").is_dir()
-    } else {
-        systemctl(&["show-environment"]).is_ok()
-    }
+    Path::new("/run/systemd/system").is_dir()
 }
 fn service_dir() -> PathBuf {
-    if runtime::euid() == 0 {
-        "/etc/systemd/system".into()
-    } else {
-        runtime::home().join(".config/systemd/user")
-    }
+    "/etc/systemd/system".into()
 }
 fn stop_background(prefix: &Path, role: Role) -> Result<()> {
     let mut command = Command::new(prefix.join("bin").join(if role == Role::Master {
@@ -542,7 +538,7 @@ fn apply_service(
             {
                 transaction.write(
                     &destination.join("sgpu-gpu-persistence.service"),
-                    include_bytes!("../sgpu-gpu-persistence.service"),
+                    PERSISTENCE_UNIT,
                     0o644,
                 )?;
                 systemctl(&["daemon-reload"])?;
@@ -561,47 +557,15 @@ fn apply_service(
     Ok(())
 }
 fn path_link(prefix: &Path, transaction: &mut Transaction) -> Result<()> {
-    if runtime::euid() == 0 {
-        let bin = Path::new("/usr/local/bin");
-        for name in BINARIES {
-            let path = bin.join(name);
-            if let Ok(st) = fs::symlink_metadata(&path)
-                && (!st.file_type().is_symlink() || !fs::read_link(&path)?.starts_with(prefix))
-            {
-                return Err(format!("refusing to replace unrelated {}", path.display()).into());
-            }
-            transaction.link(&path, &prefix.join("bin").join(name))?;
+    let bin = Path::new("/usr/local/bin");
+    for name in BINARIES {
+        let path = bin.join(name);
+        if let Ok(st) = fs::symlink_metadata(&path)
+            && (!st.file_type().is_symlink() || !fs::read_link(&path)?.starts_with(prefix))
+        {
+            return Err(format!("refusing to replace unrelated {}", path.display()).into());
         }
-    } else {
-        let file = runtime::home().join(".profile");
-        let existing = match fs::symlink_metadata(&file) {
-            Ok(st) if !st.is_file() || st.uid() != runtime::euid() => {
-                return Err("unsafe shell profile; add sgpu/bin to PATH explicitly".into());
-            }
-            Ok(_) => String::from_utf8(
-                runtime::read_regular(&file, 1024 * 1024, Some(runtime::euid()))?.0,
-            )?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(error) => return Err(error.into()),
-        };
-        let line = format!(
-            "export PATH={}:\"$PATH\" # sgpu native",
-            crate::cli::quote(&prefix.join("bin").to_string_lossy())
-        );
-        if !existing.lines().any(|l| l == line) {
-            let st = fs::symlink_metadata(runtime::home())?;
-            if st.uid() != runtime::euid() || st.mode() & 0o022 != 0 {
-                return Err(
-                    "profile directory writable by other users; add sgpu/bin to PATH explicitly"
-                        .into(),
-                );
-            }
-            transaction.write(
-                &file,
-                format!("{}\n{line}\n", existing.trim_end()).as_bytes(),
-                0o644,
-            )?;
-        }
+        transaction.link(&path, &prefix.join("bin").join(name))?;
     }
     Ok(())
 }
@@ -757,9 +721,9 @@ fn uninstall(prefix: &Path, role: Role, no_service: bool) -> Result<()> {
             fs::remove_file(path)?;
             if role == Role::Node && runtime::euid() == 0 {
                 let path = service_dir().join("sgpu-gpu-persistence.service");
-                if runtime::read_regular(&path, 65536, Some(0)).is_ok_and(|(bytes, _)| {
-                    bytes == include_bytes!("../sgpu-gpu-persistence.service")
-                }) {
+                if runtime::read_regular(&path, 65536, Some(0))
+                    .is_ok_and(|(bytes, _)| bytes == PERSISTENCE_UNIT)
+                {
                     systemctl(&["disable", "--now", "sgpu-gpu-persistence.service"])?;
                     fs::remove_file(path)?;
                 }
@@ -774,25 +738,6 @@ fn uninstall(prefix: &Path, role: Role, no_service: bool) -> Result<()> {
         fs::remove_file(unit)?;
     }
     if record.roles.is_empty() {
-        if !no_service && runtime::euid() != 0 {
-            let profile = runtime::home().join(".profile");
-            if let Ok((bytes, st)) =
-                runtime::read_regular(&profile, 1024 * 1024, Some(runtime::euid()))
-            {
-                let line = format!(
-                    "export PATH={}:\"$PATH\" # sgpu native",
-                    crate::cli::quote(&prefix.join("bin").to_string_lossy())
-                );
-                let content = String::from_utf8(bytes)?;
-                let filtered = content
-                    .lines()
-                    .filter(|l| *l != line)
-                    .collect::<Vec<_>>()
-                    .join("\n")
-                    + "\n";
-                runtime::atomic_write(&profile, filtered.as_bytes(), st.mode() & 0o777, true)?;
-            }
-        }
         for name in BINARIES {
             let path = prefix.join("bin").join(name);
             if fs::read_link(&path).is_ok_and(|p| p == Path::new(&format!("../current/{name}"))) {
@@ -826,6 +771,9 @@ fn uninstall(prefix: &Path, role: Role, no_service: bool) -> Result<()> {
     Ok(())
 }
 pub fn run(args: Args) -> Result<()> {
+    if runtime::euid() != 0 {
+        return Err("installation and configuration require root (sudo)".into());
+    }
     match args.command {
         Action::Install {
             role,

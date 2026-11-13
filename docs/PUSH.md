@@ -12,18 +12,18 @@ the published JSON files need the shared filesystem.
 
 ```bash
 # Master host
-SLURM_GPU_TUI_AGENT_DIR=/nfs/sgpu-nodes bash install.sh --role master
+curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/refs/heads/main/bootstrap.sh | sudo env SLURM_GPU_TUI_AGENT_DIR=/nfs/sgpu-nodes bash -s -- --role master
 
 # Each GPU node, locally
-SLURM_GPU_TUI_AGENT_DIR=/nfs/sgpu-nodes bash install.sh --role node --mode gpu
+curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/refs/heads/main/bootstrap.sh | sudo env SLURM_GPU_TUI_AGENT_DIR=/nfs/sgpu-nodes bash -s -- --role node --mode gpu
 
 # Each CPU-only node, locally
-SLURM_GPU_TUI_AGENT_DIR=/nfs/sgpu-nodes bash install.sh --role node --mode cpu
+curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/refs/heads/main/bootstrap.sh | sudo env SLURM_GPU_TUI_AGENT_DIR=/nfs/sgpu-nodes bash -s -- --role node --mode cpu
 ```
 
 Use `--no-build` and `SGPU_BIN_DIR` for prebuilt binaries. Match the node's
-architecture and C library. Root system units and nonroot user units use
-`sgpu-agent.service`; systems without a service manager use `--daemon`.
+architecture and C library. Installation requires root and uses
+`sgpu-agent.service`; systems without a service manager use a root background daemon.
 The service waits for network/shared mounts, restarts after failure, and receives
 60 seconds to stop. `sgpu-agent --stop` stops only the current user's local
 publisher validated against its lock holder. Configure agent runtime files on
@@ -77,21 +77,58 @@ GPU PID-attributed VRAM is reported separately, with per-metric coverage.
 
 GPU health is capability-gated and cached for at least 10s; topology is cached
 for 300s. Power uses local RAPL and optional `ipmitool`. Run
-`setup-node-power.sh --check` locally for a read-only check, or `--apply` as root
+`scripts/setup-node-power.sh --check` locally for a read-only check, or `--apply` as root
 for local package/module setup. Missing hardware stays unavailable.
 
 ## Diagnosis and removal
 
 Run `sgpu doctor` on the master. On a stale node, locally inspect
 `systemctl status sgpu-agent`, its journal, mount visibility and write permissions.
-For user units add `--user`. Restart or reinstall on that node after fixing the
-cause. The collector does not coordinate recovery.
+Restart or reinstall on that node after fixing the cause. The collector does not coordinate recovery.
 
-Uninstall the local role with `uninstall.sh --role node`; remove the collector
-separately with `--role master`. Usage, shared payloads and previous releases
-remain. Do not delete shared binaries still used by another host's service.
+Uninstall the local role with `sudo sgpu-install uninstall --role node`; remove
+the collector separately with `sudo sgpu-install uninstall --role master`.
+Usage, shared payloads and previous releases remain. Do not delete shared binaries still used by another host's service.
 
 References: [cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html),
 [PSI](https://docs.kernel.org/accounting/psi.html),
 [Slurm cgroup paths](https://slurm.schedmd.com/cgroup_v2.html),
 [NVIDIA SMI](https://docs.nvidia.com/deploy/nvidia-smi/index.html).
+
+## Configuration
+
+Set public settings when installing; they are captured in the generated system
+unit. Credentials stay in the private Slack configuration.
+
+| `SLURM_GPU_TUI_` suffix | Default | Purpose |
+|---|---|---|
+| `DATA_DIR` | `/tmp/slurm-gpu-tui` | Merged snapshot, metrics and collector runtime |
+| `STATE_DIR` | `/var/lib/sgpu` | Usage, inventory, idle and notification state |
+| `AGENT_DIR` | `~/.sgpu/nodes` | Shared publisher directory; set explicitly across hosts |
+| `AGENT_TRUSTED_UIDS` | root, own UID, directory owner, 65534 | Override accepted file authors with comma-separated numeric UIDs |
+| `AGENT_RUNTIME_DIR` | `/run` | Optional private local agent lock/log directory |
+| `REFRESH_SEC` / `COLLECTOR_SEC` | `3` / `3` | UI / collector cadence |
+| `SCHEDULER_SEC` / `SCHEDULER_MAX_AGE_SEC` | collector cadence / `30` | Background scheduler cadence / maximum age |
+| `MEM_REFRESH_SEC` | `15` | Scheduler AllocMem query cadence |
+| `AGENT_SEC` / `CPU_AGENT_SEC` | `3` / `20` | GPU / CPU publisher cadence |
+| `AGENT_MAX_AGE_SEC` / `AGENT_MAX_BYTES` | `45` / `1048576` | Payload freshness / byte limit |
+| `AGENT_CMD_TIMEOUT_SEC` | `40` | Local agent command timeout |
+| `TELEMETRY_SEC` / `TELEMETRY_MAX_JOBS` | `10` / `256` | CPU/PSI/cgroup sampling interval / job scan cap |
+| `GPU_TOPOLOGY_TTL_SEC` | `300` | GPU identity cache |
+| `WASTE_MIN_SEC` / `ROGUE_IGNORE` | `600` / `root,gdm,xdm` | Waste threshold / ignored process users |
+| `USAGE_KEEP_DAYS` / `USAGE_SAVE_SEC` | `30` / `30` | Retention / durable checkpoint cadence |
+| `SACCT_SEC` | `3600` | Usage backfill (`0` disables) |
+| `METRICS_SEC` / `METRICS_PENDING_MAX` | `15` / `100` | Textfile cadence / per-job pending-series cap |
+| `METRICS_FILE` | `<data>/metrics.prom` | Textfile path |
+| `SHARE_LOGS` / `SHARE_JOB_DETAILS` / `SHARE_SCRIPTS` | off before installer defaults | Publish selected content to every snapshot reader |
+| `LOG_TAIL_BYTES` / `LOG_MIRROR_SEC` / `LOG_MIRROR_MAX_SEC` | `65536` / `10` / `60` | Shared tail cap / scan and unchanged-file backoff |
+| `SLACK_CONFIG` | `/etc/sgpu/slack.json` | Explicit override; legacy paths are also searched |
+| `SLACK_DEBOUNCE_SEC` / `SLACK_NAG_SEC` | `1800` / `21600` | Event / standing-condition debounce |
+
+For a source checkout, use `sudo bash scripts/install.sh`; `scripts/deploy.sh`
+runs the required gate before the local installation. Both require root.
+The default prefix is `/opt/sgpu`; `SGPU_INSTALL_DIR` overrides it. Source and
+prebuilt binaries must match the host architecture and C library. Upgrades
+keep previous releases and persistent state; failed activation attempts roll
+back the current release and service configuration. `--no-service` prepares
+files only and still requires root.

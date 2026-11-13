@@ -20,7 +20,8 @@ creates that parent at the start of each day even when there are no alerts, so
 a healthy day remains visible with zero replies. The native installer does
 not prompt for or print tokens. Set `SGPU_SLACK_BOT_TOKEN`,
 `SGPU_SLACK_CHANNEL`, and optionally `SGPU_SLACK_SENDER` / `SGPU_SLACK_LANG`,
-then run `sgpu-install slack-config` (optionally `--output PATH`). Export secrets
+then, from a root shell, run `sgpu-install slack-config` (optionally
+`--output PATH`). Export secrets
 using the site's secret mechanism, keeping them out of shell history. A master
 install also writes config when `SGPU_SLACK_BOT_TOKEN` is set. Existing extra
 keys are preserved, malformed existing config is rejected, and output mode is

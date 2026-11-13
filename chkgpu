@@ -1,9 +1,0 @@
-#!/usr/bin/env bash
-# Convenience shim for the native chkgpu binary in a source checkout.
-set -euo pipefail
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-for binary in "$REPO/target/release/chkgpu" "$REPO/target/debug/chkgpu"; do
-    [ -x "$binary" ] && exec "$binary" "$@"
-done
-echo "native chkgpu not built; run cargo build --release --bins" >&2
-exit 1
