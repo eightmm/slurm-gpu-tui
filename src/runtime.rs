@@ -144,6 +144,64 @@ pub fn secure_dir(path: &Path, mode: u32) -> Result<()> {
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+struct NfsIdentity {
+    uid: u32,
+    gid: u32,
+    // Filesystem credentials belong to this thread and must be restored here.
+    _thread: std::marker::PhantomData<*mut ()>,
+}
+impl NfsIdentity {
+    fn current() -> (u32, u32) {
+        // SAFETY: an invalid ID queries the current IDs without changing them.
+        unsafe {
+            (
+                libc::setfsuid(u32::MAX) as u32,
+                libc::setfsgid(u32::MAX) as u32,
+            )
+        }
+    }
+    fn anonymous() -> Result<Self> {
+        let (uid, gid) = Self::current();
+        let guard = Self {
+            uid,
+            gid,
+            _thread: std::marker::PhantomData,
+        };
+        // Keep process credentials for sampling/signals; change only this
+        // thread's filesystem checks for the default NFS squash identity.
+        unsafe {
+            libc::setfsgid(65534);
+            libc::setfsuid(65534);
+        }
+        if Self::current() != (65534, 65534) {
+            return Err("could not select the NFS publication identity".into());
+        }
+        Ok(guard)
+    }
+}
+impl Drop for NfsIdentity {
+    fn drop(&mut self) {
+        // SAFETY: these IDs were saved before this scope changed them.
+        unsafe {
+            libc::setfsuid(self.uid);
+            libc::setfsgid(self.gid);
+        }
+        if Self::current() != (self.uid, self.gid) {
+            // Continuing with unexpected credentials could corrupt later work.
+            std::process::abort();
+        }
+    }
+}
+
+fn is_nfs(dir: &File) -> bool {
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: dir is open and stat is read only after fstatfs initializes it.
+    unsafe {
+        libc::fstatfs(dir.as_raw_fd(), stat.as_mut_ptr()) == 0
+            && stat.assume_init().f_type == libc::NFS_SUPER_MAGIC
+    }
+}
+
 fn write_atomic(path: &Path, bytes: &[u8], mode: u32, durable: bool, shared: bool) -> Result<()> {
     let parent = path
         .parent()
@@ -152,6 +210,30 @@ fn write_atomic(path: &Path, bytes: &[u8], mode: u32, durable: bool, shared: boo
     let dir = open_directory(parent)?;
     check_directory(&dir, shared)?;
     let name = path.file_name().ok_or("missing destination name")?;
+    let result = write_at(&dir, name, bytes, mode, durable);
+    let permission_denied = result
+        .as_ref()
+        .err()
+        .and_then(|error| error.downcast_ref::<io::Error>())
+        .is_some_and(|error| error.kind() == io::ErrorKind::PermissionDenied);
+    if shared && permission_denied && euid() == 0 && is_nfs(&dir) {
+        let identity = NfsIdentity::anonymous()?;
+        // Reuse the checked directory fd: no new path traversal under the
+        // temporary identity. Executable updates never enter this branch.
+        let result = write_at(&dir, name, bytes, mode, durable);
+        drop(identity);
+        return result;
+    }
+    result
+}
+
+fn write_at(
+    dir: &File,
+    name: &std::ffi::OsStr,
+    bytes: &[u8],
+    mode: u32,
+    durable: bool,
+) -> Result<()> {
     let target = CString::new(name.as_bytes())?;
     let temporary = CString::new(format!(
         ".sgpu-{}-{}.tmp",
@@ -540,6 +622,62 @@ mod tests {
         fs::MetadataExt,
         fs::{PermissionsExt, symlink},
     };
+
+    #[test]
+    #[ignore = "requires root; scripts/check.sh runs this with sudo when available"]
+    fn root_nfs_identity_is_thread_local_and_restores_after_failure() {
+        assert_eq!(euid(), 0);
+        let original = NfsIdentity::current();
+        let tmp = tempfile::tempdir().unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o1777)).unwrap();
+        let dir = open_directory(tmp.path()).unwrap();
+        fs::write(tmp.path().join("root-owned"), b"keep").unwrap();
+        let (request, receive) = std::sync::mpsc::channel();
+        let (answer, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            receive.recv().unwrap();
+            answer.send(NfsIdentity::current()).unwrap();
+        });
+        {
+            let _identity = NfsIdentity::anonymous().unwrap();
+            assert_eq!(NfsIdentity::current(), (65534, 65534));
+            assert_eq!(euid(), 0);
+            request.send(()).unwrap();
+            assert_eq!(result.recv().unwrap(), original);
+            write_at(
+                &dir,
+                std::ffi::OsStr::new("telemetry"),
+                b"published",
+                0o644,
+                false,
+            )
+            .unwrap();
+            assert!(
+                write_at(
+                    &dir,
+                    std::ffi::OsStr::new("root-owned"),
+                    b"replace",
+                    0o644,
+                    false
+                )
+                .is_err()
+            );
+        }
+        worker.join().unwrap();
+        assert_eq!(NfsIdentity::current(), original);
+        let st = fs::metadata(tmp.path().join("telemetry")).unwrap();
+        assert_eq!(
+            (st.uid(), st.gid(), st.mode() & 0o777),
+            (65534, 65534, 0o644)
+        );
+        assert_eq!(fs::read(tmp.path().join("root-owned")).unwrap(), b"keep");
+        let panic = std::panic::catch_unwind(|| {
+            let _identity = NfsIdentity::anonymous().unwrap();
+            panic!("publication failure");
+        });
+        assert!(panic.is_err());
+        assert_eq!(NfsIdentity::current(), original);
+    }
 
     #[test]
     fn atomic_publication_replaces_symlinks_and_defeats_umask() {

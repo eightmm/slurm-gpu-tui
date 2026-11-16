@@ -11,14 +11,21 @@ for candidate in "${CARGO_TARGET_DIR:-$REPO/target}"/debug/deps/install_lifecycl
     if [ -f "$candidate" ] && [ -x "$candidate" ] && { [ -z "$INSTALL_TEST" ] || [ "$candidate" -nt "$INSTALL_TEST" ]; }; then INSTALL_TEST="$candidate"; fi
 done
 [ -n "$INSTALL_TEST" ] || { echo "installer integration test binary missing" >&2; exit 1; }
+LIB_TEST=""
+for candidate in "${CARGO_TARGET_DIR:-$REPO/target}"/debug/deps/sgpu-*; do
+    if [ -f "$candidate" ] && [ -x "$candidate" ] && [ -f "$candidate.d" ] && grep -Fq ': src/lib.rs' "$candidate.d" && { [ -z "$LIB_TEST" ] || [ "$candidate" -nt "$LIB_TEST" ]; }; then LIB_TEST="$candidate"; fi
+done
+[ -n "$LIB_TEST" ] || { echo "library test binary missing" >&2; exit 1; }
 if [ "$(id -u)" = 0 ]; then
     "$INSTALL_TEST" --ignored
+    "$LIB_TEST" --ignored
 elif command -v sudo >/dev/null && sudo -n true 2>/dev/null; then
     sudo -n -- "$INSTALL_TEST" --ignored
+    sudo -n -- "$LIB_TEST" --ignored
 elif [ "${SGPU_REQUIRE_ROOT_TESTS:-0}" = 1 ]; then
     echo "root installer checks require passwordless sudo" >&2; exit 1
 else
-    echo "SKIPPED: four root-only lifecycle checks (passwordless sudo unavailable)"
+    echo "SKIPPED: four root-only lifecycle checks and one NFS identity check (passwordless sudo unavailable)"
 fi
 SCRIPTS=(bootstrap.sh scripts/*.sh)
 for script in "${SCRIPTS[@]}"; do bash -n "$script"; done

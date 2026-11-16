@@ -590,8 +590,13 @@ pub fn run(args: Args) -> Result<()> {
         let cycle = Instant::now();
         let result = sampler
             .collect(args.mode, epoch.elapsed().as_secs_f64())
+            .map_err(|error| -> crate::Error { format!("collect local telemetry: {error}").into() })
             .and_then(|payload| {
-                runtime::publish_agent(&destination, &serde_json::to_vec(&payload)?)
+                runtime::publish_agent(&destination, &serde_json::to_vec(&payload)?).map_err(
+                    |error| -> crate::Error {
+                        format!("publish {}: {error}", destination.display()).into()
+                    },
+                )
             });
         match result {
             Ok(()) => {

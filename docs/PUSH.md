@@ -36,6 +36,14 @@ ACLs explicitly when NFS `root_squash` prevents directory creation. A malicious
 first writer can block a node's filename; it cannot impersonate a trusted author.
 Resolve such a collision as the directory owner or site administrator.
 
+On NFS, if root's atomic publication fails with `Permission denied`, the agent
+retries that telemetry write with filesystem UID/GID 65534, the usual squash
+identity. The checked directory handle is reused and the original thread
+credentials are restored before further collection. GPU/cgroup sampling retains
+its root access. Executable updates keep their separate root ownership checks.
+Sites with an explicit trusted-UID list must allow the actual telemetry author.
+Other mount/permission failures still need local administration.
+
 ## Payload validation
 
 Nodes atomically publish `<hostname>.json` (schema v9). The collector checks:
