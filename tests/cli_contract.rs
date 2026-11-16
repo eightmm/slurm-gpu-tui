@@ -46,6 +46,8 @@ impl Fixture {
             ..Default::default()
         };
         let snapshot = Snapshot {
+            ts: chrono::Local::now().to_rfc3339(),
+            controller: json!({"hostname":"fixture-master","observed_at":runtime::now(),"cpu_util":25,"cpu_online":8,"mem_total_bytes":17179869184_u64,"mem_used_bytes":4294967296_u64}),
             scheduler: SchedulerStatus {
                 job_backend: "structured-json".into(),
                 ..Default::default()
@@ -179,6 +181,14 @@ fn cli_commands_use_local_published_state_and_preserve_personal_cpu_jobs() {
     assert_eq!(successful(fixture.run(&["logs", "42"])), "fixture output\n");
     assert!(successful(fixture.run(&["doctor"])).contains("push-only"));
     let before = fs::read(fixture.root.path().join("calls")).unwrap();
+    let host = successful(fixture.run(&["host"]));
+    assert!(
+        host.contains("fixture-master") && host.contains("CPU busy") && host.contains("4.0 GiB")
+    );
+    let users = successful(fixture.run(&["users"]));
+    assert!(users.contains(&fixture.user) && users.contains("other-user"));
+    assert!(users.contains("CPU cores") && users.contains("SHARED"));
+    assert_eq!(before, fs::read(fixture.root.path().join("calls")).unwrap());
     assert!(
         successful(fixture.run(&["bench", "--nodes", "2", "--repeat", "1"]))
             .contains("median_update_render_ms")
@@ -191,6 +201,23 @@ fn cli_commands_use_local_published_state_and_preserve_personal_cpu_jobs() {
             .all(|c| matches!(c, "scontrol" | "sinfo" | "sacct"))
     );
     assert!(fixture.log.exists());
+}
+#[test]
+fn host_and_users_require_fresh_publications_without_sampling_the_client() {
+    let fixture = Fixture::new();
+    let path = fixture.data.join("data.json");
+    let mut snapshot: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    snapshot["controller"]["observed_at"] = json!(runtime::now() - 600.0);
+    fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    assert!(!fixture.run(&["host"]).status.success());
+    let old = std::time::SystemTime::now() - Duration::from_secs(60);
+    fs::File::open(&path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(old))
+        .unwrap();
+    assert!(!fixture.run(&["users"]).status.success());
+    assert!(!fixture.root.path().join("calls").exists());
 }
 #[test]
 fn invalid_input_is_rejected_and_private_logs_cannot_follow_symlinks() {
@@ -218,7 +245,7 @@ fn chkgpu_colors_are_opt_in_for_pipes_and_remain_explicitly_controllable() {
     for (name, body) in [
         (
             "squeue",
-            "echo '42|gpu|alice|RUNNING|00:01|8|gpu:2|N/A|gpu1'",
+            "printf '%s\\n' '42|gpu|alice|RUNNING|00:01|8|gpu:2|N/A|gpu1' '43|gpu|bob|COMPLETING|00:01|0|gpu:1|N/A|gpu1' '44|gpu|alice|PENDING|00:00|4|gpu:1|N/A|(Resources)'",
         ),
         (
             "sinfo",
@@ -243,7 +270,11 @@ fn chkgpu_colors_are_opt_in_for_pipes_and_remain_explicitly_controllable() {
     };
     let plain = run(&[]);
     assert!(!plain.contains('\x1b'));
-    assert!(plain.contains("GPU allocation") && plain.contains("2/4 (50%)"));
+    assert!(plain.contains("GPU allocation") && plain.contains("3/4 (75%)"));
+    assert!(plain.contains("Pending reasons") && plain.contains("Resources"));
+    let summary = run(&["--summary"]);
+    assert!(summary.contains("Node capacity") && summary.contains("CPU idle"));
+    assert!(!summary.contains("GPU allocation") && !summary.contains('\x1b'));
     assert!(run(&["--color", "always"]).contains("\x1b[38;"));
     assert!(!run(&["--color", "never"]).contains('\x1b'));
 }
@@ -330,6 +361,23 @@ fn interactive_terminal_opens_handles_tabs_and_restores_terminal_mode() {
     }
     assert!(child.0.try_wait().unwrap().is_some(), "UI did not exit");
     assert!(sent);
+    loop {
+        let mut bytes = [0; 8192];
+        match master.read(&mut bytes) {
+            Ok(0) => break,
+            Ok(n) => output.extend_from_slice(&bytes[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("terminal drain: {e}"),
+        }
+    }
+    assert!(
+        output.windows(8).any(|w| w == b"\x1b[?1006h"),
+        "mouse capture not enabled"
+    );
+    assert!(
+        output.windows(8).any(|w| w == b"\x1b[?1006l"),
+        "mouse capture not restored"
+    );
     let mut after = std::mem::MaybeUninit::<libc::termios>::uninit();
     assert_eq!(
         unsafe { libc::tcgetattr(slave.as_raw_fd(), after.as_mut_ptr()) },

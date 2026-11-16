@@ -4,6 +4,11 @@ use clap::Parser;
 struct Args {
     #[arg(
         long,
+        help = "Compact node capacity and pending-reason report instead of allocation matrices"
+    )]
+    summary: bool,
+    #[arg(
+        long,
         value_enum,
         default_value = "auto",
         help = "Color output; auto respects NO_COLOR and TERM=dumb"
@@ -12,7 +17,7 @@ struct Args {
 }
 fn main() {
     let args = Args::parse();
-    if let Err(error) = sgpu::quickview::run(args.color) {
+    if let Err(error) = sgpu::quickview::run(args.color, args.summary) {
         eprintln!("chkgpu: {error}");
         std::process::exit(1);
     }

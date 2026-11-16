@@ -19,6 +19,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use unicode_width::UnicodeWidthStr;
 
 pub fn terminal_safe(raw: &str) -> String {
     raw.chars()
@@ -68,6 +69,10 @@ pub enum Command {
     Json,
     Once,
     Doctor,
+    #[command(about = "Published controller CPU, memory, storage and network snapshot")]
+    Host,
+    #[command(about = "Published per-user job resources; node network/load are shared")]
+    Users,
     Me,
     Waste {
         #[arg(short, long)]
@@ -143,6 +148,8 @@ pub fn normalize(mut args: Vec<String>) -> Vec<String> {
         "wait-free",
         "fit",
         "logs",
+        "host",
+        "users",
         "bench",
     ];
     for arg in args.iter_mut().skip(1) {
@@ -703,6 +710,44 @@ fn report(month: &str) -> Result<i32> {
     Ok(0)
 }
 
+fn text_table(headers: &[&str], rows: &[Vec<String>]) -> String {
+    let widths: Vec<_> = headers
+        .iter()
+        .enumerate()
+        .map(|(i, header)| {
+            rows.iter()
+                .filter_map(|r| r.get(i))
+                .map(|s| s.width())
+                .max()
+                .unwrap_or(0)
+                .max(header.width())
+                .min(28)
+        })
+        .collect();
+    let line = |cells: &[String]| {
+        cells
+            .iter()
+            .enumerate()
+            .map(|(i, value)| {
+                if i + 1 == headers.len() {
+                    terminal_safe(value).replace(['\n', '\t'], " ")
+                } else {
+                    crate::quickview::cell(value, widths[i], i > 0)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+    let mut out = format!(
+        "{}\n",
+        line(&headers.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    );
+    for row in rows {
+        out.push_str(&format!("{}\n", line(row)));
+    }
+    out
+}
+
 pub fn run(args: Args) -> Result<i32> {
     match args.command {
         None => crate::ui::run(args.highlight_user),
@@ -719,6 +764,71 @@ pub fn run(args: Args) -> Result<i32> {
             Ok(0)
         }
         Some(Command::Doctor) => Ok(doctor()),
+        Some(Command::Host) => {
+            let data = runtime::read_snapshot(Some(30.0))?;
+            let rows = crate::host_view::rows(
+                &data.controller,
+                &data.collector,
+                &crate::host_view::History::default(),
+                runtime::now(),
+            );
+            if rows.is_empty() {
+                return Err(
+                    "controller telemetry unavailable or stale; check the collector".into(),
+                );
+            }
+            println!(
+                "Host {} · published {}",
+                terminal_safe(data.controller["hostname"].as_str().unwrap_or("controller")),
+                terminal_safe(&data.ts)
+            );
+            print!(
+                "{}",
+                text_table(
+                    &[
+                        "Resource",
+                        "Now / R / RX",
+                        "Total / W / TX",
+                        "Fill / 15m",
+                        "Guide"
+                    ],
+                    &rows.into_iter().map(|r| r.cells).collect::<Vec<_>>()
+                )
+            );
+            println!(
+                "Guide thresholds are review hints. ? unavailable; storage freshness is tracked separately."
+            );
+            Ok(0)
+        }
+        Some(Command::Users) => {
+            let data = runtime::read_snapshot(Some(30.0))?;
+            let mut users = crate::users::summarize(&data, runtime::now(), "", "");
+            users.sort_by(|a, b| b.gpus.cmp(&a.gpus).then(a.name.cmp(&b.name)));
+            println!("User resources · published {}", terminal_safe(&data.ts));
+            print!(
+                "{}",
+                text_table(
+                    &[
+                        "User",
+                        "Run/PD",
+                        "GPU",
+                        "CPU cores",
+                        "RAM GiB",
+                        "IO R/W MiB/s",
+                        "Node net MiB/s",
+                        "Load1 max",
+                        "Quota GiB",
+                        "Files",
+                        "Nodes"
+                    ],
+                    &users.into_iter().map(|u| u.cells()).collect::<Vec<_>>()
+                )
+            );
+            println!(
+                "Job CPU/RAM/block I/O; node network/load are SHARED. ? unavailable; ~ partial coverage."
+            );
+            Ok(0)
+        }
         Some(Command::Waste { verbose }) => {
             let rows = rules::waste(
                 &snapshot()?.nodes,

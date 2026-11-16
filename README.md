@@ -11,7 +11,7 @@ A Rust terminal monitor for jobs, GPU waste, usage and alerts.
 [![Linux](https://img.shields.io/badge/platform-Linux-2D6A4F?logo=linux&logoColor=white)](https://github.com/eightmm/slurm-gpu-tui#build-and-install)
 [![GitHub stars](https://img.shields.io/github/stars/eightmm/slurm-gpu-tui?style=social)](https://github.com/eightmm/slurm-gpu-tui/stargazers)
 
-[Install](#build-and-install) · [Usage](#usage) · [Slack alerts](docs/ALERTS.md) · [한국어](docs/README.ko.md)
+[Screenshots](#screenshots) · [Install](#build-and-install) · [Usage](#usage) · [Slack alerts](docs/ALERTS.md) · [한국어](docs/README.ko.md)
 
 </div>
 
@@ -25,6 +25,50 @@ A Rust terminal monitor for jobs, GPU waste, usage and alerts.
 | **Job inspection** | History, scripts, log tails and confirmed cancellation of your own jobs |
 | **Alerts and metrics** | Slack daily threads, owner-only failure DMs and Prometheus textfiles |
 | **Push-only collection** | Independent node publishers; missing results stay visibly unavailable |
+
+## Screenshots
+
+Rendered from synthetic demo data at 120 columns, with an 80-column Jobs example below.
+
+**Jobs** — clickable sort headers, highlighted accounts and pending reasons.
+
+![Jobs tab with priority sorting, account highlights and pending reasons](docs/images/tui-jobs.png)
+
+<details>
+<summary>GPU dashboard</summary>
+
+Resource meters, per-node state maps and individual GPU observations.
+
+![GPU dashboard with utilization, VRAM, free GPUs and parked allocations](docs/images/tui-gpu.png)
+
+</details>
+
+<details>
+<summary>Users and shared-node resources</summary>
+
+Per-user job CPU/RAM/I/O alongside shared node network and load.
+
+![Users tab with attributed job resources and shared-node counters](docs/images/tui-users.png)
+
+</details>
+
+<details>
+<summary>Controller host</summary>
+
+CPU, memory, pressure, disk/network rates and filesystem capacity with interpretation guides.
+
+![Host tab with controller resources, device rates and capacity guides](docs/images/tui-host.png)
+
+</details>
+
+<details>
+<summary>Jobs in an 80-column terminal</summary>
+
+Priority, GPU/CPU requests and pending reasons stay visible in the narrow layout.
+
+![80-column Jobs tab retaining priority, resource requests and pending reasons](docs/images/tui-jobs-narrow.png)
+
+</details>
 
 ## Build and install
 
@@ -57,7 +101,10 @@ sgpu usage 7 --daily     # GPU-hours
 sgpu jobs 7              # Job history
 sgpu logs 12345 -e -f    # Follow stderr
 sgpu doctor             # Collection and configuration checks
+sgpu host               # Published controller resources, disks and filesystems
+sgpu users              # Published per-user resources and shared-node counters
 chkgpu                  # Colored user × node allocation matrix
+chkgpu --summary        # Node capacity, blocked nodes and pending reasons
 ```
 
 | Key | Action |
@@ -66,6 +113,7 @@ chkgpu                  # Colored user × node allocation matrix
 | `u` / `p` / `m` / `i` | User / partition / highlighted user / free GPU filters |
 | `[` / `]` / `0` | Previous node / next node / reset filters |
 | `/` / `s` / `S` | Search / sort / reverse |
+| `v` in Jobs | All / running / pending jobs |
 | Enter / Tab | Details / switch information, script and log tabs |
 | `w` / `f` / `h` | Waste / capacity / job history |
 | `n` / `x` | Watch a job / confirm cancellation of my job |
@@ -74,6 +122,36 @@ chkgpu                  # Colored user × node allocation matrix
 `sgpu` opens a live dashboard with resource meters, GPU state symbols and sortable
 tables. `chkgpu` automatically uses color in terminals; pipes stay plain. Use
 `chkgpu --color always` or `--color never` to override, or set `NO_COLOR`.
+`chkgpu --summary` replaces matrices with node state, GPU allocation/headroom,
+CPU idle threads, blocked-node reasons and pending-reason counts/oldest wait.
+CPU idle/allocation comes from `sinfo`; missing values stay `?`, and blocked or
+unknown nodes show `—` for headroom. GPU requests in `COMPLETING` still count as
+allocated. The default matrix also includes the pending-reason summary. Collection
+keeps the same three Slurm queries and never requests a compute-node session.
+Headroom describes scheduler counters, not utilization or guaranteed admission;
+next-end estimates follow job time limits. Multi-node CPU user rows are estimates.
+`sgpu host` and `sgpu users` print the corresponding published resource views
+without opening the TUI. They require a fresh collector snapshot and never
+substitute measurements from the client machine. User network/load remains shared
+node data; unsupported metrics remain unavailable.
+
+In **Jobs**, `s` cycles priority, user, requested GPUs, requested CPUs, pending
+wait and running time left; `S` reverses. Priority starts highest first, user
+groups keep higher priorities first, and missing values stay last in either
+direction. `v` filters all/running/pending; `0` clears filters. The summary follows
+the visible jobs and shows running/pending job and user counts, leading pending reasons
+and longest wait. Search also matches partition and QOS. Priority and pending
+reasons remain visible in narrow terminals; CPU cores and RAM/VRAM in GiB appear
+when space permits. Sort settings survive refresh and switching to other tabs.
+Priority is Slurm's numeric score, not a guaranteed queue position. Time left is
+the remaining job time limit. GPU requests use Slurm's per-node GRES field;
+CPU requests cover the whole job. Older snapshots without running-job priority show `?`.
+Click **User**, **Priority**, **Req GPU** or **Req CPU** in the Jobs header to
+sort directly; click the same header again to reverse. Arrows mark clickable
+headers and the current direction. The mouse wheel scrolls tables and details.
+Tables and popups share a high-contrast dark palette. Selected rows, your account
+and the active sort header have distinct highlights; status colors concentrate
+on state and resource cells. Jobs, Users and Attention reserve more room for rows.
 
 Your rows use a teal background and `◆`, separate from the selection cursor.
 Utilization goes from dim through blue/cyan to green as activity increases;

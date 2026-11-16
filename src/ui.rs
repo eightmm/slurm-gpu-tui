@@ -1,19 +1,23 @@
 use crate::{
     Result, cli, history,
+    job_view::{self, Entry},
     model::{Gpu, Job, Node, PendingJob, Snapshot, number},
     process::{self, Program},
     rules::{self, Class},
     runtime, usage,
 };
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Flex, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
-        Block, BorderType, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, TableState, Tabs,
-        Wrap,
+        Block, BorderType, Borders, Cell, Clear, Gauge, HighlightSpacing, Paragraph, Row, Table,
+        TableState, Tabs, Wrap,
     },
 };
 use std::{
@@ -25,13 +29,22 @@ use std::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-const BACKGROUND: Color = Color::Rgb(13, 17, 23);
-const PANEL: Color = Color::Rgb(22, 27, 34);
-const BORDER: Color = Color::Rgb(48, 58, 70);
-const TEXT: Color = Color::Rgb(220, 225, 232);
-const MUTED: Color = Color::Rgb(145, 155, 170);
-const FOCUS: Color = Color::Rgb(99, 230, 232);
-const FOCUS_BG: Color = Color::Rgb(18, 58, 63);
+const BACKGROUND: Color = Color::Rgb(15, 20, 30);
+const PANEL: Color = Color::Rgb(22, 29, 42);
+const BORDER: Color = Color::Rgb(61, 78, 101);
+const TEXT: Color = Color::Rgb(226, 232, 240);
+const MUTED: Color = Color::Rgb(158, 173, 194);
+const BLUE: Color = Color::Rgb(126, 176, 255);
+const CYAN: Color = Color::Rgb(103, 212, 235);
+const GREEN: Color = Color::Rgb(115, 215, 158);
+const YELLOW: Color = Color::Rgb(243, 202, 115);
+const ORANGE: Color = Color::Rgb(255, 173, 105);
+const RED: Color = Color::Rgb(255, 128, 142);
+const PURPLE: Color = Color::Rgb(196, 163, 245);
+const FOCUS: Color = Color::Rgb(112, 224, 211);
+const FOCUS_BG: Color = Color::Rgb(22, 52, 58);
+const HEADER_BG: Color = Color::Rgb(29, 42, 60);
+const SELECTED_BG: Color = Color::Rgb(35, 53, 76);
 
 #[derive(Clone, Copy)]
 enum MetricKind {
@@ -45,14 +58,14 @@ impl MetricKind {
         };
         match self {
             Self::Activity if value <= 5.0 => MUTED,
-            Self::Activity if value < 30.0 => Color::Blue,
-            Self::Activity if value < 70.0 => Color::Cyan,
-            Self::Activity => Color::Green,
-            Self::Memory if value < 50.0 => Color::Blue,
-            Self::Memory if value < 80.0 => Color::Cyan,
-            Self::Memory if value < 90.0 => Color::Yellow,
-            Self::Memory if value < 97.0 => Color::Rgb(255, 166, 87),
-            Self::Memory => Color::Red,
+            Self::Activity if value < 30.0 => BLUE,
+            Self::Activity if value < 70.0 => CYAN,
+            Self::Activity => GREEN,
+            Self::Memory if value < 50.0 => BLUE,
+            Self::Memory if value < 80.0 => CYAN,
+            Self::Memory if value < 90.0 => YELLOW,
+            Self::Memory if value < 97.0 => ORANGE,
+            Self::Memory => RED,
         }
     }
 }
@@ -96,7 +109,7 @@ fn column_alignment(tab: usize, compact: bool, column: usize) -> Alignment {
     let numeric = match tab {
         0 => (compact && column == 4) || (!compact && column == 5),
         1 => matches!(column, 2 | 4 | 5),
-        3 => column == 0 || matches!(column, 3..=8),
+        3 => column == 0 || matches!(column, 3 | 4 | 6..=9 | 12),
         4 => matches!(column, 1..=5),
         5 => matches!(column, 1..=9),
         6 => matches!(column, 1 | 2),
@@ -118,13 +131,22 @@ fn panel(title: &str) -> Block<'_> {
         .title_style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD))
         .style(Style::default().bg(PANEL).fg(TEXT))
 }
+fn job_column_sort(column: usize) -> Option<job_view::Sort> {
+    match column {
+        1 => Some(job_view::Sort::User),
+        3 => Some(job_view::Sort::Gpu),
+        4 => Some(job_view::Sort::Cpu),
+        12 => Some(job_view::Sort::Priority),
+        _ => None,
+    }
+}
 fn gpu_mark(class: Class) -> (&'static str, &'static str, Color) {
     match class {
-        Class::Busy => ("●", "busy", Color::Cyan),
-        Class::Free => ("○", "free", Color::Green),
-        Class::Idle => ("!", "idle", Color::Yellow),
-        Class::Parked => ("◇", "parked", Color::Magenta),
-        Class::Rogue => ("×", "rogue", Color::Red),
+        Class::Busy => ("●", "busy", CYAN),
+        Class::Free => ("○", "free", GREEN),
+        Class::Idle => ("!", "idle", YELLOW),
+        Class::Parked => ("◇", "parked", PURPLE),
+        Class::Rogue => ("×", "rogue", RED),
         Class::Unknown => ("?", "unknown", MUTED),
     }
 }
@@ -461,6 +483,10 @@ pub struct App {
     searching: bool,
     sort: usize,
     reverse: bool,
+    job_sort: job_view::Sort,
+    job_reverse: bool,
+    job_filter: job_view::Filter,
+    header_hits: Vec<(Rect, job_view::Sort)>,
     details: bool,
     pending: bool,
     trend: bool,
@@ -508,6 +534,10 @@ impl App {
             searching: false,
             sort: 0,
             reverse: false,
+            job_sort: job_view::Sort::default(),
+            job_reverse: false,
+            job_filter: job_view::Filter::default(),
+            header_hits: Vec::new(),
             details: false,
             pending: false,
             trend: false,
@@ -684,6 +714,72 @@ impl App {
                 || fields
                     .iter()
                     .any(|s| s.to_lowercase().contains(&self.search.to_lowercase())))
+    }
+    fn visible_jobs(&self) -> impl Iterator<Item = Entry<'_>> {
+        self.data
+            .jobs
+            .iter()
+            .map(Entry::Running)
+            .chain(self.data.pending.iter().map(Entry::Pending))
+            .filter(|entry| {
+                self.job_filter.includes(*entry)
+                    && self.job_visible(entry.user(), entry.partition(), &entry.fields())
+            })
+    }
+    fn job_summary(&self, now: f64) -> [String; 2] {
+        let (mut running, mut pending) = (0, 0);
+        let mut users = BTreeSet::new();
+        let mut reasons = BTreeMap::<&str, usize>::new();
+        let mut longest: Option<f64> = None;
+        for entry in self.visible_jobs() {
+            users.insert(entry.user());
+            match entry {
+                Entry::Running(_) => running += 1,
+                Entry::Pending(job) => {
+                    pending += 1;
+                    *reasons
+                        .entry(if job.reason.is_empty() {
+                            "unknown"
+                        } else {
+                            &job.reason
+                        })
+                        .or_default() += 1;
+                    if let Some(wait) = entry.wait(now) {
+                        longest = Some(longest.unwrap_or(0.0).max(wait));
+                    }
+                }
+            }
+        }
+        let mut reasons: Vec<_> = reasons.into_iter().collect();
+        reasons.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        let detail = if pending == 0 {
+            "Pending: none in current filters".into()
+        } else {
+            format!(
+                "Pending: {}{} · max wait {}",
+                reasons
+                    .iter()
+                    .take(2)
+                    .map(|(reason, count)| format!("{} ×{count}", clipped(reason, 20)))
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+                if reasons.len() > 2 {
+                    format!(" · +{} reasons", reasons.len() - 2)
+                } else {
+                    String::new()
+                },
+                longest
+                    .map(|s| rules::span(s as u64))
+                    .unwrap_or_else(|| "?".into())
+            )
+        };
+        [
+            format!(
+                "Jobs: {running} running · {pending} pending · {} users",
+                users.len()
+            ),
+            detail,
+        ]
     }
     pub fn rebuild(&mut self) {
         let selected = self.selected().map(|r| r.key.clone());
@@ -889,12 +985,8 @@ impl App {
                             ),
                         ],
                         style: Style::default()
-                            .bg(Color::Rgb(30, 44, 61))
-                            .fg(if node.stale {
-                                Color::Yellow
-                            } else {
-                                Color::White
-                            })
+                            .bg(HEADER_BG)
+                            .fg(if node.stale { YELLOW } else { TEXT })
                             .add_modifier(Modifier::BOLD),
                     });
                     if self.collapsed.contains(&node.name) {
@@ -975,22 +1067,8 @@ impl App {
                                 job.map(|j| j.jobname.clone()).unwrap_or_default(),
                             ]);
                         }
-                        let style = Style::default().fg(match class {
-                            Class::Rogue => Color::Red,
-                            Class::Idle => Color::Yellow,
-                            Class::Parked => Color::Magenta,
-                            Class::Unknown => MUTED,
-                            Class::Free => Color::Green,
-                            _ => Color::White,
-                        });
-                        let style = if gpu.alloc_user == self.highlight_user
-                            || (gpu.alloc_user.is_empty()
-                                && gpu.users.contains(&self.highlight_user))
-                        {
-                            style.bg(Color::Rgb(22, 35, 50)).fg(gpu_mark(class).2)
-                        } else {
-                            style
-                        };
+                        let style =
+                            Style::default().fg(if class == Class::Unknown { MUTED } else { TEXT });
                         rows.push(ViewRow {
                             key: format!("gpu:{}:{}", node.name, gpu.index),
                             node: node.name.clone(),
@@ -1001,6 +1079,12 @@ impl App {
                                     && gpu.users.contains(&self.highlight_user)))
                             .then_some(if self.compact { 3 } else { 4 }),
                             accents: vec![
+                                (
+                                    0,
+                                    Style::default()
+                                        .fg(gpu_mark(class).2)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
                                 (
                                     if self.compact { 1 } else { 2 },
                                     Style::default().fg(MetricKind::Activity
@@ -1022,9 +1106,9 @@ impl App {
                                 (
                                     if self.compact { 5 } else { 6 },
                                     Style::default().fg(if node.stale {
-                                        Color::Yellow
+                                        YELLOW
                                     } else if rules::health(gpu, now).1 > 0 {
-                                        Color::Red
+                                        RED
                                     } else {
                                         MUTED
                                     }),
@@ -1070,8 +1154,14 @@ impl App {
                                 job: Some(job.jobid.clone()),
                                 cells,
                                 focus: (job.user == self.highlight_user).then_some(1),
-                                accents: Vec::new(),
-                                style: Style::default().fg(Color::Yellow),
+                                accents: vec![
+                                    (0, Style::default().fg(YELLOW)),
+                                    (
+                                        if self.compact { 3 } else { 4 },
+                                        Style::default().fg(YELLOW),
+                                    ),
+                                ],
+                                style: Style::default().fg(TEXT),
                             });
                         }
                     }
@@ -1130,7 +1220,11 @@ impl App {
                             format!("{}/{}", node.cpu_alloc, node.cpus),
                             mini_meter(fresh.then(|| number(&node.cpu_util)).flatten()),
                             ram(node),
-                            node.cpu_load.clone(),
+                            if node.stale {
+                                "?".into()
+                            } else {
+                                node.cpu_load.clone()
+                            },
                             psi,
                             node.partition.clone(),
                         ],
@@ -1150,11 +1244,7 @@ impl App {
                                 Style::default().fg(MetricKind::Memory.color(memory_percent(node))),
                             ),
                         ],
-                        style: Style::default().fg(if node.stale {
-                            Color::Yellow
-                        } else {
-                            Color::White
-                        }),
+                        style: Style::default().fg(if node.stale { YELLOW } else { TEXT }),
                     });
                 }
             }
@@ -1166,112 +1256,134 @@ impl App {
                     "JobID",
                     "User",
                     "State",
-                    "Req GPU/CPU/RAM",
-                    "CPU used",
-                    "RAM used",
-                    "VRAM",
+                    "Req GPU",
+                    "Req CPU",
+                    "Req RAM",
+                    "CPU cores",
+                    "RAM GiB",
+                    "VRAM GiB",
                     "Left / wait",
-                    "Coverage / OOM",
+                    "Reason / coverage",
                     "Name",
+                    "Priority",
                 ]
                 .map(str::to_string)
                 .to_vec();
-                for job in &self.data.jobs {
-                    if !self.job_visible(
-                        &job.user,
-                        &job.partition,
-                        &[&job.jobid, &job.user, &job.jobname, &job.node],
-                    ) {
-                        continue;
-                    }
-                    let metrics = rules::resource_summary(job, &self.data.nodes, now);
-                    let field = |key: &str, scale: f64| {
-                        metrics
-                            .get(key)
-                            .map(|v| {
-                                format!(
-                                    "{}{:.1}",
-                                    if metrics.get(&format!("{key}_nodes")).copied().unwrap_or(0.0)
-                                        < metrics.get("expected_nodes").copied().unwrap_or(0.0)
-                                    {
-                                        "~"
-                                    } else {
-                                        ""
-                                    },
-                                    v / scale
-                                )
-                            })
-                            .unwrap_or_else(|| "?".into())
-                    };
-                    rows.push(ViewRow {
-                        key: format!("job:{}", job.jobid),
-                        node: String::new(),
-                        job: Some(job.jobid.clone()),
-                        cells: vec![
-                            job.jobid.clone(),
-                            job.user.clone(),
-                            "RUNNING".into(),
-                            format!("{}/{}/{}", job.gpu_count, job.cpu_count, job.mem),
-                            field("cpu_cores", 1.0),
-                            field("mem_current_mib", 1024.0),
-                            field("vram_mib", 1024.0),
-                            rules::duration(&job.time_limit)
-                                .zip(rules::duration(&job.elapsed))
-                                .map(|(l, e)| rules::span(l.saturating_sub(e)))
-                                .unwrap_or_else(|| job.elapsed.clone()),
-                            format!(
-                                "{}/{} OOM:{}",
-                                metrics.get("sampled_nodes").unwrap_or(&0.0),
-                                metrics.get("expected_nodes").unwrap_or(&0.0),
-                                field("oom_kill", 1.0)
-                            ),
-                            job.jobname.clone(),
-                        ],
-                        focus: (job.user == self.highlight_user).then_some(1),
-                        accents: vec![
-                            (2, Style::default().fg(Color::Green)),
-                            (
-                                8,
-                                Style::default().fg(
-                                    if metrics.get("oom_kill").is_some_and(|n| *n > 0.0) {
-                                        Color::Red
-                                    } else {
-                                        MUTED
-                                    },
-                                ),
-                            ),
-                        ],
-                        style: Style::default().fg(TEXT),
-                    });
-                }
-                for job in &self.data.pending {
-                    if self.job_visible(
-                        &job.user,
-                        &job.partition,
-                        &[&job.jobid, &job.user, &job.jobname, &job.reason],
-                    ) {
-                        rows.push(ViewRow {
-                            key: format!("pending:{}", job.jobid),
-                            node: String::new(),
-                            job: Some(job.jobid.clone()),
-                            cells: vec![
-                                job.jobid.clone(),
-                                job.user.clone(),
-                                "PENDING".into(),
-                                format!("{}/{}/{}", job.gpu_count, job.cpu_count, job.mem),
-                                "?".into(),
-                                "?".into(),
-                                "?".into(),
-                                rules::pending_wait(job, now)
-                                    .map(|s| rules::span(s as u64))
-                                    .unwrap_or_else(|| "?".into()),
-                                rules::pending_reason(job),
-                                job.jobname.clone(),
-                            ],
-                            focus: (job.user == self.highlight_user).then_some(1),
-                            accents: vec![(2, Style::default().fg(Color::Yellow))],
-                            style: Style::default().fg(TEXT),
-                        });
+                let mut entries: Vec<_> = self.visible_jobs().collect();
+                entries.sort_by(|a, b| self.job_sort.compare(*a, *b, now, self.job_reverse));
+                for entry in entries {
+                    match entry {
+                        Entry::Running(job) => {
+                            let metrics = rules::resource_summary(job, &self.data.nodes, now);
+                            let field = |key: &str, scale: f64| {
+                                metrics
+                                    .get(key)
+                                    .map(|v| {
+                                        format!(
+                                            "{}{:.1}",
+                                            if metrics
+                                                .get(&format!("{key}_nodes"))
+                                                .copied()
+                                                .unwrap_or(0.0)
+                                                < metrics
+                                                    .get("expected_nodes")
+                                                    .copied()
+                                                    .unwrap_or(0.0)
+                                            {
+                                                "~"
+                                            } else {
+                                                ""
+                                            },
+                                            v / scale
+                                        )
+                                    })
+                                    .unwrap_or_else(|| "?".into())
+                            };
+                            rows.push(ViewRow {
+                                key: format!("job:{}", job.jobid),
+                                node: String::new(),
+                                job: Some(job.jobid.clone()),
+                                cells: vec![
+                                    job.jobid.clone(),
+                                    job.user.clone(),
+                                    "RUNNING".into(),
+                                    job.gpu_count.to_string(),
+                                    job.cpu_count.to_string(),
+                                    job.mem.clone(),
+                                    field("cpu_cores", 1.0),
+                                    field("mem_current_mib", 1024.0),
+                                    field("vram_mib", 1024.0),
+                                    entry.left().map(rules::span).unwrap_or_else(|| "?".into()),
+                                    format!(
+                                        "{}/{} OOM:{}",
+                                        metrics.get("sampled_nodes").unwrap_or(&0.0),
+                                        metrics.get("expected_nodes").unwrap_or(&0.0),
+                                        field("oom_kill", 1.0)
+                                    ),
+                                    job.jobname.clone(),
+                                    entry
+                                        .priority()
+                                        .map(|p| p.to_string())
+                                        .unwrap_or_else(|| "?".into()),
+                                ],
+                                focus: (job.user == self.highlight_user).then_some(1),
+                                accents: vec![
+                                    (0, Style::default().fg(MUTED)),
+                                    (2, Style::default().fg(GREEN)),
+                                    (3, Style::default().fg(BLUE)),
+                                    (4, Style::default().fg(BLUE)),
+                                    (12, Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+                                    (
+                                        10,
+                                        Style::default().fg(
+                                            if metrics.get("oom_kill").is_some_and(|n| *n > 0.0) {
+                                                RED
+                                            } else {
+                                                MUTED
+                                            },
+                                        ),
+                                    ),
+                                ],
+                                style: Style::default().fg(TEXT),
+                            });
+                        }
+                        Entry::Pending(job) => {
+                            rows.push(ViewRow {
+                                key: format!("pending:{}", job.jobid),
+                                node: String::new(),
+                                job: Some(job.jobid.clone()),
+                                cells: vec![
+                                    job.jobid.clone(),
+                                    job.user.clone(),
+                                    "PENDING".into(),
+                                    job.gpu_count.to_string(),
+                                    job.cpu_count.to_string(),
+                                    job.mem.clone(),
+                                    "?".into(),
+                                    "?".into(),
+                                    "?".into(),
+                                    rules::pending_wait(job, now)
+                                        .map(|s| rules::span(s as u64))
+                                        .unwrap_or_else(|| "?".into()),
+                                    rules::pending_reason(job),
+                                    job.jobname.clone(),
+                                    entry
+                                        .priority()
+                                        .map(|p| p.to_string())
+                                        .unwrap_or_else(|| "?".into()),
+                                ],
+                                focus: (job.user == self.highlight_user).then_some(1),
+                                accents: vec![
+                                    (0, Style::default().fg(MUTED)),
+                                    (2, Style::default().fg(YELLOW)),
+                                    (3, Style::default().fg(BLUE)),
+                                    (4, Style::default().fg(BLUE)),
+                                    (10, Style::default().fg(YELLOW)),
+                                    (12, Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+                                ],
+                                style: Style::default().fg(TEXT),
+                            });
+                        }
                     }
                 }
             }
@@ -1307,15 +1419,22 @@ impl App {
                         node: String::new(),
                         job: None,
                         focus: (group.user == self.highlight_user).then_some(0),
-                        accents: vec![(
-                            4,
-                            Style::default().fg(if group.rogue > 0 { Color::Red } else { MUTED }),
-                        )],
-                        style: Style::default().fg(if group.rogue > 0 {
-                            Color::Red
-                        } else {
-                            Color::Yellow
-                        }),
+                        accents: vec![
+                            (1, Style::default().fg(YELLOW).add_modifier(Modifier::BOLD)),
+                            (
+                                2,
+                                Style::default().fg(if group.idle > 0 { YELLOW } else { MUTED }),
+                            ),
+                            (
+                                3,
+                                Style::default().fg(if group.parked > 0 { PURPLE } else { MUTED }),
+                            ),
+                            (
+                                4,
+                                Style::default().fg(if group.rogue > 0 { RED } else { MUTED }),
+                            ),
+                        ],
+                        style: Style::default().fg(TEXT),
                         cells: group.cells(),
                     });
                 }
@@ -1369,8 +1488,9 @@ impl App {
                         job: None,
                         focus: (person.name == self.highlight_user).then_some(0),
                         accents: vec![
-                            (6, Style::default().fg(Color::Blue)),
-                            (7, Style::default().fg(Color::Blue)),
+                            (2, Style::default().fg(BLUE).add_modifier(Modifier::BOLD)),
+                            (6, Style::default().fg(BLUE)),
+                            (7, Style::default().fg(BLUE)),
                         ],
                         style: Style::default().fg(TEXT),
                         cells: person.cells(),
@@ -1403,11 +1523,11 @@ impl App {
                         continue;
                     }
                     let color = match row.level {
-                        crate::host_view::Level::Info => Color::Cyan,
-                        crate::host_view::Level::Good => Color::Green,
-                        crate::host_view::Level::Watch => Color::Yellow,
-                        crate::host_view::Level::High => Color::Rgb(255, 166, 87),
-                        crate::host_view::Level::Critical => Color::Red,
+                        crate::host_view::Level::Info => CYAN,
+                        crate::host_view::Level::Good => GREEN,
+                        crate::host_view::Level::Watch => YELLOW,
+                        crate::host_view::Level::High => ORANGE,
+                        crate::host_view::Level::Critical => RED,
                         crate::host_view::Level::Unknown => MUTED,
                     };
                     rows.push(ViewRow {
@@ -1576,7 +1696,7 @@ impl App {
                         "{} {name:<10} ",
                         if node.name == selected { "▸" } else { " " }
                     ),
-                    Style::default().fg(if node.stale { Color::Yellow } else { TEXT }),
+                    Style::default().fg(if node.stale { YELLOW } else { TEXT }),
                 )];
                 let room = inner.width.saturating_sub(24) as usize;
                 for (_, class) in gpus.iter().take(room) {
@@ -1592,7 +1712,7 @@ impl App {
                 let free = gpus.iter().filter(|(_, c)| *c == Class::Free).count();
                 spans.push(Span::styled(
                     format!(" {free}/{} free", gpus.len()),
-                    Style::default().fg(if node.stale { Color::Yellow } else { MUTED }),
+                    Style::default().fg(if node.stale { YELLOW } else { MUTED }),
                 ));
                 Line::from(spans)
             })
@@ -1607,6 +1727,7 @@ impl App {
         );
     }
     pub fn draw(&mut self, frame: &mut Frame) {
+        self.header_hits.clear();
         let compact = frame.area().width < 130;
         let narrow = frame.area().width < 100;
         if compact != self.compact || narrow != self.narrow {
@@ -1620,7 +1741,11 @@ impl App {
         );
         let dashboard_height =
             if frame.area().height >= 20 && frame.area().width >= 70 && self.tab != 6 {
-                if frame.area().height >= 30 { 10 } else { 6 }
+                if frame.area().height >= 30 && matches!(self.tab, 0 | 1) {
+                    10
+                } else {
+                    6
+                }
             } else {
                 0
             };
@@ -1641,11 +1766,8 @@ impl App {
         let heading =
             Layout::horizontal([Constraint::Length(9), Constraint::Min(1)]).split(areas[0]);
         frame.render_widget(
-            Paragraph::new(" ▰ sgpu ").style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Paragraph::new(" ▰ sgpu ")
+                .style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
             heading[0],
         );
         frame.render_widget(
@@ -1658,7 +1780,7 @@ impl App {
             .highlight_style(
                 Style::default()
                     .fg(BACKGROUND)
-                    .bg(Color::Cyan)
+                    .bg(CYAN)
                     .add_modifier(Modifier::BOLD),
             ),
             heading[1],
@@ -1678,9 +1800,7 @@ impl App {
         let mut summary = vec![Line::from(vec![
             Span::styled(
                 format!("GPU {free}/{total} FREE"),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(
                 " · cluster: {} run / {} pd · fresh {fresh}/{}",
@@ -1692,23 +1812,31 @@ impl App {
         let sort_label = match self.tab {
             1 => "node",
             2 => "GPU-hours",
-            3 => "scheduler",
+            3 => self.job_sort.label(),
             4 => "priority",
             5 => ["GPU", "CPU", "focus", "quota"][self.sort],
             6 => "resource",
             _ => ["node", "util", "focus", "free"][self.sort],
         };
+        let descending = if self.tab == 3 {
+            self.job_reverse ^ self.job_sort.descending()
+        } else {
+            self.reverse ^ (self.tab == 5 || (self.tab == 0 && self.sort > 0))
+        };
         let mut chips = vec![Span::styled(
-            format!(
-                " sort:{sort_label}{} ",
-                if self.reverse ^ (self.tab == 5 || (self.tab == 0 && self.sort > 0)) {
-                    "↓"
-                } else {
-                    "↑"
-                }
-            ),
+            format!(" sort:{sort_label}{} ", if descending { "↓" } else { "↑" }),
             Style::default().fg(MUTED),
         )];
+        if self.tab == 3 {
+            chips.push(Span::styled(
+                format!(" state:{} [v] ", self.job_filter.label()),
+                Style::default().fg(if self.job_filter == job_view::Filter::All {
+                    MUTED
+                } else {
+                    FOCUS
+                }),
+            ));
+        }
         for (text, active) in [
             (
                 format!(
@@ -1733,7 +1861,7 @@ impl App {
                 !self.partition.is_empty(),
             ),
             ("MINE".into(), self.mine),
-            ("FREE".into(), self.free_only),
+            ("FREE".into(), self.free_only && self.tab == 0),
             (format!("search:{}", self.search), !self.search.is_empty()),
         ] {
             if active || text.starts_with("user:") || text.starts_with("part:") {
@@ -1774,11 +1902,7 @@ impl App {
         let attention_count: usize = attention.iter().map(|r| r.total()).sum();
         summary[0].spans.push(Span::styled(
             format!(" · ! {attention_count} [5]"),
-            Style::default().fg(if attention_count > 0 {
-                Color::Yellow
-            } else {
-                MUTED
-            }),
+            Style::default().fg(if attention_count > 0 { YELLOW } else { MUTED }),
         ));
         summary.push(Line::from(vec![
             Span::styled(
@@ -1795,11 +1919,11 @@ impl App {
         ]));
         if self.data.errors.is_empty() {
             summary.push(Line::from(vec![
-                Span::styled("● busy ", Style::default().fg(Color::Cyan)),
-                Span::styled("○ free ", Style::default().fg(Color::Green)),
-                Span::styled("! idle ", Style::default().fg(Color::Yellow)),
-                Span::styled("◇ parked ", Style::default().fg(Color::Magenta)),
-                Span::styled("× rogue ", Style::default().fg(Color::Red)),
+                Span::styled("● busy ", Style::default().fg(CYAN)),
+                Span::styled("○ free ", Style::default().fg(GREEN)),
+                Span::styled("! idle ", Style::default().fg(YELLOW)),
+                Span::styled("◇ parked ", Style::default().fg(PURPLE)),
+                Span::styled("× rogue ", Style::default().fg(RED)),
                 Span::styled("? unknown", Style::default().fg(MUTED)),
             ]));
         } else {
@@ -1808,22 +1932,29 @@ impl App {
                     "Scheduler unavailable: {}",
                     cli::terminal_safe(&self.data.errors)
                 ),
-                Style::default().fg(Color::Red),
+                Style::default().fg(RED),
             ));
+        }
+        if self.tab == 3 {
+            let [counts, reasons] = self.job_summary(runtime::now());
+            summary[2] = Line::styled(counts, Style::default().fg(FOCUS));
+            if self.data.errors.is_empty() {
+                summary[3] = Line::styled(reasons, Style::default().fg(MUTED));
+            }
         }
         if self.trend {
             summary.extend([
                 Line::styled(
                     format!("5m GPU% {}", self.spark(0)),
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(CYAN),
                 ),
                 Line::styled(
                     format!("VRAM% {}", self.spark(1)),
-                    Style::default().fg(Color::Magenta),
+                    Style::default().fg(PURPLE),
                 ),
                 Line::styled(
                     format!("GPU W {} · = unknown", self.spark(2)),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(YELLOW),
                 ),
             ]);
         }
@@ -1842,7 +1973,7 @@ impl App {
                         cli::terminal_safe(host["hostname"].as_str().unwrap_or("controller")),
                         if fresh { "LIVE" } else { "STALE / UNAVAILABLE" }
                     ),
-                    Style::default().fg(if fresh { Color::Cyan } else { Color::Yellow }),
+                    Style::default().fg(if fresh { CYAN } else { YELLOW }),
                 ),
                 Line::styled(
                     "Capacity 80/90/97% · PSI 1/10% · link 80%: review hints, not diagnoses",
@@ -1879,8 +2010,9 @@ impl App {
             let visible_columns: Vec<usize> = match self.tab {
                 0 if self.narrow => vec![0, 1, 2, 3, 5],
                 1 if frame.area().width < 110 => vec![0, 1, 2, 3, 4, 7],
-                3 if frame.area().width < 110 => vec![0, 1, 2, 3, 7, 9],
-                3 if frame.area().width < 140 => vec![0, 1, 2, 3, 4, 5, 7, 9],
+                3 if frame.area().width < 100 => vec![0, 1, 2, 12, 3, 4, 9, 10],
+                3 if frame.area().width < 140 => vec![0, 1, 2, 12, 3, 4, 5, 9, 10, 11],
+                3 => vec![0, 1, 2, 12, 3, 4, 5, 6, 7, 8, 9, 10, 11],
                 4 if self.narrow => vec![0, 1, 2, 3, 4, 5, 7],
                 5 if frame.area().width < 110 => vec![0, 3, 4, 5, 6, 7],
                 5 if frame.area().width < 150 => vec![0, 1, 2, 3, 4, 5, 6, 7, 10],
@@ -1921,13 +2053,15 @@ impl App {
                         _ => Constraint::Min(9),
                     },
                     3 => match i {
-                        0 => Constraint::Length(10),
-                        1 => Constraint::Length(12),
-                        2 => Constraint::Length(8),
-                        3 => Constraint::Length(15),
-                        4..=6 => Constraint::Length(9),
-                        7 => Constraint::Length(10),
-                        8 => Constraint::Length(15),
+                        0 => Constraint::Length(if self.narrow { 7 } else { 10 }),
+                        1 => Constraint::Length(if self.narrow { 8 } else { 12 }),
+                        2 => Constraint::Length(7),
+                        3 | 4 => Constraint::Length(8),
+                        5 => Constraint::Length(8),
+                        6..=8 => Constraint::Length(9),
+                        9 => Constraint::Length(10),
+                        10 => Constraint::Min(if self.narrow { 8 } else { 18 }),
+                        12 => Constraint::Length(9),
                         _ => Constraint::Min(12),
                     },
                     4 => match i {
@@ -1965,10 +2099,23 @@ impl App {
                     },
                 })
                 .collect();
-            let inner_width = areas[3].width.saturating_sub(4);
+            let table_area = panel("").inner(areas[3]);
+            let [_, columns_area] =
+                Layout::horizontal([Constraint::Length(2), Constraint::Fill(0)]).areas(table_area);
             let cell_areas = Layout::horizontal(widths.clone())
+                .flex(Flex::Start)
                 .spacing(1)
-                .split(Rect::new(0, 0, inner_width, 1));
+                .split(columns_area);
+            if self.tab == 3 && !table_area.is_empty() {
+                self.header_hits = visible_columns
+                    .iter()
+                    .zip(cell_areas.iter())
+                    .filter_map(|(column, area)| {
+                        job_column_sort(*column)
+                            .map(|sort| (Rect::new(area.x, table_area.y, area.width, 1), sort))
+                    })
+                    .collect();
+            }
             let rows = self.rows.iter().enumerate().map(|(index, row)| {
                 let cells = visible_columns
                     .iter()
@@ -1989,6 +2136,9 @@ impl App {
                         };
                         if let Some((_, accent)) = row.accents.iter().find(|(i, _)| i == column) {
                             style = style.patch(*accent);
+                        }
+                        if matches!(text.trim(), "?" | "—") {
+                            style = style.fg(MUTED);
                         }
                         Some(
                             Cell::from(
@@ -2019,35 +2169,66 @@ impl App {
                             .enumerate()
                             .filter_map(|(position, i)| {
                                 self.headers.get(*i).map(|text| {
+                                    let sort =
+                                        (self.tab == 3).then(|| job_column_sort(*i)).flatten();
+                                    let text = if let Some(sort) = sort {
+                                        format!(
+                                            "{text}{}",
+                                            if sort == self.job_sort {
+                                                if self.job_reverse ^ sort.descending() {
+                                                    "↓"
+                                                } else {
+                                                    "↑"
+                                                }
+                                            } else {
+                                                "↕"
+                                            }
+                                        )
+                                    } else {
+                                        text.clone()
+                                    };
                                     Cell::from(
-                                        Line::from(clipped(text, cell_areas[position].width))
+                                        Line::from(clipped(&text, cell_areas[position].width))
                                             .alignment(column_alignment(
                                                 self.tab,
                                                 self.compact,
                                                 *i,
                                             )),
                                     )
+                                    .style(
+                                        if sort == Some(self.job_sort) {
+                                            Style::default()
+                                                .fg(FOCUS)
+                                                .bg(SELECTED_BG)
+                                                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                                        } else if sort.is_some() {
+                                            Style::default().fg(BLUE)
+                                        } else {
+                                            Style::default().fg(MUTED)
+                                        },
+                                    )
                                 })
                             }),
                     )
                     .style(
                         Style::default()
-                            .fg(Color::Cyan)
-                            .bg(PANEL)
+                            .fg(CYAN)
+                            .bg(HEADER_BG)
                             .add_modifier(Modifier::BOLD),
                     ),
                 )
                 .column_spacing(1)
                 .row_highlight_style(
                     Style::default()
-                        .bg(Color::Rgb(36, 55, 76))
+                        .bg(SELECTED_BG)
                         .add_modifier(Modifier::BOLD),
                 )
                 .highlight_symbol("▸ ")
+                .highlight_spacing(HighlightSpacing::Always)
                 .block(panel(match self.tab {
                     0 => " GPUs · Space fold · Enter inspect ",
                     1 => " Nodes · measured CPU / RAM ",
-                    3 => " Jobs · ? unavailable · ~ partial coverage ",
+                    3 => " Jobs · click ↕ header · s sort · S reverse · v state ",
                     4 => " Attention · sustained idle / parked allocations; unallocated processes ",
                     5 => " Users · job CPU/RAM/IO; node network/load are SHARED ",
                     _ => " Host · R/W disk · RX/TX net · Enter: guide + 5m trend ",
@@ -2078,7 +2259,7 @@ impl App {
             vec![
                 Line::styled(
                     format!("Search: {}▏", cli::terminal_safe(&self.search)),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(YELLOW),
                 ),
                 Line::from("Enter apply · Esc clear"),
             ]
@@ -2098,9 +2279,15 @@ impl App {
             if self.tab < 2 {
                 bindings.push(("[]", "Node"));
             }
+            if self.tab == 3 {
+                bindings.extend([("s/S", "Sort"), ("v", "State")]);
+            }
             if frame.area().width >= 110 {
+                if matches!(self.tab, 0 | 5) {
+                    bindings.push(("s", "Sort"));
+                }
                 if self.tab != 6 {
-                    bindings.extend([("s", "Sort"), ("p", "Part")]);
+                    bindings.push(("p", "Part"));
                 }
                 bindings.push(("r", "Refresh"));
             }
@@ -2110,7 +2297,7 @@ impl App {
                     format!(" {key} "),
                     Style::default()
                         .bg(BORDER)
-                        .fg(Color::Cyan)
+                        .fg(CYAN)
                         .add_modifier(Modifier::BOLD),
                 ));
                 keys.push(Span::styled(format!("{label} "), Style::default().fg(TEXT)));
@@ -2178,6 +2365,48 @@ impl App {
         };
         if let Some(index) = index {
             self.table.select(Some(index));
+        }
+    }
+    fn mouse(&mut self, mouse: MouseEvent, worker: &Worker) -> bool {
+        if !mouse.modifiers.is_empty() {
+            return false;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                self.key(
+                    if mouse.kind == MouseEventKind::ScrollDown {
+                        KeyCode::Down
+                    } else {
+                        KeyCode::Up
+                    },
+                    worker,
+                );
+                true
+            }
+            MouseEventKind::Down(MouseButton::Left)
+                if self.tab == 3 && self.popup.is_none() && !self.searching =>
+            {
+                let Some((_, sort)) = self
+                    .header_hits
+                    .iter()
+                    .find(|(area, _)| area.contains((mouse.column, mouse.row).into()))
+                else {
+                    return false;
+                };
+                if self.job_sort == *sort {
+                    self.job_reverse = !self.job_reverse;
+                } else {
+                    self.job_sort = *sort;
+                    self.job_reverse = false;
+                }
+                self.status = format!(
+                    "Jobs sort: {} · click again to reverse",
+                    self.job_sort.label()
+                );
+                self.rebuild();
+                true
+            }
+            _ => false,
         }
     }
     fn key(&mut self, key: KeyCode, worker: &Worker) -> bool {
@@ -2304,6 +2533,7 @@ impl App {
                 self.mine = false;
                 self.free_only = false;
                 self.search.clear();
+                self.job_filter = job_view::Filter::All;
                 self.status = "Filters cleared".into();
             }
             KeyCode::Home if self.tab != 2 => {
@@ -2330,12 +2560,22 @@ impl App {
             KeyCode::Esc => self.search.clear(),
             KeyCode::Char('s') if matches!(self.tab, 0 | 5) => self.sort = (self.sort + 1) % 4,
             KeyCode::Char('S') if matches!(self.tab, 0 | 5) => self.reverse = !self.reverse,
+            KeyCode::Char('s') if self.tab == 3 => {
+                self.job_sort = self.job_sort.next();
+                self.job_reverse = false;
+                self.status = format!("Jobs sort: {} · s next · S reverse", self.job_sort.label());
+            }
+            KeyCode::Char('S') if self.tab == 3 => self.job_reverse = !self.job_reverse,
             KeyCode::Char('s' | 'S') => {
-                self.status = "Interactive sorting is available in GPU and Users".into()
+                self.status = "Interactive sorting is available in GPU, Jobs and Users".into()
             }
             KeyCode::Char('i') => self.free_only = !self.free_only,
             KeyCode::Char('m') => self.mine = !self.mine,
             KeyCode::Char('d') => self.details = !self.details,
+            KeyCode::Char('v') if self.tab == 3 => {
+                self.job_filter = self.job_filter.next();
+                self.status = format!("Jobs state: {} · v next · 0 reset", self.job_filter.label());
+            }
             KeyCode::Char('v') => self.pending = !self.pending,
             KeyCode::Char('t') => self.trend = !self.trend,
             KeyCode::Char('u') => {
@@ -2652,6 +2892,9 @@ impl App {
 }
 
 fn ram(node: &Node) -> String {
+    if node.stale {
+        return "?".into();
+    }
     let total = number(&node.mem_total);
     let used = total
         .zip(number(&node.mem_avail).or_else(|| number(&node.mem_free)))
@@ -2684,10 +2927,10 @@ fn draw_popup(frame: &mut Frame, popup: &mut Popup) {
         height,
     );
     frame.render_widget(Clear, rect);
-    let block = Block::default().borders(Borders::ALL).title(format!(
-        " {} · Esc close ",
-        cli::terminal_safe(&popup.title)
-    ));
+    let title = format!(" {} · Esc close ", cli::terminal_safe(&popup.title));
+    let block = panel(&title)
+        .border_style(Style::default().fg(BLUE))
+        .title_style(Style::default().fg(TEXT).add_modifier(Modifier::BOLD));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     if !popup.history.is_empty() {
@@ -2699,7 +2942,7 @@ fn draw_popup(frame: &mut Frame, popup: &mut Popup) {
             Constraint::Length(16),
             Constraint::Min(20),
         ];
-        let rows = popup.history.iter().map(|row| {
+        let rows = popup.history.iter().enumerate().map(|(index, row)| {
             Row::new([
                 row.jobid.clone(),
                 row.state.clone(),
@@ -2708,22 +2951,22 @@ fn draw_popup(frame: &mut Frame, popup: &mut Popup) {
                 row.partition.clone(),
                 cli::terminal_safe(&row.name),
             ])
-            .style(Style::default().fg(if row.exit != "0:0" {
-                Color::Yellow
-            } else {
-                Color::White
-            }))
+            .style(
+                Style::default()
+                    .bg(if index % 2 == 0 { BACKGROUND } else { PANEL })
+                    .fg(if row.exit != "0:0" { YELLOW } else { TEXT }),
+            )
         });
         let table = Table::new(rows, widths)
-            .header(Row::new([
-                "JobID",
-                "State",
-                "Exit",
-                "Elapsed",
-                "Partition",
-                "Name",
-            ]))
-            .row_highlight_style(Style::default().bg(Color::Rgb(40, 50, 60)));
+            .header(
+                Row::new(["JobID", "State", "Exit", "Elapsed", "Partition", "Name"]).style(
+                    Style::default()
+                        .fg(BLUE)
+                        .bg(HEADER_BG)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            )
+            .row_highlight_style(Style::default().bg(SELECTED_BG));
         let mut state = TableState::default().with_selected(Some(popup.selected));
         frame.render_stateful_widget(table, inner, &mut state);
         return;
@@ -2732,7 +2975,13 @@ fn draw_popup(frame: &mut Frame, popup: &mut Popup) {
     frame.render_widget(
         Tabs::new(popup.panes.iter().map(|p| p.name.clone()))
             .select(popup.active)
-            .highlight_style(Style::default().fg(Color::Cyan)),
+            .style(Style::default().fg(MUTED))
+            .highlight_style(
+                Style::default()
+                    .fg(FOCUS)
+                    .bg(SELECTED_BG)
+                    .add_modifier(Modifier::BOLD),
+            ),
         sections[0],
     );
     if let Some(pane) = popup.panes.get(popup.active) {
@@ -2747,9 +2996,9 @@ fn draw_popup(frame: &mut Frame, popup: &mut Popup) {
                             .iter()
                             .any(|s| line.contains(s))
                         {
-                            Color::Red
+                            RED
                         } else {
-                            Color::White
+                            TEXT
                         },
                     ),
                 ))
@@ -2794,12 +3043,27 @@ fn ime(key: KeyCode) -> KeyCode {
     }
 }
 
+struct MouseCapture;
+impl MouseCapture {
+    fn enable() -> std::io::Result<Self> {
+        let capture = Self;
+        crossterm::execute!(std::io::stdout(), EnableMouseCapture)?;
+        Ok(capture)
+    }
+}
+impl Drop for MouseCapture {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    }
+}
+
 pub fn run(highlight_user: Option<String>) -> Result<i32> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err("interactive mode requires a terminal; use sgpu once or sgpu json".into());
     }
     let mut terminal = ratatui::try_init()?;
     let result = (|| -> Result<i32> {
+        let _mouse = MouseCapture::enable()?;
         let mut app = App::new();
         if let Some(user) = highlight_user {
             app.set_highlight_user(user);
@@ -2912,7 +3176,11 @@ pub fn run(highlight_user: Option<String>) -> Result<i32> {
                         }
                         dirty = true;
                     }
-                    Event::Resize(_, _) => dirty = true,
+                    Event::Mouse(mouse) => dirty |= app.mouse(mouse, &worker),
+                    Event::Resize(_, _) => {
+                        app.header_hits.clear();
+                        dirty = true;
+                    }
                     _ => (),
                 }
             }
@@ -2926,6 +3194,10 @@ const HELP: &str = concat!(
     "1/2/3/4  GPU / CPU / Usage / Jobs\n5/6/7  Attention / Users / Controller\n",
     "g Usage · v pending · t 5-minute cluster trend\nr refresh published data\n",
     "s sort · S reverse · [ / ] previous/next node · Home/End first/last row\n",
+    "Jobs: s cycles priority / user / GPU / CPU / wait / left; S reverses.\n",
+    "Jobs: click User, Priority, Req GPU or Req CPU headers to sort; click again to reverse.\n",
+    "Header arrows show direction; ↕ marks clickable headers. Mouse wheel scrolls.\n",
+    "Jobs: v cycles all / running / pending; 0 clears state and other filters.\n",
     "u user filter (highlight first) · p partition · m highlighted user's jobs\n",
     "i free GPUs · 0 reset all filters · / search · Esc clear search\n",
     "d detail columns · Space fold node · z fold/unfold all\nj/k or arrows move\n",
@@ -2949,6 +3221,10 @@ const HELP: &str = concat!(
     "Block I/O excludes cached and network-filesystem traffic; rates need two samples.\n",
     "Network/load are not attributed to individual users. Storage queries run in the background.\n",
     "Pending start and capacity are estimates, not scheduler guarantees.\n",
+    "Priority is Slurm's numeric score, not queue position; partition/QOS policy still applies.\n",
+    "Wait sorts pending jobs longest first; left sorts running jobs by time limit remaining.\n",
+    "Unknown sort values stay last in either direction. Job RAM/VRAM columns use GiB.\n",
+    "GPU requests follow Slurm's per-node GRES field; CPU requests cover the whole job.\n",
     "PSI is pressure, not a diagnosis. GPU power caps alone are informational.\n\n",
     "Node results are push-only; missing agents stay stale without master-to-node requests."
 );
@@ -2958,6 +3234,416 @@ mod tests {
     use super::*;
     use crate::model::Gpu;
     use ratatui::{Terminal, backend::TestBackend};
+
+    fn jobs_snapshot() -> Snapshot {
+        let submitted = |hours: i64| {
+            (chrono::Local::now() - chrono::Duration::hours(hours))
+                .format("%Y-%m-%dT%H:%M:%S")
+                .to_string()
+        };
+        Snapshot {
+            jobs: vec![
+                Job {
+                    jobid: "42".into(),
+                    user: "alice".into(),
+                    priority: "100".into(),
+                    gpu_count: 2,
+                    cpu_count: 16,
+                    partition: "gpu".into(),
+                    qos: "normal".into(),
+                    node: "gpu1".into(),
+                    jobname: "training".into(),
+                    time_limit: "01:00:00".into(),
+                    elapsed: "00:55:00".into(),
+                    ..Default::default()
+                },
+                Job {
+                    jobid: "43".into(),
+                    user: "bob".into(),
+                    priority: "20".into(),
+                    cpu_count: 32,
+                    partition: "cpu".into(),
+                    node: "cpu1".into(),
+                    ..Default::default()
+                },
+            ],
+            pending: vec![
+                PendingJob {
+                    jobid: "90".into(),
+                    user: "alice".into(),
+                    priority: "90".into(),
+                    gpu_count: 4,
+                    cpu_count: 32,
+                    partition: "gpu".into(),
+                    qos: "normal".into(),
+                    reason: "Resources".into(),
+                    submit_time: submitted(2),
+                    ..Default::default()
+                },
+                PendingJob {
+                    jobid: "91".into(),
+                    user: "bob".into(),
+                    priority: "9".into(),
+                    gpu_count: 8,
+                    cpu_count: 16,
+                    partition: "gpu".into(),
+                    reason: "Dependency".into(),
+                    submit_time: submitted(1),
+                    ..Default::default()
+                },
+                PendingJob {
+                    jobid: "92".into(),
+                    user: "bob".into(),
+                    gpu_count: 1,
+                    partition: "gpu".into(),
+                    reason: "Priority".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn header_position(terminal: &Terminal<TestBackend>, label: &str) -> (u16, u16) {
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let line = |y| {
+            (area.x..area.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let y = (area.y..area.bottom())
+            .find(|y| line(*y).contains("JobID"))
+            .unwrap();
+        let x = (area.x..area.right())
+            .find(|x| {
+                (*x..area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .starts_with(label)
+            })
+            .unwrap();
+        (x, y)
+    }
+
+    #[test]
+    fn jobs_header_clicks_follow_rendered_columns_across_resize_and_empty_results() {
+        let mut app = App::for_user("alice".into());
+        app.tab = 3;
+        app.apply(jobs_snapshot());
+        let worker = Worker::new();
+        for width in [160, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            for (label, sort) in [
+                ("User", job_view::Sort::User),
+                ("Priority", job_view::Sort::Priority),
+                ("Req GPU", job_view::Sort::Gpu),
+                ("Req CPU", job_view::Sort::Cpu),
+            ] {
+                terminal.draw(|f| app.draw(f)).unwrap();
+                let (column, row) = header_position(&terminal, label);
+                let mouse = MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                };
+                let selected = app.selected().unwrap().key.clone();
+                assert!(
+                    app.mouse(mouse, &worker),
+                    "{label} not clickable at {width}"
+                );
+                assert_eq!(app.job_sort, sort);
+                assert!(!app.job_reverse);
+                assert_eq!(app.selected().unwrap().key, selected);
+                assert!(app.mouse(mouse, &worker));
+                assert!(app.job_reverse);
+                terminal.draw(|f| app.draw(f)).unwrap();
+                let (x, y) = header_position(&terminal, label);
+                assert_eq!(terminal.backend().buffer()[(x, y)].bg, SELECTED_BG);
+                assert_eq!(terminal.backend().buffer()[(x, y)].fg, FOCUS);
+                let text: String = (x..width)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect();
+                assert!(text.starts_with(&format!(
+                    "{label}{}",
+                    if sort.descending() { "↑" } else { "↓" }
+                )));
+            }
+        }
+        app.data.jobs.clear();
+        app.data.pending.clear();
+        app.rebuild();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let (column, row) = header_position(&terminal, "User");
+        assert!(app.mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE
+            },
+            &worker
+        ));
+        assert_eq!(app.job_sort, job_view::Sort::User);
+    }
+
+    #[test]
+    fn mouse_ignores_non_header_and_modal_clicks_and_wheel_moves_the_current_view() {
+        let mut app = App::for_user("alice".into());
+        app.tab = 3;
+        app.apply(jobs_snapshot());
+        let worker = Worker::new();
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let (column, row) = header_position(&terminal, "User");
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        for kind in [
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+        ] {
+            assert!(!app.mouse(MouseEvent { kind, ..mouse }, &worker));
+        }
+        assert!(!app.mouse(
+            MouseEvent {
+                row: row + 1,
+                ..mouse
+            },
+            &worker
+        ));
+        assert!(!app.mouse(
+            MouseEvent {
+                modifiers: KeyModifiers::SHIFT,
+                ..mouse
+            },
+            &worker
+        ));
+        app.open(Popup::text("modal", "content".into()));
+        assert!(!app.mouse(mouse, &worker));
+        assert!(app.mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                ..mouse
+            },
+            &worker
+        ));
+        assert_eq!(app.popup.as_ref().unwrap().scroll, 1);
+        app.popup = None;
+        app.searching = true;
+        assert!(!app.mouse(mouse, &worker));
+        app.searching = false;
+        assert!(app.mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                ..mouse
+            },
+            &worker
+        ));
+        assert_eq!(app.table.selected(), Some(1));
+        app.tab = 0;
+        assert!(!app.mouse(mouse, &worker));
+        assert_eq!(app.job_sort, job_view::Sort::Priority);
+        terminal.draw(|f| app.draw(f)).unwrap();
+        assert!(app.header_hits.is_empty());
+    }
+
+    #[test]
+    fn jobs_sort_state_and_account_filters_preserve_selection_and_tab_preferences() {
+        let mut app = App::for_user("alice".into());
+        app.tab = 3;
+        app.apply(jobs_snapshot());
+        let ids = |app: &App| {
+            app.rows
+                .iter()
+                .map(|r| r.cells[0].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&app), ["42", "90", "43", "91", "92"]);
+        assert_eq!(app.rows.last().unwrap().cells[12], "?");
+        let worker = Worker::new();
+        app.table.select(Some(1));
+        app.key(KeyCode::Char('s'), &worker);
+        assert_eq!(app.job_sort, job_view::Sort::User);
+        assert_eq!(ids(&app), ["42", "90", "43", "91", "92"]);
+        assert_eq!(app.selected().unwrap().job.as_deref(), Some("90"));
+        app.key(KeyCode::Char('s'), &worker);
+        assert_eq!(ids(&app), ["91", "90", "42", "92", "43"]);
+        app.key(KeyCode::Char('S'), &worker);
+        assert_eq!(ids(&app), ["43", "92", "42", "90", "91"]);
+        app.key(KeyCode::Char('6'), &worker);
+        app.key(KeyCode::Char('s'), &worker);
+        app.key(KeyCode::Char('4'), &worker);
+        assert_eq!(app.job_sort, job_view::Sort::Gpu);
+        assert!(app.job_reverse);
+        assert_eq!(app.sort, 1);
+        app.key(KeyCode::Char('m'), &worker);
+        assert_eq!(ids(&app), ["42", "90"]);
+        app.key(KeyCode::Char('v'), &worker);
+        assert_eq!(ids(&app), ["42"]);
+        app.key(KeyCode::Char('v'), &worker);
+        assert_eq!(ids(&app), ["90"]);
+        let mut fresh = jobs_snapshot();
+        fresh.pending[0].priority = "1000".into();
+        app.apply(fresh);
+        assert_eq!(app.selected().unwrap().job.as_deref(), Some("90"));
+        app.key(KeyCode::Char('0'), &worker);
+        assert_eq!(app.job_filter, job_view::Filter::All);
+        assert_eq!(app.rows.len(), 5);
+    }
+
+    #[test]
+    fn jobs_summary_and_search_follow_the_visible_queue() {
+        let mut app = App::for_user("alice".into());
+        app.tab = 3;
+        app.apply(jobs_snapshot());
+        let summary = app.job_summary(runtime::now());
+        assert_eq!(summary[0], "Jobs: 2 running · 3 pending · 2 users");
+        assert!(summary[1].contains("+1 reasons"));
+        assert!(summary[1].contains("max wait 2.0h"));
+        app.mine = true;
+        assert_eq!(
+            app.job_summary(runtime::now())[0],
+            "Jobs: 1 running · 1 pending · 1 users"
+        );
+        app.search = "normal".into();
+        app.rebuild();
+        assert_eq!(app.rows.len(), 2);
+        app.search = "Resources".into();
+        app.rebuild();
+        assert_eq!(app.rows.len(), 1);
+        assert!(app.job_summary(runtime::now())[1].contains("Resources ×1"));
+        app.mine = false;
+        app.search.clear();
+        app.partition = "cpu".into();
+        app.rebuild();
+        assert_eq!(app.rows[0].job.as_deref(), Some("43"));
+        assert_eq!(
+            app.job_summary(runtime::now())[1],
+            "Pending: none in current filters"
+        );
+    }
+
+    #[test]
+    fn text_palette_has_contrast_on_panels_selected_and_highlighted_rows() {
+        let luminance = |color: Color| {
+            let Color::Rgb(r, g, b) = color else {
+                panic!("theme must use explicit RGB colors")
+            };
+            [r, g, b]
+                .into_iter()
+                .zip([0.2126, 0.7152, 0.0722])
+                .map(|(v, weight)| {
+                    let v = f64::from(v) / 255.0;
+                    (if v <= 0.04045 {
+                        v / 12.92
+                    } else {
+                        ((v + 0.055) / 1.055).powf(2.4)
+                    }) * weight
+                })
+                .sum::<f64>()
+        };
+        for foreground in [
+            TEXT, MUTED, BLUE, CYAN, GREEN, YELLOW, ORANGE, RED, PURPLE, FOCUS,
+        ] {
+            for background in [BACKGROUND, PANEL, HEADER_BG, SELECTED_BG, FOCUS_BG] {
+                let ratio = (luminance(foreground) + 0.05) / (luminance(background) + 0.05);
+                assert!(
+                    ratio >= 4.5,
+                    "low contrast {ratio:.2}: {foreground:?} on {background:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stale_cpu_rows_keep_cached_ram_and_load_unavailable() {
+        let mut app = App::for_user("alice".into());
+        app.tab = 1;
+        app.apply(Snapshot {
+            nodes: vec![Node {
+                name: "gpu1".into(),
+                stale: true,
+                mem_total: "65536".into(),
+                mem_avail: "32768".into(),
+                cpu_load: "42".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert_eq!(app.rows[0].cells[1], "STALE");
+        assert_eq!(app.rows[0].cells[4], "?");
+        assert_eq!(app.rows[0].cells[5], "?");
+    }
+
+    #[test]
+    fn jobs_priority_reason_and_sort_controls_remain_visible_in_narrow_terminals() {
+        let mut app = App::for_user("alice".into());
+        app.tab = 3;
+        app.job_filter = job_view::Filter::Pending;
+        app.apply(jobs_snapshot());
+        for width in [80, 120, 160] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|f| app.draw(f)).unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            for expected in [
+                "Priority",
+                "Req GPU",
+                "Req CPU",
+                "Resources",
+                "state:pending",
+                "sort:priority↓",
+                "s/S",
+            ] {
+                assert!(
+                    text.contains(expected),
+                    "missing {expected:?} at {width} columns"
+                );
+            }
+            let lines: Vec<String> = terminal
+                .backend()
+                .buffer()
+                .content
+                .chunks(width as usize)
+                .map(|row| row.iter().map(|c| c.symbol()).collect())
+                .collect();
+            let header = lines.iter().find(|line| line.contains("JobID")).unwrap();
+            assert!(
+                header.contains("Priority"),
+                "priority header hidden at {width}"
+            );
+            assert!(header.contains("Reason"), "reason header hidden at {width}");
+            assert!(
+                lines.iter().any(|line| line.contains("PENDING")
+                    && line.contains("Resources")
+                    && line.contains("90")),
+                "pending resource row hidden at {width}"
+            );
+        }
+        app.data.errors = "controller query failed".into();
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("Scheduler unavailable"));
+    }
     #[test]
     fn host_columns_units_guides_and_details_survive_resize_and_search() {
         let now = runtime::now();
@@ -3120,13 +3806,13 @@ mod tests {
             buffer
                 .content
                 .iter()
-                .any(|c| c.symbol() == "━" && c.fg == Color::Green)
+                .any(|c| c.symbol() == "━" && c.fg == GREEN)
         );
         assert!(
             buffer
                 .content
                 .iter()
-                .any(|c| c.symbol() == "━" && c.fg == Color::Rgb(255, 166, 87))
+                .any(|c| c.symbol() == "━" && c.fg == ORANGE)
         );
         let lines = buffer
             .content
@@ -3143,7 +3829,7 @@ mod tests {
             .position(|line| line.contains("HOT") && line.contains("#42"))
             .unwrap();
         let x = lines[hot].chars().position(|c| c == 'H').unwrap();
-        assert_eq!(buffer[(x as u16, hot as u16)].fg, Color::Red);
+        assert_eq!(buffer[(x as u16, hot as u16)].fg, RED);
         app.key(KeyCode::Char('x'), &worker);
         assert!(app.popup.is_none());
         assert_eq!(app.current_user, "root");
@@ -3192,9 +3878,9 @@ mod tests {
         assert_eq!(app.popup.as_ref().unwrap().selected, 24);
         app.key(KeyCode::Home, &worker);
         assert_eq!(app.popup.as_ref().unwrap().selected, 0);
-        assert_eq!(MetricKind::Activity.color(Some(80.0)), Color::Green);
+        assert_eq!(MetricKind::Activity.color(Some(80.0)), GREEN);
         assert_eq!(MetricKind::Activity.color(Some(0.0)), MUTED);
-        assert_eq!(MetricKind::Memory.color(Some(98.0)), Color::Red);
+        assert_eq!(MetricKind::Memory.color(Some(98.0)), RED);
         assert_eq!(MetricKind::Memory.color(None), MUTED);
         assert_eq!(MetricKind::Memory.color(Some(f64::NAN)), MUTED);
         assert_eq!(clipped("가나다라마바사", 5).width(), 5);
@@ -3314,7 +4000,7 @@ mod tests {
                         "Node / GPU",
                         "CPU alloc",
                         "GPU-hours",
-                        "Req GPU/CPU/RAM",
+                        "Req GPU",
                         "User",
                         "User",
                         "Resource"

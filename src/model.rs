@@ -50,7 +50,8 @@ model!(Job {
     time_limit: String = String::new(), mem: String = String::new(), script: String = String::new(),
     log_out: String = String::new(), log_err: String = String::new(), detail: String = String::new(),
     log_status: BTreeMap<String, String> = BTreeMap::new(), uid: i64 = -1,
-    qos: String = String::new(), telemetry: BTreeMap<String, Value> = BTreeMap::new()
+    qos: String = String::new(), priority: String = String::new(),
+    telemetry: BTreeMap<String, Value> = BTreeMap::new()
 });
 
 model!(PendingJob {
@@ -161,6 +162,7 @@ mod tests {
         assert!(serde_json::from_value::<Node>(json!({})).unwrap().has_gpu);
         let job: Job = serde_json::from_value(json!({"uid": "malformed"})).unwrap();
         assert_eq!(job.uid, -1);
+        assert!(job.priority.is_empty());
         let node: Node = serde_json::from_value(json!({"has_gpu": "malformed"})).unwrap();
         assert!(node.has_gpu);
     }

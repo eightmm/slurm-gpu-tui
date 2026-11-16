@@ -36,6 +36,9 @@ pub struct Inventory {
     pub partition: String,
     pub gpus: u32,
     pub cpus: u32,
+    pub cpu_alloc: Option<u32>,
+    pub cpu_idle: Option<u32>,
+    pub reason: String,
 }
 #[derive(Default)]
 pub struct Allocation {
@@ -43,6 +46,8 @@ pub struct Allocation {
     pub cpu: BTreeMap<String, BTreeMap<String, u32>>,
     pub pending: BTreeMap<String, BTreeMap<String, u32>>,
     pub ends: BTreeMap<String, f64>,
+    pub pending_reasons: BTreeMap<String, u32>,
+    pub oldest_pending: Option<f64>,
 }
 
 pub fn parse_inventory(raw: &str, cpu: &str) -> BTreeMap<String, Inventory> {
@@ -50,8 +55,8 @@ pub fn parse_inventory(raw: &str, cpu: &str) -> BTreeMap<String, Inventory> {
     let mut partitions = BTreeMap::<String, Vec<String>>::new();
     let mut members = BTreeMap::<String, BTreeSet<String>>::new();
     for line in raw.lines() {
-        let p: Vec<_> = line.split('|').map(str::trim).collect();
-        if p.len() != 4 {
+        let p: Vec<_> = line.splitn(5, '|').map(str::trim).collect();
+        if !matches!(p.len(), 4 | 5) {
             continue;
         }
         let name = p[0].split('.').next().unwrap_or("");
@@ -62,6 +67,9 @@ pub fn parse_inventory(raw: &str, cpu: &str) -> BTreeMap<String, Inventory> {
         let entry = out.entry(name.into()).or_default();
         entry.state = p[1].into();
         entry.gpus = entry.gpus.max(scheduler::gpu_count(p[2]));
+        if let Some(reason) = p.get(4).filter(|s| !matches!(**s, "" | "none" | "(null)")) {
+            entry.reason = reason.to_string();
+        }
         let parts = partitions.entry(name.into()).or_default();
         if !parts.iter().any(|p| p == part) {
             parts.push(part.into());
@@ -99,8 +107,21 @@ pub fn parse_inventory(raw: &str, cpu: &str) -> BTreeMap<String, Inventory> {
         if !runtime::valid_host(name) {
             continue;
         }
-        if let Some(count) = p[1].rsplit('/').next().and_then(|s| s.parse::<u32>().ok()) {
-            out.entry(name.into()).or_default().cpus = count;
+        let counts: Vec<_> = p[1]
+            .split('/')
+            .map(str::parse::<u32>)
+            .collect::<std::result::Result<_, _>>()
+            .unwrap_or_default();
+        if let [allocated, idle, other, total] = counts.as_slice()
+            && allocated
+                .checked_add(*idle)
+                .and_then(|n| n.checked_add(*other))
+                == Some(*total)
+        {
+            let entry = out.entry(name.into()).or_default();
+            entry.cpus = *total;
+            entry.cpu_alloc = Some(*allocated);
+            entry.cpu_idle = Some(*idle);
         }
     }
     out
@@ -110,7 +131,7 @@ pub fn parse_allocations(raw: &str) -> Allocation {
     let mut out = Allocation::default();
     for line in raw.lines() {
         let p: Vec<_> = line.split('|').map(str::trim).collect();
-        if p.len() != 9
+        if !matches!(p.len(), 9 | 10)
             || !scheduler::valid_job_id(p[0])
             || p[2].is_empty()
             || p[2].len() > 256
@@ -124,9 +145,16 @@ pub fn parse_allocations(raw: &str) -> Allocation {
                 .or_default()
                 .entry(p[1].into())
                 .or_default() += 1;
+            let reason = p[8].trim_matches(['(', ')']);
+            *out.pending_reasons
+                .entry(if reason.is_empty() { "unknown" } else { reason }.into())
+                .or_default() += 1;
+            if let Some(stamp) = p.get(9).and_then(|s| rules::parse_timestamp(s)) {
+                out.oldest_pending = Some(out.oldest_pending.unwrap_or(stamp).min(stamp));
+            }
             continue;
         }
-        if p[3] != "RUNNING" {
+        if !matches!(p[3], "RUNNING" | "COMPLETING") {
             continue;
         }
         let Some(nodes) = scheduler::expand_nodes(p[8]) else {
@@ -138,7 +166,9 @@ pub fn parse_allocations(raw: &str) -> Allocation {
         let per_node = scheduler::gpu_count(p[6]);
         let cpu = p[5].parse::<u32>().unwrap_or(0);
         let count = nodes.len() as u32;
-        let end = rules::parse_timestamp(p[7]);
+        let end = (p[3] == "RUNNING")
+            .then(|| rules::parse_timestamp(p[7]))
+            .flatten();
         for (index, node) in nodes.iter().enumerate() {
             let node = node.split('.').next().unwrap_or(node).to_string();
             if per_node > 0 {
@@ -247,6 +277,7 @@ struct Presentation {
     color: bool,
     width: usize,
     user: String,
+    summary: bool,
 }
 impl Presentation {
     fn paint(&self, text: &str, tone: Tone) -> String {
@@ -272,6 +303,9 @@ impl Presentation {
         }
     }
     fn resource(&self, label: &str, used: u64, total: u64) -> String {
+        if total == 0 {
+            return format!("{label}: {used}/0 · no reported capacity\n");
+        }
         let fraction = if total > 0 {
             used as f64 / total as f64
         } else {
@@ -298,7 +332,20 @@ fn allocation_tone(used: u64, total: u64) -> Tone {
         Tone::Good
     }
 }
-fn cell(raw: &str, width: usize, right: bool) -> String {
+fn admitting(state: &str) -> bool {
+    let state = state.to_ascii_lowercase();
+    !state.contains('*')
+        && ![
+            "down", "drain", "fail", "maint", "reserv", "planned", "power", "reboot", "unknown",
+        ]
+        .iter()
+        .any(|flag| state.contains(flag))
+        && matches!(
+            state.split('+').next().unwrap_or(""),
+            "idle" | "mix" | "mixed" | "alloc" | "allocated"
+        )
+}
+pub(crate) fn cell(raw: &str, width: usize, right: bool) -> String {
     let safe: String = raw.chars().filter(|c| !c.is_control()).collect();
     let mut text = String::new();
     let clipped = safe.width() > width;
@@ -379,9 +426,7 @@ fn table(
             out.push_str(&view.paint(&cell(label, 13, false), Tone::Heading));
             out.push_str(&separator);
             for node in nodes {
-                let warning = ["down", "drain", "fail"]
-                    .iter()
-                    .any(|s| inventory[node].state.to_lowercase().contains(s));
+                let warning = !admitting(&inventory[node].state);
                 let text = if partition {
                     inventory[node].partition.clone()
                 } else {
@@ -442,7 +487,14 @@ fn table(
         out.push_str(&separator);
         let (mut used, mut capacity) = (0, 0u64);
         for node in nodes {
-            let allocated = sum(rows, node);
+            let allocated = if gpu {
+                sum(rows, node)
+            } else {
+                inventory[node]
+                    .cpu_alloc
+                    .map(u64::from)
+                    .unwrap_or_else(|| sum(rows, node))
+            };
             let total = if gpu {
                 inventory[node].gpus
             } else {
@@ -462,19 +514,158 @@ fn table(
         ));
         out.push('\n');
         if gpu && nodes.iter().any(|n| ends.contains_key(n)) {
-            out.push_str(&view.paint(&cell("Next free ~", 13, false), Tone::Muted));
+            out.push_str(&view.paint(&cell("Next end ~", 13, false), Tone::Muted));
             out.push_str(&separator);
             for node in nodes {
                 let value = ends
                     .get(node)
                     .filter(|_| sum(rows, node) > 0)
-                    .map(|end| eta(*end, now))
+                    .map(|end| {
+                        if *end > now {
+                            eta(*end, now)
+                        } else {
+                            "?".into()
+                        }
+                    })
                     .unwrap_or_default();
                 out.push_str(&view.paint(&cell(&value, width, true), Tone::Busy));
                 out.push_str(&separator);
             }
             out.push_str(&cell("", 10, true));
             out.push('\n');
+        }
+    }
+}
+
+fn node_summary(
+    out: &mut String,
+    inventory: &BTreeMap<String, Inventory>,
+    allocation: &Allocation,
+    now: f64,
+    view: &Presentation,
+) {
+    out.push_str(&format!(
+        "\n{}\n",
+        view.paint("── Node capacity", Tone::Heading)
+    ));
+    let name_width = (view.width / 5).clamp(8, 20);
+    let full_cpu = view.width >= 85;
+    let ends = view.width >= 100;
+    let gpu_headroom = view.width >= 60;
+    out.push_str(&view.paint(
+        &format!(
+            "{} {} {}{} {}{}{}\n",
+            cell("Node", name_width, false),
+            cell("State", 12, false),
+            cell("GPU alloc", 9, true),
+            if gpu_headroom {
+                format!(" {}", cell("GPU unalloc", 11, true))
+            } else {
+                String::new()
+            },
+            cell("CPU idle", 8, true),
+            if full_cpu {
+                format!(" {}", cell("CPU alloc", 12, true))
+            } else {
+                String::new()
+            },
+            if ends {
+                format!(" {}", cell("Next end ~", 10, true))
+            } else {
+                String::new()
+            },
+        ),
+        Tone::Heading,
+    ));
+    let mut nodes: Vec<_> = inventory.iter().collect();
+    nodes.sort_by(|a, b| natural(a.0, b.0));
+    for (name, node) in nodes {
+        let up = admitting(&node.state);
+        let tone = if up { Tone::Normal } else { Tone::Alert };
+        let idle = if up {
+            node.cpu_idle
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "?".into())
+        } else {
+            "—".into()
+        };
+        out.push_str(&format!(
+            "{} {} {}{} {}{}{}\n",
+            view.paint(&cell(name, name_width, false), tone),
+            view.paint(
+                &cell(
+                    if node.state.is_empty() {
+                        "unknown"
+                    } else {
+                        &node.state
+                    },
+                    12,
+                    false
+                ),
+                tone
+            ),
+            cell(
+                &format!("{}/{}", sum(&allocation.gpu, name), node.gpus),
+                9,
+                true
+            ),
+            if gpu_headroom {
+                let idle = if up {
+                    u64::from(node.gpus)
+                        .saturating_sub(sum(&allocation.gpu, name))
+                        .to_string()
+                } else {
+                    "—".into()
+                };
+                format!(" {}", cell(&idle, 11, true))
+            } else {
+                String::new()
+            },
+            cell(&idle, 8, true),
+            if full_cpu {
+                format!(
+                    " {}",
+                    cell(
+                        &format!(
+                            "{}/{}",
+                            node.cpu_alloc
+                                .map(|n| n.to_string())
+                                .unwrap_or_else(|| "?".into()),
+                            node.cpus
+                        ),
+                        12,
+                        true
+                    )
+                )
+            } else {
+                String::new()
+            },
+            if ends {
+                format!(
+                    " {}",
+                    cell(
+                        &allocation
+                            .ends
+                            .get(name)
+                            .filter(|end| **end > now)
+                            .map(|end| eta(*end, now))
+                            .unwrap_or_else(|| "?".into()),
+                        10,
+                        true
+                    )
+                )
+            } else {
+                String::new()
+            },
+        ));
+        if !up && !node.reason.is_empty() {
+            out.push_str(&format!(
+                "  {}\n",
+                view.paint(
+                    cell(&node.reason, view.width.saturating_sub(2), false).trim_end(),
+                    Tone::Muted
+                )
+            ));
         }
     }
 }
@@ -492,6 +683,7 @@ pub fn render(
             color: false,
             width: 100,
             user: String::new(),
+            summary: false,
         },
     )
 }
@@ -515,70 +707,100 @@ fn render_with(
             .filter(|u| !gpu_users.contains(u)),
     );
     let mut out = String::new();
-    table(
-        &mut out,
-        "GPU allocation",
-        &gpu_nodes,
-        &gpu_users,
-        &allocation.gpu,
-        TableContext {
-            inventory,
-            gpu: true,
-            ends: &allocation.ends,
-            now,
-            view,
-        },
-    );
-    for (category, label) in [
-        (0, "CPU Threads — GPU nodes"),
-        (1, "CPU Threads — CPU nodes"),
-        (2, "CPU Threads — Other nodes"),
-    ] {
-        let mut nodes: Vec<_> = inventory
-            .iter()
-            .filter(|(name, n)| {
-                n.cpus > 0
-                    && match category {
-                        0 => n.gpus > 0,
-                        1 => n.gpus == 0 && name.starts_with("cpu"),
-                        _ => n.gpus == 0 && !name.starts_with("cpu"),
-                    }
-            })
-            .map(|(name, _)| name.clone())
-            .collect();
-        nodes.sort_by(|a, b| natural(a, b));
+    if !view.summary {
         table(
             &mut out,
-            label,
-            &nodes,
-            &users,
-            &allocation.cpu,
+            "GPU allocation",
+            &gpu_nodes,
+            &gpu_users,
+            &allocation.gpu,
             TableContext {
                 inventory,
-                gpu: false,
-                ends: &BTreeMap::new(),
+                gpu: true,
+                ends: &allocation.ends,
                 now,
                 view,
             },
         );
+        for (category, label) in [
+            (0, "CPU Threads — GPU nodes"),
+            (1, "CPU Threads — CPU nodes"),
+            (2, "CPU Threads — Other nodes"),
+        ] {
+            let mut nodes: Vec<_> = inventory
+                .iter()
+                .filter(|(name, n)| {
+                    n.cpus > 0
+                        && match category {
+                            0 => n.gpus > 0,
+                            1 => n.gpus == 0 && name.starts_with("cpu"),
+                            _ => n.gpus == 0 && !name.starts_with("cpu"),
+                        }
+                })
+                .map(|(name, _)| name.clone())
+                .collect();
+            nodes.sort_by(|a, b| natural(a, b));
+            table(
+                &mut out,
+                label,
+                &nodes,
+                &users,
+                &allocation.cpu,
+                TableContext {
+                    inventory,
+                    gpu: false,
+                    ends: &BTreeMap::new(),
+                    now,
+                    view,
+                },
+            );
+        }
+        if !allocation.pending.is_empty() {
+            out.push_str(&format!(
+                "\n{}\n",
+                view.paint("── Pending jobs", Tone::Heading)
+            ));
+            for user in ordered(&allocation.pending) {
+                let row = &allocation.pending[&user];
+                out.push_str(&format!(
+                    "{}: {} ({})\n",
+                    view.paint(&cell(&view.user(&user).0, 13, false), view.user(&user).1),
+                    row.values().map(|n| *n as u64).sum::<u64>(),
+                    row.iter()
+                        .map(|(p, n)| format!("{}:{n}", cli::terminal_safe(p)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+    } else {
+        node_summary(&mut out, inventory, allocation, now, view);
     }
-    if !allocation.pending.is_empty() {
+    if !allocation.pending_reasons.is_empty() {
         out.push_str(&format!(
             "\n{}\n",
-            view.paint("── Pending jobs", Tone::Heading)
+            view.paint("── Pending reasons", Tone::Heading)
         ));
-        for user in ordered(&allocation.pending) {
-            let row = &allocation.pending[&user];
+        let mut reasons: Vec<_> = allocation.pending_reasons.iter().collect();
+        reasons.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        for (reason, count) in reasons {
             out.push_str(&format!(
-                "{}: {} ({})\n",
-                view.paint(&cell(&view.user(&user).0, 13, false), view.user(&user).1),
-                row.values().map(|n| *n as u64).sum::<u64>(),
-                row.iter()
-                    .map(|(p, n)| format!("{}:{n}", cli::terminal_safe(p)))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "  {count:>5}  {}\n",
+                view.paint(
+                    &cell(reason, view.width.saturating_sub(10), false),
+                    Tone::Busy
+                )
+                .trim_end()
             ));
         }
+        out.push_str(&format!(
+            "Oldest pending: {}\n",
+            allocation
+                .oldest_pending
+                .filter(|t| *t > 0.0 && *t <= now + 5.0)
+                .map(|t| rules::span((now - t).max(0.0) as u64))
+                .unwrap_or_else(|| "?".into())
+        ));
     }
     let gpu_used = gpu_nodes
         .iter()
@@ -587,7 +809,12 @@ fn render_with(
     let gpu_total = inventory.values().map(|n| n.gpus as u64).sum::<u64>();
     let cpu_used = inventory
         .keys()
-        .map(|n| sum(&allocation.cpu, n))
+        .map(|n| {
+            inventory[n]
+                .cpu_alloc
+                .map(u64::from)
+                .unwrap_or_else(|| sum(&allocation.cpu, n))
+        })
         .sum::<u64>();
     let cpu_total = inventory.values().map(|n| n.cpus as u64).sum::<u64>();
     let timestamp = chrono::DateTime::from_timestamp(now as i64, 0)
@@ -603,13 +830,40 @@ fn render_with(
         view.paint(&timestamp, Tone::Muted)
     );
     header.push_str(&view.resource("GPU", gpu_used, gpu_total));
-    header.push_str(&view.resource("CPU", cpu_used, cpu_total));
+    header.push_str(&view.resource(
+        if inventory.values().any(|n| n.cpu_alloc.is_none()) {
+            "CPU ~"
+        } else {
+            "CPU"
+        },
+        cpu_used,
+        cpu_total,
+    ));
+    let blocked = inventory.values().filter(|n| !admitting(&n.state)).count();
+    let unallocated: u64 = inventory
+        .iter()
+        .filter(|(_, n)| admitting(&n.state))
+        .map(|(name, n)| u64::from(n.gpus).saturating_sub(sum(&allocation.gpu, name)))
+        .sum();
+    header.push_str(&format!(
+        "Nodes: {} · blocked/unknown {blocked} · GPU unallocated on up nodes: {unallocated}\n",
+        inventory.len()
+    ));
+    let pending: u64 = allocation
+        .pending
+        .values()
+        .flat_map(|r| r.values())
+        .map(|n| u64::from(*n))
+        .sum();
+    header.push_str(&format!("Pending jobs: {pending}\n"));
     header.push_str(&out);
     out = header;
     for note in [
         "Allocation, not measured utilization.",
-        "Next free ~ estimates a job end.",
-        "It is not a reservation. * marks your jobs.",
+        "Next end ~ follows job time limits, not actual finishes.",
+        "Unallocated is not an admission guarantee. * marks your jobs.",
+        "CPU user rows split multi-node requests; node totals use sinfo.",
+        "! marks blocked/unknown nodes. --summary shows node details.",
     ] {
         out.push_str(&view.paint(note, Tone::Muted));
         out.push('\n');
@@ -688,19 +942,19 @@ fn conf_fallback(inventory: &mut BTreeMap<String, Inventory>) {
     }
 }
 
-pub fn run(color: ColorMode) -> Result<()> {
+pub fn run(color: ColorMode, summary: bool) -> Result<()> {
     let (queue, nodes, cpu) = std::thread::scope(|scope| {
         let queue = scope.spawn(|| {
             process::run(
                 Program::Squeue,
-                &["--noheader", "-o", "%i|%P|%u|%T|%M|%C|%b|%e|%R"],
+                &["--noheader", "-o", "%i|%P|%u|%T|%M|%C|%b|%e|%R|%V"],
                 Duration::from_secs(12),
             )
         });
         let nodes = scope.spawn(|| {
             process::run(
                 Program::Sinfo,
-                &["-N", "--noheader", "-o", "%n|%T|%G|%P"],
+                &["-N", "--noheader", "-o", "%n|%T|%G|%P|%E"],
                 Duration::from_secs(12),
             )
         });
@@ -746,6 +1000,7 @@ pub fn run(color: ColorMode) -> Result<()> {
                     .unwrap_or(100)
                     .max(40),
                 user: cli::current_user(),
+                summary,
             }
         )
     );
@@ -755,6 +1010,77 @@ pub fn run(color: ColorMode) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn summary_excludes_blocked_capacity_counts_completing_and_explains_pending() {
+        let inventory = parse_inventory(
+            "gpu1|mixed|gpu:4|gpu|none\ngpu2|drain|gpu:8|gpu|maintenance\ngpu3|idle*|gpu:2|gpu|not responding\ncpu1|idle|(null)|cpu|none",
+            "gpu1|4/4/0/8\ngpu2|0/0/8/8\ngpu3|0/0/8/8\ncpu1|0/8/0/8",
+        );
+        let start = "2026-11-16T00:00:00";
+        let now = rules::parse_timestamp(start).unwrap() + 7200.0;
+        let allocation = parse_allocations(&format!(
+            "42|gpu|alice|RUNNING|00:01|2|gpu:1|2026-11-16T04:00:00|gpu1|{start}\n43|gpu|bob|COMPLETING|00:01|2|gpu:1|2026-11-16T00:30:00|gpu1|{start}\n44|gpu|alice|PENDING|00:00|4|gpu:2|N/A|(Resources)|{start}"
+        ));
+        assert_eq!(sum(&allocation.gpu, "gpu1"), 2);
+        assert_eq!(allocation.pending_reasons["Resources"], 1);
+        assert_eq!(
+            allocation.ends["gpu1"],
+            rules::parse_timestamp("2026-11-16T04:00:00").unwrap()
+        );
+        let view = Presentation {
+            color: false,
+            width: 100,
+            user: String::new(),
+            summary: true,
+        };
+        let summary = render_with(&inventory, &allocation, now, &view);
+        assert!(summary.contains("Node capacity"));
+        assert!(summary.contains("GPU unalloc") && summary.contains("CPU idle"));
+        assert!(summary.contains("blocked/unknown 2"));
+        assert!(summary.contains("GPU unallocated on up nodes: 2"));
+        assert!(summary.contains("Pending jobs: 1"));
+        assert!(summary.contains("Oldest pending: 2.0h"));
+        assert!(summary.contains("maintenance"));
+        assert!(!summary.contains("GPU allocation"));
+        let blocked = summary.lines().find(|l| l.starts_with("gpu2 ")).unwrap();
+        assert!(blocked.contains('—'));
+        let matrix = render(&inventory, &allocation, now);
+        assert!(matrix.contains("GPU allocation") && matrix.contains("Pending reasons"));
+        for state in [
+            "down",
+            "draining",
+            "reserved",
+            "mixed+drain",
+            "idle*",
+            "unknown",
+            "completing",
+        ] {
+            assert!(!admitting(state), "{state}");
+        }
+    }
+
+    #[test]
+    fn summary_preserves_missing_cpu_counts_and_bounded_node_rows() {
+        let inventory = parse_inventory(
+            "gpu1|idle|gpu:4|gpu\ngpu2|idle|gpu:4|gpu",
+            "gpu1|malformed\ngpu2|4/4/0/9",
+        );
+        assert!(inventory["gpu1"].cpu_idle.is_none());
+        assert!(inventory["gpu2"].cpu_alloc.is_none());
+        for width in [40, 60, 80, 100] {
+            let view = Presentation {
+                color: false,
+                width,
+                user: String::new(),
+                summary: true,
+            };
+            let summary = render_with(&inventory, &Allocation::default(), 0.0, &view);
+            for row in summary.lines().filter(|l| l.starts_with("gpu")) {
+                assert!(row.contains('?'));
+                assert!(row.width() <= width, "{}: {row}", row.width());
+            }
+        }
+    }
     #[test]
     fn gpu_partition_labels_prefer_dedicated_members_over_cpu_aliases() {
         let lines = [
@@ -801,6 +1127,7 @@ mod tests {
                 color: false,
                 width: 50,
                 user: String::new(),
+                summary: false,
             },
         );
         assert!(!plain.contains('\x1b'));

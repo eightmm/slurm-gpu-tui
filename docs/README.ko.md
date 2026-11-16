@@ -11,7 +11,7 @@
 [![Linux](https://img.shields.io/badge/platform-Linux-2D6A4F?logo=linux&logoColor=white)](https://github.com/eightmm/slurm-gpu-tui#build-and-install)
 [![GitHub stars](https://img.shields.io/github/stars/eightmm/slurm-gpu-tui?style=social)](https://github.com/eightmm/slurm-gpu-tui/stargazers)
 
-[설치](#build-and-install) · [사용법](#사용법) · [Slack 알림](ALERTS.md) · [English](../README.md)
+[화면 예시](#화면-예시) · [설치](#build-and-install) · [사용법](#사용법) · [Slack 알림](ALERTS.md) · [English](../README.md)
 
 </div>
 
@@ -25,6 +25,50 @@
 | **작업 들여다보기** | 이력·스크립트·로그와 본인 작업 취소 확인 |
 | **화면 밖에서도 알림** | Slack 일별 스레드, 소유자 전용 실패 DM, Prometheus textfile |
 | **노드가 결과 게시** | 독립 publisher로 수집하며, 결측·stale을 가용량과 구분 |
+
+## 화면 예시
+
+예시 데이터로 렌더링한 120열 화면입니다. 아래에는 80열 Jobs 화면도 포함했습니다.
+
+**Jobs** — 클릭 정렬 헤더, 사용자 강조와 대기 이유를 함께 보여줍니다.
+
+![Priority 정렬, 사용자 강조와 대기 이유를 표시한 Jobs 화면](images/tui-jobs.png)
+
+<details>
+<summary>GPU 대시보드</summary>
+
+자원 막대, 노드별 상태 지도와 GPU별 관측값을 확인합니다.
+
+![사용률, VRAM, 빈 GPU와 parked 할당을 표시한 GPU 대시보드](images/tui-gpu.png)
+
+</details>
+
+<details>
+<summary>사용자별 자원과 공유 노드 지표</summary>
+
+작업에 귀속되는 CPU·RAM·I/O와 노드 공용 network·load를 구분합니다.
+
+![사용자별 작업 자원과 공유 노드 카운터를 표시한 Users 화면](images/tui-users.png)
+
+</details>
+
+<details>
+<summary>컨트롤러 Host</summary>
+
+CPU·메모리·pressure, 디스크·네트워크 처리량과 파일시스템 용량을 해석 기준과 함께 보여줍니다.
+
+![컨트롤러 자원, 장치 처리량과 용량 해석 기준을 표시한 Host 화면](images/tui-host.png)
+
+</details>
+
+<details>
+<summary>80열 터미널의 Jobs</summary>
+
+좁은 화면에서도 priority, GPU·CPU 요청과 대기 이유를 유지합니다.
+
+![Priority, 자원 요청과 대기 이유를 유지한 80열 Jobs 화면](images/tui-jobs-narrow.png)
+
+</details>
 
 ## Build and install
 
@@ -57,7 +101,10 @@ sgpu usage 7 --daily     # GPU-hours
 sgpu jobs 7              # 작업 이력
 sgpu logs 12345 -e -f    # stderr 따라가기
 sgpu doctor             # 수집·설정 진단
+sgpu host               # 게시된 컨트롤러 자원·디스크·파일시스템
+sgpu users              # 게시된 사용자별 자원과 공유 노드 카운터
 chkgpu                  # 사용자 × 노드 할당량
+chkgpu --summary        # 노드별 여유 자원·사용 불가 상태·대기 이유
 ```
 
 | 키 | 동작 |
@@ -66,6 +113,7 @@ chkgpu                  # 사용자 × 노드 할당량
 | `u` / `p` / `m` / `i` | 사용자 / 파티션 / 강조한 사용자 / 빈 GPU 필터 |
 | `[` / `]` / `0` | 이전 노드 / 다음 노드 / 필터 초기화 |
 | `/` / `s` / `S` | 검색 / 정렬 / 역순 |
+| Jobs에서 `v` | 전체 / 실행 / 대기 작업 |
 | Enter / Tab | 상세 열기 / 정보·스크립트·로그 탭 전환 |
 | `w` / `f` / `h` | 낭비 / 가용량 / 작업 이력 |
 | `n` / `x` | 작업 watch / 본인 작업 취소 확인 |
@@ -74,6 +122,34 @@ chkgpu                  # 사용자 × 노드 할당량
 `sgpu`는 자원 막대·GPU 상태 기호·정렬 가능한 표를 갖춘 대시보드를 엽니다.
 `chkgpu`는 터미널에서 자동으로 색상을 쓰고 파이프 출력에서는 제거합니다.
 `--color always`, `--color never`로 지정하거나 `NO_COLOR`로 끌 수 있습니다.
+`chkgpu --summary`는 행렬 대신 노드 상태, GPU 할당·미할당 수, CPU idle 수,
+사용 불가 이유와 대기 이유별 개수·최장 대기 시간을 보여줍니다. CPU 수는 `sinfo`를
+사용하며 결측은 `?`, 사용 불가·상태 불명 노드의 여유량은 `—`로 표시합니다.
+`COMPLETING` 작업도 할당에 포함하며 기본 행렬에도 대기 이유 요약을 추가했습니다.
+Slurm 조회는 기존과 같은 세 번이며 compute node에 접속하지 않습니다.
+여유량은 scheduler 카운터 기준으로 실행 승인을 보장하지 않으며 다음 종료 예상은
+작업 제한 시간 기준입니다. 다중 노드 작업의 사용자별 CPU 분배는 추정값입니다.
+`sgpu host`, `sgpu users`는 해당 자원 화면을 단발 출력합니다. 최신 collector
+snapshot이 필요하며 UI를 실행한 컴퓨터의 측정값으로 대체하지 않습니다.
+사용자별 network/load는 공유 노드 값이며 미지원 지표는 결측으로 남깁니다.
+
+**Jobs**에서 `s`로 priority·사용자·요청 GPU·요청 CPU·대기 시간·남은 시간을
+순환 정렬하고 `S`로 방향을 바꿉니다. Priority는 높은 점수부터, 사용자별 묶음은
+이름순으로 표시하고 묶음 안에서는 높은 priority부터 보여줍니다. 결측값은 양쪽
+방향 모두 뒤에 둡니다. `v`로 전체/실행/대기를 전환하고 `0`으로 필터를 초기화합니다.
+요약에는 현재 필터에 맞는 실행·대기 작업 수와 사용자 수, 주요 대기 이유와 최장 대기 시간이
+표시됩니다. 검색은 partition과 QOS도 찾으며, 좁은 화면에도 priority와 대기 이유를
+남기고 여유가 있으면 CPU cores와 RAM/VRAM GiB 열을 표시합니다. 새로고침이나
+탭 이동 후에도 Jobs 정렬 설정을 유지합니다. Priority는 Slurm 점수이며 실행 순번을
+보장하지 않습니다. 남은 시간은 작업 제한 시간 기준이며 GPU 요청은 노드당 GRES,
+CPU 요청은 작업 전체 기준입니다. 실행 작업의 priority가
+없는 이전 snapshot은 `?`로 표시합니다.
+Jobs의 **User**, **Priority**, **Req GPU**, **Req CPU** 헤더를 클릭해 바로
+정렬하고 같은 헤더를 다시 클릭하면 방향을 바꿉니다. 헤더의 화살표로 클릭 가능
+여부와 현재 방향을 표시합니다. 마우스 휠로 표와 상세 화면을 스크롤할 수 있습니다.
+표와 팝업은 대비가 높은 어두운 팔레트를 공유합니다. 선택 행·본인 계정·현재 정렬
+헤더를 다르게 강조하고, 상태와 주요 자원 값에 색을 집중합니다. Jobs·Users·Attention은
+대시보드 높이를 줄여 목록을 더 많이 보여줍니다.
 
 본인 작업은 청록색 배경과 `◆`로 강조하며 선택 커서와 구분합니다.
 Util은 활동량에 따라 회색·파랑·청록·초록, VRAM은 포화도에 따라

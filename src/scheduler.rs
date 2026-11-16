@@ -246,6 +246,7 @@ pub fn parse_queue(raw: &str) -> Queue {
                 gres_raw: fields[7].into(),
                 time_limit: fields[8].into(),
                 mem: fields[10].into(),
+                priority: fields[12].into(),
                 ..Default::default()
             });
         } else if state == "PENDING" {
@@ -1233,6 +1234,7 @@ mod tests {
     fn queue_rejects_duplicate_identity_and_keeps_submit_time() {
         let line = "RUNNING|42|alice|1001|gpu|00:01|gpu1|gpu:h100:2|01:00:00|4|8G|None|1|N/A|2026-07-01T00:00:00";
         assert_eq!(parse_queue(line).jobs[0].gpu_count, 2);
+        assert_eq!(parse_queue(line).jobs[0].priority, "1");
         let duplicate = parse_queue(&format!("{line}\n{line}"));
         assert!(duplicate.jobs.is_empty());
         assert!(duplicate.anchors.is_empty());

@@ -143,6 +143,7 @@ fn collector_merges_push_payload_without_a_node_request_and_preserves_inventory_
     assert!(snapshot.controller["observed_at"].as_f64().is_some());
     assert!(!String::from_utf8_lossy(&first.stdout).contains("NEVER_EXPORTED"));
     assert!(snapshot.jobs[0].detail.is_empty());
+    assert_eq!(snapshot.jobs[0].priority, "1");
     assert!(!String::from_utf8_lossy(&first.stdout).contains("/private/owner"));
     fs::remove_file(cluster.agents.join("gpu1.json")).unwrap();
     let second = cluster.collector();

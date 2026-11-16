@@ -8,6 +8,7 @@ pub mod collector;
 pub mod history;
 pub mod host;
 pub mod host_view;
+pub mod job_view;
 pub mod logs;
 pub mod metrics;
 pub mod model;
