@@ -13,7 +13,7 @@ use std::{
     },
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 pub fn now() -> f64 {
@@ -300,10 +300,24 @@ pub fn read_regular(
     limit: u64,
     owner: Option<u32>,
 ) -> Result<(Vec<u8>, fs::Metadata)> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)?;
+    let start = Instant::now();
+    let mut file = loop {
+        let opened = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path);
+        match opened {
+            // NFS write delegations can briefly reject local nonblocking
+            // opens while the kernel recalls the lease. Keep FIFO safety.
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    && start.elapsed() < Duration::from_millis(250) =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => break result?,
+        }
+    };
     let st = file.metadata()?;
     if !st.is_file() || owner.is_some_and(|uid| st.uid() != uid) || st.len() > limit {
         return Err("unsafe or oversized file".into());
@@ -693,6 +707,61 @@ mod tests {
     }
 
     #[test]
+    fn regular_reads_retry_lease_recalls_and_bound_an_unreleased_lease() {
+        use std::sync::{Arc, atomic::AtomicBool};
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("payload");
+        let mut owner = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        owner.write_all(b"payload").unwrap();
+        let notified = Arc::new(AtomicBool::new(false));
+        let handler = signal_hook::flag::register(libc::SIGIO, notified.clone()).unwrap();
+        // SAFETY: owner is an open, regular file owned by this test user.
+        assert_eq!(
+            unsafe { libc::fcntl(owner.as_raw_fd(), libc::F_SETLEASE, libc::F_WRLCK) },
+            0
+        );
+        let release = owner.try_clone().unwrap();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            // SAFETY: release keeps the leased file descriptor alive.
+            assert_eq!(
+                unsafe { libc::fcntl(release.as_raw_fd(), libc::F_SETLEASE, libc::F_UNLCK) },
+                0
+            );
+        });
+        let read = read_regular(&path, 32, None);
+        let released = worker.join();
+        // SAFETY: the first read has closed its descriptor before reacquiring.
+        assert_eq!(
+            unsafe { libc::fcntl(owner.as_raw_fd(), libc::F_SETLEASE, libc::F_WRLCK) },
+            0
+        );
+        let start = Instant::now();
+        let blocked = read_regular(&path, 32, None);
+        let elapsed = start.elapsed();
+        // SAFETY: owner still owns this lease; release it before assertions.
+        unsafe {
+            libc::fcntl(owner.as_raw_fd(), libc::F_SETLEASE, libc::F_UNLCK);
+        }
+        signal_hook::low_level::unregister(handler);
+        released.unwrap();
+        assert_eq!(read.unwrap().0, b"payload");
+        assert!(notified.load(Ordering::Relaxed));
+        assert!(
+            blocked
+                .unwrap_err()
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+        );
+        assert!(elapsed < Duration::from_secs(2));
+    }
+
+    #[test]
     fn unsafe_directory_and_unbounded_reads_are_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o777)).unwrap();
@@ -702,6 +771,16 @@ mod tests {
         assert!(read_regular(&tmp.path().join("x"), 2, None).is_err());
         symlink(tmp.path().join("x"), tmp.path().join("link")).unwrap();
         assert!(read_regular(&tmp.path().join("link"), 20, None).is_err());
+        let fifo = tmp.path().join("fifo");
+        let raw = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: raw is a valid NUL-terminated path in the test directory.
+        assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o600) }, 0);
+        let (answer, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            answer.send(read_regular(&fifo, 20, None).is_err()).unwrap()
+        });
+        assert!(result.recv_timeout(Duration::from_secs(2)).unwrap());
+        worker.join().unwrap();
     }
 
     #[test]

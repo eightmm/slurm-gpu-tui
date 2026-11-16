@@ -100,6 +100,7 @@ impl StoragePump {
 #[derive(Debug)]
 pub enum PayloadError {
     Missing,
+    Unreadable(String),
     Untrusted(u32),
     Stale,
     Invalid(String),
@@ -115,8 +116,16 @@ pub fn read_payload(
         return Err(PayloadError::Invalid("invalid node name".into()));
     }
     let path = config.agents.join(format!("{name}.json"));
-    let (bytes, st) = runtime::read_regular(&path, config.max_payload, None)
-        .map_err(|_| PayloadError::Missing)?;
+    let (bytes, st) = runtime::read_regular(&path, config.max_payload, None).map_err(|error| {
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            PayloadError::Missing
+        } else {
+            PayloadError::Unreadable(error.to_string())
+        }
+    })?;
     if !config.trusted.contains(&st.uid()) {
         return Err(PayloadError::Untrusted(st.uid()));
     }
@@ -285,14 +294,17 @@ impl Collector {
                 }
                 Err(PayloadError::Untrusted(uid)) => {
                     rejected.insert(node.name.clone(), uid);
-                    Some("untrusted agent payload")
+                    Some("untrusted agent payload".into())
                 }
-                Err(PayloadError::Invalid(_)) => Some("invalid agent payload"),
-                Err(PayloadError::Stale) => Some("stale agent payload"),
-                Err(PayloadError::Missing) => Some("missing agent payload"),
+                Err(PayloadError::Invalid(_)) => Some("invalid agent payload".into()),
+                Err(PayloadError::Stale) => Some("stale agent payload".into()),
+                Err(PayloadError::Missing) => Some("missing agent payload".into()),
+                Err(PayloadError::Unreadable(error)) => {
+                    Some(format!("unreadable agent payload: {error}"))
+                }
             };
             node.stale = failure.is_some();
-            node.error = failure.unwrap_or("").into();
+            node.error = failure.unwrap_or_default();
             node.error_kind = if node.stale { "stale_cached" } else { "ok" }.into();
             node.source = if node.stale { "stale" } else { "agent" }.into();
             node.scheduler_age_sec = sample.status.age_sec;
@@ -1046,6 +1058,12 @@ mod tests {
         let path = cfg.agents.join("gpu1.json");
         fs::write(&path, serde_json::to_vec(&payload()).unwrap()).unwrap();
         assert!(read_payload(&cfg, "gpu1", "gpu", runtime::now()).is_ok());
+        cfg.max_payload = 1;
+        assert!(matches!(
+            read_payload(&cfg, "gpu1", "gpu", runtime::now()),
+            Err(PayloadError::Unreadable(_))
+        ));
+        cfg.max_payload = 1048576;
         cfg.trusted.clear();
         assert!(matches!(
             read_payload(&cfg, "gpu1", "gpu", runtime::now()),

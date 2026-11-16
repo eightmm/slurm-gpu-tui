@@ -145,7 +145,8 @@ measurements `?`; cached GPU names and memory capacity do not prove live telemet
 
 | Error | Check |
 |---|---|
-| `missing agent payload` | Node service installation, shared mount/path and file readability |
+| `missing agent payload` | Node service installation and shared mount/path |
+| `unreadable agent payload` | Reported I/O error, file permissions/type/size; brief lease conflicts retry for up to 250ms |
 | `stale agent payload` | Service status, publication failures and file modification time |
 | `untrusted agent payload` | File author UID and the collector's trusted UID configuration |
 | `invalid agent payload` | Agent/collector version, GPU/CPU mode and hostname matching Slurm |
