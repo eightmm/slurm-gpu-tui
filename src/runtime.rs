@@ -1,8 +1,9 @@
 use crate::{Result, model::Snapshot};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, hash_map::RandomState},
     ffi::{CStr, CString},
     fs::{self, File, OpenOptions},
+    hash::BuildHasher,
     io::{self, Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
@@ -12,7 +13,10 @@ use std::{
         },
     },
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -143,6 +147,7 @@ pub fn secure_dir(path: &Path, mode: u32) -> Result<()> {
 }
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static TEMP_NAMESPACE: OnceLock<u64> = OnceLock::new();
 
 struct NfsIdentity {
     uid: u32,
@@ -235,8 +240,10 @@ fn write_at(
     durable: bool,
 ) -> Result<()> {
     let target = CString::new(name.as_bytes())?;
+    // Shared writers on different hosts can have the same PID and sequence.
+    let namespace = TEMP_NAMESPACE.get_or_init(|| RandomState::new().hash_one(()));
     let temporary = CString::new(format!(
-        ".sgpu-{}-{}.tmp",
+        ".sgpu-{}-{namespace:016x}-{}.tmp",
         std::process::id(),
         TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ))?;
@@ -250,7 +257,13 @@ fn write_at(
         )
     };
     if raw < 0 {
-        return Err(io::Error::last_os_error().into());
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::PermissionDenied && euid() == 0 && is_nfs(dir) {
+            // Exclusive NFS creation can succeed before setting root's
+            // attributes fails. Remove only our empty squash-owned partial.
+            discard_squashed_partial(dir, &temporary, mode);
+        }
+        return Err(error.into());
     }
     // SAFETY: successful openat returned a new owned fd.
     let mut file = unsafe { File::from_raw_fd(raw) };
@@ -285,6 +298,32 @@ fn write_at(
         }
     }
     result
+}
+
+fn discard_squashed_partial(dir: &File, name: &CStr, mode: u32) {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: the directory and name stay valid; metadata is used only after
+    // fstatat succeeds, without following a potentially substituted symlink.
+    unsafe {
+        if libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        ) != 0
+        {
+            return;
+        }
+        let stat = stat.assume_init();
+        if stat.st_mode & libc::S_IFMT == libc::S_IFREG
+            && stat.st_uid == 65534
+            && stat.st_size == 0
+            && stat.st_nlink == 1
+            && (stat.st_mode & 0o7777 == mode || stat.st_mode & 0o7777 == 0)
+        {
+            libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0);
+        }
+    }
 }
 
 pub fn atomic_write(path: &Path, bytes: &[u8], mode: u32, durable: bool) -> Result<()> {
@@ -646,6 +685,7 @@ mod tests {
         fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o1777)).unwrap();
         let dir = open_directory(tmp.path()).unwrap();
         fs::write(tmp.path().join("root-owned"), b"keep").unwrap();
+        fs::write(tmp.path().join("root-empty"), b"").unwrap();
         let (request, receive) = std::sync::mpsc::channel();
         let (answer, result) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
@@ -663,6 +703,24 @@ mod tests {
                 std::ffi::OsStr::new("telemetry"),
                 b"published",
                 0o644,
+                false,
+            )
+            .unwrap();
+            write_at(&dir, std::ffi::OsStr::new("partial"), b"", 0o644, false).unwrap();
+            write_at(&dir, std::ffi::OsStr::new("linked"), b"", 0o644, false).unwrap();
+            write_at(
+                &dir,
+                std::ffi::OsStr::new("nonempty"),
+                b"keep",
+                0o644,
+                false,
+            )
+            .unwrap();
+            write_at(
+                &dir,
+                std::ffi::OsStr::new("different-mode"),
+                b"",
+                0o600,
                 false,
             )
             .unwrap();
@@ -685,6 +743,23 @@ mod tests {
             (65534, 65534, 0o644)
         );
         assert_eq!(fs::read(tmp.path().join("root-owned")).unwrap(), b"keep");
+        fs::hard_link(tmp.path().join("linked"), tmp.path().join("alias")).unwrap();
+        for name in [
+            "partial",
+            "nonempty",
+            "different-mode",
+            "root-owned",
+            "root-empty",
+            "linked",
+        ] {
+            discard_squashed_partial(&dir, &CString::new(name).unwrap(), 0o644);
+        }
+        assert!(!tmp.path().join("partial").exists());
+        assert_eq!(fs::read(tmp.path().join("nonempty")).unwrap(), b"keep");
+        assert!(tmp.path().join("different-mode").exists());
+        assert!(tmp.path().join("root-owned").exists());
+        assert!(tmp.path().join("root-empty").exists());
+        assert!(tmp.path().join("linked").exists());
         let panic = std::panic::catch_unwind(|| {
             let _identity = NfsIdentity::anonymous().unwrap();
             panic!("publication failure");

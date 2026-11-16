@@ -41,6 +41,8 @@ retries that telemetry write with filesystem UID/GID 65534, the usual squash
 identity. The checked directory handle is reused and the original thread
 credentials are restored before further collection. GPU/cgroup sampling retains
 its root access. Executable updates keep their separate root ownership checks.
+Failed exclusive NFS creates clean up verified empty anonymous temporary files;
+temporary names use a per-process namespace to avoid collisions across hosts.
 Sites with an explicit trusted-UID list must allow the actual telemetry author.
 Other mount/permission failures still need local administration.
 
