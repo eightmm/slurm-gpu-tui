@@ -295,6 +295,13 @@ pub fn snapshot() -> Result<Snapshot> {
 }
 
 pub fn once(data: &Snapshot) -> String {
+    let metric = |raw: &str, available| {
+        if available && number(raw).is_some_and(|value| value >= 0.0) {
+            raw.to_string()
+        } else {
+            "?".into()
+        }
+    };
     let mut out = format!("sgpu {} · push-only\n", data.ts);
     for node in &data.nodes {
         out.push_str(&format!(
@@ -304,23 +311,46 @@ pub fn once(data: &Snapshot) -> String {
             terminal_safe(&node.partition),
             node.cpu_alloc,
             node.cpus,
-            if node.stale { "STALE" } else { "" }
+            if node.stale {
+                format!(
+                    "STALE · {}",
+                    terminal_safe(if node.error.is_empty() {
+                        "agent telemetry unavailable"
+                    } else {
+                        &node.error
+                    })
+                )
+            } else {
+                String::new()
+            }
         ));
         for gpu in &node.gpus {
             out.push_str(&format!(
-                "  GPU{} {:<20} util {:>4}% VRAM {}/{} MiB {} #{} {}\n",
+                "  GPU{} {:<20} util {:>4}% VRAM {}/{} MiB {} job {} health {}\n",
                 gpu.index,
                 terminal_safe(&gpu.name),
-                gpu.util,
-                gpu.mem_used,
-                gpu.mem_total,
-                terminal_safe(&if gpu.users.is_empty() {
-                    gpu.alloc_user.clone()
+                metric(&gpu.util, !node.stale),
+                metric(&gpu.mem_used, !node.stale),
+                metric(&gpu.mem_total, true),
+                terminal_safe(&if node.stale || gpu.users.is_empty() {
+                    if gpu.alloc_user.is_empty() {
+                        "—".into()
+                    } else {
+                        gpu.alloc_user.clone()
+                    }
                 } else {
                     gpu.users.join(",")
                 }),
-                gpu.alloc_jobid,
-                rules::health(gpu, runtime::now()).0
+                if gpu.alloc_jobid.is_empty() {
+                    "—".into()
+                } else {
+                    format!("#{}", gpu.alloc_jobid)
+                },
+                if node.stale {
+                    "?".into()
+                } else {
+                    rules::health(gpu, runtime::now()).0
+                }
             ));
         }
     }
@@ -340,6 +370,9 @@ pub fn once(data: &Snapshot) -> String {
     }
     if !data.errors.is_empty() {
         out.push_str(&format!("\nScheduler: {}\n", terminal_safe(&data.errors)));
+    }
+    if data.nodes.iter().any(|node| node.stale) {
+        out.push_str("\n? = unavailable node measurements; GPU names/capacity may be cached.\nCPU allocations and job IDs come from Slurm. Run sgpu doctor for node delivery checks.\n");
     }
     out
 }
@@ -466,6 +499,30 @@ pub fn doctor() -> i32 {
             );
             if fresh < data.nodes.len() {
                 println!("stale nodes: {}", data.stale_nodes.join(","));
+                for node in data
+                    .nodes
+                    .iter()
+                    .filter(|node| node.stale || node.source != "agent")
+                {
+                    println!(
+                        "  {}: {}",
+                        terminal_safe(&node.name),
+                        terminal_safe(if node.error.is_empty() {
+                            "agent telemetry unavailable"
+                        } else {
+                            &node.error
+                        })
+                    );
+                }
+                println!(
+                    "node setup: every node needs a local sgpu-agent service. Master installation alone does not install node services."
+                );
+                println!(
+                    "publication: collector and agents need SLURM_GPU_TUI_AGENT_DIR on the same shared filesystem; matching local directory names are insufficient."
+                );
+                println!(
+                    "check on each node: systemctl status sgpu-agent; journalctl -u sgpu-agent -n 30"
+                );
                 problems += 1;
             }
             if !data.untrusted_payloads.is_empty() {

@@ -328,6 +328,55 @@ fn host_and_users_require_fresh_publications_without_sampling_the_client() {
     assert!(!fixture.root.path().join("calls").exists());
 }
 #[test]
+fn missing_publishers_explain_stale_nodes_without_showing_blank_or_cached_measurements() {
+    let fixture = Fixture::new();
+    let path = fixture.data.join("data.json");
+    let mut snapshot: Snapshot = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let node = &mut snapshot.nodes[0];
+    node.stale = true;
+    node.source = "stale".into();
+    node.error = "missing agent payload".into();
+    node.gpus[0].util.clear();
+    node.gpus[0].mem_used.clear();
+    node.gpus[0].alloc_user = fixture.user.clone();
+    node.gpus[0].alloc_jobid = "42".into();
+    let mut cached = node.clone();
+    cached.name = "gpu2".into();
+    cached.error = "stale agent payload".into();
+    cached.gpus[0].util = "99".into();
+    cached.gpus[0].mem_used = "50000".into();
+    cached.gpus[0].users = vec!["previous-observed-owner".into()];
+    snapshot.nodes.push(cached);
+    snapshot.stale_nodes = vec!["gpu1".into(), "gpu2".into()];
+    fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    let once = successful(fixture.run(&["once"]));
+    assert!(once.contains("STALE · missing agent payload"));
+    assert!(once.contains("STALE · stale agent payload"));
+    assert_eq!(once.matches("util    ?% VRAM ?/80000 MiB").count(), 2);
+    assert!(once.contains(&format!("{} job #42 health ?", fixture.user)));
+    assert!(!once.contains("previous-observed-owner") && !once.contains("50000"));
+    assert!(once.contains("Run sgpu doctor"));
+    assert!(!fixture.root.path().join("calls").exists());
+    let doctor = fixture.run(&["doctor"]);
+    assert_eq!(doctor.status.code(), Some(1));
+    let diagnosis = String::from_utf8(doctor.stdout).unwrap();
+    assert!(diagnosis.contains("gpu1: missing agent payload"));
+    assert!(diagnosis.contains("gpu2: stale agent payload"));
+    assert!(diagnosis.contains("Master installation alone does not install node services"));
+    assert!(diagnosis.contains("same shared filesystem"));
+    let calls = fs::read_to_string(fixture.root.path().join("calls")).unwrap();
+    assert_eq!(calls.lines().collect::<Vec<_>>(), ["sinfo", "sacct"]);
+    let node = &mut snapshot.nodes[1];
+    node.stale = false;
+    node.source = "agent".into();
+    node.error.clear();
+    node.gpus[0].util = "0".into();
+    node.gpus[0].mem_used = "0".into();
+    fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    assert!(successful(fixture.run(&["once"])).contains("util    0% VRAM 0/80000 MiB"));
+}
+
+#[test]
 fn invalid_input_is_rejected_and_private_logs_cannot_follow_symlinks() {
     let fixture = Fixture::new();
     for args in [

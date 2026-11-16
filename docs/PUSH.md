@@ -126,6 +126,26 @@ Run `sgpu doctor` on the master. On a stale node, locally inspect
 `systemctl status sgpu-agent`, its journal, mount visibility and write permissions.
 Restart or reinstall on that node after fixing the cause. The collector does not coordinate recovery.
 
+The same setup works for a few workstations. Installing the master alone does
+not install publishers on the other hosts, and identical directory names on
+local disks do not form a shared directory. Use an existing NFS/shared mount,
+visible at the same absolute path, for `AGENT_DIR` on every host.
+
+`sgpu once` keeps Slurm allocation/job information visible while marking missing
+measurements `?`; cached GPU names and memory capacity do not prove live telemetry.
+`sgpu doctor` reports each affected node's publication error:
+
+| Error | Check |
+|---|---|
+| `missing agent payload` | Node service installation, shared mount/path and file readability |
+| `stale agent payload` | Service status, publication failures and file modification time |
+| `untrusted agent payload` | File author UID and the collector's trusted UID configuration |
+| `invalid agent payload` | Agent/collector version, GPU/CPU mode and hostname matching Slurm |
+
+Run the publisher as the installed system service. A shell adopted into a Slurm
+job can have restricted device visibility and ends with that job; it is not a
+persistent host publisher.
+
 Uninstall the local role with `sudo sgpu-install uninstall --role node`; remove
 the collector separately with `sudo sgpu-install uninstall --role master`.
 Usage, shared payloads and previous releases remain. Do not delete shared binaries still used by another host's service.
