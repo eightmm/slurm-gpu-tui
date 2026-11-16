@@ -46,3 +46,11 @@ path = "src/bin/chkgpu.rs"
 [[bin]]
 name = "sgpu-install"
 path = "src/bin/sgpu-install.rs"
+
+[[bin]]
+name = "chkfail"
+path = "src/bin/chkfail.rs"
+
+[[bin]]
+name = "chkqueue"
+path = "src/bin/chkqueue.rs"

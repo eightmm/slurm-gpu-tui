@@ -32,6 +32,8 @@ const BINARIES: &[&str] = &[
     "sgpu-agent",
     "sgpu-collector",
     "chkgpu",
+    "chkfail",
+    "chkqueue",
     "sgpu-install",
 ];
 // Only public, implemented settings may enter the world-readable unit.
@@ -1134,11 +1136,23 @@ mod tests {
             .unwrap();
             path_links_in(&public, &root, &mut transaction).unwrap();
             assert!(
+                fs::read(public.join("chkfail"))
+                    .unwrap()
+                    .starts_with(b"\x7fELF")
+            );
+            assert!(
+                fs::read(public.join("chkqueue"))
+                    .unwrap()
+                    .starts_with(b"\x7fELF")
+            );
+            assert!(
                 fs::read(public.join("sgpu"))
                     .unwrap()
                     .starts_with(b"\x7fELF")
             );
             transaction.rollback().unwrap();
+            assert!(!public.join("chkfail").exists());
+            assert!(!public.join("chkqueue").exists());
             assert!(
                 fs::read_to_string(public.join("sgpu"))
                     .unwrap()

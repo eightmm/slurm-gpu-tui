@@ -10,6 +10,8 @@ const NAMES: &[&str] = &[
     "sgpu-agent",
     "sgpu-collector",
     "chkgpu",
+    "chkfail",
+    "chkqueue",
     "sgpu-install",
 ];
 fn source() -> PathBuf {

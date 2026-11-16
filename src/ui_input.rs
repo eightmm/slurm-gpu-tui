@@ -12,6 +12,8 @@ pub enum Action {
     Pane(usize),
     History(usize),
     Menu(usize),
+    Choice(usize),
+    Close,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

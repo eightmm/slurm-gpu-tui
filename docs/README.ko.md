@@ -56,6 +56,9 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/refs/heads/ma
 sgpu                    # 대화형 대시보드
 chkgpu                  # 사용자 × 노드 할당 행렬
 chkgpu --summary        # 노드 여유량과 대기 이유
+chkqueue --mine         # 내 대기 작업의 priority·대기 시간·이유
+chkfail                 # 최근 24시간에 끝난 내 실패·중단 작업
+sgpu explain 12345      # 대기 사실·해석·노드 여유량
 sgpu me                 # 내 작업·사용량
 sgpu users              # 사용자별 자원
 sgpu host               # 컨트롤러 자원
@@ -69,6 +72,8 @@ sgpu doctor             # 수집 상태 진단
 | `1`–`7` | GPU / CPU / Usage / Jobs / Attention / Users / Host |
 | `↕` 클릭 · `s` / `S` | Jobs 헤더 정렬 · 정렬 순환 / 역순 |
 | `u` / `p` / `m` | 사용자 / 파티션 / 강조한 계정 필터 |
+| `U` / `P` | 사용자 / 파티션을 검색해서 선택 |
+| `E` / `F` | 선택한 대기 작업 설명 / 내 24시간 실패 요약 |
 | Jobs에서 `v` | 전체 / 실행 / 대기 |
 | `/` / `0` | 검색 / 필터 초기화 |
 | Enter / Tab | 상세 / 스크립트·로그 탭 |
@@ -85,6 +90,12 @@ sgpu doctor             # 수집 상태 진단
 탭·행·정렬 표시가 있는 헤더·필터·버튼을 클릭할 수 있습니다.
 행 선택 후 **Detail**을 누르세요. 짧은 창에서는 상세가 화면 전체로 확장되며,
 휠·페이지 버튼으로 스크롤하고 **Follow**로 실시간 로그 따라가기를 재개합니다.
+상세·로그에서 `/`로 문자열을 찾고 `n` / `N`으로 일치하는 줄을 이동합니다.
+Enter로 검색을 적용하며, Esc는 검색 입력을 지운 뒤 팝업을 닫습니다.
+
+`chkqueue` = `sgpu queue` (`--mine`, `--partition`, `--limit`, `--json`).
+`chkfail` = `sgpu failures` (`--hours 24`, `--json`): 본인 accounting만 한 번 조회하고
+UTC 종료 시각으로 집계합니다. 취소·선점은 구분하며 작업 step은 집계에서 제외합니다.
 
 `?`는 결측, `~`는 부분 관측입니다. 오래된 데이터는 빈 자원으로 계산하지 않습니다.
 Users의 network/load는 노드 공용 값이며 priority·여유량·예상 시작 시각은 실행 승인을

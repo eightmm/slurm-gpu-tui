@@ -129,7 +129,10 @@ impl Fixture {
         }
     }
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sgpu"));
+        self.binary(env!("CARGO_BIN_EXE_sgpu"))
+    }
+    fn binary(&self, executable: &str) -> Command {
+        let mut command = Command::new(executable);
         command
             .env("HOME", self.root.path())
             .env("PATH", &self.bin)
@@ -148,6 +151,103 @@ impl Fixture {
         self.command().args(args).output().unwrap()
     }
 }
+#[test]
+fn quick_failure_and_queue_commands_share_the_cli_and_keep_owner_and_window_boundaries() {
+    let fixture = Fixture::new();
+    let uid = runtime::euid();
+    let recent = (chrono::Utc::now() - chrono::Duration::minutes(5))
+        .format("%Y-%m-%dT%H:%M:%S")
+        .to_string();
+    let old = (chrono::Utc::now() - chrono::Duration::hours(25))
+        .format("%Y-%m-%dT%H:%M:%S")
+        .to_string();
+    let raw = format!(
+        "42|{uid}|gpu|OUT_OF_MEMORY|0:9|{recent}\n43_1|{uid}|cpu|TIMEOUT|0:15|{recent}\n44|{}|gpu|FAILED|1:0|{recent}\n42.batch|{uid}|gpu|FAILED|1:0|{recent}\n45|{uid}|gpu|FAILED|1:0|{old}",
+        uid + 1
+    );
+    let script = format!(
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$SGPU_TEST_CALLS"
+[ "$SLURM_TIME_FORMAT" = standard ] || exit 19
+[ "$TZ" = UTC ] || exit 20
+printf '%s\n' '{raw}'
+"#
+    );
+    fs::write(fixture.bin.join("sacct"), script).unwrap();
+    for executable in [
+        env!("CARGO_BIN_EXE_chkfail"),
+        env!("CARGO_BIN_EXE_chkqueue"),
+    ] {
+        for arg in ["--help", "--version"] {
+            assert!(
+                fixture
+                    .binary(executable)
+                    .arg(arg)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+    }
+    assert!(!fixture.root.path().join("calls").exists());
+    let report: serde_json::Value = serde_json::from_str(&successful(
+        fixture
+            .command()
+            .args(["failures", "--json"])
+            .env("SLURM_TIME_FORMAT", "relative")
+            .env("TZ", "Pacific/Honolulu")
+            .output()
+            .unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(report["user"], fixture.user);
+    assert_eq!(report["jobs"].as_array().unwrap().len(), 2);
+    assert_eq!(report["outcomes"]["OUT_OF_MEMORY"], 1);
+    assert_eq!(report["outcomes"]["TIMEOUT"], 1);
+    assert!(report["through"].as_str().unwrap().ends_with('Z'));
+    assert!(!report.to_string().contains("workdir"));
+    let calls = fs::read_to_string(fixture.root.path().join("calls")).unwrap();
+    assert_eq!(calls.lines().count(), 1);
+    assert!(calls.contains(&format!("-u {uid} -S")) && calls.contains(" -E "));
+    assert!(calls.contains("-X --array --local"));
+    let mut alias = fixture.binary(env!("CARGO_BIN_EXE_chkfail"));
+    let alias_report: serde_json::Value =
+        serde_json::from_str(&successful(alias.arg("--json").output().unwrap())).unwrap();
+    assert_eq!(alias_report["jobs"], report["jobs"]);
+    let queue: serde_json::Value =
+        serde_json::from_str(&successful(fixture.run(&["queue", "--mine", "--json"]))).unwrap();
+    assert_eq!(queue["total"], 1);
+    assert_eq!(queue["jobs"][0]["jobid"], "43");
+    let alias_queue: serde_json::Value = serde_json::from_str(&successful(
+        fixture
+            .binary(env!("CARGO_BIN_EXE_chkqueue"))
+            .args(["--mine", "--json"])
+            .output()
+            .unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(queue["jobs"], alias_queue["jobs"]);
+    assert!(successful(fixture.run(&["explain", "43"])).contains("Reason: Resources"));
+    assert_eq!(
+        fs::read_to_string(fixture.root.path().join("calls"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    assert!(
+        !fixture
+            .run(&["failures", "--user", "other-user"])
+            .status
+            .success()
+    );
+    assert!(!fixture.run(&["failures", "--hours", "0"]).status.success());
+    fs::write(fixture.bin.join("sacct"), "#!/bin/sh\nexit 77\n").unwrap();
+    let unavailable = fixture.run(&["failures", "--json"]);
+    assert!(!unavailable.status.success() && unavailable.stdout.is_empty());
+}
+
 fn successful(output: Output) -> String {
     assert!(
         output.status.success(),

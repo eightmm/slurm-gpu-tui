@@ -74,6 +74,16 @@ pub enum Command {
     #[command(about = "Published per-user job resources; node network/load are shared")]
     Users,
     Me,
+    #[command(
+        about = "Explain a pending job using scheduler facts and published node observations"
+    )]
+    Explain {
+        jobid: String,
+    },
+    #[command(about = "My failed/stopped allocations ending in a rolling time window")]
+    Failures(FailureOptions),
+    #[command(about = "Pending jobs by numeric priority, with reasons and wait times")]
+    Queue(QueueOptions),
     Waste {
         #[arg(short, long)]
         verbose: bool,
@@ -134,6 +144,54 @@ pub enum Command {
     },
 }
 
+#[derive(clap::Args)]
+pub struct FailureOptions {
+    #[arg(long, default_value_t = 24, value_parser = clap::value_parser!(u32).range(1..=744))]
+    pub hours: u32,
+    #[arg(long)]
+    pub json: bool,
+}
+
+pub fn failures(options: FailureOptions) -> Result<i32> {
+    let report = crate::failures::query(options.hours)?;
+    if options.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", crate::failures::render(&report));
+    }
+    Ok(0)
+}
+
+#[derive(clap::Args)]
+pub struct QueueOptions {
+    #[arg(long)]
+    pub mine: bool,
+    #[arg(long, default_value = "")]
+    pub partition: String,
+    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=1000))]
+    pub limit: u32,
+    #[arg(long)]
+    pub json: bool,
+}
+pub fn queue(options: QueueOptions) -> Result<i32> {
+    let data = snapshot()?;
+    if !data.errors.is_empty() {
+        return Err(format!("scheduler queue unavailable: {}", data.errors).into());
+    }
+    let user = if options.mine {
+        current_user()
+    } else {
+        String::new()
+    };
+    let report = crate::queue::report(&data, &user, &options.partition, options.limit as usize);
+    if options.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", crate::queue::render(&report));
+    }
+    Ok(0)
+}
+
 pub fn normalize(mut args: Vec<String>) -> Vec<String> {
     const VERBS: &[&str] = &[
         "version",
@@ -150,15 +208,11 @@ pub fn normalize(mut args: Vec<String>) -> Vec<String> {
         "logs",
         "host",
         "users",
+        "explain",
+        "failures",
+        "queue",
         "bench",
     ];
-    for arg in args.iter_mut().skip(1) {
-        if arg == "-V" {
-            *arg = "version".into();
-        } else if arg.starts_with("--") && VERBS[..VERBS.len() - 1].contains(&&arg[2..]) {
-            *arg = arg[2..].into();
-        }
-    }
     let mut skip = false;
     let mut position = None;
     for (i, arg) in args.iter().enumerate().skip(1) {
@@ -166,8 +220,18 @@ pub fn normalize(mut args: Vec<String>) -> Vec<String> {
             skip = false;
             continue;
         }
-        if VERBS.contains(&arg.as_str()) {
+        let verb = if arg == "-V" {
+            Some("version")
+        } else if VERBS.contains(&arg.as_str()) {
+            Some(arg.as_str())
+        } else {
+            arg.strip_prefix("--")
+                .filter(|name| VERBS[..VERBS.len() - 1].contains(name))
+        };
+        if let Some(verb) = verb {
+            let verb = verb.to_string();
             position = Some(i);
+            args[i] = verb;
             break;
         }
         if [
@@ -182,6 +246,8 @@ pub fn normalize(mut args: Vec<String>) -> Vec<String> {
             "--repeat",
             "--replay",
             "--highlight-user",
+            "--hours",
+            "--limit",
         ]
         .contains(&arg.as_str())
         {
@@ -764,6 +830,21 @@ pub fn run(args: Args) -> Result<i32> {
             Ok(0)
         }
         Some(Command::Doctor) => Ok(doctor()),
+        Some(Command::Failures(options)) => failures(options),
+        Some(Command::Queue(options)) => queue(options),
+        Some(Command::Explain { jobid }) => {
+            if !scheduler::valid_job_id(&jobid) {
+                return Err("invalid job ID".into());
+            }
+            let data = snapshot()?;
+            let job = data
+                .pending
+                .iter()
+                .find(|job| job.jobid == jobid)
+                .ok_or("job is not in the current pending snapshot")?;
+            print!("{}", crate::explain::pending(&data, job));
+            Ok(0)
+        }
         Some(Command::Host) => {
             let data = runtime::read_snapshot(Some(30.0))?;
             let rows = crate::host_view::rows(
@@ -1063,6 +1144,26 @@ mod tests {
             ))
             .is_err()
         );
+    }
+    #[test]
+    fn subcommand_flags_are_not_rewritten_as_root_aliases() {
+        let parse = |args: &[&str]| {
+            Args::try_parse_from(normalize(args.iter().map(|arg| arg.to_string()).collect()))
+                .unwrap()
+                .command
+                .unwrap()
+        };
+        assert!(matches!(
+            parse(&["sgpu", "fit", "--explain"]),
+            Command::Fit { explain: true, .. }
+        ));
+        assert!(matches!(
+            parse(&["sgpu", "--hours", "12", "--failures", "--json"]),
+            Command::Failures(FailureOptions {
+                hours: 12,
+                json: true
+            })
+        ));
     }
     #[test]
     fn resource_validation_rejects_nan_overflow_and_zero_cpu() {

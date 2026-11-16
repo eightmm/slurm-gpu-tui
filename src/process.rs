@@ -60,12 +60,26 @@ pub fn stats() -> BTreeMap<String, CommandStats> {
 }
 
 pub fn run(program: Program, args: &[&str], timeout: Duration) -> Result<String> {
+    run_with_env(program, args, timeout, &[])
+}
+
+pub(crate) fn run_with_env(
+    program: Program,
+    args: &[&str],
+    timeout: Duration,
+    environment: &[(&str, &str)],
+) -> Result<String> {
     let start = Instant::now();
     let mut command = Command::new(program.name());
     command.args(args).env("LC_ALL", "C");
     if matches!(program, Program::Squeue) {
         command.env("SLURM_BITSTR_LEN", "0");
     }
+    if matches!(program, Program::Sacct) {
+        // Internal timestamp parsing must not inherit relative display formats.
+        command.env("SLURM_TIME_FORMAT", "standard");
+    }
+    command.envs(environment.iter().copied());
     let result = capture(&mut command, timeout, 64 * 1024 * 1024);
     let label = match (program, args.contains(&"node")) {
         (Program::Scontrol, true) => "scontrol_nodes",

@@ -5,7 +5,9 @@ use crate::{
     process::{self, Program},
     rules::{self, Class},
     runtime,
+    ui_find::Find,
     ui_input::{Action as Click, Hits, Scope},
+    ui_picker::{Kind as PickerKind, Picker},
     ui_preferences, usage,
 };
 use crossterm::event::{
@@ -16,7 +18,7 @@ use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Flex, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
+    text::{Line, Span},
     widgets::{
         Block, BorderType, Borders, Cell, Clear, Gauge, HighlightSpacing, Paragraph, Row, Table,
         TableState, Wrap,
@@ -342,6 +344,8 @@ pub struct Popup {
     source_row: Option<String>,
     source_tab: Option<usize>,
     table: TableState,
+    picker: Option<Picker>,
+    find: Find,
 }
 impl Popup {
     fn text(title: &str, body: String) -> Self {
@@ -363,9 +367,12 @@ impl Popup {
             source_row: None,
             source_tab: None,
             table: TableState::default(),
+            picker: None,
+            find: Find::default(),
         }
     }
     fn pane(&mut self, index: usize) {
+        self.find.pane_changed();
         self.active = index.min(self.panes.len().saturating_sub(1));
         self.follow = self
             .panes
@@ -381,8 +388,10 @@ enum Task {
         job: Option<Box<Job>>,
         pending: Option<Box<PendingJob>>,
         node: Option<Box<Node>>,
+        explanation: Option<String>,
     },
     History,
+    Failures,
     HistoryDetail(history::Record),
     Cancel(String),
     Logs {
@@ -392,7 +401,7 @@ enum Task {
 }
 enum Answer {
     Snapshot(Box<crate::Result<(Snapshot, Option<serde_json::Value>)>>),
-    Popup(crate::Result<Popup>),
+    Popup(Box<crate::Result<Popup>>),
     Status(String),
     Logs {
         token: u64,
@@ -402,6 +411,11 @@ enum Answer {
 struct Worker {
     sender: SyncSender<Task>,
     receiver: Receiver<Answer>,
+}
+impl Answer {
+    fn popup(result: crate::Result<Popup>) -> Self {
+        Self::Popup(Box::new(result))
+    }
 }
 impl Worker {
     fn new() -> Self {
@@ -413,10 +427,32 @@ impl Worker {
                     Task::Refresh => Answer::Snapshot(Box::new(
                         cli::snapshot().map(|snapshot| (snapshot, usage::read())),
                     )),
-                    Task::Detail { job, pending, node } => {
-                        Answer::Popup(details(job.as_deref(), pending.as_deref(), node.as_deref()))
-                    }
-                    Task::History => Answer::Popup((|| -> Result<Popup> {
+                    Task::Detail {
+                        job,
+                        pending,
+                        node,
+                        explanation,
+                    } => Answer::popup(
+                        details(job.as_deref(), pending.as_deref(), node.as_deref()).map(
+                            |mut popup| {
+                                if let Some(body) = explanation {
+                                    popup.panes.insert(
+                                        0,
+                                        Pane {
+                                            name: "Why pending".into(),
+                                            body,
+                                            log: None,
+                                        },
+                                    );
+                                }
+                                popup
+                            },
+                        ),
+                    ),
+                    Task::Failures => Answer::popup(crate::failures::query(24).map(|report| {
+                        Popup::text("My failures · last 24h", crate::failures::render(&report))
+                    })),
+                    Task::History => Answer::popup((|| -> Result<Popup> {
                         let mut rows = history::query(
                             &format!("{}T00:00:00", usage::window(7)),
                             "",
@@ -427,7 +463,7 @@ impl Worker {
                         popup.history = rows;
                         Ok(popup)
                     })()),
-                    Task::HistoryDetail(row) => Answer::Popup((|| -> Result<Popup> {
+                    Task::HistoryDetail(row) => Answer::popup((|| -> Result<Popup> {
                         let mut popup = Popup::text(
                             &format!("History #{}", row.jobid),
                             history::details(&row.jobid)?,
@@ -2151,7 +2187,7 @@ impl App {
                     }
                 ),
                 !self.user_filter().is_empty(),
-                'u',
+                'U',
             ),
             (
                 format!(
@@ -2163,7 +2199,7 @@ impl App {
                     }
                 ),
                 !self.partition.is_empty(),
-                'p',
+                'P',
             ),
             ("MINE".into(), self.mine, 'm'),
             ("FREE".into(), self.free_only && self.tab == 0, 'i'),
@@ -2681,6 +2717,51 @@ impl App {
         popup.token = self.popup_sequence;
         self.popup = Some(popup);
     }
+    fn open_picker(&mut self, kind: PickerKind) {
+        let current = match kind {
+            PickerKind::User => self.user_filter(),
+            PickerKind::Partition => &self.partition,
+        };
+        let picker = Picker::new(kind, &self.data, current, &self.highlight_user);
+        let mut popup = Popup::text(
+            match kind {
+                PickerKind::User => "User filter · type to search",
+                PickerKind::Partition => "Partition filter · type to search",
+            },
+            String::new(),
+        );
+        popup.selected = picker
+            .choices()
+            .iter()
+            .position(|value| *value == current)
+            .unwrap_or(0);
+        popup.picker = Some(picker);
+        self.open(popup);
+    }
+    fn choose(&mut self, index: usize) {
+        let choice = self
+            .popup
+            .as_ref()
+            .and_then(|popup| popup.picker.as_ref())
+            .and_then(|picker| {
+                picker
+                    .choices()
+                    .get(index)
+                    .map(|value| (picker.kind, value.to_string()))
+            });
+        if let Some((kind, value)) = choice {
+            match kind {
+                PickerKind::User => {
+                    self.filter_user = value;
+                    self.mine = false;
+                }
+                PickerKind::Partition => self.partition = value,
+            }
+            self.popup = None;
+            self.table = TableState::default();
+            self.rebuild();
+        }
+    }
     fn actions(&self) -> Vec<(KeyCode, String)> {
         let mut actions = Vec::new();
         if self.tab != 2 {
@@ -2713,6 +2794,8 @@ impl App {
         }
         if self.tab != 6 {
             actions.extend([
+                (KeyCode::Char('U'), "U · Search/select user filter".into()),
+                (KeyCode::Char('P'), "P · Search/select partition".into()),
                 (KeyCode::Char('u'), "u · Next user filter".into()),
                 (KeyCode::Char('p'), "p · Next partition filter".into()),
                 (KeyCode::Char('m'), "m · Highlighted account only".into()),
@@ -2757,6 +2840,11 @@ impl App {
             (KeyCode::PageDown, "PgDn · Next page".into()),
             (KeyCode::Char('r'), "r · Refresh published data".into()),
             (KeyCode::Char('h'), "h · My job history".into()),
+            (KeyCode::Char('F'), "F · My failures in the last 24h".into()),
+            (
+                KeyCode::Char('E'),
+                "E · Explain selected pending job".into(),
+            ),
             (KeyCode::Char('w'), "w · Wasted GPU evidence".into()),
             (KeyCode::Char('f'), "f · Free capacity".into()),
             (KeyCode::Char('e'), "e · Export JSON".into()),
@@ -2772,7 +2860,10 @@ impl App {
         let Some((key, _)) = popup.actions.get(index) else {
             return false;
         };
-        if matches!(key, KeyCode::Enter | KeyCode::Char('J' | 'n' | 'x' | ' ')) {
+        if matches!(
+            key,
+            KeyCode::Enter | KeyCode::Char('J' | 'n' | 'x' | ' ' | 'E')
+        ) {
             let target = popup
                 .source_row
                 .and_then(|key| self.rows.iter().position(|row| row.key == key));
@@ -2920,6 +3011,8 @@ impl App {
             Click::Menu(index) => {
                 self.quit_requested = self.menu_action(index, worker);
             }
+            Click::Choice(index) => self.choose(index),
+            Click::Close => self.popup = None,
         }
         true
     }
@@ -2942,6 +3035,36 @@ impl App {
             return false;
         }
         if let Some(popup) = &mut self.popup {
+            if popup.find.input(key) {
+                popup.follow = false;
+                return false;
+            }
+            if let Some(picker) = &mut popup.picker {
+                match key {
+                    KeyCode::Enter => {
+                        let index = popup.selected;
+                        self.choose(index);
+                        return false;
+                    }
+                    KeyCode::Esc => {
+                        self.popup = None;
+                        return false;
+                    }
+                    KeyCode::Backspace => {
+                        picker.query.pop();
+                        popup.selected = 0;
+                        return false;
+                    }
+                    KeyCode::Char(c) if !c.is_control() => {
+                        if picker.query.len() + c.len_utf8() <= 256 {
+                            picker.query.push(c);
+                        }
+                        popup.selected = 0;
+                        return false;
+                    }
+                    _ => (),
+                }
+            }
             if !popup.actions.is_empty() && key == KeyCode::Enter {
                 let index = popup.selected;
                 return self.menu_action(index, worker);
@@ -2965,11 +3088,28 @@ impl App {
                     _ => (),
                 }
             }
-            let row_count = if popup.actions.is_empty() {
+            let row_count = if let Some(picker) = &popup.picker {
+                picker.choices().len()
+            } else if popup.actions.is_empty() {
                 popup.history.len()
             } else {
                 popup.actions.len()
             };
+            if row_count == 0 && popup.cancel.is_none() && popup.picker.is_none() {
+                match key {
+                    KeyCode::Char('/') => {
+                        popup.find.editing = true;
+                        popup.follow = false;
+                        return false;
+                    }
+                    KeyCode::Char('n' | 'N') if !popup.find.query.is_empty() => {
+                        popup.find.next(key == KeyCode::Char('N'));
+                        popup.follow = false;
+                        return false;
+                    }
+                    _ => (),
+                }
+            }
             match key {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => self.popup = None,
                 KeyCode::Tab | KeyCode::Right => {
@@ -3043,6 +3183,26 @@ impl App {
         }
         match key {
             KeyCode::Char('q') => return true,
+            KeyCode::Char('U') => self.open_picker(PickerKind::User),
+            KeyCode::Char('P') => self.open_picker(PickerKind::Partition),
+            KeyCode::Char('E') => {
+                let pending = self
+                    .selected()
+                    .and_then(|row| row.job.as_ref())
+                    .and_then(|id| self.data.pending.iter().find(|job| job.jobid == *id));
+                if let Some(job) = pending {
+                    self.open(Popup::text(
+                        &format!("Why pending #{}", job.jobid),
+                        crate::explain::pending(&self.data, job),
+                    ));
+                } else {
+                    self.status = "Select a pending job to explain · 4 Jobs · v state".into();
+                }
+            }
+            KeyCode::Char('F') => {
+                worker.send(Task::Failures);
+                self.status = "Loading my failures · last 24h…".into();
+            }
             KeyCode::Char('a') => {
                 let mut popup = Popup::text("Actions · ↑↓ / Tab select · Enter run", String::new());
                 popup.actions = self.actions();
@@ -3345,7 +3505,15 @@ impl App {
                         .find(|n| n.name == row.node)
                         .cloned()
                         .map(Box::new);
-                    worker.send(Task::Detail { job, pending, node });
+                    let explanation = pending
+                        .as_ref()
+                        .map(|job| crate::explain::pending(&self.data, job));
+                    worker.send(Task::Detail {
+                        job,
+                        pending,
+                        node,
+                        explanation,
+                    });
                     self.status = "Loading detail…".into();
                 }
             }
@@ -3498,10 +3666,12 @@ fn draw_popup(frame: &mut Frame, popup: &mut Popup, hits: &mut Hits) {
             Paragraph::new("[×]").style(Style::default().fg(CYAN)),
             close,
         );
-        hits.add(close, Click::Key(KeyCode::Esc));
+        hits.add(close, Click::Close);
     }
-    let [heading, body, footer] = Layout::vertical([
-        Constraint::Length(u16::from(inner.height >= 3)),
+    let finding = popup.find.editing || !popup.find.query.is_empty();
+    let [heading, findbar, body, footer] = Layout::vertical([
+        Constraint::Length(u16::from(inner.height >= if finding { 4 } else { 3 })),
+        Constraint::Length(u16::from(finding && inner.height >= 3)),
         Constraint::Min(1),
         Constraint::Length(u16::from(inner.height >= 2)),
     ])
@@ -3518,18 +3688,71 @@ fn draw_popup(frame: &mut Frame, popup: &mut Popup, hits: &mut Hits) {
             ),
         ]
     } else {
-        vec![(KeyCode::Esc, "Close".into())]
+        vec![(
+            KeyCode::Esc,
+            if popup.find.editing { "Clear" } else { "Close" }.into(),
+        )]
     };
-    if !popup.actions.is_empty() || !popup.history.is_empty() {
+    if popup.cancel.is_none()
+        && popup.picker.is_none()
+        && popup.actions.is_empty()
+        && popup.history.is_empty()
+    {
+        if popup.find.editing {
+            bindings.push((KeyCode::Enter, "Apply".into()));
+        } else {
+            bindings.push((
+                KeyCode::Char('/'),
+                if inner.width < 32 { "/" } else { "/ Find" }.into(),
+            ));
+            if !popup.find.query.is_empty() {
+                bindings.extend([
+                    (
+                        KeyCode::Char('N'),
+                        if inner.width < 32 { "N" } else { "N Prev" }.into(),
+                    ),
+                    (
+                        KeyCode::Char('n'),
+                        if inner.width < 32 { "n" } else { "n Next" }.into(),
+                    ),
+                ]);
+            }
+        }
+    }
+    if !popup.actions.is_empty() || !popup.history.is_empty() || popup.picker.is_some() {
         let menu = !popup.actions.is_empty();
+        let picker = popup.picker.is_some();
         if !heading.is_empty() {
             frame.render_widget(
-                Paragraph::new("↑↓ / wheel · Enter opens selection")
-                    .style(Style::default().fg(MUTED)),
+                Paragraph::new(
+                    popup
+                        .picker
+                        .as_ref()
+                        .map(|picker| {
+                            format!(
+                                "Search: {}▏ · Enter select",
+                                cli::terminal_safe(&picker.query)
+                            )
+                        })
+                        .unwrap_or_else(|| "↑↓ / wheel · Enter opens selection".into()),
+                )
+                .style(Style::default().fg(MUTED)),
                 heading,
             );
         }
-        let rows: Vec<Row> = if menu {
+        let rows: Vec<Row> = if let Some(picker) = &popup.picker {
+            picker
+                .choices()
+                .iter()
+                .map(|value| {
+                    Row::new([if value.is_empty() {
+                        "(all)".into()
+                    } else {
+                        cli::terminal_safe(value)
+                    }])
+                })
+                .collect()
+        } else if menu {
             popup
                 .actions
                 .iter()
@@ -3564,7 +3787,7 @@ fn draw_popup(frame: &mut Frame, popup: &mut Popup, hits: &mut Hits) {
                 })
                 .collect()
         };
-        let widths = if menu {
+        let widths = if menu || picker {
             vec![Constraint::Min(1)]
         } else if body.width < 85 {
             vec![
@@ -3593,7 +3816,7 @@ fn draw_popup(frame: &mut Frame, popup: &mut Popup, hits: &mut Hits) {
                 .bg(SELECTED_BG)
                 .add_modifier(Modifier::BOLD),
         );
-        let header = !menu && body.height > 1;
+        let header = !menu && !picker && body.height > 1;
         if header {
             table = table.header(
                 Row::new(if body.width < 85 {
@@ -3615,14 +3838,32 @@ fn draw_popup(frame: &mut Frame, popup: &mut Popup, hits: &mut Hits) {
             }
             hits.add(
                 Rect::new(body.x, y, body.width, 1),
-                if menu {
+                if picker {
+                    Click::Choice(index)
+                } else if menu {
                     Click::Menu(index)
                 } else {
                     Click::History(index)
                 },
             );
         }
-        bindings.push((KeyCode::Enter, if menu { "Run" } else { "Open" }.into()));
+        if row_count == 0 && picker {
+            frame.render_widget(
+                Paragraph::new("No matching choices").style(Style::default().fg(MUTED)),
+                body,
+            );
+        }
+        bindings.push((
+            KeyCode::Enter,
+            if picker {
+                "Apply"
+            } else if menu {
+                "Run"
+            } else {
+                "Open"
+            }
+            .into(),
+        ));
     } else {
         if popup.panes.len() > 1 {
             let labels = popup
@@ -3639,25 +3880,43 @@ fn draw_popup(frame: &mut Frame, popup: &mut Popup, hits: &mut Hits) {
         }
         if let Some(pane) = popup.panes.get(popup.active) {
             let safe = cli::terminal_safe(&pane.body);
-            let lines = safe
-                .lines()
-                .map(|line| {
-                    Line::from(Span::styled(
-                        line.to_string(),
-                        Style::default().fg(
-                            if ["Error", "ERROR", "Traceback", "Exception", "OOM", "FAILED"]
-                                .iter()
-                                .any(|word| line.contains(word))
-                            {
-                                RED
-                            } else {
-                                TEXT
-                            },
-                        ),
-                    ))
-                })
-                .collect::<Vec<_>>();
-            let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+            let text = popup.find.text(
+                &safe,
+                body.width,
+                Style::default().fg(TEXT),
+                Style::default().fg(RED),
+                Style::default()
+                    .fg(BACKGROUND)
+                    .bg(YELLOW)
+                    .add_modifier(Modifier::BOLD),
+            );
+            if let Some(row) = popup.find.take_jump()
+                && !popup.follow
+            {
+                popup.scroll = row.saturating_sub(body.height / 2);
+                popup.follow = false;
+            }
+            if finding {
+                let label = format!(
+                    "Find: {}{} · line {}/{}",
+                    cli::terminal_safe(&popup.find.query),
+                    if popup.find.editing { "▏" } else { "" },
+                    if popup.find.rows.is_empty() {
+                        0
+                    } else {
+                        popup.find.selected + 1
+                    },
+                    popup.find.rows.len()
+                );
+                frame.render_widget(
+                    Paragraph::new(label).style(Style::default().fg(YELLOW)),
+                    findbar,
+                );
+                if !popup.find.editing {
+                    hits.add(findbar, Click::Key(KeyCode::Char('/')));
+                }
+            }
+            let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
             let total = paragraph.line_count(body.width);
             let max = total
                 .saturating_sub(body.height as usize)
@@ -3809,7 +4068,7 @@ pub fn run(highlight_user: Option<String>) -> Result<i32> {
                             }
                         }
                     }
-                    Answer::Popup(result) => match result {
+                    Answer::Popup(result) => match *result {
                         Ok(popup) => app.open(popup),
                         Err(error) => app.status = error.to_string(),
                     },
@@ -3873,7 +4132,12 @@ pub fn run(highlight_user: Option<String>) -> Result<i32> {
                         {
                             return Ok(0);
                         }
-                        let code = if app.searching {
+                        let code = if app.searching
+                            || app
+                                .popup
+                                .as_ref()
+                                .is_some_and(|popup| popup.picker.is_some() || popup.find.editing)
+                        {
                             key.code
                         } else {
                             ime(key.code)
@@ -3924,9 +4188,13 @@ const HELP: &str = concat!(
     "Popup tabs, Close and paging buttons are clickable. Follow resumes logs; scrolling up pauses.\n",
     "Jobs: v cycles all / running / pending; 0 clears state and other filters.\n",
     "u user filter (highlight first) · p partition · m highlighted user's jobs\n",
+    "U/P search user/partition · type, ↑↓, Enter or click to select · Esc cancels.\n",
+    "E explain selected pending job · F my last-24h failures (one accounting query).\n",
     "i free GPUs · 0 reset all filters · / search · Esc clear search\n",
     "d detail columns · Space fold node · z fold/unfold all\nj/k or arrows move\n",
     "Enter full values or job/node detail · Tab info/script/stdout/stderr\n",
+    "Inside details/logs: / literal find · Enter apply · n/N next/previous matching line.\n",
+    "Esc clears active search input; the next Esc closes. Query text stays in memory only.\n",
     "J related Jobs from GPU/CPU/Users/Attention · Esc restores the previous view.\n",
     "Users opens all user jobs; Attention opens only jobs linked in current evidence.\n",
     "GPU/node links use exact job IDs or expanded node names; unlinked processes stay inspectable.\n",
@@ -4423,8 +4691,12 @@ mod tests {
             &mut app,
             &mut terminal,
             &worker,
-            Click::Key(KeyCode::Char('u')),
+            Click::Key(KeyCode::Char('U')),
         );
+        for c in "alice".chars() {
+            app.key(KeyCode::Char(c), &worker);
+        }
+        click_action(&mut app, &mut terminal, &worker, Click::Choice(0));
         assert_eq!(app.user_filter(), "alice");
         click_action(
             &mut app,
@@ -4674,6 +4946,126 @@ mod tests {
         assert!(app.popup.is_none());
         assert!(app.status.contains("Original row is no longer available"));
         assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn searchable_pickers_keep_exact_filters_and_pending_explanations_are_local() {
+        let (sender, requests) = mpsc::sync_channel(8);
+        let (_, receiver) = mpsc::sync_channel(8);
+        let worker = Worker { sender, receiver };
+        let mut app = App::for_user("alice".into());
+        app.tab = 3;
+        let mut data = mouse_snapshot();
+        data.pending[0].partition = "special".into();
+        app.apply(data);
+        let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        app.key(KeyCode::Char('U'), &worker);
+        for c in "BO".chars() {
+            app.key(KeyCode::Char(c), &worker);
+        }
+        click_action(&mut app, &mut terminal, &worker, Click::Choice(0));
+        assert_eq!(app.user_filter(), "bob");
+        assert_eq!(app.rows.len(), 3);
+        app.key(KeyCode::Char('u'), &worker);
+        assert!(app.user_filter().is_empty());
+        app.key(KeyCode::Char('P'), &worker);
+        for c in "sPeC".chars() {
+            app.key(KeyCode::Char(c), &worker);
+        }
+        app.key(KeyCode::Enter, &worker);
+        assert_eq!(app.partition, "special");
+        assert_eq!(app.rows.len(), 1);
+        app.key(KeyCode::Char('P'), &worker);
+        for c in "no-such-partition".chars() {
+            app.key(KeyCode::Char(c), &worker);
+        }
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert!(screen(&terminal).contains("No matching choices"));
+        app.key(KeyCode::Enter, &worker);
+        assert!(app.popup.is_some());
+        app.key(KeyCode::Esc, &worker);
+        assert_eq!(app.partition, "special");
+        app.key(KeyCode::Char('E'), &worker);
+        assert!(
+            app.popup.as_ref().unwrap().panes[0]
+                .body
+                .contains("Reason: Resources")
+        );
+        assert!(requests.try_recv().is_err());
+        app.key(KeyCode::Esc, &worker);
+        app.key(KeyCode::Enter, &worker);
+        assert!(
+            matches!(requests.try_recv().unwrap(), Task::Detail { explanation: Some(body), pending: Some(job), .. } if job.jobid == "90" && body.contains("Per-node observations"))
+        );
+        app.key(KeyCode::Char('F'), &worker);
+        assert!(matches!(requests.try_recv().unwrap(), Task::Failures));
+    }
+
+    #[test]
+    fn popup_find_highlights_literal_matches_and_preserves_follow_and_close_controls() {
+        let worker = Worker::new();
+        for (width, height) in [(20, 4), (40, 8), (80, 12)] {
+            let mut app = App::for_user("alice".into());
+            let text = format!(
+                "{}\n긴 경로/path/Error[7]/suffix\n{}\nError[7] second\nEND_LOG",
+                "line\n".repeat(30),
+                "more\n".repeat(30)
+            );
+            app.open(Popup::text("find logs", text));
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            click_action(
+                &mut app,
+                &mut terminal,
+                &worker,
+                Click::Key(KeyCode::Char('/')),
+            );
+            for c in "Error[7]".chars() {
+                app.key(KeyCode::Char(c), &worker);
+            }
+            app.key(KeyCode::Enter, &worker);
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            assert!(app.popup.as_ref().unwrap().find.rows.len() >= 2);
+            assert!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .any(|cell| cell.bg == YELLOW),
+                "match hidden at {width}x{height}"
+            );
+            click_action(
+                &mut app,
+                &mut terminal,
+                &worker,
+                Click::Key(KeyCode::Char('n')),
+            );
+            assert_eq!(app.popup.as_ref().unwrap().find.selected, 1);
+            app.key(KeyCode::Char('N'), &worker);
+            assert_eq!(app.popup.as_ref().unwrap().find.selected, 0);
+            app.key(KeyCode::End, &worker);
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            assert!(screen(&terminal).contains("END_LOG"));
+            app.key(KeyCode::Char('/'), &worker);
+            for _ in 0..8 {
+                app.key(KeyCode::Backspace, &worker);
+            }
+            for c in "not-found".chars() {
+                app.key(KeyCode::Char(c), &worker);
+            }
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            assert!(app.popup.as_ref().unwrap().find.rows.is_empty());
+            app.key(KeyCode::Esc, &worker);
+            assert!(app.popup.is_some());
+            assert!(app.popup.as_ref().unwrap().find.query.is_empty());
+            if width >= 40 {
+                app.key(KeyCode::Char('/'), &worker);
+                click_action(&mut app, &mut terminal, &worker, Click::Close);
+            } else {
+                click_action(&mut app, &mut terminal, &worker, Click::Key(KeyCode::Esc));
+            }
+            assert!(app.popup.is_none());
+        }
     }
 
     fn header_position(terminal: &Terminal<TestBackend>, label: &str) -> (u16, u16) {

@@ -56,6 +56,9 @@ on each node; bootstrapped compatible agents receive [automatic updates](docs/PU
 sgpu                    # Interactive dashboard
 chkgpu                  # User × node allocation matrix
 chkgpu --summary        # Node headroom and pending reasons
+chkqueue --mine         # My pending jobs by priority, wait and reason
+chkfail                 # My failures/stops ending in the last 24h
+sgpu explain 12345      # Pending facts, interpretation and node headroom
 sgpu me                 # My jobs and usage
 sgpu users              # Per-user resources
 sgpu host               # Controller resources
@@ -69,6 +72,8 @@ sgpu doctor             # Collection checks
 | `1`–`7` | GPU / CPU / Usage / Jobs / Attention / Users / Host |
 | Click `↕` · `s` / `S` | Jobs header sorting · cycle sort / reverse |
 | `u` / `p` / `m` | User / partition / highlighted-account filters |
+| `U` / `P` | Search and select a user / partition |
+| `E` / `F` | Explain pending job / my 24h failure report |
 | `v` in Jobs | All / running / pending |
 | `/` / `0` | Search / reset filters |
 | Enter / Tab | Details / script and log tabs |
@@ -85,6 +90,12 @@ Searches, account filters, logs and temporary related views stay in the current 
 Tabs, rows, marked sort headers, filter chips and buttons accept mouse clicks.
 Select a row, then click **Detail**. Short detail windows expand to the screen;
 use the wheel or paging buttons to scroll, and **Follow** to resume live logs.
+Inside details/logs, `/` finds literal text; `n` / `N` move between matching lines.
+Enter applies the search; Esc clears the search input, then closes the popup.
+
+`chkqueue` = `sgpu queue` (`--mine`, `--partition`, `--limit`, `--json`).
+`chkfail` = `sgpu failures` (`--hours 24`, `--json`): one owner-only accounting query,
+UTC end-time window; cancellations/preemptions are separate, allocation records exclude job steps.
 
 `?` means unavailable, `~` partial coverage. Stale data never counts as free capacity.
 Network/load in Users are shared-node values. Priority, headroom and start-time
