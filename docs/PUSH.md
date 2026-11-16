@@ -113,7 +113,10 @@ finite numeric values only to validated scheduler jobs on allocated nodes.
 GPU PID-attributed VRAM is reported separately, with per-metric coverage.
 
 GPU health is capability-gated and cached for at least 10s; topology is cached
-for 300s. Power uses local RAPL and optional `ipmitool`. Run
+for 300s. In GPU Health, `CAP` means NVIDIA's software power cap is reducing
+clocks to stay within the power limit; the flag alone is informational.
+`THERMAL` and `SLOW` identify separate thermal/hardware clock-limit reasons.
+Power uses local RAPL and optional `ipmitool`. Run
 `scripts/setup-node-power.sh --check` locally for a read-only check, or `--apply` as root
 for local package/module setup. Missing hardware stays unavailable.
 

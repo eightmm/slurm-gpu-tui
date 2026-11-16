@@ -150,6 +150,13 @@ pub struct FailureOptions {
     pub hours: u32,
     #[arg(long)]
     pub json: bool,
+    #[arg(
+        long,
+        value_enum,
+        default_value = "auto",
+        help = "Color text output; auto respects NO_COLOR and TERM=dumb"
+    )]
+    pub color: crate::terminal::ColorMode,
 }
 
 pub fn failures(options: FailureOptions) -> Result<i32> {
@@ -157,7 +164,10 @@ pub fn failures(options: FailureOptions) -> Result<i32> {
     if options.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        print!("{}", crate::failures::render(&report));
+        print!(
+            "{}",
+            crate::failures::render_with_color(&report, options.color.stdout())
+        );
     }
     Ok(0)
 }
@@ -172,6 +182,13 @@ pub struct QueueOptions {
     pub limit: u32,
     #[arg(long)]
     pub json: bool,
+    #[arg(
+        long,
+        value_enum,
+        default_value = "auto",
+        help = "Color text output; auto respects NO_COLOR and TERM=dumb"
+    )]
+    pub color: crate::terminal::ColorMode,
 }
 pub fn queue(options: QueueOptions) -> Result<i32> {
     let data = snapshot()?;
@@ -187,7 +204,10 @@ pub fn queue(options: QueueOptions) -> Result<i32> {
     if options.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        print!("{}", crate::queue::render(&report));
+        print!(
+            "{}",
+            crate::queue::render_with_color(&report, options.color.stdout())
+        );
     }
     Ok(0)
 }
@@ -248,6 +268,7 @@ pub fn normalize(mut args: Vec<String>) -> Vec<String> {
             "--highlight-user",
             "--hours",
             "--limit",
+            "--color",
         ]
         .contains(&arg.as_str())
         {
@@ -1161,7 +1182,8 @@ mod tests {
             parse(&["sgpu", "--hours", "12", "--failures", "--json"]),
             Command::Failures(FailureOptions {
                 hours: 12,
-                json: true
+                json: true,
+                ..
             })
         ));
     }

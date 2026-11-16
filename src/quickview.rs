@@ -1,34 +1,18 @@
+pub use crate::terminal::ColorMode;
+pub(crate) use crate::terminal::cell;
 use crate::{
     Result, cli,
     process::{self, Program},
     rules, runtime, scheduler,
+    terminal::{Tone, paint, reason_tone},
 };
-use crossterm::style::Stylize;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
-    io::IsTerminal,
     path::PathBuf,
     time::Duration,
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-
-#[derive(Clone, Copy, Default, clap::ValueEnum)]
-pub enum ColorMode {
-    #[default]
-    Auto,
-    Always,
-    Never,
-}
-impl ColorMode {
-    fn enabled(self, terminal: bool, no_color: bool, dumb: bool) -> bool {
-        match self {
-            Self::Auto => terminal && !no_color && !dumb,
-            Self::Always => true,
-            Self::Never => false,
-        }
-    }
-}
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Clone, Default)]
 pub struct Inventory {
@@ -262,17 +246,6 @@ fn sum(rows: &BTreeMap<String, BTreeMap<String, u32>>, node: &str) -> u64 {
         .map(|r| *r.get(node).unwrap_or(&0) as u64)
         .sum()
 }
-#[derive(Clone, Copy)]
-enum Tone {
-    Normal,
-    Muted,
-    Heading,
-    Mine,
-    Good,
-    Busy,
-    Alert,
-    Bold,
-}
 struct Presentation {
     color: bool,
     width: usize,
@@ -281,19 +254,7 @@ struct Presentation {
 }
 impl Presentation {
     fn paint(&self, text: &str, tone: Tone) -> String {
-        if !self.color {
-            return text.into();
-        }
-        match tone {
-            Tone::Normal => text.to_string(),
-            Tone::Muted => text.dark_grey().to_string(),
-            Tone::Heading => text.cyan().bold().to_string(),
-            Tone::Mine => text.green().bold().to_string(),
-            Tone::Good => text.green().to_string(),
-            Tone::Busy => text.yellow().to_string(),
-            Tone::Alert => text.red().bold().to_string(),
-            Tone::Bold => text.bold().to_string(),
-        }
+        paint(text, tone, self.color)
     }
     fn user(&self, user: &str) -> (String, Tone) {
         if user == self.user && !user.is_empty() {
@@ -344,29 +305,6 @@ fn admitting(state: &str) -> bool {
             state.split('+').next().unwrap_or(""),
             "idle" | "mix" | "mixed" | "alloc" | "allocated"
         )
-}
-pub(crate) fn cell(raw: &str, width: usize, right: bool) -> String {
-    let safe: String = raw.chars().filter(|c| !c.is_control()).collect();
-    let mut text = String::new();
-    let clipped = safe.width() > width;
-    let mut remaining = width.saturating_sub(usize::from(clipped));
-    for c in safe.chars() {
-        let size = c.width().unwrap_or(0);
-        if size > remaining {
-            break;
-        }
-        text.push(c);
-        remaining -= size;
-    }
-    if clipped {
-        text.push('…');
-    }
-    let padding = " ".repeat(width.saturating_sub(text.width()));
-    if right {
-        format!("{padding}{text}")
-    } else {
-        format!("{text}{padding}")
-    }
 }
 #[derive(Clone, Copy)]
 struct TableContext<'a> {
@@ -787,10 +725,9 @@ fn render_with(
             out.push_str(&format!(
                 "  {count:>5}  {}\n",
                 view.paint(
-                    &cell(reason, view.width.saturating_sub(10), false),
-                    Tone::Busy
+                    cell(reason, view.width.saturating_sub(10), false).trim_end(),
+                    reason_tone(reason)
                 )
-                .trim_end()
             ));
         }
         out.push_str(&format!(
@@ -981,12 +918,7 @@ pub fn run(color: ColorMode, summary: bool) -> Result<()> {
     if inventory.is_empty() {
         return Err("no scheduler nodes found".into());
     }
-    let color = color.enabled(
-        std::io::stdout().is_terminal(),
-        std::env::var_os("NO_COLOR").is_some(),
-        std::env::var("TERM").is_ok_and(|v| v == "dumb"),
-    );
-    crossterm::style::force_color_output(color);
+    let color = color.stdout();
     print!(
         "{}",
         render_with(
@@ -1101,15 +1033,6 @@ mod tests {
             assert_eq!(inventory["gpu2"].partition, "6000ada");
             assert_eq!(inventory["gpu3"].partition, "heavy");
         }
-    }
-    #[test]
-    fn terminal_colors_respect_pipes_opt_out_and_explicit_overrides() {
-        assert!(ColorMode::Auto.enabled(true, false, false));
-        assert!(!ColorMode::Auto.enabled(false, false, false));
-        assert!(!ColorMode::Auto.enabled(true, true, false));
-        assert!(!ColorMode::Auto.enabled(true, false, true));
-        assert!(ColorMode::Always.enabled(false, true, true));
-        assert!(!ColorMode::Never.enabled(true, false, false));
     }
     #[test]
     fn narrow_matrices_keep_unicode_cells_aligned_and_never_emit_untrusted_controls() {

@@ -3,6 +3,7 @@ use crate::{
     job_view::{Entry, Sort},
     model::Snapshot,
     rules, runtime,
+    terminal::{Tone, cell, paint, reason_tone},
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -74,52 +75,108 @@ pub fn report(data: &Snapshot, user: &str, partition: &str, limit: usize) -> Rep
     }
 }
 pub fn render(report: &Report) -> String {
+    render_with_color(report, false)
+}
+pub(crate) fn render_with_color(report: &Report, color: bool) -> String {
+    let mark = |text: &str, tone| paint(text, tone, color);
+    let column = |text: &str, width, right, tone| mark(&cell(text, width, right), tone);
+    let id_width = report
+        .jobs
+        .iter()
+        .map(|job| job.jobid.len())
+        .max()
+        .unwrap_or(14)
+        .max(14);
     let mut out = format!(
-        "{} pending · user:{} · partition:{} · published {}\n",
-        report.total,
+        "{}\n{} pending · user:{} · partition:{}\n{}\n",
+        mark("sgpu · pending queue", Tone::Heading),
+        mark(
+            &report.total.to_string(),
+            if report.total == 0 {
+                Tone::Good
+            } else {
+                Tone::Bold
+            }
+        ),
         if report.user.is_empty() {
-            "all"
+            "all".into()
         } else {
-            &report.user
+            mark(&report.user, Tone::Mine)
         },
         if report.partition.is_empty() {
-            "all"
+            "all".into()
         } else {
-            &report.partition
+            mark(&report.partition, Tone::Value)
         },
-        report.snapshot
+        mark(&format!("Published {}", report.snapshot), Tone::Muted)
     );
-    for (reason, count) in &report.reasons {
-        out.push_str(&format!("  {reason}: {count}\n"));
+    let current_user = cli::current_user();
+    if !report.reasons.is_empty() {
+        out.push_str(&format!(
+            "\n{}\n",
+            mark("── Pending reasons", Tone::Heading)
+        ));
     }
-    out.push_str(&format!(
-        "\n{:<14} {:<12} {:>10} {:>7} {:>6} {:>6}  {}\n",
-        "JobID", "User", "Priority", "Wait", "GPU/n", "CPU/j", "Partition / QOS / reason"
+    for (reason, count) in &report.reasons {
+        out.push_str(&format!(
+            "  {}: {}\n",
+            mark(reason, reason_tone(reason)),
+            mark(&count.to_string(), Tone::Bold)
+        ));
+    }
+    out.push_str(&mark(
+        &format!(
+            "\n{:<id_width$} {:<12} {:>10} {:>7} {:>6} {:>6}  {}\n",
+            "JobID", "User", "Priority", "Wait", "GPU/n", "CPU/j", "Partition / QOS / reason"
+        ),
+        Tone::Heading,
     ));
     for job in &report.jobs {
+        let mine = job.user == current_user && !job.user.is_empty();
         out.push_str(&format!(
-            "{:<14} {:<12} {:>10} {:>7} {:>6} {:>6}  {} / {} / {}\n",
-            job.jobid,
-            job.user,
-            job.priority,
-            job.wait_seconds
-                .map(rules::span)
-                .unwrap_or_else(|| "?".into()),
-            job.gpus_per_node,
-            job.cpus_per_job,
-            job.partition,
-            job.qos,
-            job.reason
+            "{} {} {} {} {} {}  {} / {} / {}\n",
+            column(&job.jobid, id_width, false, Tone::Value),
+            column(
+                &if mine {
+                    format!("{} *", job.user)
+                } else {
+                    job.user.clone()
+                },
+                12,
+                false,
+                if mine { Tone::Mine } else { Tone::Normal }
+            ),
+            column(&job.priority, 10, true, Tone::Value),
+            column(
+                &job.wait_seconds
+                    .map(rules::span)
+                    .unwrap_or_else(|| "?".into()),
+                7,
+                true,
+                if job.wait_seconds.is_some() {
+                    Tone::Normal
+                } else {
+                    Tone::Muted
+                }
+            ),
+            column(&job.gpus_per_node.to_string(), 6, true, Tone::Bold),
+            column(&job.cpus_per_job.to_string(), 6, true, Tone::Normal),
+            mark(&job.partition, Tone::Normal),
+            mark(&job.qos, Tone::Muted),
+            mark(&job.reason, reason_tone(&job.reason))
         ));
     }
     if report.total > report.jobs.len() {
-        out.push_str(&format!(
-            "… {} more jobs; increase --limit to show more.\n",
-            report.total - report.jobs.len()
+        out.push_str(&mark(
+            &format!(
+                "… {} more jobs; increase --limit to show more.\n",
+                report.total - report.jobs.len()
+            ),
+            Tone::Muted,
         ));
     }
-    out.push_str("\nPriority is a numeric score, not queue position. Start/admission depend on scheduler policy.\nUse sgpu explain JOBID for facts, interpretation and per-node observations.\n");
-    cli::terminal_safe(&out)
+    out.push_str(&mark("\nPriority is a numeric score, not queue position. Start/admission depend on scheduler policy.\n* marks your jobs. Use sgpu explain JOBID for facts, interpretation and per-node observations.\n", Tone::Muted));
+    out
 }
 
 #[cfg(test)]

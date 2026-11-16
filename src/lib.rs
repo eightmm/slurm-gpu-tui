@@ -23,6 +23,7 @@ pub mod quickview;
 pub mod rules;
 pub mod runtime;
 pub mod scheduler;
+pub mod terminal;
 pub mod ui;
 mod ui_find;
 mod ui_input;

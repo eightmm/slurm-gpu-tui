@@ -170,6 +170,13 @@ fn quick_failure_and_queue_commands_share_the_cli_and_keep_owner_and_window_boun
 printf '%s\n' "$*" >> "$SGPU_TEST_CALLS"
 [ "$SLURM_TIME_FORMAT" = standard ] || exit 19
 [ "$TZ" = UTC ] || exit 20
+[ "$SLURM_BITSTR_LEN" = 0 ] || exit 21
+for arg do
+    if [ "$arg" = --array ]; then
+        printf '%s\n' "sacct: unrecognized option '--array'" >&2
+        exit 1
+    fi
+done
 printf '%s\n' '{raw}'
 "#
     );
@@ -210,7 +217,8 @@ printf '%s\n' '{raw}'
     let calls = fs::read_to_string(fixture.root.path().join("calls")).unwrap();
     assert_eq!(calls.lines().count(), 1);
     assert!(calls.contains(&format!("-u {uid} -S")) && calls.contains(" -E "));
-    assert!(calls.contains("-X --array --local"));
+    assert!(calls.contains("-X --local"));
+    assert!(!calls.contains("--array"));
     let mut alias = fixture.binary(env!("CARGO_BIN_EXE_chkfail"));
     let alias_report: serde_json::Value =
         serde_json::from_str(&successful(alias.arg("--json").output().unwrap())).unwrap();
@@ -340,12 +348,12 @@ fn invalid_input_is_rejected_and_private_logs_cannot_follow_symlinks() {
 }
 
 #[test]
-fn chkgpu_colors_are_opt_in_for_pipes_and_remain_explicitly_controllable() {
+fn quick_commands_share_colors_respect_pipes_and_keep_json_and_columns_clean() {
     let fixture = Fixture::new();
     for (name, body) in [
         (
             "squeue",
-            "printf '%s\\n' '42|gpu|alice|RUNNING|00:01|8|gpu:2|N/A|gpu1' '43|gpu|bob|COMPLETING|00:01|0|gpu:1|N/A|gpu1' '44|gpu|alice|PENDING|00:00|4|gpu:1|N/A|(Resources)'",
+            "printf '%s\\n' '42|gpu|alice|RUNNING|00:01|8|gpu:2|N/A|gpu1' '43|gpu|bob|COMPLETING|00:01|0|gpu:1|N/A|gpu1' '44|gpu|alice|PENDING|00:00|4|gpu:1|N/A|(Resources)' '45|gpu|bob|PENDING|00:00|4|gpu:1|N/A|(DependencyNeverSatisfied)'",
         ),
         (
             "sinfo",
@@ -377,6 +385,82 @@ fn chkgpu_colors_are_opt_in_for_pipes_and_remain_explicitly_controllable() {
     assert!(!summary.contains("GPU allocation") && !summary.contains('\x1b'));
     assert!(run(&["--color", "always"]).contains("\x1b[38;"));
     assert!(!run(&["--color", "never"]).contains('\x1b'));
+
+    let mut snapshot: Snapshot =
+        serde_json::from_slice(&fs::read(fixture.data.join("data.json")).unwrap()).unwrap();
+    snapshot.pending.push(PendingJob {
+        jobid: "4294967295_4294967295".into(),
+        user: "another-user".into(),
+        reason: "DependencyNeverSatisfied".into(),
+        ..Default::default()
+    });
+    fs::write(
+        fixture.data.join("data.json"),
+        serde_json::to_vec(&snapshot).unwrap(),
+    )
+    .unwrap();
+    let uid = runtime::euid();
+    let ended = (chrono::Utc::now() - chrono::Duration::minutes(5)).format("%Y-%m-%dT%H:%M:%S");
+    fs::write(
+        fixture.bin.join("sacct"),
+        format!("#!/bin/sh\nprintf '%s\\n' '42|{uid}|gpu|OUT_OF_MEMORY|0:9|{ended}' '43|{uid}|gpu|CANCELLED by {uid}|0:15|{ended}'\n"),
+    ).unwrap();
+    let ansi = regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
+    let timestamps = regex::Regex::new(r"20\d\d[-/]\d\d[-/]\d\d[T ]\d\d:\d\d:\d\dZ?").unwrap();
+    let normalize = |text: &str| timestamps.replace_all(text, "<timestamp>").into_owned();
+    for (executable, prefix) in [
+        (env!("CARGO_BIN_EXE_chkgpu"), vec![]),
+        (env!("CARGO_BIN_EXE_chkqueue"), vec![]),
+        (env!("CARGO_BIN_EXE_chkfail"), vec![]),
+        (env!("CARGO_BIN_EXE_sgpu"), vec!["queue"]),
+        (env!("CARGO_BIN_EXE_sgpu"), vec!["failures"]),
+    ] {
+        let render = |args: &[&str], term: &str, no_color: bool| {
+            let mut command = fixture.binary(executable);
+            command
+                .args(&prefix)
+                .args(args)
+                .env("TERM", term)
+                .env_remove("NO_COLOR");
+            if no_color {
+                command.env("NO_COLOR", "1");
+            }
+            successful(command.output().unwrap())
+        };
+        let plain = render(&["--color", "never"], "xterm-256color", false);
+        assert!(!plain.contains('\x1b'));
+        for (term, no_color) in [
+            ("xterm-256color", false),
+            ("xterm-256color", true),
+            ("dumb", false),
+        ] {
+            let auto = render(&[], term, no_color);
+            assert!(!auto.contains('\x1b'));
+            assert_eq!(normalize(&auto), normalize(&plain));
+        }
+        let colored = render(&["--color", "always"], "dumb", true);
+        assert!(colored.contains("\x1b[38;5;117;1msgpu ·"));
+        assert_eq!(
+            normalize(&ansi.replace_all(&colored, "")),
+            normalize(&plain)
+        );
+        if prefix == ["failures"] || executable == env!("CARGO_BIN_EXE_chkfail") {
+            assert!(colored.contains("\x1b[38;5;210;1mOUT_OF_MEMORY"));
+            assert!(colored.contains("\x1b[38;5;222mCANCELLED"));
+        } else {
+            assert!(colored.contains("\x1b[38;5;210;1mDependencyNeverSatisfied"));
+            assert!(colored.contains("\x1b[38;5;222mResources"));
+            if executable != env!("CARGO_BIN_EXE_chkgpu") {
+                assert!(plain.contains("4294967295_4294967295"));
+            }
+        }
+        if executable != env!("CARGO_BIN_EXE_chkgpu") {
+            let json = render(&["--json", "--color", "always"], "xterm-256color", false);
+            assert!(!json.contains('\x1b'));
+            let report: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert!(report["jobs"].is_array());
+        }
+    }
 }
 
 struct ChildGuard(Child);

@@ -82,7 +82,10 @@ sgpu doctor             # Collection checks
 | `?` / `q` | Full help / quit |
 
 Use `sgpu --help` for all commands. Highlight an account with `sgpu --highlight-user alice`;
-permissions still follow the executing account. `chkgpu` respects `NO_COLOR` and supports `--color always` / `--color never`.
+permissions still follow the executing account. All three `chk*` commands share
+`--color auto|always|never`, respect `NO_COLOR`, and omit colors in pipes by default.
+Cyan headings · green own jobs/clear results · yellow waiting/stopped · red failures/full capacity · grey context.
+JSON stays uncolored, including with `--color always`.
 
 The last tab, sort and Jobs state are saved in `~/.sgpu/ui/preferences.json`.
 Searches, account filters, logs and temporary related views stay in the current session.
@@ -96,8 +99,10 @@ Enter applies the search; Esc clears the search input, then closes the popup.
 `chkqueue` = `sgpu queue` (`--mine`, `--partition`, `--limit`, `--json`).
 `chkfail` = `sgpu failures` (`--hours 24`, `--json`): one owner-only accounting query,
 UTC end-time window; cancellations/preemptions are separate, allocation records exclude job steps.
+Works with Slurm 19.05 and newer without requiring `sacct --array`; grouped array tasks are expanded locally.
 
 `?` means unavailable, `~` partial coverage. Stale data never counts as free capacity.
+GPU Health `CAP` means a power-limit clock adjustment; it is informational on its own.
 Network/load in Users are shared-node values. Priority, headroom and start-time
 estimates do not guarantee scheduler admission. See [metric interpretation](docs/PUSH.md#resource-views).
 

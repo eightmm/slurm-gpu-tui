@@ -4224,7 +4224,9 @@ const HELP: &str = concat!(
     "Wait sorts pending jobs longest first; left sorts running jobs by time limit remaining.\n",
     "Unknown sort values stay last in either direction. Job RAM/VRAM columns use GiB.\n",
     "GPU requests follow Slurm's per-node GRES field; CPU requests cover the whole job.\n",
-    "PSI is pressure, not a diagnosis. GPU power caps alone are informational.\n\n",
+    "PSI is pressure, not a diagnosis.\n",
+    "GPU Health CAP: NVIDIA SW power cap is reducing clocks to stay within the power limit.\n",
+    "CAP alone is informational; THERMAL/SLOW indicate separate clock-limit reasons.\n\n",
     "Node results are push-only; missing agents stay stale without master-to-node requests."
 );
 

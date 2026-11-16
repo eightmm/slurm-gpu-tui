@@ -82,7 +82,10 @@ sgpu doctor             # 수집 상태 진단
 | `?` / `q` | 전체 도움말 / 종료 |
 
 전체 명령은 `sgpu --help`에서 확인합니다. `sgpu --highlight-user alice`로 계정을
-강조할 수 있으며 권한은 실행 계정을 따릅니다. `chkgpu`는 `NO_COLOR`와 `--color always` / `--color never`를 지원합니다.
+강조할 수 있으며 권한은 실행 계정을 따릅니다. 세 `chk*` 명령은 공통으로
+`--color auto|always|never`와 `NO_COLOR`를 지원하며 파이프에서는 기본으로 색을 끕니다.
+청록 제목 · 초록 본인/이상 없음 · 노랑 대기/중단 · 빨강 실패/할당 포화 · 회색 보조 정보로 통일했습니다.
+JSON에는 `--color always`에서도 색상 코드를 넣지 않습니다.
 
 마지막 탭·정렬·Jobs 상태는 `~/.sgpu/ui/preferences.json`에 저장합니다.
 검색어·계정 필터·로그·임시 관련 화면은 현재 세션에만 유지합니다.
@@ -96,8 +99,10 @@ Enter로 검색을 적용하며, Esc는 검색 입력을 지운 뒤 팝업을 �
 `chkqueue` = `sgpu queue` (`--mine`, `--partition`, `--limit`, `--json`).
 `chkfail` = `sgpu failures` (`--hours 24`, `--json`): 본인 accounting만 한 번 조회하고
 UTC 종료 시각으로 집계합니다. 취소·선점은 구분하며 작업 step은 집계에서 제외합니다.
+Slurm 19.05 이상에서 `sacct --array` 없이 동작하며 묶인 배열 작업은 개별 task로 풀어서 집계합니다.
 
 `?`는 결측, `~`는 부분 관측입니다. 오래된 데이터는 빈 자원으로 계산하지 않습니다.
+GPU Health의 `CAP`은 전력 상한에 따른 클록 조절이며, 단독으로는 장애 표시가 아닙니다.
 Users의 network/load는 노드 공용 값이며 priority·여유량·예상 시작 시각은 실행 승인을
 보장하지 않습니다. 자세한 기준은 [지표 해석](PUSH.md#resource-views)을 참고하세요.
 
