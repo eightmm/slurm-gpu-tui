@@ -4,7 +4,9 @@ use crate::{
     model::{Gpu, Job, Node, PendingJob, Snapshot, number},
     process::{self, Program},
     rules::{self, Class},
-    runtime, ui_preferences, usage,
+    runtime,
+    ui_input::{Action as Click, Hits, Scope},
+    ui_preferences, usage,
 };
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -17,7 +19,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{
         Block, BorderType, Borders, Cell, Clear, Gauge, HighlightSpacing, Paragraph, Row, Table,
-        TableState, Tabs, Wrap,
+        TableState, Wrap,
     },
 };
 use std::{
@@ -131,6 +133,107 @@ fn panel(title: &str) -> Block<'_> {
         .title_style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD))
         .style(Style::default().bg(PANEL).fg(TEXT))
 }
+
+fn buttons(frame: &mut Frame, area: Rect, bindings: &[(KeyCode, String)], hits: &mut Hits) {
+    let mut x = area.x;
+    for (index, (key, label)) in bindings.iter().enumerate() {
+        let text = if area.width < 32 {
+            label.clone()
+        } else {
+            format!(" {label} ")
+        };
+        let width = text.width().min(u16::MAX as usize) as u16;
+        let remaining = area.right().saturating_sub(x);
+        if width > remaining && index > 0 {
+            continue;
+        }
+        let rect = Rect::new(x, area.y, width.min(remaining), area.height.min(1));
+        frame.render_widget(
+            Paragraph::new(text).style(
+                Style::default()
+                    .fg(CYAN)
+                    .bg(HEADER_BG)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            rect,
+        );
+        hits.add(rect, Click::Key(*key));
+        x = rect.right().saturating_add(1).min(area.right());
+    }
+}
+
+fn tab_bar(
+    frame: &mut Frame,
+    area: Rect,
+    labels: &[String],
+    selected: usize,
+    hits: &mut Hits,
+    panes: bool,
+) {
+    if panes
+        && labels
+            .iter()
+            .map(|label| label.width() + 3)
+            .sum::<usize>()
+            .saturating_sub(1)
+            > area.width as usize
+    {
+        let [arrows, name] =
+            Layout::horizontal([Constraint::Length(6), Constraint::Min(0)]).areas(area);
+        buttons(
+            frame,
+            arrows,
+            &[(KeyCode::BackTab, "←".into()), (KeyCode::Tab, "→".into())],
+            hits,
+        );
+        if let Some(label) = labels.get(selected) {
+            frame.render_widget(
+                Paragraph::new(cli::terminal_safe(label)).style(Style::default().fg(FOCUS)),
+                name,
+            );
+        }
+        return;
+    }
+    let mut spans = Vec::new();
+    let mut actions = Vec::new();
+    for (index, label) in labels.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled("│", Style::default().fg(BORDER)));
+            actions.push(None);
+        }
+        spans.push(Span::styled(
+            format!(" {} ", cli::terminal_safe(label)),
+            if index == selected {
+                Style::default()
+                    .fg(BACKGROUND)
+                    .bg(CYAN)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(MUTED)
+            },
+        ));
+        actions.push(Some(if panes {
+            Click::Pane(index)
+        } else {
+            Click::Key(KeyCode::Char(b'1'.saturating_add(index as u8) as char))
+        }));
+    }
+    hits.spans(area, &spans, &actions);
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn view_column_sort(tab: usize, compact: bool, column: usize) -> Option<usize> {
+    match (tab, column) {
+        (0, 0) => Some(0),
+        (0, 1) if compact => Some(1),
+        (0, 2) if !compact => Some(1),
+        (5, 2) => Some(0),
+        (5, 3) => Some(1),
+        (5, 8) => Some(3),
+        _ => None,
+    }
+}
+
 fn job_column_sort(column: usize) -> Option<job_view::Sort> {
     match column {
         1 => Some(job_view::Sort::User),
@@ -235,6 +338,10 @@ pub struct Popup {
     pub selected: usize,
     pub cancel: Option<String>,
     pub token: u64,
+    actions: Vec<(KeyCode, String)>,
+    source_row: Option<String>,
+    source_tab: Option<usize>,
+    table: TableState,
 }
 impl Popup {
     fn text(title: &str, body: String) -> Self {
@@ -252,7 +359,19 @@ impl Popup {
             selected: 0,
             cancel: None,
             token: 0,
+            actions: Vec::new(),
+            source_row: None,
+            source_tab: None,
+            table: TableState::default(),
         }
+    }
+    fn pane(&mut self, index: usize) {
+        self.active = index.min(self.panes.len().saturating_sub(1));
+        self.follow = self
+            .panes
+            .get(self.active)
+            .is_some_and(|pane| pane.log.is_some());
+        self.scroll = if self.follow { u16::MAX } else { 0 };
     }
 }
 
@@ -535,7 +654,8 @@ pub struct App {
     job_reverse: bool,
     job_filter: job_view::Filter,
     related: Option<RelatedView>,
-    header_hits: Vec<(Rect, job_view::Sort)>,
+    hits: Hits,
+    quit_requested: bool,
     details: bool,
     pending: bool,
     trend: bool,
@@ -587,7 +707,8 @@ impl App {
             job_reverse: false,
             job_filter: job_view::Filter::default(),
             related: None,
-            header_hits: Vec::new(),
+            hits: Hits::default(),
+            quit_requested: false,
             details: false,
             pending: false,
             trend: false,
@@ -936,6 +1057,7 @@ impl App {
         ]
     }
     pub fn rebuild(&mut self) {
+        self.hits.clear();
         let selected = self.selected().map(|r| r.key.clone());
         let now = runtime::now();
         let mut rows = Vec::new();
@@ -1881,7 +2003,6 @@ impl App {
         );
     }
     pub fn draw(&mut self, frame: &mut Frame) {
-        self.header_hits.clear();
         let compact = frame.area().width < 130;
         let narrow = frame.area().width < 100;
         if compact != self.compact || narrow != self.narrow {
@@ -1889,6 +2010,10 @@ impl App {
             self.narrow = narrow;
             self.rebuild();
         }
+        self.hits.reset(Scope::Main {
+            tab: self.tab,
+            searching: self.searching,
+        });
         frame.render_widget(
             Block::default().style(Style::default().fg(TEXT).bg(BACKGROUND)),
             frame.area(),
@@ -1903,42 +2028,42 @@ impl App {
             } else {
                 0
             };
+        let summary_height = if self.tab == 6 {
+            3
+        } else if self.trend {
+            7
+        } else {
+            4
+        };
+        let spaced_rows = frame.area().height >= 20;
         let areas = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(dashboard_height),
-            Constraint::Length(if self.tab == 6 {
-                3
-            } else if self.trend {
-                7
-            } else {
-                4
-            }),
+            Constraint::Length(summary_height.min(frame.area().height.saturating_sub(8))),
             Constraint::Min(3),
             Constraint::Length(2),
         ])
         .split(frame.area());
-        let heading =
-            Layout::horizontal([Constraint::Length(9), Constraint::Min(1)]).split(areas[0]);
+        let heading = Layout::horizontal([
+            Constraint::Length(if frame.area().width < 50 { 0 } else { 9 }),
+            Constraint::Min(1),
+        ])
+        .split(areas[0]);
         frame.render_widget(
             Paragraph::new(" ▰ sgpu ")
                 .style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
             heading[0],
         );
-        frame.render_widget(
-            Tabs::new([
+        let labels = if frame.area().width < 58 {
+            ["1", "2", "3", "4", "5", "6", "7"]
+        } else {
+            [
                 "1 GPU", "2 CPU", "3 Use", "4 Jobs", "5 Attn", "6 Users", "7 Host",
-            ])
-            .select(self.tab)
-            .style(Style::default().fg(MUTED))
-            .divider(Span::styled("│", Style::default().fg(BORDER)))
-            .highlight_style(
-                Style::default()
-                    .fg(BACKGROUND)
-                    .bg(CYAN)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            heading[1],
-        );
+            ]
+        }
+        .map(str::to_string);
+        tab_bar(frame, heading[1], &labels, self.tab, &mut self.hits, false);
+        self.hits.scroll = areas[3];
         self.draw_dashboard(frame, areas[1]);
         let mut free = 0;
         let mut total = 0;
@@ -1977,10 +2102,18 @@ impl App {
         } else {
             self.reverse ^ (self.tab == 5 || (self.tab == 0 && self.sort > 0))
         };
-        let mut chips = vec![Span::styled(
-            format!(" sort:{sort_label}{} ", if descending { "↓" } else { "↑" }),
-            Style::default().fg(MUTED),
-        )];
+        let mut chips = vec![
+            Span::styled(format!(" sort:{sort_label}"), Style::default().fg(MUTED)),
+            Span::styled(
+                if descending { "↓ " } else { "↑ " },
+                Style::default().fg(BLUE),
+            ),
+        ];
+        let sortable = matches!(self.tab, 0 | 3 | 5);
+        let mut chip_actions = vec![
+            sortable.then_some(Click::Key(KeyCode::Char('s'))),
+            sortable.then_some(Click::Key(KeyCode::Char('S'))),
+        ];
         if let Some(related) = &self.related {
             let label = related
                 .target
@@ -1994,6 +2127,7 @@ impl App {
                     Style::default().fg(FOCUS).add_modifier(Modifier::BOLD),
                 ),
             );
+            chip_actions.insert(0, Some(Click::Key(KeyCode::Esc)));
         }
         if self.tab == 3 {
             chips.push(Span::styled(
@@ -2004,8 +2138,9 @@ impl App {
                     FOCUS
                 }),
             ));
+            chip_actions.push(Some(Click::Key(KeyCode::Char('v'))));
         }
-        for (text, active) in [
+        for (text, active, key) in [
             (
                 format!(
                     "user:{}",
@@ -2016,6 +2151,7 @@ impl App {
                     }
                 ),
                 !self.user_filter().is_empty(),
+                'u',
             ),
             (
                 format!(
@@ -2027,21 +2163,35 @@ impl App {
                     }
                 ),
                 !self.partition.is_empty(),
+                'p',
             ),
-            ("MINE".into(), self.mine),
-            ("FREE".into(), self.free_only && self.tab == 0),
-            (format!("search:{}", self.search), !self.search.is_empty()),
+            ("MINE".into(), self.mine, 'm'),
+            ("FREE".into(), self.free_only && self.tab == 0, 'i'),
+            (
+                format!("search:{}", self.search),
+                !self.search.is_empty(),
+                '/',
+            ),
         ] {
             if active || text.starts_with("user:") || text.starts_with("part:") {
                 chips.push(Span::styled(
-                    format!(" {text} "),
+                    format!(" {} ", cli::terminal_safe(&text)),
                     Style::default()
                         .fg(if active { BACKGROUND } else { MUTED })
                         .bg(if active { FOCUS } else { BACKGROUND }),
                 ));
+                chip_actions.push(Some(Click::Key(KeyCode::Char(key))));
             }
         }
         chips.push(Span::styled(" 0 reset", Style::default().fg(MUTED)));
+        chip_actions.push(Some(Click::Key(KeyCode::Char('0'))));
+        if self.tab != 6 && areas[2].height > 1 {
+            self.hits.spans(
+                Rect::new(areas[2].x, areas[2].y + 1, areas[2].width, 1),
+                &chips,
+                &chip_actions,
+            );
+        }
         summary.push(Line::from(chips));
         let own_gpu = self
             .data
@@ -2165,15 +2315,16 @@ impl App {
                 .unwrap_or_else(|| {
                     "No usage data yet. Start the collector to record usage.".into()
                 });
-            let paragraph = Paragraph::new(cli::terminal_safe(&body))
-                .block(panel(" GPU-hours · observation coverage "))
-                .wrap(Wrap { trim: false });
+            let block = panel(" GPU-hours · observation coverage ");
+            let inner = block.inner(areas[3]);
+            frame.render_widget(block, areas[3]);
+            let paragraph = Paragraph::new(cli::terminal_safe(&body)).wrap(Wrap { trim: false });
             let max = paragraph
-                .line_count(areas[3].width)
-                .saturating_sub(areas[3].height as usize)
+                .line_count(inner.width)
+                .saturating_sub(inner.height as usize)
                 .min(u16::MAX as usize) as u16;
             self.usage_scroll = self.usage_scroll.min(max);
-            frame.render_widget(paragraph.scroll((self.usage_scroll, 0)), areas[3]);
+            frame.render_widget(paragraph.scroll((self.usage_scroll, 0)), inner);
         } else {
             let visible_columns: Vec<usize> = match self.tab {
                 0 if self.narrow => vec![0, 1, 2, 3, 5],
@@ -2275,14 +2426,22 @@ impl App {
                 .spacing(1)
                 .split(columns_area);
             if self.tab == 3 && !table_area.is_empty() {
-                self.header_hits = visible_columns
-                    .iter()
-                    .zip(cell_areas.iter())
-                    .filter_map(|(column, area)| {
-                        job_column_sort(*column)
-                            .map(|sort| (Rect::new(area.x, table_area.y, area.width, 1), sort))
-                    })
-                    .collect();
+                for (column, area) in visible_columns.iter().zip(cell_areas.iter()) {
+                    if let Some(sort) = job_column_sort(*column) {
+                        self.hits.add(
+                            Rect::new(area.x, table_area.y, area.width, 1),
+                            Click::JobSort(sort),
+                        );
+                    }
+                }
+            }
+            for (column, area) in visible_columns.iter().zip(cell_areas.iter()) {
+                if let Some(sort) = view_column_sort(self.tab, self.compact, *column) {
+                    self.hits.add(
+                        Rect::new(area.x, table_area.y, area.width, table_area.height.min(1)),
+                        Click::Sort(sort),
+                    );
+                }
             }
             let rows = self.rows.iter().enumerate().map(|(index, row)| {
                 let cells = visible_columns
@@ -2326,7 +2485,7 @@ impl App {
                         style
                     })
                     .top_margin(u16::from(
-                        self.tab == 0 && index > 0 && row.key.starts_with("node:"),
+                        spaced_rows && self.tab == 0 && index > 0 && row.key.starts_with("node:"),
                     ))
             });
             let table = Table::new(rows, widths)
@@ -2339,15 +2498,19 @@ impl App {
                                 self.headers.get(*i).map(|text| {
                                     let sort =
                                         (self.tab == 3).then(|| job_column_sort(*i)).flatten();
-                                    let text = if let Some(sort) = sort {
+                                    let view_sort = view_column_sort(self.tab, self.compact, *i);
+                                    let active_sort =
+                                        sort == Some(self.job_sort) || view_sort == Some(self.sort);
+                                    let clickable = sort.is_some() || view_sort.is_some();
+                                    let text = if clickable {
                                         format!(
-                                            "{text}{}",
-                                            if sort == self.job_sort {
-                                                if self.job_reverse ^ sort.descending() {
-                                                    "↓"
-                                                } else {
-                                                    "↑"
-                                                }
+                                            "{}{}",
+                                            clipped(
+                                                text,
+                                                cell_areas[position].width.saturating_sub(1)
+                                            ),
+                                            if active_sort {
+                                                if descending { "↓" } else { "↑" }
                                             } else {
                                                 "↕"
                                             }
@@ -2363,18 +2526,16 @@ impl App {
                                                 *i,
                                             )),
                                     )
-                                    .style(
-                                        if sort == Some(self.job_sort) {
-                                            Style::default()
-                                                .fg(FOCUS)
-                                                .bg(SELECTED_BG)
-                                                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-                                        } else if sort.is_some() {
-                                            Style::default().fg(BLUE)
-                                        } else {
-                                            Style::default().fg(MUTED)
-                                        },
-                                    )
+                                    .style(if active_sort {
+                                        Style::default()
+                                            .fg(FOCUS)
+                                            .bg(SELECTED_BG)
+                                            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                                    } else if clickable {
+                                        Style::default().fg(BLUE)
+                                    } else {
+                                        Style::default().fg(MUTED)
+                                    })
                                 })
                             }),
                     )
@@ -2402,6 +2563,27 @@ impl App {
                     _ => " Host · R/W disk · RX/TX net · Enter: guide + 5m trend ",
                 }));
             frame.render_stateful_widget(table, areas[3], &mut self.table);
+            let mut y = table_area.y.saturating_add(1);
+            for (index, row) in self.rows.iter().enumerate().skip(self.table.offset()) {
+                if spaced_rows && self.tab == 0 && index > 0 && row.key.starts_with("node:") {
+                    y = y.saturating_add(1);
+                }
+                if y >= table_area.bottom() {
+                    break;
+                }
+                let rect = Rect::new(table_area.x, y, table_area.width, 1);
+                self.hits.add(rect, Click::Row(row.key.clone()));
+                if self.tab == 0
+                    && row.key.starts_with("node:")
+                    && let Some(area) = cell_areas.first()
+                {
+                    self.hits.add(
+                        Rect::new(area.x, y, area.width.min(1), 1),
+                        Click::Fold(row.key.clone()),
+                    );
+                }
+                y = y.saturating_add(1);
+            }
             if self.rows.is_empty() && areas[3].height > 3 {
                 let message = match self.tab {
                     4 => "No confirmed sustained waste matches these filters",
@@ -2423,82 +2605,185 @@ impl App {
                 );
             }
         }
-        let footer = if self.searching {
+        let [status_area, buttons_area] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(areas[4]);
+        let bindings = if self.searching {
+            self.hits.reset(Scope::Main {
+                tab: self.tab,
+                searching: true,
+            });
+            frame.render_widget(
+                Paragraph::new(format!("Search: {}▏", cli::terminal_safe(&self.search)))
+                    .style(Style::default().fg(YELLOW)),
+                status_area,
+            );
             vec![
-                Line::styled(
-                    format!("Search: {}▏", cli::terminal_safe(&self.search)),
-                    Style::default().fg(YELLOW),
-                ),
-                Line::from("Enter apply · Esc clear"),
+                (KeyCode::Enter, "Enter Apply".into()),
+                (KeyCode::Esc, "Esc Clear".into()),
             ]
         } else {
-            let mut keys = Vec::new();
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "{} · row {}/{}",
+                    cli::terminal_safe(&self.status),
+                    self.table.selected().map_or(0, |i| i + 1),
+                    self.rows.len()
+                ))
+                .style(Style::default().fg(MUTED)),
+                status_area,
+            );
             let mut bindings = vec![
-                ("?", "Help"),
-                ("/", "Search"),
-                ("↵", "Detail"),
-                ("m", "Mine"),
-                ("0", "Reset"),
+                (KeyCode::Char('a'), "a Actions".into()),
+                (KeyCode::Char('q'), "q Quit".into()),
             ];
             if self.related.is_some() {
-                bindings.retain(|(key, _)| *key != "m");
-                bindings.insert(0, ("Esc", "Back"));
+                bindings.push((KeyCode::Esc, "Esc Back".into()));
+            } else if matches!(self.tab, 0 | 1 | 4 | 5) {
+                bindings.push((KeyCode::Char('J'), "J Jobs".into()));
             }
-            if matches!(self.tab, 0 | 1 | 4 | 5) {
-                bindings.insert(3, ("J", "Jobs"));
+            if self.tab != 2 {
+                bindings.push((KeyCode::Enter, "Enter Detail".into()));
             }
-            if self.tab == 6 {
-                bindings.retain(|(key, _)| *key != "m");
-                bindings.push(("PgUp/Dn", "Page"));
-            }
-            if self.tab < 2 {
-                bindings.push(("[]", "Node"));
+            if matches!(self.tab, 0 | 3 | 5) {
+                bindings.extend([
+                    (KeyCode::Char('s'), "s Sort".into()),
+                    (KeyCode::Char('S'), "S Reverse".into()),
+                ]);
             }
             if self.tab == 3 {
-                bindings.extend([("s/S", "Sort"), ("v", "State")]);
+                bindings.push((KeyCode::Char('v'), "v State".into()));
             }
-            if frame.area().width >= 110 {
-                if matches!(self.tab, 0 | 5) {
-                    bindings.push(("s", "Sort"));
-                }
-                if self.tab != 6 {
-                    bindings.push(("p", "Part"));
-                }
-                bindings.push(("r", "Refresh"));
+            if self.tab == 2 {
+                bindings.extend([
+                    (KeyCode::PageUp, "Pg↑".into()),
+                    (KeyCode::PageDown, "Pg↓".into()),
+                    (KeyCode::Home, "Home".into()),
+                    (KeyCode::End, "End".into()),
+                ]);
             }
-            bindings.push(("q", "Quit"));
-            for (key, label) in bindings {
-                keys.push(Span::styled(
-                    format!(" {key} "),
-                    Style::default()
-                        .bg(BORDER)
-                        .fg(CYAN)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                keys.push(Span::styled(format!("{label} "), Style::default().fg(TEXT)));
-            }
-            vec![
-                Line::styled(
-                    format!(
-                        "{} · row {}/{}",
-                        cli::terminal_safe(&self.status),
-                        self.table.selected().map_or(0, |i| i + 1),
-                        self.rows.len()
-                    ),
-                    Style::default().fg(MUTED),
-                ),
-                Line::from(keys),
-            ]
+            bindings.extend([
+                (KeyCode::Char('/'), "/ Search".into()),
+                (KeyCode::Char('0'), "0 Reset".into()),
+                (KeyCode::Char('?'), "? Help".into()),
+                (KeyCode::Char('r'), "r Refresh".into()),
+            ]);
+            bindings
         };
-        frame.render_widget(Paragraph::new(footer), areas[4]);
+        buttons(frame, buttons_area, &bindings, &mut self.hits);
         if let Some(popup) = &mut self.popup {
-            draw_popup(frame, popup);
+            draw_popup(frame, popup, &mut self.hits);
         }
     }
     fn open(&mut self, mut popup: Popup) {
+        self.searching = false;
+        self.hits.clear();
         self.popup_sequence += 1;
         popup.token = self.popup_sequence;
         self.popup = Some(popup);
+    }
+    fn actions(&self) -> Vec<(KeyCode, String)> {
+        let mut actions = Vec::new();
+        if self.tab != 2 {
+            actions.push((KeyCode::Enter, "Enter · Selected row details".into()));
+        }
+        for (index, name) in ["GPU", "CPU", "Usage", "Jobs", "Attention", "Users", "Host"]
+            .iter()
+            .enumerate()
+        {
+            actions.push((
+                KeyCode::Char((b'1' + index as u8) as char),
+                format!("{} · {name}", index + 1),
+            ));
+        }
+        actions.extend([
+            (KeyCode::Char('/'), "/ · Search".into()),
+            (KeyCode::Char('0'), "0 · Reset filters".into()),
+        ]);
+        if matches!(self.tab, 0 | 1 | 4 | 5) {
+            actions.push((KeyCode::Char('J'), "J · Related Jobs".into()));
+        }
+        if self.related.is_some() {
+            actions.push((KeyCode::Esc, "Esc · Back to previous view".into()));
+        }
+        if matches!(self.tab, 0 | 3 | 5) {
+            actions.extend([
+                (KeyCode::Char('s'), "s · Next sort column".into()),
+                (KeyCode::Char('S'), "S · Reverse sort".into()),
+            ]);
+        }
+        if self.tab != 6 {
+            actions.extend([
+                (KeyCode::Char('u'), "u · Next user filter".into()),
+                (KeyCode::Char('p'), "p · Next partition filter".into()),
+                (KeyCode::Char('m'), "m · Highlighted account only".into()),
+                (KeyCode::Char('t'), "t · Toggle five-minute trend".into()),
+            ]);
+        }
+        if matches!(self.tab, 0 | 3) {
+            actions.push((
+                KeyCode::Char('v'),
+                if self.tab == 3 {
+                    "v · Next Jobs state"
+                } else {
+                    "v · Show pending jobs"
+                }
+                .into(),
+            ));
+        }
+        if self.tab == 0 {
+            actions.extend([
+                (KeyCode::Char('i'), "i · Free GPUs only".into()),
+                (KeyCode::Char('d'), "d · Detail columns".into()),
+                (KeyCode::Char(' '), "Space · Fold selected node".into()),
+                (KeyCode::Char('z'), "z · Fold/unfold all nodes".into()),
+            ]);
+        }
+        if self.tab < 2 {
+            actions.extend([
+                (KeyCode::Char('['), "[ · Previous node".into()),
+                (KeyCode::Char(']'), "] · Next node".into()),
+            ]);
+        }
+        if self.selected().is_some_and(|row| row.job.is_some()) {
+            actions.extend([
+                (KeyCode::Char('n'), "n · Watch/unwatch selected job".into()),
+                (KeyCode::Char('x'), "x · Cancel my own job…".into()),
+            ]);
+        }
+        actions.extend([
+            (KeyCode::Home, "Home · First row / top".into()),
+            (KeyCode::End, "End · Last row / bottom".into()),
+            (KeyCode::PageUp, "PgUp · Previous page".into()),
+            (KeyCode::PageDown, "PgDn · Next page".into()),
+            (KeyCode::Char('r'), "r · Refresh published data".into()),
+            (KeyCode::Char('h'), "h · My job history".into()),
+            (KeyCode::Char('w'), "w · Wasted GPU evidence".into()),
+            (KeyCode::Char('f'), "f · Free capacity".into()),
+            (KeyCode::Char('e'), "e · Export JSON".into()),
+            (KeyCode::Char('?'), "? · Help".into()),
+            (KeyCode::Char('q'), "q · Quit".into()),
+        ]);
+        actions
+    }
+    fn menu_action(&mut self, index: usize, worker: &Worker) -> bool {
+        let Some(popup) = self.popup.take() else {
+            return false;
+        };
+        let Some((key, _)) = popup.actions.get(index) else {
+            return false;
+        };
+        if matches!(key, KeyCode::Enter | KeyCode::Char('J' | 'n' | 'x' | ' ')) {
+            let target = popup
+                .source_row
+                .and_then(|key| self.rows.iter().position(|row| row.key == key));
+            if popup.source_tab != Some(self.tab) || target.is_none() {
+                self.status =
+                    "Original row is no longer available · select a row and reopen Actions".into();
+                return false;
+            }
+            self.table.select(target);
+        }
+        self.key(*key, worker)
     }
     fn move_selection(&mut self, down: bool) {
         if self.tab == 2 {
@@ -2543,35 +2828,68 @@ impl App {
         }
     }
     fn mouse(&mut self, mouse: MouseEvent, worker: &Worker) -> bool {
-        if !mouse.modifiers.is_empty() {
+        let scope = self.popup.as_ref().map_or(
+            Scope::Main {
+                tab: self.tab,
+                searching: self.searching,
+            },
+            |popup| Scope::Popup(popup.token),
+        );
+        if !mouse.modifiers.is_empty() || self.hits.scope != Some(scope) {
             return false;
         }
-        match mouse.kind {
-            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
-                self.key(
-                    if mouse.kind == MouseEventKind::ScrollDown {
-                        KeyCode::Down
-                    } else {
-                        KeyCode::Up
-                    },
-                    worker,
-                );
-                true
-            }
-            MouseEventKind::Down(MouseButton::Left)
-                if self.tab == 3 && self.popup.is_none() && !self.searching =>
+        if mouse.kind == MouseEventKind::Down(MouseButton::Right)
+            && self.popup.is_none()
+            && !self.searching
+        {
+            if let Some(Click::Row(key) | Click::Fold(key)) = self.hits.at(mouse.column, mouse.row)
             {
-                let Some((_, sort)) = self
-                    .header_hits
-                    .iter()
-                    .find(|(area, _)| area.contains((mouse.column, mouse.row).into()))
-                else {
+                self.table
+                    .select(self.rows.iter().position(|row| row.key == key));
+            }
+            self.key(KeyCode::Char('a'), worker);
+            return true;
+        }
+        if matches!(
+            mouse.kind,
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+        ) {
+            if !self.hits.scroll.contains((mouse.column, mouse.row).into()) {
+                return false;
+            }
+            self.key(
+                if mouse.kind == MouseEventKind::ScrollDown {
+                    KeyCode::Down
+                } else {
+                    KeyCode::Up
+                },
+                worker,
+            );
+            return true;
+        }
+        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+            return false;
+        }
+        let Some(action) = self.hits.at(mouse.column, mouse.row) else {
+            return false;
+        };
+        self.hits.clear();
+        match action {
+            Click::Key(key) => self.quit_requested = self.key(key, worker),
+            Click::Row(ref key) | Click::Fold(ref key) => {
+                let Some(index) = self.rows.iter().position(|row| row.key == *key) else {
                     return false;
                 };
-                if self.job_sort == *sort {
+                self.table.select(Some(index));
+                if matches!(action, Click::Fold(_)) {
+                    self.key(KeyCode::Char(' '), worker);
+                }
+            }
+            Click::JobSort(sort) => {
+                if self.job_sort == sort {
                     self.job_reverse = !self.job_reverse;
                 } else {
-                    self.job_sort = *sort;
+                    self.job_sort = sort;
                     self.job_reverse = false;
                 }
                 self.status = format!(
@@ -2579,13 +2897,35 @@ impl App {
                     self.job_sort.label()
                 );
                 self.rebuild();
-                true
             }
-            _ => false,
+            Click::Sort(sort) => {
+                if self.sort == sort {
+                    self.reverse = !self.reverse;
+                } else {
+                    self.sort = sort;
+                    self.reverse = false;
+                }
+                self.rebuild();
+            }
+            Click::Pane(index) => {
+                if let Some(popup) = &mut self.popup {
+                    popup.pane(index);
+                }
+            }
+            Click::History(index) => {
+                if let Some(popup) = &mut self.popup {
+                    popup.selected = index.min(popup.history.len().saturating_sub(1));
+                }
+            }
+            Click::Menu(index) => {
+                self.quit_requested = self.menu_action(index, worker);
+            }
         }
+        true
     }
     fn key(&mut self, key: KeyCode, worker: &Worker) -> bool {
-        if self.searching {
+        self.hits.clear();
+        if self.searching && self.popup.is_none() {
             match key {
                 KeyCode::Esc => {
                     self.search.clear();
@@ -2602,6 +2942,10 @@ impl App {
             return false;
         }
         if let Some(popup) = &mut self.popup {
+            if !popup.actions.is_empty() && key == KeyCode::Enter {
+                let index = popup.selected;
+                return self.menu_action(index, worker);
+            }
             if let Some(id) = popup.cancel.clone() {
                 match key {
                     KeyCode::Char('y') | KeyCode::Enter => {
@@ -2612,59 +2956,63 @@ impl App {
                         }
                         .into();
                         self.popup = None;
+                        return false;
                     }
-                    KeyCode::Esc | KeyCode::Char('n') => self.popup = None,
+                    KeyCode::Esc | KeyCode::Char('n' | 'q') => {
+                        self.popup = None;
+                        return false;
+                    }
                     _ => (),
                 }
-                return false;
             }
+            let row_count = if popup.actions.is_empty() {
+                popup.history.len()
+            } else {
+                popup.actions.len()
+            };
             match key {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => self.popup = None,
                 KeyCode::Tab | KeyCode::Right => {
-                    popup.active = (popup.active + 1) % popup.panes.len().max(1);
-                    popup.scroll = 0;
-                    popup.follow = popup
-                        .panes
-                        .get(popup.active)
-                        .is_some_and(|p| p.log.is_some());
-                    if popup.follow {
-                        popup.scroll = u16::MAX;
+                    if row_count > 0 {
+                        popup.selected = (popup.selected + 1).min(row_count - 1);
+                    } else {
+                        popup.pane((popup.active + 1) % popup.panes.len().max(1));
                     }
                 }
                 KeyCode::Left | KeyCode::BackTab => {
-                    popup.active =
-                        (popup.active + popup.panes.len() - 1) % popup.panes.len().max(1);
-                    popup.scroll = 0;
+                    if row_count > 0 {
+                        popup.selected = popup.selected.saturating_sub(1);
+                    } else {
+                        popup.pane(
+                            (popup.active + popup.panes.len().max(1) - 1)
+                                % popup.panes.len().max(1),
+                        );
+                    }
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    if popup.history.is_empty() {
+                    if row_count == 0 {
                         popup.scroll = popup.scroll.saturating_add(1);
                         popup.follow = false;
                     } else {
-                        popup.selected = (popup.selected + 1).min(popup.history.len() - 1);
+                        popup.selected = (popup.selected + 1).min(row_count - 1);
                     }
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    if popup.history.is_empty() {
+                    if row_count == 0 {
                         popup.scroll = popup.scroll.saturating_sub(1);
                         popup.follow = false;
                     } else {
                         popup.selected = popup.selected.saturating_sub(1);
                     }
                 }
-                KeyCode::PageDown if !popup.history.is_empty() => {
-                    popup.selected = popup
-                        .selected
-                        .saturating_add(20)
-                        .min(popup.history.len() - 1)
+                KeyCode::PageDown if row_count > 0 => {
+                    popup.selected = popup.selected.saturating_add(20).min(row_count - 1)
                 }
-                KeyCode::PageUp if !popup.history.is_empty() => {
+                KeyCode::PageUp if row_count > 0 => {
                     popup.selected = popup.selected.saturating_sub(20)
                 }
-                KeyCode::End if !popup.history.is_empty() => {
-                    popup.selected = popup.history.len() - 1
-                }
-                KeyCode::Home if !popup.history.is_empty() => popup.selected = 0,
+                KeyCode::End if row_count > 0 => popup.selected = row_count - 1,
+                KeyCode::Home if row_count > 0 => popup.selected = 0,
                 KeyCode::PageDown => {
                     popup.scroll = popup.scroll.saturating_add(20);
                     popup.follow = false;
@@ -2695,6 +3043,13 @@ impl App {
         }
         match key {
             KeyCode::Char('q') => return true,
+            KeyCode::Char('a') => {
+                let mut popup = Popup::text("Actions · ↑↓ / Tab select · Enter run", String::new());
+                popup.actions = self.actions();
+                popup.source_row = self.selected().map(|row| row.key.clone());
+                popup.source_tab = Some(self.tab);
+                self.open(popup);
+            }
             KeyCode::Char(c @ '1'..='7') => {
                 self.return_from_jobs();
                 self.tab = (c as u8 - b'1') as usize;
@@ -3103,107 +3458,264 @@ fn ram(node: &Node) -> String {
         })
         .unwrap_or_else(|| "?".into())
 }
-fn draw_popup(frame: &mut Frame, popup: &mut Popup) {
+fn draw_popup(frame: &mut Frame, popup: &mut Popup, hits: &mut Hits) {
     let area = frame.area();
-    let width = area.width.saturating_sub(4).max(area.width.min(3)).min(140);
-    let height = area.height.saturating_sub(4).max(area.height.min(3));
-    let rect = Rect::new(
-        area.x + (area.width - width) / 2,
-        area.y + (area.height - height) / 2,
-        width,
-        height,
-    );
+    let rect = if area.width < 80 || area.height < 18 {
+        area
+    } else {
+        let width = area.width.saturating_sub(4).min(140);
+        let height = area.height.saturating_sub(4);
+        Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        )
+    };
+    hits.reset(Scope::Popup(popup.token));
+    hits.scroll = rect;
     frame.render_widget(Clear, rect);
-    let title = format!(" {} · Esc close ", cli::terminal_safe(&popup.title));
+    let bordered = rect.width >= 6 && rect.height >= 5;
+    let title = format!(
+        " {} ",
+        clipped(
+            &cli::terminal_safe(&popup.title),
+            rect.width.saturating_sub(8)
+        )
+    );
     let block = panel(&title)
-        .border_style(Style::default().fg(BLUE))
-        .title_style(Style::default().fg(TEXT).add_modifier(Modifier::BOLD));
+        .borders(if bordered {
+            Borders::ALL
+        } else {
+            Borders::NONE
+        })
+        .border_style(Style::default().fg(BLUE));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
-    if !popup.history.is_empty() {
-        let widths = [
-            Constraint::Length(14),
-            Constraint::Length(17),
-            Constraint::Length(8),
-            Constraint::Length(9),
-            Constraint::Length(16),
-            Constraint::Min(20),
-        ];
-        let rows = popup.history.iter().enumerate().map(|(index, row)| {
-            Row::new([
-                row.jobid.clone(),
-                row.state.clone(),
-                row.exit.clone(),
-                rules::span(row.elapsed as u64),
-                row.partition.clone(),
-                cli::terminal_safe(&row.name),
-            ])
-            .style(
-                Style::default()
-                    .bg(if index % 2 == 0 { BACKGROUND } else { PANEL })
-                    .fg(if row.exit != "0:0" { YELLOW } else { TEXT }),
-            )
-        });
-        let table = Table::new(rows, widths)
-            .header(
-                Row::new(["JobID", "State", "Exit", "Elapsed", "Partition", "Name"]).style(
-                    Style::default()
-                        .fg(BLUE)
-                        .bg(HEADER_BG)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            )
-            .row_highlight_style(Style::default().bg(SELECTED_BG));
-        let mut state = TableState::default().with_selected(Some(popup.selected));
-        frame.render_stateful_widget(table, inner, &mut state);
-        return;
+    if bordered {
+        let close = Rect::new(rect.right().saturating_sub(5), rect.y, 3, 1);
+        frame.render_widget(
+            Paragraph::new("[×]").style(Style::default().fg(CYAN)),
+            close,
+        );
+        hits.add(close, Click::Key(KeyCode::Esc));
     }
-    let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
-    frame.render_widget(
-        Tabs::new(popup.panes.iter().map(|p| p.name.clone()))
-            .select(popup.active)
-            .style(Style::default().fg(MUTED))
-            .highlight_style(
-                Style::default()
-                    .fg(FOCUS)
-                    .bg(SELECTED_BG)
-                    .add_modifier(Modifier::BOLD),
+    let [heading, body, footer] = Layout::vertical([
+        Constraint::Length(u16::from(inner.height >= 3)),
+        Constraint::Min(1),
+        Constraint::Length(u16::from(inner.height >= 2)),
+    ])
+    .areas(inner);
+    let mut bindings = if popup.cancel.is_some() {
+        vec![
+            (
+                KeyCode::Char('n'),
+                if inner.width < 24 { "No" } else { "n Keep" }.into(),
             ),
-        sections[0],
-    );
-    if let Some(pane) = popup.panes.get(popup.active) {
-        let safe = cli::terminal_safe(&pane.body);
-        let lines = safe
-            .lines()
-            .map(|line| {
-                Line::from(Span::styled(
-                    line.to_string(),
-                    Style::default().fg(
-                        if ["Error", "ERROR", "Traceback", "Exception", "OOM", "FAILED"]
-                            .iter()
-                            .any(|s| line.contains(s))
-                        {
-                            RED
-                        } else {
-                            TEXT
-                        },
-                    ),
-                ))
-            })
-            .collect::<Vec<_>>();
-        let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-        let max = paragraph
-            .line_count(sections[1].width)
-            .saturating_sub(sections[1].height as usize)
-            .min(u16::MAX as usize) as u16;
-        popup.scroll = popup.scroll.min(max);
-        frame.render_widget(paragraph.scroll((popup.scroll, 0)), sections[1]);
+            (
+                KeyCode::Char('y'),
+                if inner.width < 24 { "Yes" } else { "y Cancel" }.into(),
+            ),
+        ]
+    } else {
+        vec![(KeyCode::Esc, "Close".into())]
+    };
+    if !popup.actions.is_empty() || !popup.history.is_empty() {
+        let menu = !popup.actions.is_empty();
+        if !heading.is_empty() {
+            frame.render_widget(
+                Paragraph::new("↑↓ / wheel · Enter opens selection")
+                    .style(Style::default().fg(MUTED)),
+                heading,
+            );
+        }
+        let rows: Vec<Row> = if menu {
+            popup
+                .actions
+                .iter()
+                .map(|(_, label)| Row::new([label.clone()]))
+                .collect()
+        } else {
+            popup
+                .history
+                .iter()
+                .map(|row| {
+                    let cells = if body.width < 85 {
+                        vec![
+                            row.jobid.clone(),
+                            row.state.clone(),
+                            cli::terminal_safe(&row.name),
+                        ]
+                    } else {
+                        vec![
+                            row.jobid.clone(),
+                            row.state.clone(),
+                            row.exit.clone(),
+                            rules::span(row.elapsed as u64),
+                            row.partition.clone(),
+                            cli::terminal_safe(&row.name),
+                        ]
+                    };
+                    Row::new(cells).style(Style::default().fg(if row.exit != "0:0" {
+                        YELLOW
+                    } else {
+                        TEXT
+                    }))
+                })
+                .collect()
+        };
+        let widths = if menu {
+            vec![Constraint::Min(1)]
+        } else if body.width < 85 {
+            vec![
+                Constraint::Length(12),
+                Constraint::Length(15),
+                Constraint::Min(1),
+            ]
+        } else {
+            vec![
+                Constraint::Length(14),
+                Constraint::Length(17),
+                Constraint::Length(8),
+                Constraint::Length(9),
+                Constraint::Length(16),
+                Constraint::Min(1),
+            ]
+        };
+        let row_count = rows.len();
+        popup.selected = popup.selected.min(row_count.saturating_sub(1));
+        popup
+            .table
+            .select((row_count > 0).then_some(popup.selected));
+        let mut table = Table::new(rows, widths).row_highlight_style(
+            Style::default()
+                .fg(FOCUS)
+                .bg(SELECTED_BG)
+                .add_modifier(Modifier::BOLD),
+        );
+        let header = !menu && body.height > 1;
+        if header {
+            table = table.header(
+                Row::new(if body.width < 85 {
+                    vec!["JobID", "State", "Name"]
+                } else {
+                    vec!["JobID", "State", "Exit", "Elapsed", "Partition", "Name"]
+                })
+                .style(Style::default().fg(BLUE).bg(HEADER_BG)),
+            );
+        }
+        frame.render_stateful_widget(table, body, &mut popup.table);
+        for (line, index) in (popup.table.offset()..row_count).enumerate() {
+            let y = body
+                .y
+                .saturating_add(u16::from(header))
+                .saturating_add(line.min(u16::MAX as usize) as u16);
+            if y >= body.bottom() {
+                break;
+            }
+            hits.add(
+                Rect::new(body.x, y, body.width, 1),
+                if menu {
+                    Click::Menu(index)
+                } else {
+                    Click::History(index)
+                },
+            );
+        }
+        bindings.push((KeyCode::Enter, if menu { "Run" } else { "Open" }.into()));
+    } else {
+        if popup.panes.len() > 1 {
+            let labels = popup
+                .panes
+                .iter()
+                .map(|pane| pane.name.clone())
+                .collect::<Vec<_>>();
+            tab_bar(frame, heading, &labels, popup.active, hits, true);
+        } else {
+            frame.render_widget(
+                Paragraph::new("↑↓ / wheel scroll · Home/End").style(Style::default().fg(MUTED)),
+                heading,
+            );
+        }
+        if let Some(pane) = popup.panes.get(popup.active) {
+            let safe = cli::terminal_safe(&pane.body);
+            let lines = safe
+                .lines()
+                .map(|line| {
+                    Line::from(Span::styled(
+                        line.to_string(),
+                        Style::default().fg(
+                            if ["Error", "ERROR", "Traceback", "Exception", "OOM", "FAILED"]
+                                .iter()
+                                .any(|word| line.contains(word))
+                            {
+                                RED
+                            } else {
+                                TEXT
+                            },
+                        ),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+            let total = paragraph.line_count(body.width);
+            let max = total
+                .saturating_sub(body.height as usize)
+                .min(u16::MAX as usize) as u16;
+            popup.scroll = if popup.follow {
+                max
+            } else {
+                popup.scroll.min(max)
+            };
+            if popup.panes.len() == 1 {
+                frame.render_widget(
+                    Paragraph::new(format!(
+                        "lines {}–{}/{total} · ↑↓ / wheel · Home/End",
+                        (popup.scroll as usize + 1).min(total),
+                        (popup.scroll as usize + body.height as usize).min(total)
+                    ))
+                    .style(Style::default().fg(MUTED)),
+                    heading,
+                );
+            }
+            frame.render_widget(paragraph.scroll((popup.scroll, 0)), body);
+        }
     }
+    if popup.panes.len() > 1 && heading.is_empty() {
+        bindings.extend([(KeyCode::BackTab, "←".into()), (KeyCode::Tab, "→".into())]);
+    }
+    bindings.extend([
+        (
+            KeyCode::End,
+            if inner.width < 32 {
+                "End"
+            } else if popup
+                .panes
+                .get(popup.active)
+                .is_some_and(|pane| pane.log.is_some())
+            {
+                if popup.follow { "Follow ✓" } else { "Follow" }
+            } else {
+                "End"
+            }
+            .into(),
+        ),
+        (KeyCode::Up, "↑".into()),
+        (KeyCode::Down, "↓".into()),
+        (KeyCode::Home, "Home".into()),
+        (KeyCode::PageUp, "Pg↑".into()),
+        (KeyCode::PageDown, "Pg↓".into()),
+    ]);
+    if popup.panes.len() > 1 && !heading.is_empty() {
+        bindings.extend([(KeyCode::BackTab, "←".into()), (KeyCode::Tab, "→".into())]);
+    }
+    buttons(frame, footer, &bindings, hits);
 }
 
 fn ime(key: KeyCode) -> KeyCode {
     if let KeyCode::Char(c) = key {
         let mapped = match c {
+            'ㅁ' => 'a',
             'ㅂ' => 'q',
             'ㄱ' => 'r',
             'ㄴ' => 's',
@@ -3371,9 +3883,14 @@ pub fn run(highlight_user: Option<String>) -> Result<i32> {
                         }
                         dirty = true;
                     }
-                    Event::Mouse(mouse) => dirty |= app.mouse(mouse, &worker),
+                    Event::Mouse(mouse) => {
+                        dirty |= app.mouse(mouse, &worker);
+                        if app.quit_requested {
+                            return Ok(0);
+                        }
+                    }
                     Event::Resize(_, _) => {
-                        app.header_hits.clear();
+                        app.hits.clear();
                         dirty = true;
                     }
                     _ => (),
@@ -3400,6 +3917,11 @@ const HELP: &str = concat!(
     "Jobs: s cycles priority / user / GPU / CPU / wait / left; S reverses.\n",
     "Jobs: click User, Priority, Req GPU or Req CPU headers to sort; click again to reverse.\n",
     "Header arrows show direction; ↕ marks clickable headers. Mouse wheel scrolls.\n",
+    "Mouse: click tabs, rows, marked headers, filter chips and footer buttons.\n",
+    "Row click selects; Detail opens. Right-click or a opens Actions for every command.\n",
+    "Actions: ↑↓ / Tab select · Enter runs · Esc closes. Terminal selection may use Shift-drag.\n",
+    "Short detail windows expand to the screen; wheel/↑↓/PgUp/PgDn/Home/End scroll.\n",
+    "Popup tabs, Close and paging buttons are clickable. Follow resumes logs; scrolling up pauses.\n",
     "Jobs: v cycles all / running / pending; 0 clears state and other filters.\n",
     "u user filter (highlight first) · p partition · m highlighted user's jobs\n",
     "i free GPUs · 0 reset all filters · / search · Esc clear search\n",
@@ -3702,6 +4224,458 @@ mod tests {
         assert!(app.popup.is_some());
     }
 
+    fn click_action(
+        app: &mut App,
+        terminal: &mut Terminal<TestBackend>,
+        worker: &Worker,
+        action: Click,
+    ) {
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let area = app
+            .hits
+            .items
+            .iter()
+            .find(|(_, candidate)| *candidate == action)
+            .unwrap_or_else(|| panic!("missing click action {action:?}"))
+            .0;
+        assert!(app.mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: area.x,
+                row: area.y,
+                modifiers: KeyModifiers::NONE
+            },
+            worker
+        ));
+    }
+
+    fn screen(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn mouse_snapshot() -> Snapshot {
+        let mut data = jobs_snapshot();
+        for index in 1..=2 {
+            data.nodes.push(Node {
+                name: format!("gpu{index}"),
+                partition: "gpu".into(),
+                state: "allocated".into(),
+                cpus: "32".into(),
+                gpus: vec![Gpu {
+                    index: "0".into(),
+                    util: "0".into(),
+                    mem_used: "0".into(),
+                    mem_total: "100".into(),
+                    alloc_jobid: "42".into(),
+                    alloc_user: "alice".into(),
+                    idle_sec: u64::MAX,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+        }
+        data.controller =
+            serde_json::json!({"observed_at":runtime::now(),"cpu_online":16,"cpu_util":30});
+        data
+    }
+
+    #[test]
+    fn mouse_tabs_rows_folding_and_actions_work_at_narrow_and_wide_sizes() {
+        let worker = Worker::new();
+        let mut app = App::for_user("alice".into());
+        app.apply(mouse_snapshot());
+        for (width, height) in [(40, 24), (80, 24), (140, 24), (80, 8)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            for tab in 0..7 {
+                click_action(
+                    &mut app,
+                    &mut terminal,
+                    &worker,
+                    Click::Key(KeyCode::Char((b'1' + tab) as char)),
+                );
+                assert_eq!(app.tab, tab as usize);
+                terminal.draw(|frame| app.draw(frame)).unwrap();
+                if tab != 2 {
+                    let key = app
+                        .hits
+                        .items
+                        .iter()
+                        .rev()
+                        .find_map(|(_, action)| {
+                            if let Click::Row(key) = action {
+                                Some(key.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap();
+                    click_action(&mut app, &mut terminal, &worker, Click::Row(key.clone()));
+                    assert_eq!(app.selected().unwrap().key, key);
+                    assert!(app.popup.is_none());
+                }
+                click_action(
+                    &mut app,
+                    &mut terminal,
+                    &worker,
+                    Click::Key(KeyCode::Char('a')),
+                );
+                assert!(!app.popup.as_ref().unwrap().actions.is_empty());
+                app.key(KeyCode::End, &worker);
+                terminal.draw(|frame| app.draw(frame)).unwrap();
+                assert!(app.popup.as_ref().unwrap().table.offset() > 0);
+                click_action(&mut app, &mut terminal, &worker, Click::Key(KeyCode::Esc));
+            }
+        }
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        app.key(KeyCode::Char('6'), &worker);
+        click_action(
+            &mut app,
+            &mut terminal,
+            &worker,
+            Click::Row("user:bob".into()),
+        );
+        click_action(
+            &mut app,
+            &mut terminal,
+            &worker,
+            Click::Key(KeyCode::Char('J')),
+        );
+        assert!(app.visible_jobs().all(|entry| entry.user() == "bob"));
+        click_action(&mut app, &mut terminal, &worker, Click::Key(KeyCode::Esc));
+        assert_eq!(app.tab, 5);
+        assert_eq!(app.selected().unwrap().key, "user:bob");
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let row = app
+            .hits
+            .items
+            .iter()
+            .find(|(_, action)| *action == Click::Row("user:alice".into()))
+            .unwrap()
+            .0;
+        assert!(app.mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: row.x,
+                row: row.y,
+                modifiers: KeyModifiers::NONE
+            },
+            &worker
+        ));
+        assert_eq!(
+            app.popup.as_ref().unwrap().source_row.as_deref(),
+            Some("user:alice")
+        );
+        click_action(&mut app, &mut terminal, &worker, Click::Key(KeyCode::Esc));
+        app.key(KeyCode::Char('1'), &worker);
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let node = app
+            .hits
+            .items
+            .iter()
+            .find(|(_, action)| *action == Click::Row("node:gpu2".into()))
+            .unwrap()
+            .0;
+        assert!(
+            app.hits.at(node.x, node.y - 1).is_none(),
+            "node margin selected a row"
+        );
+        click_action(
+            &mut app,
+            &mut terminal,
+            &worker,
+            Click::Fold("node:gpu2".into()),
+        );
+        assert!(app.collapsed.contains("gpu2"));
+        app.key(KeyCode::End, &worker);
+        let mut short = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        short.draw(|frame| app.draw(frame)).unwrap();
+        assert!(app.table.offset() > 0);
+        let key = app
+            .hits
+            .items
+            .iter()
+            .find_map(|(_, action)| {
+                if let Click::Row(key) = action {
+                    Some(key.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        click_action(&mut app, &mut short, &worker, Click::Row(key.clone()));
+        assert_eq!(app.selected().unwrap().key, key);
+    }
+
+    #[test]
+    fn mouse_filters_search_menu_and_quit_share_keyboard_actions() {
+        let worker = Worker::new();
+        let mut app = App::for_user("alice".into());
+        app.tab = 3;
+        app.apply(mouse_snapshot());
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        click_action(
+            &mut app,
+            &mut terminal,
+            &worker,
+            Click::Key(KeyCode::Char('u')),
+        );
+        assert_eq!(app.user_filter(), "alice");
+        click_action(
+            &mut app,
+            &mut terminal,
+            &worker,
+            Click::Key(KeyCode::Char('v')),
+        );
+        assert_eq!(app.job_filter, job_view::Filter::Running);
+        click_action(
+            &mut app,
+            &mut terminal,
+            &worker,
+            Click::Key(KeyCode::Char('S')),
+        );
+        assert!(app.job_reverse);
+        click_action(
+            &mut app,
+            &mut terminal,
+            &worker,
+            Click::Key(KeyCode::Char('/')),
+        );
+        app.key(KeyCode::Char('4'), &worker);
+        click_action(&mut app, &mut terminal, &worker, Click::Key(KeyCode::Enter));
+        assert!(!app.searching);
+        assert_eq!(app.rows.len(), 1);
+        click_action(
+            &mut app,
+            &mut terminal,
+            &worker,
+            Click::Key(KeyCode::Char('0')),
+        );
+        assert_eq!(app.rows.len(), 5);
+        click_action(
+            &mut app,
+            &mut terminal,
+            &worker,
+            Click::Key(KeyCode::Char('a')),
+        );
+        let index = app
+            .popup
+            .as_ref()
+            .unwrap()
+            .actions
+            .iter()
+            .position(|(key, _)| *key == KeyCode::Char('m'))
+            .unwrap();
+        app.popup.as_mut().unwrap().selected = index;
+        click_action(&mut app, &mut terminal, &worker, Click::Menu(index));
+        assert!(app.mine);
+        app.key(KeyCode::Char('a'), &worker);
+        let index = app
+            .popup
+            .as_ref()
+            .unwrap()
+            .actions
+            .iter()
+            .position(|(key, _)| *key == KeyCode::Char('7'))
+            .unwrap();
+        for _ in 0..index {
+            app.key(KeyCode::Tab, &worker);
+        }
+        app.key(KeyCode::Enter, &worker);
+        assert_eq!(app.tab, 6);
+        click_action(
+            &mut app,
+            &mut terminal,
+            &worker,
+            Click::Key(KeyCode::Char('q')),
+        );
+        assert!(app.quit_requested);
+    }
+
+    #[test]
+    fn short_detail_windows_keep_wrapped_end_and_controls_visible_on_resize() {
+        let worker = Worker::new();
+        let mut app = App::for_user("alice".into());
+        app.open(Popup::text(
+            "long 상세 / fixture",
+            format!("TOP\n{}\nTAIL_END", "긴 내용 with wrapping ".repeat(300)),
+        ));
+        for (width, height) in [(80, 12), (40, 8), (20, 4), (80, 6), (140, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            if app.popup.as_ref().unwrap().follow {
+                terminal.draw(|frame| app.draw(frame)).unwrap();
+                assert!(
+                    screen(&terminal).contains("TAIL_END"),
+                    "lost followed end after resize {width}x{height}"
+                );
+            }
+            app.key(KeyCode::Home, &worker);
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            assert!(screen(&terminal).contains("TOP"));
+            assert!(screen(&terminal).contains("Close"));
+            click_action(&mut app, &mut terminal, &worker, Click::Key(KeyCode::End));
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            assert!(
+                screen(&terminal).contains("TAIL_END"),
+                "clipped bottom at {width}x{height}"
+            );
+            let bottom = app.popup.as_ref().unwrap().scroll;
+            assert!(bottom > 0);
+            app.key(KeyCode::PageUp, &worker);
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            assert!(app.popup.as_ref().unwrap().scroll < bottom);
+            app.key(KeyCode::End, &worker);
+        }
+    }
+
+    #[test]
+    fn mouse_panes_and_history_use_the_rendered_offset_and_consistent_follow() {
+        let (sender, requests) = mpsc::sync_channel(8);
+        let (_, receiver) = mpsc::sync_channel(8);
+        let worker = Worker { sender, receiver };
+        let mut app = App::for_user("alice".into());
+        let mut popup = Popup::text("job", "info".into());
+        for name in ["stdout", "stderr"] {
+            popup.panes.push(Pane {
+                name: name.into(),
+                body: "line\n".repeat(100),
+                log: Some(cli::LogView {
+                    path: "/fixture.log".into(),
+                    owner: None,
+                    shared: false,
+                    merged: false,
+                }),
+            });
+        }
+        app.open(popup);
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        click_action(&mut app, &mut terminal, &worker, Click::Pane(1));
+        assert!(app.popup.as_ref().unwrap().follow);
+        app.key(KeyCode::Right, &worker);
+        app.key(KeyCode::Left, &worker);
+        assert_eq!(app.popup.as_ref().unwrap().active, 1);
+        assert!(app.popup.as_ref().unwrap().follow);
+        click_action(&mut app, &mut terminal, &worker, Click::Pane(0));
+        assert!(!app.popup.as_ref().unwrap().follow);
+        assert_eq!(app.popup.as_ref().unwrap().scroll, 0);
+        let mut narrow = Terminal::new(TestBackend::new(20, 4)).unwrap();
+        click_action(&mut app, &mut narrow, &worker, Click::Key(KeyCode::Tab));
+        narrow.draw(|frame| app.draw(frame)).unwrap();
+        assert_eq!(app.popup.as_ref().unwrap().active, 1);
+        assert!(screen(&narrow).contains("stdout"));
+        click_action(&mut app, &mut narrow, &worker, Click::Key(KeyCode::Home));
+        click_action(&mut app, &mut narrow, &worker, Click::Key(KeyCode::End));
+        assert!(app.popup.as_ref().unwrap().follow);
+        let mut popup = Popup::text("history", String::new());
+        popup.history = (0..80)
+            .map(|index| history::Record {
+                jobid: index.to_string(),
+                state: "COMPLETED".into(),
+                name: format!("job{index}"),
+                ..Default::default()
+            })
+            .collect();
+        popup.selected = 60;
+        app.open(popup);
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let offset = app.popup.as_ref().unwrap().table.offset();
+        assert!(offset > 0);
+        assert!(screen(&terminal).contains(&format!("job{offset}")));
+        click_action(&mut app, &mut terminal, &worker, Click::History(offset));
+        assert_eq!(app.popup.as_ref().unwrap().selected, offset);
+        assert!(requests.try_recv().is_err());
+        click_action(&mut app, &mut terminal, &worker, Click::Key(KeyCode::Enter));
+        assert!(
+            matches!(requests.try_recv().unwrap(), Task::HistoryDetail(row) if row.jobid == offset.to_string())
+        );
+    }
+
+    #[test]
+    fn mouse_cancellation_requires_an_explicit_confirmation_for_the_actual_owner() {
+        let (sender, requests) = mpsc::sync_channel(8);
+        let (_, receiver) = mpsc::sync_channel(8);
+        let worker = Worker { sender, receiver };
+        let mut app = App::for_user("alice".into());
+        app.tab = 3;
+        app.apply(jobs_snapshot());
+        let mut terminal = Terminal::new(TestBackend::new(40, 6)).unwrap();
+        app.key(KeyCode::Char('a'), &worker);
+        let index = app
+            .popup
+            .as_ref()
+            .unwrap()
+            .actions
+            .iter()
+            .position(|(key, _)| *key == KeyCode::Char('x'))
+            .unwrap();
+        app.popup.as_mut().unwrap().selected = index;
+        click_action(&mut app, &mut terminal, &worker, Click::Menu(index));
+        assert_eq!(app.popup.as_ref().unwrap().cancel.as_deref(), Some("42"));
+        assert!(requests.try_recv().is_err());
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert!(!app.mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: 2,
+                modifiers: KeyModifiers::NONE
+            },
+            &worker
+        ));
+        assert!(requests.try_recv().is_err());
+        click_action(
+            &mut app,
+            &mut terminal,
+            &worker,
+            Click::Key(KeyCode::Char('n')),
+        );
+        assert!(app.popup.is_none());
+        app.key(KeyCode::Char('x'), &worker);
+        click_action(
+            &mut app,
+            &mut terminal,
+            &worker,
+            Click::Key(KeyCode::Char('y')),
+        );
+        assert!(matches!(requests.try_recv().unwrap(), Task::Cancel(id) if id == "42"));
+        app.table.select(
+            app.rows
+                .iter()
+                .position(|row| row.job.as_deref() == Some("43")),
+        );
+        app.key(KeyCode::Char('x'), &worker);
+        assert!(app.popup.is_none());
+        assert!(app.status.contains("Only your own jobs"));
+        assert!(requests.try_recv().is_err());
+        app.table.select(
+            app.rows
+                .iter()
+                .position(|row| row.job.as_deref() == Some("42")),
+        );
+        app.key(KeyCode::Char('a'), &worker);
+        let index = app
+            .popup
+            .as_ref()
+            .unwrap()
+            .actions
+            .iter()
+            .position(|(key, _)| *key == KeyCode::Char('x'))
+            .unwrap();
+        let mut updated = app.data.clone();
+        updated.jobs.retain(|job| job.jobid != "42");
+        app.apply(updated);
+        app.popup.as_mut().unwrap().selected = index;
+        click_action(&mut app, &mut terminal, &worker, Click::Menu(index));
+        assert!(app.popup.is_none());
+        assert!(app.status.contains("Original row is no longer available"));
+        assert!(requests.try_recv().is_err());
+    }
+
     fn header_position(terminal: &Terminal<TestBackend>, label: &str) -> (u16, u16) {
         let buffer = terminal.backend().buffer();
         let area = buffer.area;
@@ -3754,6 +4728,7 @@ mod tests {
                 assert_eq!(app.job_sort, sort);
                 assert!(!app.job_reverse);
                 assert_eq!(app.selected().unwrap().key, selected);
+                terminal.draw(|f| app.draw(f)).unwrap();
                 assert!(app.mouse(mouse, &worker));
                 assert!(app.job_reverse);
                 terminal.draw(|f| app.draw(f)).unwrap();
@@ -3785,10 +4760,25 @@ mod tests {
             &worker
         ));
         assert_eq!(app.job_sort, job_view::Sort::User);
+        app.apply(mouse_snapshot());
+        for (tab, width) in [(0, 80), (0, 160), (5, 160)] {
+            app.tab = tab;
+            app.sort = 0;
+            app.reverse = false;
+            app.rebuild();
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            click_action(&mut app, &mut terminal, &worker, Click::Sort(1));
+            assert_eq!(app.sort, 1);
+            assert!(!app.reverse);
+            click_action(&mut app, &mut terminal, &worker, Click::Sort(1));
+            assert!(app.reverse);
+            app.key(KeyCode::Char('S'), &worker);
+            assert!(!app.reverse);
+        }
     }
 
     #[test]
-    fn mouse_ignores_non_header_and_modal_clicks_and_wheel_moves_the_current_view() {
+    fn mouse_respects_buttons_modals_search_and_rendered_scope() {
         let mut app = App::for_user("alice".into());
         app.tab = 3;
         app.apply(jobs_snapshot());
@@ -3803,19 +4793,19 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         for kind in [
-            MouseEventKind::Down(MouseButton::Right),
             MouseEventKind::Up(MouseButton::Left),
             MouseEventKind::Drag(MouseButton::Left),
         ] {
             assert!(!app.mouse(MouseEvent { kind, ..mouse }, &worker));
         }
-        assert!(!app.mouse(
+        assert!(app.mouse(
             MouseEvent {
                 row: row + 1,
                 ..mouse
             },
             &worker
         ));
+        terminal.draw(|f| app.draw(f)).unwrap();
         assert!(!app.mouse(
             MouseEvent {
                 modifiers: KeyModifiers::SHIFT,
@@ -3825,6 +4815,15 @@ mod tests {
         ));
         app.open(Popup::text("modal", "content".into()));
         assert!(!app.mouse(mouse, &worker));
+        terminal.draw(|f| app.draw(f)).unwrap();
+        assert!(!app.mouse(
+            MouseEvent {
+                column: 0,
+                row: 0,
+                ..mouse
+            },
+            &worker
+        ));
         assert!(app.mouse(
             MouseEvent {
                 kind: MouseEventKind::ScrollDown,
@@ -3835,8 +4834,10 @@ mod tests {
         assert_eq!(app.popup.as_ref().unwrap().scroll, 1);
         app.popup = None;
         app.searching = true;
+        terminal.draw(|f| app.draw(f)).unwrap();
         assert!(!app.mouse(mouse, &worker));
         app.searching = false;
+        terminal.draw(|f| app.draw(f)).unwrap();
         assert!(app.mouse(
             MouseEvent {
                 kind: MouseEventKind::ScrollDown,
@@ -3849,7 +4850,12 @@ mod tests {
         assert!(!app.mouse(mouse, &worker));
         assert_eq!(app.job_sort, job_view::Sort::Priority);
         terminal.draw(|f| app.draw(f)).unwrap();
-        assert!(app.header_hits.is_empty());
+        assert!(
+            !app.hits
+                .items
+                .iter()
+                .any(|(_, action)| matches!(action, Click::JobSort(_)))
+        );
     }
 
     #[test]
@@ -4003,7 +5009,7 @@ mod tests {
                 "Resources",
                 "state:pending",
                 "sort:priority↓",
-                "s/S",
+                "s Sort",
             ] {
                 assert!(
                     text.contains(expected),

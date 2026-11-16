@@ -21,6 +21,7 @@ pub mod rules;
 pub mod runtime;
 pub mod scheduler;
 pub mod ui;
+mod ui_input;
 mod ui_preferences;
 pub mod update;
 pub mod usage;

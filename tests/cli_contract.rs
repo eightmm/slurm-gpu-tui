@@ -362,7 +362,7 @@ fn interactive_terminal_opens_handles_tabs_and_restores_terminal_mode() {
             );
             master.write_all(b"1234sv?q").unwrap();
             std::thread::sleep(Duration::from_millis(100));
-            master.write_all(b"q").unwrap();
+            master.write_all(b"\x1b[<0;13;24M\x1b[<0;13;24m").unwrap();
             sent = true;
         }
         if let Some(status) = child.0.try_wait().unwrap() {

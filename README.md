@@ -72,6 +72,7 @@ sgpu doctor             # Collection checks
 | `v` in Jobs | All / running / pending |
 | `/` / `0` | Search / reset filters |
 | Enter / Tab | Details / script and log tabs |
+| Right-click / `a` | Actions menu: mouse click or arrows + Enter |
 | `J` / Esc | Related Jobs from GPU, CPU, Users or Attention / return |
 | `?` / `q` | Full help / quit |
 
@@ -80,6 +81,10 @@ permissions still follow the executing account. `chkgpu` respects `NO_COLOR` and
 
 The last tab, sort and Jobs state are saved in `~/.sgpu/ui/preferences.json`.
 Searches, account filters, logs and temporary related views stay in the current session.
+
+Tabs, rows, marked sort headers, filter chips and buttons accept mouse clicks.
+Select a row, then click **Detail**. Short detail windows expand to the screen;
+use the wheel or paging buttons to scroll, and **Follow** to resume live logs.
 
 `?` means unavailable, `~` partial coverage. Stale data never counts as free capacity.
 Network/load in Users are shared-node values. Priority, headroom and start-time
