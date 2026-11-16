@@ -4,69 +4,36 @@
 
 **Your Slurm GPU cluster, at a glance.**
 
-A Rust terminal monitor for jobs, GPU waste, usage and alerts.
+GPU · CPU · RAM · Jobs · People · Alerts
 
 [![CI](https://github.com/eightmm/slurm-gpu-tui/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/eightmm/slurm-gpu-tui/actions/workflows/test.yml)
 [![Rust](https://img.shields.io/badge/Rust-1.93%2B-CE422B?logo=rust)](https://github.com/eightmm/slurm-gpu-tui/blob/main/Cargo.toml)
-[![Linux](https://img.shields.io/badge/platform-Linux-2D6A4F?logo=linux&logoColor=white)](https://github.com/eightmm/slurm-gpu-tui#build-and-install)
-[![GitHub stars](https://img.shields.io/github/stars/eightmm/slurm-gpu-tui?style=social)](https://github.com/eightmm/slurm-gpu-tui/stargazers)
+[![Linux](https://img.shields.io/badge/Linux-2D6A4F?logo=linux&logoColor=white)](#build-and-install)
 
-[Screenshots](#screenshots) · [Install](#build-and-install) · [Usage](#usage) · [Slack alerts](docs/ALERTS.md) · [한국어](docs/README.ko.md)
+[Screenshots](#screenshots) · [Install](#build-and-install) · [Usage](#usage) · [Guides](#guides) · [한국어](docs/README.ko.md)
 
 </div>
 
-## What you get
-
-| Feature | What you get |
-|---|---|
-| **Cluster visibility** | Live GPU/CPU/RAM meters, per-node GPU state maps and keyboard-driven job tables |
-| **People and controller** | Per-user job resources, sustained-waste groups, controller I/O and storage quotas when available |
-| **Less wasted capacity** | Idle, parked and rogue GPU detection, plus per-user GPU-hours |
-| **Job inspection** | History, scripts, log tails and confirmed cancellation of your own jobs |
-| **Alerts and metrics** | Slack daily threads, owner-only failure DMs and Prometheus textfiles |
-| **Push-only collection** | Independent node publishers; missing results stay visibly unavailable |
+| See the cluster | Inspect work | Keep it running |
+|---|---|---|
+| Live resource meters, node maps and capacity | Priority sorting, user views, logs and own-job cancellation | GPU waste, usage history, Slack alerts and Prometheus metrics |
 
 ## Screenshots
 
-Rendered from synthetic demo data at 120 columns, with an 80-column Jobs example below.
+![Jobs with clickable sort headers, highlighted accounts and pending reasons](docs/images/tui-jobs.png)
 
-**Jobs** — clickable sort headers, highlighted accounts and pending reasons.
-
-![Jobs tab with priority sorting, account highlights and pending reasons](docs/images/tui-jobs.png)
+*Rendered with synthetic demo data at 120 columns.*
 
 <details>
-<summary>GPU dashboard</summary>
+<summary>More views: GPU · Users · Host · 80-column Jobs</summary>
 
-Resource meters, per-node state maps and individual GPU observations.
+![GPU dashboard with resource meters and per-node GPU state](docs/images/tui-gpu.png)
 
-![GPU dashboard with utilization, VRAM, free GPUs and parked allocations](docs/images/tui-gpu.png)
+![Users with attributed job resources and shared-node counters](docs/images/tui-users.png)
 
-</details>
+![Controller host resources, storage and interpretation guides](docs/images/tui-host.png)
 
-<details>
-<summary>Users and shared-node resources</summary>
-
-Per-user job CPU/RAM/I/O alongside shared node network and load.
-
-![Users tab with attributed job resources and shared-node counters](docs/images/tui-users.png)
-
-</details>
-
-<details>
-<summary>Controller host</summary>
-
-CPU, memory, pressure, disk/network rates and filesystem capacity with interpretation guides.
-
-![Host tab with controller resources, device rates and capacity guides](docs/images/tui-host.png)
-
-</details>
-
-<details>
-<summary>Jobs in an 80-column terminal</summary>
-
-Priority, GPU/CPU requests and pending reasons stay visible in the narrow layout.
-
-![80-column Jobs tab retaining priority, resource requests and pending reasons](docs/images/tui-jobs-narrow.png)
+![Jobs in an 80-column terminal](docs/images/tui-jobs-narrow.png)
 
 </details>
 
@@ -76,128 +43,53 @@ Priority, GPU/CPU requests and pending reasons stay visible in the narrow layout
 curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/refs/heads/main/bootstrap.sh | sudo bash
 ```
 
-Install on the master as root. Linux, git and a C compiler are required; the
-installer prepares Rust when needed. The first build may take several minutes.
-Run the same command to upgrade. Existing installation paths, service settings,
-state and Slack configuration are preserved. Check `sgpu --version` after
-installation; the current version is **2.3.0**. Users simply run `sgpu`.
+Run on the master as root. Requires Linux, git and a C compiler; Rust is prepared
+when needed. Run again to upgrade while keeping existing paths, state and Slack
+settings. Users run `sgpu`.
 
-Configure each node's publisher and the shared directory using the
-[node setup guide](docs/PUSH.md). Nodes publish results to a shared filesystem;
-the master reads those files. Master upgrades also publish an agent release;
-nodes installed with 2.2.0 or later pull and activate newer compatible versions
-automatically, with rollback on failure. Older agents need one local upgrade.
-See [automatic updates](docs/PUSH.md#automatic-agent-updates) for requirements.
+Nodes publish to a shared filesystem. Follow the [node setup guide](docs/PUSH.md)
+on each node; bootstrapped compatible agents receive [automatic updates](docs/PUSH.md#automatic-agent-updates).
 
 ## Usage
 
 ```bash
-sgpu                    # GPU / CPU / Usage / Jobs / Attention / Users / Controller
-sgpu --highlight-user alice  # Highlight an account while viewing as an administrator
-sgpu once               # Current snapshot
-sgpu me                 # My jobs, waste and usage
-sgpu waste -v           # Wasted GPUs
+sgpu                    # Interactive dashboard
+chkgpu                  # User × node allocation matrix
+chkgpu --summary        # Node headroom and pending reasons
+sgpu me                 # My jobs and usage
+sgpu users              # Per-user resources
+sgpu host               # Controller resources
 sgpu usage 7 --daily     # GPU-hours
-sgpu jobs 7              # Job history
 sgpu logs 12345 -e -f    # Follow stderr
-sgpu doctor             # Collection and configuration checks
-sgpu host               # Published controller resources, disks and filesystems
-sgpu users              # Published per-user resources and shared-node counters
-chkgpu                  # Colored user × node allocation matrix
-chkgpu --summary        # Node capacity, blocked nodes and pending reasons
+sgpu doctor             # Collection checks
 ```
 
-| Key | Action |
+| Control | Action |
 |---|---|
-| `1`–`7` | GPU / CPU / Usage / Jobs / Attention / Users / Controller |
-| `u` / `p` / `m` / `i` | User / partition / highlighted user / free GPU filters |
-| `[` / `]` / `0` | Previous node / next node / reset filters |
-| `/` / `s` / `S` | Search / sort / reverse |
-| `v` in Jobs | All / running / pending jobs |
-| Enter / Tab | Details / switch information, script and log tabs |
-| `w` / `f` / `h` | Waste / capacity / job history |
-| `n` / `x` | Watch a job / confirm cancellation of my job |
+| `1`–`7` | GPU / CPU / Usage / Jobs / Attention / Users / Host |
+| Click `↕` · `s` / `S` | Jobs header sorting · cycle sort / reverse |
+| `u` / `p` / `m` | User / partition / highlighted-account filters |
+| `v` in Jobs | All / running / pending |
+| `/` / `0` | Search / reset filters |
+| Enter / Tab | Details / script and log tabs |
 | `?` / `q` | Full help / quit |
 
-`sgpu` opens a live dashboard with resource meters, GPU state symbols and sortable
-tables. `chkgpu` automatically uses color in terminals; pipes stay plain. Use
-`chkgpu --color always` or `--color never` to override, or set `NO_COLOR`.
-`chkgpu --summary` replaces matrices with node state, GPU allocation/headroom,
-CPU idle threads, blocked-node reasons and pending-reason counts/oldest wait.
-CPU idle/allocation comes from `sinfo`; missing values stay `?`, and blocked or
-unknown nodes show `—` for headroom. GPU requests in `COMPLETING` still count as
-allocated. The default matrix also includes the pending-reason summary. Collection
-keeps the same three Slurm queries and never requests a compute-node session.
-Headroom describes scheduler counters, not utilization or guaranteed admission;
-next-end estimates follow job time limits. Multi-node CPU user rows are estimates.
-`sgpu host` and `sgpu users` print the corresponding published resource views
-without opening the TUI. They require a fresh collector snapshot and never
-substitute measurements from the client machine. User network/load remains shared
-node data; unsupported metrics remain unavailable.
+Use `sgpu --help` for all commands. Highlight an account with `sgpu --highlight-user alice`;
+permissions still follow the executing account. `chkgpu` respects `NO_COLOR` and supports `--color always` / `--color never`.
 
-In **Jobs**, `s` cycles priority, user, requested GPUs, requested CPUs, pending
-wait and running time left; `S` reverses. Priority starts highest first, user
-groups keep higher priorities first, and missing values stay last in either
-direction. `v` filters all/running/pending; `0` clears filters. The summary follows
-the visible jobs and shows running/pending job and user counts, leading pending reasons
-and longest wait. Search also matches partition and QOS. Priority and pending
-reasons remain visible in narrow terminals; CPU cores and RAM/VRAM in GiB appear
-when space permits. Sort settings survive refresh and switching to other tabs.
-Priority is Slurm's numeric score, not a guaranteed queue position. Time left is
-the remaining job time limit. GPU requests use Slurm's per-node GRES field;
-CPU requests cover the whole job. Older snapshots without running-job priority show `?`.
-Click **User**, **Priority**, **Req GPU** or **Req CPU** in the Jobs header to
-sort directly; click the same header again to reverse. Arrows mark clickable
-headers and the current direction. The mouse wheel scrolls tables and details.
-Tables and popups share a high-contrast dark palette. Selected rows, your account
-and the active sort header have distinct highlights; status colors concentrate
-on state and resource cells. Jobs, Users and Attention reserve more room for rows.
+`?` means unavailable, `~` partial coverage. Stale data never counts as free capacity.
+Network/load in Users are shared-node values. Priority, headroom and start-time
+estimates do not guarantee scheduler admission. See [metric interpretation](docs/PUSH.md#resource-views).
 
-Your rows use a teal background and `◆`, separate from the selection cursor.
-Utilization goes from dim through blue/cyan to green as activity increases;
-VRAM goes through blue/cyan/yellow/orange/red as it fills. Large terminals use
-thicker resource bars. The highlight override changes display and filtering;
-cancellation and private logs still use the executing account.
+## Guides
 
-**Users** separates attributed job CPU/RAM/block I/O from shared-node network
-and load. **Controller** shows local CPU/RAM, load, physical disk/NIC rates and
-filesystem capacity; user-quota records appear when the filesystem exposes them.
-The **Host** tab aligns read/write and RX/TX columns, scales capacity through
-TiB, and adds pressure, disk latency/queue, link capacity and inode indicators.
-Enter opens interpretation guides and recent five-minute trends. Colored
-thresholds are review hints; high throughput alone is not a fault.
-**Attention** groups current idle/parked and unallocated GPU observations by user
-and shows the evidence. Existing Slack thresholds continue to control delivery.
-See [sampling and attribution](docs/PUSH.md#resource-views) before interpreting
-shared counters. Bootstrapped agents receive upgrades automatically; older node
-publishers need the one-time local upgrade described in the setup guide.
+| Guide | Covers |
+|---|---|
+| [Node setup and upgrades](docs/PUSH.md) | Shared directories, services, configuration and troubleshooting |
+| [Slack alerts](docs/ALERTS.md) | Bot setup, daily threads and owner DMs |
+| [Prometheus metrics](docs/METRICS.md) | Textfile output and alert rules |
 
-`?` means unavailable and `~` means partial coverage. Stale data never counts
-as free GPUs. Capacity and estimated start times do not guarantee admission
-by the scheduler.
+The installer shares job-log tails and sanitized job details with snapshot readers
+by default. Set `SGPU_SHARE_LOGS=0` / `SGPU_SHARE_JOB_DETAILS=0` to disable; scripts are opt-in.
 
-## Alerts and operations
-
-[Slack alerts](docs/ALERTS.md) include daily threads, node outages/recovery,
-waste, GPU health and job-failure DMs sent only to the owner. Tokens belong in
-private server configuration, never in the repository or service units.
-
-The root collector shares job-log tails and sanitized details by default.
-Set `SGPU_SHARE_LOGS=0` and `SGPU_SHARE_JOB_DETAILS=0` to disable them according
-to cluster policy. Script sharing is opt-in. Logs and scripts may contain
-sensitive output; confirm who may read them before enabling sharing.
-
-- [Node installation, configuration and upgrades](docs/PUSH.md)
-- [Slack configuration and alert types](docs/ALERTS.md)
-- [Prometheus metrics](docs/METRICS.md)
-
-Operational scripts live in `scripts/`, implementation in `src/` and checks
-in `tests/`. Run `bash scripts/check.sh` for formatting, clippy, tests and
-shell checks.
-
-## Support sgpu
-
-If sgpu saves you time on your cluster, [give it a star](https://github.com/eightmm/slurm-gpu-tui)
-so you can find it again. Bug reports and focused improvements are welcome through
-[issues](https://github.com/eightmm/slurm-gpu-tui/issues) and
-[pull requests](https://github.com/eightmm/slurm-gpu-tui/pulls).
+Checks: `bash scripts/check.sh` · [Issues](https://github.com/eightmm/slurm-gpu-tui/issues) · [Contribute](https://github.com/eightmm/slurm-gpu-tui/pulls) · [Star](https://github.com/eightmm/slurm-gpu-tui/stargazers)
