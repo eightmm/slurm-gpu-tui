@@ -289,6 +289,14 @@ impl Drop for ChildGuard {
 #[test]
 fn interactive_terminal_opens_handles_tabs_and_restores_terminal_mode() {
     let fixture = Fixture::new();
+    let preferences = fixture.root.path().join(".sgpu/ui/preferences.json");
+    fs::create_dir_all(preferences.parent().unwrap()).unwrap();
+    fs::write(
+        &preferences,
+        json!({"version":1,"tab":3,"job_sort":"wait","job_filter":"pending"}).to_string(),
+    )
+    .unwrap();
+    fs::set_permissions(&preferences, fs::Permissions::from_mode(0o600)).unwrap();
     let mut master = -1;
     let mut slave = -1;
     let size = libc::winsize {
@@ -348,7 +356,11 @@ fn interactive_terminal_opens_handles_tabs_and_restores_terminal_mode() {
             && start.elapsed() > Duration::from_millis(300)
             && output.windows(8).any(|w| w == b"\x1b[?1049h")
         {
-            master.write_all(b"2341?q").unwrap();
+            assert!(
+                String::from_utf8_lossy(&output).contains("state:pending"),
+                "saved Jobs state was not loaded"
+            );
+            master.write_all(b"1234sv?q").unwrap();
             std::thread::sleep(Duration::from_millis(100));
             master.write_all(b"q").unwrap();
             sent = true;
@@ -361,6 +373,15 @@ fn interactive_terminal_opens_handles_tabs_and_restores_terminal_mode() {
     }
     assert!(child.0.try_wait().unwrap().is_some(), "UI did not exit");
     assert!(sent);
+    let saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(&preferences).unwrap()).unwrap();
+    assert_eq!(saved["tab"], 3);
+    assert_eq!(saved["job_sort"], "left");
+    assert_eq!(saved["job_filter"], "all");
+    assert_eq!(
+        fs::metadata(&preferences).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     loop {
         let mut bytes = [0; 8192];
         match master.read(&mut bytes) {

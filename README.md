@@ -72,10 +72,14 @@ sgpu doctor             # Collection checks
 | `v` in Jobs | All / running / pending |
 | `/` / `0` | Search / reset filters |
 | Enter / Tab | Details / script and log tabs |
+| `J` / Esc | Related Jobs from GPU, CPU, Users or Attention / return |
 | `?` / `q` | Full help / quit |
 
 Use `sgpu --help` for all commands. Highlight an account with `sgpu --highlight-user alice`;
 permissions still follow the executing account. `chkgpu` respects `NO_COLOR` and supports `--color always` / `--color never`.
+
+The last tab, sort and Jobs state are saved in `~/.sgpu/ui/preferences.json`.
+Searches, account filters, logs and temporary related views stay in the current session.
 
 `?` means unavailable, `~` partial coverage. Stale data never counts as free capacity.
 Network/load in Users are shared-node values. Priority, headroom and start-time

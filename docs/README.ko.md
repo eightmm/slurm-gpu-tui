@@ -72,10 +72,14 @@ sgpu doctor             # 수집 상태 진단
 | Jobs에서 `v` | 전체 / 실행 / 대기 |
 | `/` / `0` | 검색 / 필터 초기화 |
 | Enter / Tab | 상세 / 스크립트·로그 탭 |
+| `J` / Esc | GPU·CPU·Users·Attention에서 관련 Jobs / 이전 화면 |
 | `?` / `q` | 전체 도움말 / 종료 |
 
 전체 명령은 `sgpu --help`에서 확인합니다. `sgpu --highlight-user alice`로 계정을
 강조할 수 있으며 권한은 실행 계정을 따릅니다. `chkgpu`는 `NO_COLOR`와 `--color always` / `--color never`를 지원합니다.
+
+마지막 탭·정렬·Jobs 상태는 `~/.sgpu/ui/preferences.json`에 저장합니다.
+검색어·계정 필터·로그·임시 관련 화면은 현재 세션에만 유지합니다.
 
 `?`는 결측, `~`는 부분 관측입니다. 오래된 데이터는 빈 자원으로 계산하지 않습니다.
 Users의 network/load는 노드 공용 값이며 priority·여유량·예상 시작 시각은 실행 승인을

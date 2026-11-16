@@ -4,7 +4,7 @@ use crate::{
     model::{Gpu, Job, Node, PendingJob, Snapshot, number},
     process::{self, Program},
     rules::{self, Class},
-    runtime, usage,
+    runtime, ui_preferences, usage,
 };
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -465,6 +465,54 @@ struct ViewRow {
     focus: Option<usize>,
     accents: Vec<(usize, Style)>,
 }
+
+enum JobTarget {
+    User(String),
+    Job(String),
+    Node(String),
+    Attention {
+        user: String,
+        jobs: BTreeSet<String>,
+    },
+}
+impl JobTarget {
+    fn includes(&self, entry: Entry<'_>) -> bool {
+        match self {
+            Self::User(user) => entry.user() == user,
+            Self::Job(id) => entry.id() == id,
+            Self::Node(node) => match entry {
+                Entry::Running(job) => crate::scheduler::expand_nodes(&job.node)
+                    .is_some_and(|nodes| nodes.contains(node)),
+                Entry::Pending(_) => false,
+            },
+            Self::Attention { jobs, .. } => jobs.contains(entry.id()),
+        }
+    }
+    fn label(&self) -> String {
+        match self {
+            Self::User(user) => format!("user:{user}"),
+            Self::Job(id) => format!("job:{id}"),
+            Self::Node(node) => format!("node:{node}"),
+            Self::Attention { user, .. } => format!("attention:{user}"),
+        }
+    }
+}
+
+struct ViewContext {
+    preferences: ui_preferences::Preferences,
+    filter_user: String,
+    partition: String,
+    mine: bool,
+    free_only: bool,
+    search: String,
+    table: TableState,
+    selected: Option<String>,
+}
+struct RelatedView {
+    target: Option<JobTarget>,
+    origin: ViewContext,
+}
+
 pub struct App {
     pub data: Snapshot,
     pub usage: Option<serde_json::Value>,
@@ -486,6 +534,7 @@ pub struct App {
     job_sort: job_view::Sort,
     job_reverse: bool,
     job_filter: job_view::Filter,
+    related: Option<RelatedView>,
     header_hits: Vec<(Rect, job_view::Sort)>,
     details: bool,
     pending: bool,
@@ -537,6 +586,7 @@ impl App {
             job_sort: job_view::Sort::default(),
             job_reverse: false,
             job_filter: job_view::Filter::default(),
+            related: None,
             header_hits: Vec::new(),
             details: false,
             pending: false,
@@ -557,6 +607,29 @@ impl App {
             host_history: crate::host_view::History::default(),
             popup_sequence: 0,
         }
+    }
+    fn preferences(&self) -> ui_preferences::Preferences {
+        if let Some(related) = &self.related {
+            return related.origin.preferences.clone();
+        }
+        ui_preferences::Preferences {
+            tab: self.tab,
+            sort: self.sort,
+            reverse: self.reverse,
+            job_sort: self.job_sort,
+            job_reverse: self.job_reverse,
+            job_filter: self.job_filter,
+            ..Default::default()
+        }
+    }
+    fn restore_preferences(&mut self, preferences: &ui_preferences::Preferences) {
+        self.tab = preferences.tab;
+        self.sort = preferences.sort;
+        self.reverse = preferences.reverse;
+        self.job_sort = preferences.job_sort;
+        self.job_reverse = preferences.job_reverse;
+        self.job_filter = preferences.job_filter;
+        self.rebuild();
     }
     pub fn apply(&mut self, data: Snapshot) {
         let now = runtime::now();
@@ -724,7 +797,88 @@ impl App {
             .filter(|entry| {
                 self.job_filter.includes(*entry)
                     && self.job_visible(entry.user(), entry.partition(), &entry.fields())
+                    && self
+                        .related
+                        .as_ref()
+                        .and_then(|r| r.target.as_ref())
+                        .is_none_or(|target| target.includes(*entry))
             })
+    }
+    fn open_related_jobs(&mut self) {
+        let target = self.selected().and_then(|row| match self.tab {
+            4 => row.key.strip_prefix("attention:").and_then(|user| {
+                crate::users::attention_in_partition(
+                    &self.data,
+                    runtime::env_seconds("SLURM_GPU_TUI_WASTE_MIN_SEC", 600.0, 0.0) as u64,
+                    runtime::now(),
+                    &self.partition,
+                )
+                .into_iter()
+                .find(|group| group.user == user && !group.jobs.is_empty())
+                .map(|group| JobTarget::Attention {
+                    user: group.user,
+                    jobs: group.jobs,
+                })
+            }),
+            5 => row
+                .key
+                .strip_prefix("user:")
+                .map(|user| JobTarget::User(user.into())),
+            0 | 1 => row
+                .job
+                .as_ref()
+                .map(|id| JobTarget::Job(id.clone()))
+                .or_else(|| (!row.node.is_empty()).then(|| JobTarget::Node(row.node.clone()))),
+            _ => None,
+        });
+        let Some(target) = target else {
+            self.status = if self.tab == 4 {
+                "No linked Slurm jobs in current evidence · Enter to inspect"
+            } else {
+                "Select a GPU, node or user · J related Jobs"
+            }
+            .into();
+            return;
+        };
+        let origin = ViewContext {
+            preferences: self.preferences(),
+            filter_user: std::mem::take(&mut self.filter_user),
+            partition: std::mem::take(&mut self.partition),
+            mine: std::mem::take(&mut self.mine),
+            free_only: std::mem::take(&mut self.free_only),
+            search: std::mem::take(&mut self.search),
+            selected: self.selected().map(|row| row.key.clone()),
+            table: std::mem::take(&mut self.table),
+        };
+        self.status = format!("Related Jobs · {} · Esc back", target.label());
+        self.related = Some(RelatedView {
+            target: Some(target),
+            origin,
+        });
+        self.tab = 3;
+        self.job_filter = job_view::Filter::All;
+        self.rebuild();
+    }
+    fn return_from_jobs(&mut self) {
+        let Some(related) = self.related.take() else {
+            return;
+        };
+        let origin = related.origin;
+        self.filter_user = origin.filter_user;
+        self.partition = origin.partition;
+        self.mine = origin.mine;
+        self.free_only = origin.free_only;
+        self.search = origin.search;
+        self.restore_preferences(&origin.preferences);
+        self.table = origin.table;
+        self.rebuild();
+        if let Some(index) = origin
+            .selected
+            .and_then(|key| self.rows.iter().position(|row| row.key == key))
+        {
+            self.table.select(Some(index));
+        }
+        self.status = "Returned to previous view".into();
     }
     fn job_summary(&self, now: f64) -> [String; 2] {
         let (mut running, mut pending) = (0, 0);
@@ -1827,6 +1981,20 @@ impl App {
             format!(" sort:{sort_label}{} ", if descending { "↓" } else { "↑" }),
             Style::default().fg(MUTED),
         )];
+        if let Some(related) = &self.related {
+            let label = related
+                .target
+                .as_ref()
+                .map(JobTarget::label)
+                .unwrap_or_else(|| "all jobs".into());
+            chips.insert(
+                0,
+                Span::styled(
+                    format!(" related:{} · Esc back ", cli::terminal_safe(&label)),
+                    Style::default().fg(FOCUS).add_modifier(Modifier::BOLD),
+                ),
+            );
+        }
         if self.tab == 3 {
             chips.push(Span::styled(
                 format!(" state:{} [v] ", self.job_filter.label()),
@@ -2272,6 +2440,13 @@ impl App {
                 ("m", "Mine"),
                 ("0", "Reset"),
             ];
+            if self.related.is_some() {
+                bindings.retain(|(key, _)| *key != "m");
+                bindings.insert(0, ("Esc", "Back"));
+            }
+            if matches!(self.tab, 0 | 1 | 4 | 5) {
+                bindings.insert(3, ("J", "Jobs"));
+            }
             if self.tab == 6 {
                 bindings.retain(|(key, _)| *key != "m");
                 bindings.push(("PgUp/Dn", "Page"));
@@ -2521,10 +2696,15 @@ impl App {
         match key {
             KeyCode::Char('q') => return true,
             KeyCode::Char(c @ '1'..='7') => {
+                self.return_from_jobs();
                 self.tab = (c as u8 - b'1') as usize;
                 self.table = TableState::default();
             }
-            KeyCode::Char('g') => self.tab = 2,
+            KeyCode::Char('g') => {
+                self.return_from_jobs();
+                self.tab = 2;
+            }
+            KeyCode::Char('J') => self.open_related_jobs(),
             KeyCode::Char(']') => self.jump_node(true),
             KeyCode::Char('[') => self.jump_node(false),
             KeyCode::Char('0') | KeyCode::Backspace => {
@@ -2534,6 +2714,9 @@ impl App {
                 self.free_only = false;
                 self.search.clear();
                 self.job_filter = job_view::Filter::All;
+                if let Some(related) = &mut self.related {
+                    related.target = None;
+                }
                 self.status = "Filters cleared".into();
             }
             KeyCode::Home if self.tab != 2 => {
@@ -2557,6 +2740,10 @@ impl App {
                 }
             }
             KeyCode::Char('/') => self.searching = true,
+            KeyCode::Esc if self.related.is_some() => {
+                self.return_from_jobs();
+                return false;
+            }
             KeyCode::Esc => self.search.clear(),
             KeyCode::Char('s') if matches!(self.tab, 0 | 5) => self.sort = (self.sort + 1) % 4,
             KeyCode::Char('S') if matches!(self.tab, 0 | 5) => self.reverse = !self.reverse,
@@ -3061,13 +3248,21 @@ pub fn run(highlight_user: Option<String>) -> Result<i32> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err("interactive mode requires a terminal; use sgpu once or sgpu json".into());
     }
+    let preferences_path = ui_preferences::path();
+    let loaded_preferences = ui_preferences::load(&preferences_path);
+    let can_save_preferences = loaded_preferences.is_ok();
+    let initial_preferences = loaded_preferences.unwrap_or_else(|error| {
+        eprintln!("sgpu: view settings ignored and left unchanged: {error}");
+        ui_preferences::Preferences::default()
+    });
+    let mut app = App::new();
+    app.restore_preferences(&initial_preferences);
+    if let Some(user) = highlight_user {
+        app.set_highlight_user(user);
+    }
     let mut terminal = ratatui::try_init()?;
     let result = (|| -> Result<i32> {
         let _mouse = MouseCapture::enable()?;
-        let mut app = App::new();
-        if let Some(user) = highlight_user {
-            app.set_highlight_user(user);
-        }
         let worker = Worker::new();
         worker.send(Task::Refresh);
         let mut next = Instant::now()
@@ -3187,6 +3382,14 @@ pub fn run(highlight_user: Option<String>) -> Result<i32> {
         }
     })();
     ratatui::restore();
+    let preferences = app.preferences();
+    if can_save_preferences
+        && result.is_ok()
+        && preferences != initial_preferences
+        && let Err(error) = ui_preferences::save(&preferences_path, &preferences)
+    {
+        eprintln!("sgpu: view settings not saved: {error}");
+    }
     result
 }
 
@@ -3202,6 +3405,12 @@ const HELP: &str = concat!(
     "i free GPUs · 0 reset all filters · / search · Esc clear search\n",
     "d detail columns · Space fold node · z fold/unfold all\nj/k or arrows move\n",
     "Enter full values or job/node detail · Tab info/script/stdout/stderr\n",
+    "J related Jobs from GPU/CPU/Users/Attention · Esc restores the previous view.\n",
+    "Users opens all user jobs; Attention opens only jobs linked in current evidence.\n",
+    "GPU/node links use exact job IDs or expanded node names; unlinked processes stay inspectable.\n",
+    "0 resets the related scope; Esc still returns.\n",
+    "Tab, sort and Jobs state are saved on exit in ~/.sgpu/ui/preferences.json.\n",
+    "Related views, user/partition/search filters, logs and job data are not saved.\n",
     "w wasted GPUs · f free capacity · h my job history (PageUp/Down supported)\n",
     "n watch job · x cancel my own job (confirmation required)\ne export JSON · ? help · q quit\n\n",
     "◆ + teal background: highlighted account. Cursor selection is separate.\n",
@@ -3302,6 +3511,195 @@ mod tests {
             ],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn related_user_jobs_restore_filters_and_selection_after_refresh() {
+        let worker = Worker::new();
+        let mut data = jobs_snapshot();
+        data.jobs.push(Job {
+            user: "alice2".into(),
+            jobid: "420".into(),
+            ..data.jobs[0].clone()
+        });
+        let mut app = App::for_user("alice".into());
+        app.tab = 5;
+        app.partition = "gpu".into();
+        app.mine = true;
+        app.free_only = true;
+        app.search = "alice".into();
+        app.job_filter = job_view::Filter::Pending;
+        app.job_sort = job_view::Sort::Wait;
+        app.apply(data.clone());
+        assert_eq!(app.selected().unwrap().key, "user:alice");
+        let original_preferences = app.preferences();
+        app.key(KeyCode::Char('J'), &worker);
+        assert_eq!(app.tab, 3);
+        assert_eq!(
+            app.rows
+                .iter()
+                .filter_map(|row| row.job.as_deref())
+                .collect::<Vec<_>>(),
+            ["90", "42"]
+        );
+        assert!(app.job_summary(runtime::now())[0].contains("1 running · 1 pending · 1 users"));
+        assert!(app.partition.is_empty() && app.search.is_empty() && !app.mine && !app.free_only);
+        assert_eq!(app.preferences(), original_preferences);
+        for width in [80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(text.contains("related:user:alice"));
+            assert!(text.contains("Back") && text.contains("Quit"));
+        }
+        app.key(KeyCode::Char('/'), &worker);
+        app.key(KeyCode::Char('9'), &worker);
+        app.key(KeyCode::Esc, &worker);
+        assert_eq!(app.tab, 3);
+        assert!(app.search.is_empty());
+        app.open(Popup::text("details", "evidence".into()));
+        app.key(KeyCode::Esc, &worker);
+        assert!(app.popup.is_none());
+        assert_eq!(app.tab, 3);
+        app.key(KeyCode::Char('0'), &worker);
+        assert_eq!(app.rows.len(), data.jobs.len() + data.pending.len());
+        app.key(KeyCode::Char('s'), &worker);
+        assert_eq!(app.preferences(), original_preferences);
+        data.jobs[0].gpu_count = 0;
+        data.pending[0].gpu_count = 0;
+        app.apply(data);
+        app.key(KeyCode::Esc, &worker);
+        assert_eq!(app.tab, 5);
+        assert_eq!(app.partition, "gpu");
+        assert_eq!(app.search, "alice");
+        assert!(app.mine && app.free_only);
+        assert_eq!(app.selected().unwrap().key, "user:alice");
+        assert_eq!(app.preferences(), original_preferences);
+        let mut restored = App::for_user("alice".into());
+        restored.restore_preferences(
+            &serde_json::from_str(&serde_json::to_string(&app.preferences()).unwrap()).unwrap(),
+        );
+        restored.apply(jobs_snapshot());
+        assert_eq!(restored.preferences(), original_preferences);
+        assert!(restored.search.is_empty() && restored.partition.is_empty() && !restored.mine);
+
+        app.mine = false;
+        app.rebuild();
+        app.table
+            .select(app.rows.iter().position(|row| row.key == "user:alice2"));
+        app.key(KeyCode::Char('J'), &worker);
+        let mut refreshed = app.data.clone();
+        refreshed.jobs[0].gpu_count = 10;
+        app.apply(refreshed.clone());
+        app.key(KeyCode::Esc, &worker);
+        assert_eq!(app.selected().unwrap().key, "user:alice2");
+        assert_eq!(app.table.selected(), Some(1));
+        app.key(KeyCode::Char('J'), &worker);
+        refreshed.jobs.retain(|job| job.user != "alice2");
+        app.apply(refreshed);
+        app.key(KeyCode::Esc, &worker);
+        assert_eq!(app.selected().unwrap().key, "user:alice");
+    }
+
+    #[test]
+    fn related_gpu_and_node_jobs_match_exact_ids_and_expanded_nodes() {
+        let worker = Worker::new();
+        let mut data = jobs_snapshot();
+        data.jobs.push(Job {
+            jobid: "420".into(),
+            node: "gpu10".into(),
+            ..data.jobs[0].clone()
+        });
+        data.jobs.push(Job {
+            jobid: "42_1".into(),
+            node: "gpu[1-2]".into(),
+            ..data.jobs[0].clone()
+        });
+        data.nodes.push(Node {
+            name: "gpu1".into(),
+            cpus: "32".into(),
+            gpus: vec![Gpu {
+                index: "0".into(),
+                alloc_jobid: "42".into(),
+                alloc_user: "alice".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let mut app = App::for_user("alice".into());
+        app.tab = 1;
+        app.apply(data);
+        assert_eq!(app.selected().unwrap().key, "node:gpu1");
+        app.key(KeyCode::Char('J'), &worker);
+        assert_eq!(
+            app.rows
+                .iter()
+                .filter_map(|row| row.job.as_deref())
+                .collect::<Vec<_>>(),
+            ["42", "42_1"]
+        );
+        app.key(KeyCode::Esc, &worker);
+        app.key(KeyCode::Char('1'), &worker);
+        app.table
+            .select(app.rows.iter().position(|row| row.key == "gpu:gpu1:0"));
+        app.key(KeyCode::Char('J'), &worker);
+        assert_eq!(app.rows.len(), 1);
+        assert_eq!(app.rows[0].job.as_deref(), Some("42"));
+        app.key(KeyCode::Char('7'), &worker);
+        assert_eq!(app.tab, 6);
+        assert!(app.related.is_none());
+        assert_eq!(app.job_filter, job_view::Filter::All);
+    }
+
+    #[test]
+    fn attention_links_only_evidenced_jobs_and_keeps_unlinked_processes_inspectable() {
+        let worker = Worker::new();
+        let mut data = jobs_snapshot();
+        data.nodes.push(Node {
+            name: "gpu1".into(),
+            state: "allocated".into(),
+            gpus: vec![Gpu {
+                index: "0".into(),
+                util: "0".into(),
+                mem_used: "0".into(),
+                mem_total: "100".into(),
+                alloc_jobid: "42".into(),
+                alloc_user: "alice".into(),
+                idle_sec: u64::MAX,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let mut app = App::for_user("alice".into());
+        app.tab = 4;
+        app.apply(data);
+        assert_eq!(app.selected().unwrap().key, "attention:alice");
+        app.key(KeyCode::Enter, &worker);
+        assert!(app.popup.is_some());
+        app.key(KeyCode::Esc, &worker);
+        app.key(KeyCode::Char('J'), &worker);
+        assert_eq!(app.rows.len(), 1);
+        assert_eq!(app.rows[0].job.as_deref(), Some("42"));
+        app.key(KeyCode::Esc, &worker);
+        let gpu = &mut app.data.nodes[0].gpus[0];
+        gpu.alloc_jobid.clear();
+        gpu.alloc_user.clear();
+        gpu.idle_sec = 0;
+        gpu.users = vec!["alice".into(), "bob".into()];
+        gpu.pids = vec!["123".into()];
+        app.rebuild();
+        app.key(KeyCode::Char('J'), &worker);
+        assert_eq!(app.tab, 4);
+        assert!(app.related.is_none());
+        assert!(app.status.contains("No linked Slurm jobs"));
+        app.key(KeyCode::Enter, &worker);
+        assert!(app.popup.is_some());
     }
 
     fn header_position(terminal: &Terminal<TestBackend>, label: &str) -> (u16, u16) {

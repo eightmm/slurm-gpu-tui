@@ -2,6 +2,7 @@ use crate::{
     model::{Job, PendingJob},
     quickview, rules,
 };
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
 #[derive(Clone, Copy)]
@@ -86,7 +87,8 @@ impl<'a> Entry<'a> {
     }
 }
 
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Filter {
     #[default]
     All,
@@ -117,7 +119,8 @@ impl Filter {
     }
 }
 
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Sort {
     #[default]
     Priority,
