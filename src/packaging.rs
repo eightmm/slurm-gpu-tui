@@ -182,15 +182,17 @@ fn installed_prefix(entry: &Path, name: &str) -> Option<PathBuf> {
     }
     let mut magic = [0; 4];
     file.read_exact(&mut magic).ok()?;
-    if let Some(root) = target
-        .parent()
-        .filter(|p| p.file_name().is_some_and(|s| s == "bin"))
-        .and_then(Path::parent)
-        && let Ok(record) = manifest(root)
-        && !record.roles.is_empty()
-        && magic == *b"\x7fELF"
-    {
-        return Some(root.to_path_buf());
+    for path in [entry, target.as_path()] {
+        if let Some(root) = path
+            .parent()
+            .filter(|p| p.file_name().is_some_and(|s| s == "bin"))
+            .and_then(Path::parent)
+            && let Ok(record) = manifest(root)
+            && !record.roles.is_empty()
+            && magic == *b"\x7fELF"
+        {
+            return Some(root.to_path_buf());
+        }
     }
     let (bytes, _) = runtime::read_regular(&resolved, 1024 * 1024, Some(runtime::euid())).ok()?;
     let body = std::str::from_utf8(&bytes).ok()?.trim_end();
@@ -1487,6 +1489,15 @@ mod tests {
         write_owned(
             &root.join(".sgpu-native-install"),
             br#"{"version":1,"roles":["master"]}"#,
+        );
+        assert_eq!(discover_prefix(&bin), Some(root.clone()));
+        fs::remove_file(root.join("bin/sgpu")).unwrap();
+        write_owned(&root.join("releases/fixture/sgpu"), b"\x7fELFfixture");
+        symlink("releases/fixture", root.join("current")).unwrap();
+        symlink("../current/sgpu", root.join("bin/sgpu")).unwrap();
+        assert_eq!(
+            installed_prefix(&root.join("bin/sgpu"), "sgpu"),
+            Some(root.clone())
         );
         assert_eq!(discover_prefix(&bin), Some(root));
     }
