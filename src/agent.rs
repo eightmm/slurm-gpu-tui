@@ -114,19 +114,25 @@ fn unsupported_nvidia_option(error: &str) -> bool {
 }
 
 fn complete_process_sample(raw: &str, gpus: &[Gpu]) -> bool {
+    if raw.lines().take(8193).count() > 8192 {
+        return false;
+    }
     let header = raw
         .lines()
         .filter(|line| line.trim_start().starts_with('#'))
         .any(|line| {
-            let fields: Vec<_> = line.split_whitespace().collect();
-            fields.contains(&"gpu") && fields.contains(&"pid")
+            let fields: Vec<_> = line
+                .split_whitespace()
+                .filter(|field| *field != "#")
+                .collect();
+            fields.starts_with(&["gpu", "pid", "type"])
         });
     let seen: BTreeSet<_> = raw
         .lines()
         .filter(|line| !line.trim_start().starts_with('#'))
         .filter_map(|line| {
             let fields: Vec<_> = line.split_whitespace().collect();
-            (fields.len() >= 2
+            (fields.len() >= 3
                 && (fields[1] == "-" || fields[1].parse::<u32>().is_ok_and(|pid| pid > 0)))
             .then(|| fields[0].to_string())
         })

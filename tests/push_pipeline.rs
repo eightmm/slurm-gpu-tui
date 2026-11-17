@@ -118,6 +118,12 @@ case "$1" in
     if [ "$SGPU_NVIDIA_CASE" = unsupported ]; then echo 'Process monitoring not supported' >&2; exit 3; fi
     printf '# gpu pid type sm mem enc dec command\n'
     [ "$SGPU_NVIDIA_CASE" != incomplete ] || exit 0
+    if [ "$SGPU_NVIDIA_CASE" = short-row ]; then printf '0 123\n'; exit 0; fi
+    if [ "$SGPU_NVIDIA_CASE" = oversized ]; then
+      i=0
+      while [ "$i" -lt 8193 ]; do printf '0 - - - - - - -\n'; i=$((i + 1)); done
+      exit 0
+    fi
     shift
     devices=''
     while [ "$#" -gt 0 ]; do
@@ -185,7 +191,13 @@ fn gpu_agent_reduces_optional_queries_and_covers_more_than_sixteen_devices() {
 
 #[test]
 fn unsupported_or_incomplete_process_views_and_permissions_never_publish_empty_gpu_activity() {
-    for scenario in ["unsupported", "incomplete", "permission"] {
+    for scenario in [
+        "unsupported",
+        "incomplete",
+        "short-row",
+        "oversized",
+        "permission",
+    ] {
         let cluster = Cluster::new();
         let output = cluster.gpu_agent(scenario);
         assert!(!output.status.success(), "{scenario}");
