@@ -1,18 +1,21 @@
 <div align="center">
 
-# sgpu
+# Oh My Slurm
 
-**Slurm GPU 클러스터를 터미널에서 한눈에.**
+**Slurm 클러스터의 모니터링·진단·일상 작업을 한곳에서.**
 
 GPU · CPU · RAM · 작업 · 사용자 · 알림
 
-[![CI](https://github.com/eightmm/slurm-gpu-tui/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/eightmm/slurm-gpu-tui/actions/workflows/test.yml)
-[![Rust](https://img.shields.io/badge/Rust-1.93%2B-CE422B?logo=rust)](https://github.com/eightmm/slurm-gpu-tui/blob/main/Cargo.toml)
+[![CI](https://github.com/eightmm/oh-my-slurm/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/eightmm/oh-my-slurm/actions/workflows/test.yml)
+[![Rust](https://img.shields.io/badge/Rust-1.93%2B-CE422B?logo=rust)](https://github.com/eightmm/oh-my-slurm/blob/main/Cargo.toml)
 [![Linux](https://img.shields.io/badge/Linux-2D6A4F?logo=linux&logoColor=white)](#build-and-install)
 
 [화면](#화면-예시) · [설치](#build-and-install) · [사용법](#사용법) · [가이드](#가이드) · [English](../README.md)
 
 </div>
+
+기존 `slurm-gpu-tui`에서 이름을 바꾼 독립 커뮤니티 도구입니다.
+대시보드 `sgpu`와 기존 `chk*` 명령·설정·설치 경로는 그대로 호환됩니다.
 
 | 클러스터 현황 | 작업 확인 | 운영 지원 |
 |---|---|---|
@@ -40,7 +43,7 @@ GPU · CPU · RAM · 작업 · 사용자 · 알림
 ## Build and install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/refs/heads/main/bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/eightmm/oh-my-slurm/refs/heads/main/bootstrap.sh | sudo bash
 ```
 
 마스터에서 root로 실행합니다. Linux·git·C 컴파일러가 필요하며 Rust는 필요 시
@@ -117,4 +120,4 @@ Users의 network/load는 노드 공용 값이며 priority·여유량·예상 시
 설치 기본값은 작업 로그 tail과 정제된 상세를 snapshot 독자에게 공개합니다.
 `SGPU_SHARE_LOGS=0` / `SGPU_SHARE_JOB_DETAILS=0`으로 끌 수 있으며 스크립트는 선택 공개입니다.
 
-검사: `bash scripts/check.sh` · [버그 제보](https://github.com/eightmm/slurm-gpu-tui/issues) · [기여](https://github.com/eightmm/slurm-gpu-tui/pulls) · [Star](https://github.com/eightmm/slurm-gpu-tui/stargazers)
+검사: `bash scripts/check.sh` · [버그 제보](https://github.com/eightmm/oh-my-slurm/issues) · [기여](https://github.com/eightmm/oh-my-slurm/pulls) · [Star](https://github.com/eightmm/oh-my-slurm/stargazers)

@@ -1,18 +1,21 @@
 <div align="center">
 
-# sgpu
+# Oh My Slurm
 
-**Your Slurm GPU cluster, at a glance.**
+**Monitoring, diagnostics, and everyday tools for Slurm clusters.**
 
 GPU · CPU · RAM · Jobs · People · Alerts
 
-[![CI](https://github.com/eightmm/slurm-gpu-tui/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/eightmm/slurm-gpu-tui/actions/workflows/test.yml)
-[![Rust](https://img.shields.io/badge/Rust-1.93%2B-CE422B?logo=rust)](https://github.com/eightmm/slurm-gpu-tui/blob/main/Cargo.toml)
+[![CI](https://github.com/eightmm/oh-my-slurm/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/eightmm/oh-my-slurm/actions/workflows/test.yml)
+[![Rust](https://img.shields.io/badge/Rust-1.93%2B-CE422B?logo=rust)](https://github.com/eightmm/oh-my-slurm/blob/main/Cargo.toml)
 [![Linux](https://img.shields.io/badge/Linux-2D6A4F?logo=linux&logoColor=white)](#build-and-install)
 
 [Screenshots](#screenshots) · [Install](#build-and-install) · [Usage](#usage) · [Guides](#guides) · [한국어](docs/README.ko.md)
 
 </div>
+
+An independent community toolkit, formerly `slurm-gpu-tui`. The dashboard command
+remains `sgpu`; existing `chk*` commands, settings and installation paths stay compatible.
 
 | See the cluster | Inspect work | Keep it running |
 |---|---|---|
@@ -40,7 +43,7 @@ GPU · CPU · RAM · Jobs · People · Alerts
 ## Build and install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/refs/heads/main/bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/eightmm/oh-my-slurm/refs/heads/main/bootstrap.sh | sudo bash
 ```
 
 Run on the master as root. Requires Linux, git and a C compiler; Rust is prepared
@@ -117,4 +120,4 @@ estimates do not guarantee scheduler admission. See [metric interpretation](docs
 The installer shares job-log tails and sanitized job details with snapshot readers
 by default. Set `SGPU_SHARE_LOGS=0` / `SGPU_SHARE_JOB_DETAILS=0` to disable; scripts are opt-in.
 
-Checks: `bash scripts/check.sh` · [Issues](https://github.com/eightmm/slurm-gpu-tui/issues) · [Contribute](https://github.com/eightmm/slurm-gpu-tui/pulls) · [Star](https://github.com/eightmm/slurm-gpu-tui/stargazers)
+Checks: `bash scripts/check.sh` · [Issues](https://github.com/eightmm/oh-my-slurm/issues) · [Contribute](https://github.com/eightmm/oh-my-slurm/pulls) · [Star](https://github.com/eightmm/oh-my-slurm/stargazers)

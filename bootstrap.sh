@@ -2,20 +2,20 @@
 # Fetch main and build/install natively on this host.
 set -euo pipefail
 SOURCE="${SGPU_SOURCE_DIR:-$HOME/.sgpu/source}"
-REPOSITORY="https://github.com/eightmm/slurm-gpu-tui.git"
+REPOSITORY="https://github.com/eightmm/oh-my-slurm.git"
 REQUIRED_RUST=1.93.0
 BUILD=1
 for arg in "$@"; do
     case "$arg" in
         --no-build) BUILD=0 ;;
         -h|--help)
-            echo "usage: curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/refs/heads/main/bootstrap.sh | sudo bash -s -- [install options]"
+            echo "usage: curl -fsSL https://raw.githubusercontent.com/eightmm/oh-my-slurm/refs/heads/main/bootstrap.sh | sudo bash -s -- [install options]"
             echo "Options: --role master|node --mode gpu|cpu --prefix PATH --no-service --no-build"
             echo "Requires Linux, git and a C compiler. Missing Rust is installed with rustup (SGPU_INSTALL_RUST=0 disables this)."
             exit 0 ;;
     esac
 done
-[ "$(id -u)" = 0 ] || { echo "Install as root: curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/refs/heads/main/bootstrap.sh | sudo bash" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || { echo "Install as root: curl -fsSL https://raw.githubusercontent.com/eightmm/oh-my-slurm/refs/heads/main/bootstrap.sh | sudo bash" >&2; exit 1; }
 case "$SOURCE" in
     /|*/../*|*/..|../*|..|[!/]*) echo "SGPU_SOURCE_DIR must be an absolute dedicated directory" >&2; exit 1 ;;
 esac

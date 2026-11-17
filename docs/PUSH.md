@@ -12,13 +12,13 @@ the published JSON files and automatic-update channel need the shared filesystem
 
 ```bash
 # Master host
-curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/refs/heads/main/bootstrap.sh | sudo env SLURM_GPU_TUI_AGENT_DIR=/nfs/sgpu-nodes bash -s -- --role master
+curl -fsSL https://raw.githubusercontent.com/eightmm/oh-my-slurm/refs/heads/main/bootstrap.sh | sudo env SLURM_GPU_TUI_AGENT_DIR=/nfs/sgpu-nodes bash -s -- --role master
 
 # Each GPU node, locally
-curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/refs/heads/main/bootstrap.sh | sudo env SLURM_GPU_TUI_AGENT_DIR=/nfs/sgpu-nodes bash -s -- --role node --mode gpu
+curl -fsSL https://raw.githubusercontent.com/eightmm/oh-my-slurm/refs/heads/main/bootstrap.sh | sudo env SLURM_GPU_TUI_AGENT_DIR=/nfs/sgpu-nodes bash -s -- --role node --mode gpu
 
 # Each CPU-only node, locally
-curl -fsSL https://raw.githubusercontent.com/eightmm/slurm-gpu-tui/refs/heads/main/bootstrap.sh | sudo env SLURM_GPU_TUI_AGENT_DIR=/nfs/sgpu-nodes bash -s -- --role node --mode cpu
+curl -fsSL https://raw.githubusercontent.com/eightmm/oh-my-slurm/refs/heads/main/bootstrap.sh | sudo env SLURM_GPU_TUI_AGENT_DIR=/nfs/sgpu-nodes bash -s -- --role node --mode cpu
 ```
 
 Use `--no-build` and `SGPU_BIN_DIR` for prebuilt binaries. Match the node's

@@ -46,7 +46,7 @@ fn positive(raw: &str) -> std::result::Result<usize, String> {
 #[derive(Parser)]
 #[command(
     name = "sgpu",
-    about = "Push-only Slurm GPU operations monitor. No arguments: interactive TUI.",
+    about = "Oh My Slurm: push-only cluster monitoring and diagnostics. No arguments: interactive TUI.",
     disable_version_flag = true,
     args_conflicts_with_subcommands = true
 )]
