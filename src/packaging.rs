@@ -27,7 +27,7 @@ RestartSec=10
 WantedBy=multi-user.target
 "#;
 
-const BINARIES: &[&str] = &[
+pub(crate) const BINARIES: &[&str] = &[
     "sgpu",
     "sgpu-agent",
     "sgpu-collector",
@@ -78,13 +78,13 @@ pub enum Role {
     Master,
     Node,
 }
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
 pub enum NodeMode {
     Gpu,
     Cpu,
 }
 #[derive(Parser)]
-#[command(version = crate::VERSION, about = "Install or remove native sgpu on this host only")]
+#[command(version = crate::VERSION, about = "Install sgpu; master upgrades also update node publishers")]
 pub struct Args {
     #[command(subcommand)]
     pub command: Action,
@@ -102,6 +102,29 @@ pub enum Action {
         bin_dir: Option<PathBuf>,
         #[arg(long)]
         no_service: bool,
+        #[arg(
+            long,
+            help = "Install only this host; do not publish or deploy node updates"
+        )]
+        local_only: bool,
+        #[arg(
+            long,
+            default_value = "root",
+            value_parser = crate::rollout::ssh_user,
+            help = "Administrative SSH account for legacy nodes; other accounts need noninteractive sudo"
+        )]
+        node_user: String,
+    },
+    #[command(hide = true)]
+    NodeBootstrap {
+        #[arg(long)]
+        bin_dir: Option<PathBuf>,
+        #[arg(long)]
+        agent_dir: PathBuf,
+        #[arg(long, value_enum, default_value = "gpu")]
+        fallback_mode: NodeMode,
+        #[arg(long)]
+        check: bool,
     },
     Uninstall {
         #[arg(long, value_enum, default_value = "master")]
@@ -186,6 +209,7 @@ fn installed_prefix(entry: &Path, name: &str) -> Option<PathBuf> {
     let module = match name {
         "sgpu" => "sgpu.cli",
         "sgpu-collector" => "sgpu.collector",
+        "sgpu-agent" => "sgpu.agent",
         "chkgpu" => "sgpu.quickview",
         _ => return None,
     };
@@ -692,6 +716,7 @@ fn apply_service(
     role: Role,
     mode: NodeMode,
     transaction: &mut Transaction,
+    migrate_from: Option<&Path>,
 ) -> Result<()> {
     if role == Role::Master {
         crate::collector::prepare(&crate::collector::Config::default())?;
@@ -715,7 +740,15 @@ fn apply_service(
                 1024 * 1024,
                 Some(runtime::euid()),
             )?;
-            if !String::from_utf8_lossy(&old).contains(&escape(&prefix.to_string_lossy(), true)?) {
+            let migrating = match migrate_from {
+                Some(p) => {
+                    String::from_utf8_lossy(&old).contains(&escape(&p.to_string_lossy(), true)?)
+                }
+                None => false,
+            };
+            if !String::from_utf8_lossy(&old).contains(&escape(&prefix.to_string_lossy(), true)?)
+                && !migrating
+            {
                 return Err(
                     "service belongs to another installation; select its existing prefix".into(),
                 );
@@ -772,7 +805,7 @@ fn path_links_in(bin: &Path, prefix: &Path, transaction: &mut Transaction) -> Re
         let path = bin.join(name);
         if let Ok(st) = fs::symlink_metadata(&path)
             && (!(st.file_type().is_symlink() && fs::read_link(&path)?.starts_with(prefix))
-                && installed_prefix(&path, name).as_deref() != Some(prefix))
+                && installed_prefix(&path, name).is_none())
         {
             return Err(format!("refusing to replace unrelated {}", path.display()).into());
         }
@@ -825,6 +858,8 @@ fn install(
     role: Role,
     mode: NodeMode,
     no_service: bool,
+    verify_agent: bool,
+    migrate_from: Option<&Path>,
 ) -> Result<()> {
     secure(prefix, 0o755)?;
     let _lock = runtime::Lock::acquire(&prefix.join("install.lock"), Duration::from_secs(5))?;
@@ -859,7 +894,11 @@ fn install(
                 write_slack_config(None)?;
             }
             service_touched = true;
-            apply_service(prefix, role, mode, &mut transaction)?;
+            let started = runtime::now();
+            apply_service(prefix, role, mode, &mut transaction, migrate_from)?;
+            if role == Role::Node && verify_agent {
+                verify_publication(mode, started)?;
+            }
         }
         Ok(())
     })();
@@ -911,19 +950,6 @@ fn install(
     );
     if !no_service {
         println!("Active native command: /usr/local/bin/sgpu (verify with sgpu --version)");
-        if role == Role::Master {
-            // Advertise only after the local installation and service succeeded.
-            let agent = fs::canonicalize(prefix.join("bin/sgpu-agent"))?;
-            match crate::update::publish(&agent) {
-                Ok(()) if crate::update::enabled() => {
-                    println!("Node update published; bootstrapped agents check within 60 seconds.")
-                }
-                Ok(()) => println!("Node automatic updates disabled by configuration."),
-                Err(error) => eprintln!(
-                    "WARNING: local install succeeded, but node update was not published: {error}"
-                ),
-            }
-        }
     }
     Ok(())
 }
@@ -997,6 +1023,287 @@ fn uninstall(prefix: &Path, role: Role, no_service: bool) -> Result<()> {
     );
     Ok(())
 }
+
+fn mode_from_args(args: &[String]) -> Result<NodeMode> {
+    let mut mode = NodeMode::Gpu;
+    for (i, arg) in args.iter().enumerate() {
+        let value = if arg == "--mode" {
+            Some(args.get(i + 1).ok_or("agent mode is missing")?.as_str())
+        } else {
+            arg.strip_prefix("--mode=")
+        };
+        if let Some(value) = value {
+            mode = match value {
+                "cpu" => NodeMode::Cpu,
+                "gpu" => NodeMode::Gpu,
+                _ => return Err("unsupported existing agent mode".into()),
+            };
+        }
+    }
+    Ok(mode)
+}
+
+fn adopt_settings(values: impl IntoIterator<Item = (String, String)>) -> Result<()> {
+    for (name, value) in values {
+        if value.chars().any(char::is_control) || value.len() > 8192 {
+            return Err("invalid existing agent setting".into());
+        }
+        if std::env::var_os(&name).is_none() {
+            // Node bootstrap runs in its own installer process before workers.
+            unsafe {
+                std::env::set_var(name, value);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn agent_settings(pid: u32) -> Result<Vec<(String, String)>> {
+    let (raw, _) = runtime::read_regular(
+        &PathBuf::from(format!("/proc/{pid}/environ")),
+        1024 * 1024,
+        Some(runtime::euid()),
+    )?;
+    let mut out = Vec::new();
+    for field in raw.split(|b| *b == 0) {
+        let Some((name, value)) = std::str::from_utf8(field)
+            .ok()
+            .and_then(|s| s.split_once('='))
+        else {
+            continue;
+        };
+        if name
+            .strip_prefix("SLURM_GPU_TUI_")
+            .is_some_and(|s| s == "AGENT_DIR" || PUBLIC_ENV.contains(&s))
+        {
+            out.push((name.into(), value.into()));
+        }
+    }
+    Ok(out)
+}
+
+fn node_unit() -> Result<Option<(PathBuf, String, Option<u32>)>> {
+    let mut names = vec!["sgpu-agent.service"];
+    for name in ["sgpu-cpu-agent.service", "sgpu-gpu-agent.service"] {
+        if service_dir().join(name).exists() && systemctl(&["is-active", "--quiet", name]).is_ok() {
+            names.push(name);
+        }
+    }
+    for name in names {
+        let path = service_dir().join(name);
+        if !path.exists() {
+            continue;
+        }
+        let (bytes, st) = runtime::read_regular(&path, 1024 * 1024, Some(runtime::euid()))?;
+        if st.mode() & 0o022 != 0 {
+            return Err("untrusted existing node service".into());
+        }
+        let unit = String::from_utf8(bytes)?;
+        let raw = unit
+            .lines()
+            .find_map(|s| s.trim().strip_prefix("ExecStart="))
+            .ok_or("existing node service has no executable")?;
+        let executable = if let Some(quoted) = raw.strip_prefix('"') {
+            quoted.split('"').next().unwrap_or("")
+        } else {
+            raw.split_whitespace().next().unwrap_or("")
+        };
+        let executable = PathBuf::from(executable.replace("%%", "%").replace("$$", "$"));
+        let prefix = installed_prefix(&executable, "sgpu-agent")
+            .or_else(|| {
+                let venv = executable.parent()?.parent()?;
+                (venv.file_name()? == ".venv"
+                    && runtime::read_regular(
+                        &venv.join("pyvenv.cfg"),
+                        65536,
+                        Some(runtime::euid()),
+                    )
+                    .is_ok())
+                .then(|| venv.parent().map(Path::to_path_buf))
+                .flatten()
+            })
+            .ok_or("unrecognized node service; preserve its installation before migrating")?;
+        let mut query = Command::new("systemctl");
+        query.args(["show", "--property=MainPID", "--value", name]);
+        let pid = process::capture(&mut query, Duration::from_secs(10), 1024)
+            .ok()
+            .and_then(|b| std::str::from_utf8(&b).ok()?.trim().parse::<u32>().ok())
+            .filter(|p| *p > 1);
+        return Ok(Some((prefix, unit, pid)));
+    }
+    Ok(None)
+}
+
+fn verify_publication(mode: NodeMode, started: f64) -> Result<()> {
+    let config = crate::collector::Config::default();
+    let name = runtime::hostname()?;
+    let kind = if mode == NodeMode::Cpu { "cpu" } else { "gpu" };
+    let begin = std::time::Instant::now();
+    while begin.elapsed() < Duration::from_secs(90) {
+        if let Ok((payload, stamp)) =
+            crate::collector::read_payload(&config, &name, kind, runtime::now())
+            && payload.release == crate::VERSION
+            && stamp >= started - 1.0
+        {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    Err("new agent did not publish the expected fresh telemetry".into())
+}
+
+fn node_bootstrap(
+    source: &Path,
+    fallback_dir: &Path,
+    fallback_mode: NodeMode,
+    check: bool,
+) -> Result<()> {
+    let service = node_unit()?;
+    if let Some((_, unit, pid)) = &service {
+        if let Some(pid) = pid {
+            adopt_settings(agent_settings(*pid)?)?;
+        }
+        adopt_settings(inherited_settings(unit, Role::Node)?)?;
+    }
+    let previous = crate::agent::local_agent()?;
+    let old_settings = if let Some(agent) = &previous {
+        agent_settings(agent.pid)?
+    } else {
+        Vec::new()
+    };
+    adopt_settings(old_settings.clone())?;
+    let mode = if let Some(agent) = &previous {
+        mode_from_args(&agent.args)?
+    } else if let Some((_, unit, _)) = &service {
+        mode_from_args(
+            &unit
+                .lines()
+                .find_map(|s| s.strip_prefix("ExecStart="))
+                .unwrap_or("")
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+        )?
+    } else {
+        fallback_mode
+    };
+    if std::env::var_os("SLURM_GPU_TUI_AGENT_DIR").is_none() {
+        let directory = if previous.is_some() || service.is_some() {
+            runtime::agent_dir()
+        } else {
+            fallback_dir.to_owned()
+        };
+        adopt_settings([(
+            "SLURM_GPU_TUI_AGENT_DIR".into(),
+            directory.to_string_lossy().into_owned(),
+        )])?;
+    }
+    if !runtime::agent_dir().is_absolute() {
+        return Err("node publication directory must be absolute".into());
+    }
+    let existing = discover_prefix(Path::new("/usr/local/bin"))
+        .or_else(|| service.as_ref().map(|(p, _, _)| p.clone()));
+    let mut prefix = existing.clone().unwrap_or_else(|| "/opt/sgpu".into());
+    if runtime::open_dir(&prefix).is_ok_and(|f| runtime::is_nfs(&f)) {
+        prefix = "/opt/sgpu".into();
+        println!(
+            "Moving node executables to local {}; shared installation is preserved",
+            prefix.display()
+        );
+    }
+    let candidate = source.join("sgpu-agent");
+    let (bytes, st) = runtime::read_regular(&candidate, 128 * 1024 * 1024, Some(runtime::euid()))?;
+    if st.mode() & 0o022 != 0 || !bytes.starts_with(b"\x7fELF") {
+        return Err("untrusted node candidate".into());
+    }
+    let scratch = crate::rollout::Scratch::new()?;
+    let mut probe = Command::new(&candidate);
+    probe
+        .args([
+            "--once",
+            "--mode",
+            if mode == NodeMode::Cpu { "cpu" } else { "gpu" },
+        ])
+        .env("SLURM_GPU_TUI_AGENT_DIR", scratch.0.join("data"))
+        .env("SLURM_GPU_TUI_AGENT_RUNTIME_DIR", scratch.0.join("runtime"));
+    process::capture(&mut probe, Duration::from_secs(90), 65536)?;
+    let probe_config = crate::collector::Config {
+        agents: scratch.0.join("data"),
+        trusted: BTreeSet::from([runtime::euid()]),
+        ..Default::default()
+    };
+    let (sample, _) = crate::collector::read_payload(
+        &probe_config,
+        &runtime::hostname()?,
+        if mode == NodeMode::Cpu { "cpu" } else { "gpu" },
+        runtime::now(),
+    )
+    .map_err(|_| "node candidate did not produce valid telemetry during preflight")?;
+    if sample.release != crate::VERSION {
+        return Err("node candidate version does not match the installer".into());
+    }
+    println!(
+        "Node preflight passed: {:?}, prefix {}",
+        mode,
+        prefix.display()
+    );
+    if check {
+        return Ok(());
+    }
+    let rollback = previous
+        .as_ref()
+        .filter(|agent| agent.args.iter().any(|a| a == "--daemon"))
+        .and_then(|agent| {
+            agent
+                .args
+                .iter()
+                .find(|a| Path::new(a).file_name().is_some_and(|n| n == "sgpu-agent"))
+        })
+        .map(|path| -> Result<PathBuf> {
+            let path = fs::canonicalize(path)?;
+            let (bytes, st) =
+                runtime::read_regular(&path, 128 * 1024 * 1024, Some(runtime::euid()))?;
+            if st.mode() & 0o022 != 0
+                || !(bytes.starts_with(b"\x7fELF")
+                    || installed_prefix(&path, "sgpu-agent").is_some())
+            {
+                return Err("previous daemon cannot be safely restored".into());
+            }
+            Ok(path)
+        })
+        .transpose()?;
+    let result = install(
+        &prefix,
+        source,
+        Role::Node,
+        mode,
+        false,
+        true,
+        existing.as_deref(),
+    );
+    if let Err(error) = result {
+        if let Some(executable) = rollback
+            && !background_running(Role::Node)?
+        {
+            let mut restart = Command::new(executable);
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("SLURM_GPU_TUI_") {
+                    restart.env_remove(key);
+                }
+            }
+            restart.envs(old_settings).args([
+                "--daemon",
+                "--mode",
+                if mode == NodeMode::Cpu { "cpu" } else { "gpu" },
+            ]);
+            process::capture(&mut restart, Duration::from_secs(15), 65536)
+                .map_err(|e| format!("{error}; previous publisher restart also failed: {e}"))?;
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 pub fn run(args: Args) -> Result<()> {
     if runtime::euid() != 0 {
         return Err("installation and configuration require root (sudo)".into());
@@ -1008,6 +1315,8 @@ pub fn run(args: Args) -> Result<()> {
             prefix,
             bin_dir,
             no_service,
+            local_only,
+            node_user,
         } => {
             let explicit = prefix.is_some();
             let prefix = prefix_path(prefix)?;
@@ -1020,8 +1329,48 @@ pub fn run(args: Args) -> Result<()> {
                     prefix.display()
                 );
             }
-            install(&prefix, &source_dir(bin_dir)?, role, mode, no_service)
+            install(
+                &prefix,
+                &source_dir(bin_dir)?,
+                role,
+                mode,
+                no_service,
+                false,
+                None,
+            )?;
+            if role == Role::Master && !no_service && !local_only && crate::update::enabled() {
+                let agent = fs::canonicalize(prefix.join("bin/sgpu-agent"))?;
+                let published = match crate::update::publish(&agent) {
+                    Ok(()) => {
+                        println!("Node update published; checking all Slurm nodes.");
+                        true
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "Node channel unavailable: {error}; using administrative deployment."
+                        );
+                        false
+                    }
+                };
+                crate::rollout::run(&prefix, &node_user, published)?;
+            } else if role == Role::Master && !no_service {
+                println!(
+                    "Node updates skipped ({})",
+                    if local_only {
+                        "--local-only"
+                    } else {
+                        "AGENT_AUTO_UPDATE disabled"
+                    }
+                );
+            }
+            Ok(())
         }
+        Action::NodeBootstrap {
+            bin_dir,
+            agent_dir,
+            fallback_mode,
+            check,
+        } => node_bootstrap(&source_dir(bin_dir)?, &agent_dir, fallback_mode, check),
         Action::Uninstall {
             role,
             prefix,
@@ -1044,6 +1393,50 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, body).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn existing_mode_and_recognized_command_migration_are_preserved() {
+        assert_eq!(
+            mode_from_args(&[
+                "sgpu-agent".into(),
+                "--daemon".into(),
+                "--mode".into(),
+                "cpu".into()
+            ])
+            .unwrap(),
+            NodeMode::Cpu
+        );
+        assert_eq!(
+            mode_from_args(&["sgpu-agent".into(), "--mode=gpu".into()]).unwrap(),
+            NodeMode::Gpu
+        );
+        assert!(mode_from_args(&["--mode".into()]).is_err());
+        assert!(mode_from_args(&["--mode=other".into()]).is_err());
+        let tmp = tempfile::tempdir().unwrap();
+        let public = tmp.path().join("public");
+        let old = tmp.path().join("shared");
+        let new = tmp.path().join("local");
+        fs::create_dir(&public).unwrap();
+        runtime::secure_dir(&public, 0o755).unwrap();
+        write_owned(&old.join("bin/sgpu"), b"\x7fELFold");
+        write_owned(
+            &old.join(".sgpu-native-install"),
+            br#"{"version":1,"roles":["node"]}"#,
+        );
+        symlink(old.join("bin/sgpu"), public.join("sgpu")).unwrap();
+        let mut transaction = Transaction::default();
+        path_links_in(&public, &new, &mut transaction).unwrap();
+        assert_eq!(
+            fs::read_link(public.join("sgpu")).unwrap(),
+            new.join("bin/sgpu")
+        );
+        transaction.rollback().unwrap();
+        assert_eq!(
+            fs::read_link(public.join("sgpu")).unwrap(),
+            old.join("bin/sgpu")
+        );
+        assert_eq!(fs::read(old.join("bin/sgpu")).unwrap(), b"\x7fELFold");
     }
     #[test]
     fn previous_wrappers_are_discovered_for_symlink_and_regular_entries() {

@@ -48,10 +48,13 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/oh-my-slurm/refs/heads/main
 
 Run on the master as root. Requires Linux, git and a C compiler; Rust is prepared
 when needed. Run again to upgrade while keeping existing paths, state and Slack
-settings. Users run `sgpu`.
+settings. The same command publishes and verifies node-agent updates, including
+legacy-agent migration using existing administrative SSH access. Failed nodes
+are listed and make the command exit unsuccessfully. Users run `sgpu`.
 
-Nodes publish to a shared filesystem. Follow the [node setup guide](docs/PUSH.md)
-on each node; bootstrapped compatible agents receive [automatic updates](docs/PUSH.md#automatic-agent-updates).
+Nodes publish to a shared filesystem. See [node setup and upgrade requirements](docs/PUSH.md)
+for shared paths, root SSH or remote sudo, and architecture compatibility.
+Use `--local-only` to update only the controller without publishing node updates.
 
 ## Usage
 

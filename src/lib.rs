@@ -20,6 +20,7 @@ pub mod packaging;
 pub mod process;
 pub mod queue;
 pub mod quickview;
+mod rollout;
 pub mod rules;
 pub mod runtime;
 pub mod scheduler;

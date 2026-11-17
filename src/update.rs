@@ -24,7 +24,7 @@ struct Release {
     arch: String,
     bytes: u64,
 }
-fn version(raw: &str) -> Option<[u64; 3]> {
+pub(crate) fn version(raw: &str) -> Option<[u64; 3]> {
     let parts = raw
         .split('.')
         .map(str::parse)

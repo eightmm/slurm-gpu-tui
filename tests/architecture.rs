@@ -13,7 +13,7 @@ fn visit(path: &Path, files: &mut Vec<std::path::PathBuf>) {
 }
 
 #[test]
-fn application_tree_has_no_python_runtime_or_node_request_entrypoint() {
+fn runtime_telemetry_has_no_python_runtime_or_node_requests() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
     for directory in ["src", "tests", "scripts"] {
@@ -42,7 +42,6 @@ fn application_tree_has_no_python_runtime_or_node_request_entrypoint() {
     for file in files.iter().filter(|p| p.starts_with(root.join("src"))) {
         let text = fs::read_to_string(file).unwrap();
         for denied in [
-            "Command::new(\"ssh\")",
             "Command::new(\"scp\")",
             "Command::new(\"srun\")",
             "ControlMaster",
@@ -56,6 +55,22 @@ fn application_tree_has_no_python_runtime_or_node_request_entrypoint() {
                 !text.contains(denied),
                 "{} contains {denied}",
                 file.display()
+            );
+        }
+        if text.contains("Command::new(\"ssh\")") {
+            assert_eq!(
+                file.file_name().unwrap(),
+                "rollout.rs",
+                "administrative SSH must stay in the installer rollout module"
+            );
+        }
+        if matches!(
+            file.file_name().and_then(|s| s.to_str()),
+            Some("agent.rs" | "collector.rs" | "update.rs")
+        ) {
+            assert!(
+                !text.contains("rollout::"),
+                "runtime telemetry must not invoke administrative rollout"
             );
         }
     }

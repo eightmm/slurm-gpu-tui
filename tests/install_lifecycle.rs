@@ -59,6 +59,100 @@ fn success(output: Output) {
 
 #[test]
 #[ignore = "requires root; scripts/check.sh runs these with sudo when available"]
+fn node_bootstrap_preflight_preserves_legacy_cpu_daemon_and_rejects_bad_candidate() {
+    use std::{
+        io::Write,
+        process::Stdio,
+        time::{Duration, Instant},
+    };
+    let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime_dir = root.path().join("runtime");
+    fs::create_dir(&runtime_dir).unwrap();
+    let legacy = root.path().join("sgpu-agent");
+    let mut cc = Command::new("cc")
+        .args(["-x", "c", "-o"])
+        .arg(&legacy)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    cc.stdin.take().unwrap().write_all(br#"#include <sys/file.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+int main(void) {
+ char path[4096];
+ snprintf(path,sizeof(path),"%s/sgpu-agent-0.lock",getenv("SLURM_GPU_TUI_AGENT_RUNTIME_DIR"));
+ int fd=open(path,O_RDWR|O_CREAT,0600);
+ if(fd<0 || flock(fd,LOCK_EX|LOCK_NB))return 2;
+ FILE *ready=fopen(getenv("SGPU_TEST_READY"),"w"); if(!ready)return 3;fputs("ready",ready);fclose(ready);
+ for(;;)sleep(1);
+}
+"#).unwrap();
+    assert!(cc.wait().unwrap().success());
+    let ready = root.path().join("ready");
+    struct Guard(std::process::Child);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = Guard(
+        Command::new(&legacy)
+            .args(["--daemon", "--mode", "cpu"])
+            .env("SLURM_GPU_TUI_AGENT_RUNTIME_DIR", &runtime_dir)
+            .env("SLURM_GPU_TUI_AGENT_DIR", root.path().join("agents"))
+            .env("SGPU_TEST_READY", &ready)
+            .spawn()
+            .unwrap(),
+    );
+    let start = Instant::now();
+    while !ready.exists() {
+        assert!(start.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let binaries = root.path().join("candidate");
+    fs::create_dir(&binaries).unwrap();
+    let candidate = binaries.join("sgpu-agent");
+    fs::copy(env!("CARGO_BIN_EXE_sgpu-agent"), &candidate).unwrap();
+    fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755)).unwrap();
+    let command = || {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_sgpu-install"));
+        cmd.args([
+            "node-bootstrap",
+            "--check",
+            "--fallback-mode",
+            "gpu",
+            "--bin-dir",
+        ])
+        .arg(&binaries)
+        .arg("--agent-dir")
+        .arg(root.path().join("fallback"))
+        .env("SLURM_GPU_TUI_AGENT_RUNTIME_DIR", &runtime_dir)
+        .env("SLURM_GPU_TUI_AGENT_DIR", root.path().join("agents"))
+        .env("SLURM_GPU_TUI_SLACK_BOT_TOKEN", "PRIVATE_TOKEN");
+        cmd
+    };
+    let output = command().output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Cpu"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("PRIVATE_TOKEN"));
+    assert!(child.0.try_wait().unwrap().is_none());
+    fs::copy("/bin/false", &candidate).unwrap();
+    fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!command().output().unwrap().status.success());
+    assert!(child.0.try_wait().unwrap().is_none());
+}
+
+#[test]
+#[ignore = "requires root; scripts/check.sh runs these with sudo when available"]
 fn automatic_agent_updates_activate_and_roll_back_without_losing_cpu_mode_or_stop() {
     use std::{
         io::Write,

@@ -25,7 +25,7 @@ elif command -v sudo >/dev/null && sudo -n true 2>/dev/null; then
 elif [ "${SGPU_REQUIRE_ROOT_TESTS:-0}" = 1 ]; then
     echo "root installer checks require passwordless sudo" >&2; exit 1
 else
-    echo "SKIPPED: four root-only lifecycle checks and one NFS identity check (passwordless sudo unavailable)"
+    echo "SKIPPED: five root-only lifecycle checks and one NFS identity check (passwordless sudo unavailable)"
 fi
 SCRIPTS=(bootstrap.sh scripts/*.sh)
 for script in "${SCRIPTS[@]}"; do bash -n "$script"; done

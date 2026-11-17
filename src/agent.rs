@@ -723,13 +723,18 @@ pub fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
-fn stop_local() -> Result<()> {
+pub(crate) struct LocalAgent {
+    pub pid: u32,
+    pub args: Vec<String>,
+}
+
+pub(crate) fn local_agent() -> Result<Option<LocalAgent>> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
     let lock = runtime::agent_runtime("lock");
     let st = match fs::symlink_metadata(&lock) {
         Ok(st) => st,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
     if !st.is_file() || st.uid() != runtime::euid() {
@@ -772,9 +777,25 @@ fn stop_local() -> Result<()> {
         if !valid {
             return Err("lock holder is not an sgpu agent".into());
         }
-        if unsafe { libc::kill(pid as i32, libc::SIGTERM) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
+        let args = args
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| std::str::from_utf8(s).map(str::to_owned))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        return Ok(Some(LocalAgent { pid, args }));
+    }
+    Ok(None)
+}
+
+fn stop_local() -> Result<()> {
+    if let Some(agent) = local_agent()?
+        && unsafe { libc::kill(agent.pid as i32, libc::SIGTERM) } != 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let lock = runtime::agent_runtime("lock");
+    if !lock.exists() {
+        return Ok(());
     }
     let _lock = runtime::Lock::acquire(&lock, Duration::from_secs(60))?;
     Ok(())

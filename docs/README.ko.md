@@ -48,10 +48,13 @@ curl -fsSL https://raw.githubusercontent.com/eightmm/oh-my-slurm/refs/heads/main
 
 마스터에서 root로 실행합니다. Linux·git·C 컴파일러가 필요하며 Rust는 필요 시
 준비합니다. 다시 실행하면 기존 경로·상태·Slack 설정을 유지하며 업그레이드합니다.
+같은 명령이 노드 agent 갱신도 확인하고, 구형 agent는 기존 관리자 SSH 권한으로
+최초 전환합니다. 실패한 노드는 목록과 실패 종료 코드로 표시합니다.
 일반 사용자는 `sgpu`를 실행하면 됩니다.
 
-각 노드는 공유 파일시스템에 결과를 게시합니다. [노드 설정 가이드](PUSH.md)를 따라
-설치하면 호환되는 agent는 이후 [자동 업데이트](PUSH.md#automatic-agent-updates)를 받습니다.
+각 노드는 공유 파일시스템에 결과를 게시하며 설치 후에는 자동 업데이트를 받습니다.
+[노드 설정 가이드](PUSH.md)에 공유 경로·관리자 SSH/원격 sudo·호환성 조건이 있습니다.
+`--local-only`는 노드 업데이트를 게시하지 않고 마스터만 갱신합니다.
 
 ## 사용법
 

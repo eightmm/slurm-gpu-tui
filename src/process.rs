@@ -101,18 +101,41 @@ pub(crate) fn run_with_env(
 pub fn capture(command: &mut Command, timeout: Duration, limit: usize) -> Result<Vec<u8>> {
     capture_until(command, timeout, limit, STOPPED.get().map(Arc::as_ref))
 }
+pub(crate) fn capture_file(
+    command: &mut Command,
+    input: std::fs::File,
+    timeout: Duration,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    capture_input(
+        command,
+        timeout,
+        limit,
+        STOPPED.get().map(Arc::as_ref),
+        Some(input),
+    )
+}
 fn capture_until(
     command: &mut Command,
     timeout: Duration,
     limit: usize,
     stopped: Option<&AtomicBool>,
 ) -> Result<Vec<u8>> {
+    capture_input(command, timeout, limit, stopped, None)
+}
+fn capture_input(
+    command: &mut Command,
+    timeout: Duration,
+    limit: usize,
+    stopped: Option<&AtomicBool>,
+    input: Option<std::fs::File>,
+) -> Result<Vec<u8>> {
     let cancelled = || stopped.is_some_and(|flag| flag.load(Ordering::Relaxed));
     if cancelled() {
         return Err("command cancelled during shutdown".into());
     }
     command
-        .stdin(Stdio::null())
+        .stdin(input.map_or_else(Stdio::null, Stdio::from))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
@@ -205,6 +228,25 @@ fn capture_until(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_input_is_streamed_without_losing_binary_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bundle");
+        let bytes = b"bundle\0binary\xff\n";
+        std::fs::write(&path, bytes).unwrap();
+        let mut command = Command::new("cat");
+        assert_eq!(
+            capture_file(
+                &mut command,
+                std::fs::File::open(path).unwrap(),
+                Duration::from_secs(2),
+                1024
+            )
+            .unwrap(),
+            bytes
+        );
+    }
 
     #[test]
     fn shutdown_cancels_the_command_group_and_prevents_new_commands() {

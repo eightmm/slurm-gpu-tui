@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and install native binaries on this host only.
+# Build locally; master installations also reconcile node publishers.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD=1
@@ -8,8 +8,8 @@ for arg in "$@"; do
     case "$arg" in
         --no-build) BUILD=0 ;;
         -h|--help)
-            echo "usage: $0 [--no-build] [--role master|node] [--mode gpu|cpu] [--prefix PATH] [--no-service]"
-            echo "SGPU_BIN_DIR selects prebuilt binaries. Run node installation locally on each node."
+            echo "usage: $0 [--no-build] [--role master|node] [--mode gpu|cpu] [--prefix PATH] [--no-service] [--local-only] [--node-user USER]"
+            echo "SGPU_BIN_DIR selects prebuilt binaries. Master installs also update node publishers."
             exit 0 ;;
         *) ARGS+=("$arg") ;;
     esac

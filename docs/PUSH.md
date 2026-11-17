@@ -4,8 +4,9 @@ See [mixed-cluster compatibility](COMPATIBILITY.md) for Slurm, distribution,
 GPU/driver and native-binary boundaries.
 
 The only telemetry transport is node → shared filesystem → collector.
-Install a supervised publisher locally on every node. The application never
-opens a master-to-node session or repairs a publisher when data stops.
+The master installation command installs or upgrades node publishers when
+needed. Administrative SSH belongs to the installer; the collector and running
+agents never initiate remote repairs or request telemetry from nodes.
 
 ## Local setup
 
@@ -17,10 +18,10 @@ the published JSON files and automatic-update channel need the shared filesystem
 # Master host
 curl -fsSL https://raw.githubusercontent.com/eightmm/oh-my-slurm/refs/heads/main/bootstrap.sh | sudo env SLURM_GPU_TUI_AGENT_DIR=/nfs/sgpu-nodes bash -s -- --role master
 
-# Each GPU node, locally
+# Optional manual installation on a GPU node
 curl -fsSL https://raw.githubusercontent.com/eightmm/oh-my-slurm/refs/heads/main/bootstrap.sh | sudo env SLURM_GPU_TUI_AGENT_DIR=/nfs/sgpu-nodes bash -s -- --role node --mode gpu
 
-# Each CPU-only node, locally
+# Optional manual installation on a CPU-only node
 curl -fsSL https://raw.githubusercontent.com/eightmm/oh-my-slurm/refs/heads/main/bootstrap.sh | sudo env SLURM_GPU_TUI_AGENT_DIR=/nfs/sgpu-nodes bash -s -- --role node --mode cpu
 ```
 
@@ -71,13 +72,42 @@ untrusted telemetry or build timestamps.
 
 ## Automatic agent updates
 
-Install **2.2.0 or later once on each node** using the node commands above.
-Earlier agents cannot acquire this capability from a master upgrade alone.
-After bootstrap, a successful master installation publishes its native agent
+Re-running the README command on the master updates the controller and reconciles
+the Slurm node inventory. Nodes already running the requested version are kept.
+A successful master installation publishes its native agent
 under `<AGENT_DIR>/.sgpu-updates/<architecture>`. The node supervisor checks
 every 60 seconds, copies a newer version to local storage and checks its loader
 and version before switching workers. GPU/CPU mode and the service environment
-are retained. There is no node build, Internet download or master-to-node session.
+are retained. The installer waits up to 70 seconds for existing updaters.
+
+Older publishers, including 1.3 background daemons, need a first supervised
+installation. The same master command bootstraps these nodes using existing
+root SSH access, with four concurrent transfers at most. A non-root administrative
+account can be selected with `--node-user ADMIN`; it needs `sudo -n` on the nodes.
+SSH must already authenticate without a password and trust the host keys. The
+installer does not create credentials, forward an SSH agent or disable host-key
+checking. Failed authentication is reported rather than prompting or being skipped.
+
+One native binary bundle is streamed per bootstrap over SSH, without a node
+build or Internet download. Candidate collection is tested in an isolated
+directory before stopping a publisher. Existing CPU/GPU mode and public settings
+are retained, including the publication directory. Recognized legacy daemons
+are stopped through their node-local lock. Legacy NFS executable prefixes move
+to `/opt/sgpu` on the node; shared files and environments are preserved. The new
+service must publish fresh telemetry before its installation is accepted. A
+normal installation failure restores files/services and restarts a previous
+background publisher when needed.
+
+Every target is reported separately and a fresh trusted payload verifies success.
+An incomplete rollout exits unsuccessfully while retaining the installed master
+and successful nodes. A lost SSH connection is unverified until telemetry proves
+activation; it does not prove remote rollback. Retry the same README command.
+Targets come from Slurm, never from an agent-supplied hostname. Slurm services,
+jobs and scheduler policy are not modified.
+
+`--local-only` updates just this host and skips both node publication and
+administrative deployment. `--no-service` prepares files only and also skips
+nodes. Existing `SLURM_GPU_TUI_AGENT_AUTO_UPDATE=0` disables cluster updates.
 
 The candidate must successfully collect and publish telemetry. Failure to start,
 exit after activation or no successful publication for 120 seconds restores the
@@ -139,9 +169,9 @@ Run `sgpu doctor` on the master. On a stale node, locally inspect
 `systemctl status sgpu-agent`, its journal, mount visibility and write permissions.
 Restart or reinstall on that node after fixing the cause. The collector does not coordinate recovery.
 
-The same setup works for a few workstations. Installing the master alone does
-not install publishers on the other hosts, and identical directory names on
-local disks do not form a shared directory. Use an existing NFS/shared mount,
+The same setup works for a few workstations. Master installation can bootstrap
+publishers through existing administrative SSH, but identical directory names
+on local disks do not form a shared directory. Use an existing NFS/shared mount,
 visible at the same absolute path, for `AGENT_DIR` on every host.
 
 `sgpu once` keeps Slurm allocation/job information visible while marking missing
@@ -203,13 +233,14 @@ unit. Credentials stay in the private Slack configuration.
 | `SLACK_DEBOUNCE_SEC` / `SLACK_NAG_SEC` | `1800` / `21600` | Event / standing-condition debounce |
 
 For a source checkout, use `sudo bash scripts/install.sh`; `scripts/deploy.sh`
-runs the required gate before the local installation. Both require root.
+runs the required gate before installation. Master installations also reconcile
+node publishers; both commands require root.
 The installer reuses a recognized existing installation, including the previous
 Python installation's directory and service settings. A fresh installation uses
 `/opt/sgpu`; `SGPU_INSTALL_DIR` overrides it. Explicit settings in the installing
 environment override inherited service settings. Existing Slack configuration,
 state and the old environment are retained. Check `sgpu --version` to confirm
-that the native command is active (currently **2.3.0**).
+that the native command is active.
 
 Source and prebuilt binaries must match the host architecture and C library.
 Upgrades keep previous releases and persistent state; failed activation attempts
@@ -251,7 +282,8 @@ quota backends and missing records remain unavailable. Network mounts and
 filesystem tree scans are excluded from capacity/quota sampling. No site paths,
 module lists or policy limits are embedded in the application.
 
-Bootstrapped agents pull upgrades; older agents need one local upgrade. Payload v9 and snapshot
+Bootstrapped agents pull upgrades; master installation bootstraps older agents
+through administrative SSH when available. Payload v9 and snapshot
 v1 remain compatible; older agents show unavailable new metrics. Controller
 telemetry comes from the collector host, not from the workstation running the UI.
 

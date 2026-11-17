@@ -198,7 +198,7 @@ impl Drop for NfsIdentity {
     }
 }
 
-fn is_nfs(dir: &File) -> bool {
+pub(crate) fn is_nfs(dir: &File) -> bool {
     let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
     // SAFETY: dir is open and stat is read only after fstatfs initializes it.
     unsafe {

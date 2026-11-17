@@ -14,6 +14,7 @@ single executable is not guaranteed to run on every host.
 | CPU-only nodes | `--mode cpu` samples CPU/RAM/cgroups without NVIDIA commands | GPU samplers currently target NVIDIA; AMD/Intel GPU utilization backends are not implemented |
 | Job cgroups | Per-job CPU/RAM/I/O observations use cgroup v2 | Missing v2 files, including v1-only hosts, leave those job metrics unknown; host memory and scheduler allocation are separate observations |
 | Agent updates | Check architecture, ownership, loader and version; retain the previous worker and roll back failed activation | Different libc versions may reject a candidate; local native installation remains the fallback |
+| Legacy node bootstrap | Master installer uses existing administrative SSH and tests a native bundle before migration | Matching architecture/libc, shared publication and existing root SSH or remote sudo are required; failed nodes are reported |
 | Login display | Cached snapshot, shared/personal scope, optional site hints | Debian/Ubuntu dynamic MOTD and interactive shell hooks are separate integration choices |
 
 NVIDIA's [process-monitoring documentation](https://docs.nvidia.com/deploy/nvidia-smi/#process-monitoring)

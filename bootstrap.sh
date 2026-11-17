@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fetch main and build/install natively on this host.
+# Fetch main, build locally, then install and reconcile node publishers for a master.
 set -euo pipefail
 SOURCE="${SGPU_SOURCE_DIR:-$HOME/.sgpu/source}"
 REPOSITORY="https://github.com/eightmm/oh-my-slurm.git"
@@ -10,7 +10,8 @@ for arg in "$@"; do
         --no-build) BUILD=0 ;;
         -h|--help)
             echo "usage: curl -fsSL https://raw.githubusercontent.com/eightmm/oh-my-slurm/refs/heads/main/bootstrap.sh | sudo bash -s -- [install options]"
-            echo "Options: --role master|node --mode gpu|cpu --prefix PATH --no-service --no-build"
+            echo "Options: --role master|node --mode gpu|cpu --prefix PATH --no-service --no-build --local-only --node-user USER"
+            echo "Master installs also update node agents using the shared channel or existing administrative SSH."
             echo "Requires Linux, git and a C compiler. Missing Rust is installed with rustup (SGPU_INSTALL_RUST=0 disables this)."
             exit 0 ;;
     esac
