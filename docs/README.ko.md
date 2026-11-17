@@ -68,6 +68,7 @@ sgpu host               # 컨트롤러 자원
 sgpu usage 7 --daily     # GPU-hours
 sgpu logs 12345 -e -f    # stderr 따라가기
 sgpu doctor             # 수집 상태 진단
+sgpu welcome            # 게시된 데이터로 짧은 로그인 요약
 ```
 
 | 조작 | 동작 |
@@ -114,6 +115,7 @@ Users의 network/load는 노드 공용 값이며 priority·여유량·예상 시
 | 가이드 | 내용 |
 |---|---|
 | [노드 설정·업그레이드](PUSH.md) | 공유 경로·서비스·설정·문제 해결 |
+| [로그인 요약](LOGIN.md) | 공용·개인 요약과 선택적 MOTD 연결 |
 | [Slack 알림](ALERTS.md) | Bot 설정·일별 스레드·소유자 DM |
 | [Prometheus 지표](METRICS.md) | Textfile 출력·알림 규칙 |
 

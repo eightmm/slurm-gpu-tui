@@ -68,6 +68,8 @@ pub enum Command {
     Version,
     Json,
     Once,
+    #[command(about = "Short login overview from published data only; never queries Slurm")]
+    Welcome(crate::welcome::Options),
     Doctor,
     #[command(about = "Published controller CPU, memory, storage and network snapshot")]
     Host,
@@ -908,6 +910,7 @@ pub fn run(args: Args) -> Result<i32> {
             Ok(0)
         }
         Some(Command::Doctor) => Ok(doctor()),
+        Some(Command::Welcome(options)) => crate::welcome::run(options),
         Some(Command::Failures(options)) => failures(options),
         Some(Command::Queue(options)) => queue(options),
         Some(Command::Explain { jobid }) => {

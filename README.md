@@ -68,6 +68,7 @@ sgpu host               # Controller resources
 sgpu usage 7 --daily     # GPU-hours
 sgpu logs 12345 -e -f    # Follow stderr
 sgpu doctor             # Collection checks
+sgpu welcome            # Short login overview, published data only
 ```
 
 | Control | Action |
@@ -114,6 +115,7 @@ estimates do not guarantee scheduler admission. See [metric interpretation](docs
 | Guide | Covers |
 |---|---|
 | [Node setup and upgrades](docs/PUSH.md) | Shared directories, services, configuration and troubleshooting |
+| [Login summaries](docs/LOGIN.md) | Short shared/personal views and optional MOTD integration |
 | [Slack alerts](docs/ALERTS.md) | Bot setup, daily threads and owner DMs |
 | [Prometheus metrics](docs/METRICS.md) | Textfile output and alert rules |
 

@@ -152,6 +152,76 @@ impl Fixture {
     }
 }
 #[test]
+fn welcome_uses_only_fresh_cached_data_and_keeps_shared_and_personal_output_separate() {
+    let fixture = Fixture::new();
+    let personal = successful(
+        fixture
+            .command()
+            .args(["welcome", "--scope", "personal"])
+            .env("USER", "other-user")
+            .output()
+            .unwrap(),
+    );
+    assert!(personal.contains("MY_CPU_JOB") && personal.contains("MY_PENDING"));
+    assert!(!personal.contains("OTHER_JOB"));
+    let shared = successful(fixture.run(&["welcome", "--scope", "cluster"]));
+    assert!(shared.contains("Oh My Slurm") && shared.contains("fixture-master"));
+    assert!(
+        !shared.contains("MY_CPU_JOB")
+            && !shared.contains("MY_PENDING")
+            && !shared.contains("My jobs")
+    );
+    let colored = successful(fixture.run(&["welcome", "--color", "always"]));
+    assert!(colored.contains("\x1b[38;"));
+    let plain = successful(
+        fixture
+            .command()
+            .args(["welcome", "--color", "auto"])
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap(),
+    );
+    assert!(!plain.contains('\x1b'));
+    for raw in ["{}", "not json", "{\"ts\":\"2000-01-01T00:00:00Z\"}"] {
+        fs::write(fixture.data.join("data.json"), raw).unwrap();
+        let output = successful(fixture.run(&["welcome"]));
+        assert!(output.contains("Snapshot unavailable"), "{output}");
+        assert!(!output.contains("0 running") && !output.contains("MY_CPU_JOB"));
+    }
+    fs::remove_file(fixture.data.join("data.json")).unwrap();
+    assert!(successful(fixture.run(&["welcome"])).contains("Snapshot unavailable"));
+    assert!(!fixture.root.path().join("calls").exists());
+}
+
+#[test]
+fn welcome_rejects_private_or_untrusted_display_settings_and_bounds_narrow_output() {
+    let fixture = Fixture::new();
+    let config = fixture.root.path().join("welcome.json");
+    fs::write(&config, r#"{"title":"PRIVATE_CONFIG_VALUE"}"#).unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    let output = successful(
+        fixture
+            .command()
+            .args(["welcome", "--config", config.to_str().unwrap()])
+            .output()
+            .unwrap(),
+    );
+    assert!(output.contains("Login display settings unavailable"));
+    assert!(!output.contains("PRIVATE_CONFIG_VALUE"));
+    let output = successful(fixture.run(&["welcome", "--width", "16", "--color", "never"]));
+    assert!(
+        output
+            .lines()
+            .all(|line| unicode_width::UnicodeWidthStr::width(line) <= 16)
+    );
+    assert_eq!(
+        fixture.run(&["welcome", "--width", "0"]).status.code(),
+        Some(2)
+    );
+    assert!(!fixture.root.path().join("calls").exists());
+}
+
+#[test]
 fn quick_failure_and_queue_commands_share_the_cli_and_keep_owner_and_window_boundaries() {
     let fixture = Fixture::new();
     let uid = runtime::euid();
