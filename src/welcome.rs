@@ -42,6 +42,7 @@ struct Config {
     title: String,
     notice_file: Option<PathBuf>,
     guide: String,
+    hints: Vec<String>,
 }
 
 fn public_file(path: &std::path::Path, limit: u64) -> Result<Vec<u8>> {
@@ -124,6 +125,14 @@ pub fn run(options: Options) -> Result<i32> {
         }
         if !config.guide.is_empty() {
             lines.push(&format!("Guide: {}", config.guide), Tone::Muted);
+        }
+        for hint in config
+            .hints
+            .iter()
+            .filter(|hint| !hint.trim().is_empty())
+            .take(3)
+        {
+            lines.push(hint, Tone::Muted);
         }
         lines.push("Open: sgpu | chkgpu --summary", Tone::Value);
         lines.push("Jobs: chkqueue --mine | chkfail", Tone::Value);

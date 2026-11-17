@@ -35,13 +35,17 @@ Optional `/etc/sgpu/welcome.json`:
 {
   "title": "Research cluster",
   "notice_file": "/etc/sgpu/notice",
-  "guide": "/path/to/cluster-guide.md"
+  "guide": "/path/to/cluster-guide.md",
+  "hints": ["Apps: module avail | module help NAME", "After a job: seff JOBID"]
 }
 ```
 
 Display configuration and notice files must be root-owned, world-readable,
 regular files, at most 8 KiB, and not writable by other accounts. Symlinks are
 rejected. Invalid settings produce a warning and the default display.
+Up to three nonempty hints can preserve useful site commands without listing all
+installed software. Keep policy hints conditional where administrators or other
+accounts have exceptions; an SSH connection alone does not prove job adoption.
 
 Notices show at most three active lines. Blank lines and `#` comments are skipped;
 `[until 2027-01-31] Maintenance at 18:00` expires after the stated local date.
