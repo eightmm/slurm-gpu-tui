@@ -231,13 +231,24 @@ pub fn attention_in_partition(
     partition: &str,
 ) -> Vec<Attention> {
     let mut out = BTreeMap::<String, Attention>::new();
+    let mut nodes = BTreeMap::new();
+    for node in data
+        .nodes
+        .iter()
+        .filter(|n| n.scheduler_available && n.error.is_empty() && n.scheduler_age_sec <= 30.0)
+    {
+        nodes.entry(node.name.as_str()).or_insert(node);
+    }
+    let included_jobs: BTreeSet<_> = data
+        .jobs
+        .iter()
+        .filter(|j| !partition.is_empty() && j.partition.split(',').any(|p| p == partition))
+        .map(|j| j.jobid.as_str())
+        .collect();
+    let ignored = rules::ignored_users();
+    let mut classifications = BTreeMap::new();
     for waste in rules::waste(&data.nodes, minimum) {
-        let Some(node) = data.nodes.iter().find(|n| {
-            n.name == waste.node
-                && n.scheduler_available
-                && n.error.is_empty()
-                && n.scheduler_age_sec <= 30.0
-        }) else {
+        let Some(&node) = nodes.get(waste.node.as_str()) else {
             continue;
         };
         let Some(index) = node.gpus.iter().position(|g| g.index == waste.gpu) else {
@@ -247,15 +258,15 @@ pub fn attention_in_partition(
             let included = if waste.jobid.is_empty() {
                 node.partition.split(',').any(|p| p == partition)
             } else {
-                data.jobs.iter().any(|j| {
-                    j.jobid == waste.jobid && j.partition.split(',').any(|p| p == partition)
-                })
+                included_jobs.contains(waste.jobid.as_str())
             };
             if !included {
                 continue;
             }
         }
-        let class = rules::classes(node, now)[index];
+        let class = classifications
+            .entry(node.name.as_str())
+            .or_insert_with(|| rules::classes_with_ignored(node, now, &ignored))[index];
         if !matches!(
             (waste.kind.as_str(), class),
             ("idle", rules::Class::Idle)

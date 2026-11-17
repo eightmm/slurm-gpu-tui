@@ -91,8 +91,12 @@ fn memory_percent(node: &Node) -> Option<f64> {
 
 fn clipped(raw: &str, width: u16) -> String {
     let safe = cli::terminal_safe(raw).replace(['\n', '\t'], " ");
+    clipped_safe(&safe, width)
+}
+
+fn clipped_safe(safe: &str, width: u16) -> String {
     if safe.width() <= width as usize {
-        return safe;
+        return safe.into();
     }
     let mut left = (width as usize).saturating_sub(1);
     let mut text = String::new();
@@ -124,6 +128,20 @@ fn column_alignment(tab: usize, compact: bool, column: usize) -> Alignment {
     } else {
         Alignment::Left
     }
+}
+
+fn prepared_rows(state: &TableState, count: usize, height: u16) -> [std::ops::Range<usize>; 2] {
+    let height = height as usize;
+    let offset = state.offset().min(count.saturating_sub(1));
+    let selected = state.selected().map(|s| s.min(count.saturating_sub(1)));
+    // All rows have height one plus optional margins. These windows cover both
+    // the current viewport and any native scroll needed to reveal selection.
+    [
+        offset..offset.saturating_add(height).min(count),
+        selected.map_or(0..0, |s| {
+            s.saturating_sub(height)..s.saturating_add(height).saturating_add(1).min(count)
+        }),
+    ]
 }
 
 fn panel(title: &str) -> Block<'_> {
@@ -668,6 +686,16 @@ struct RelatedView {
     origin: ViewContext,
 }
 
+struct AttentionCache {
+    minimum: u64,
+    ignored: BTreeSet<String>,
+    rows: Vec<crate::users::Attention>,
+}
+struct NodeView {
+    classes: Vec<Class>,
+    visible: bool,
+}
+
 pub struct App {
     pub data: Snapshot,
     pub usage: Option<serde_json::Value>,
@@ -704,6 +732,7 @@ pub struct App {
     job_baseline: Option<BTreeSet<String>>,
     own_baseline: BTreeSet<String>,
     attention_keys: BTreeSet<String>,
+    attention: Option<AttentionCache>,
     usage_scroll: u16,
     down_baseline: BTreeSet<String>,
     observations: VecDeque<(f64, [Option<f64>; 3])>,
@@ -717,6 +746,35 @@ impl Default for App {
     }
 }
 impl App {
+    fn refresh_attention(&mut self) {
+        let minimum = runtime::env_seconds("SLURM_GPU_TUI_WASTE_MIN_SEC", 600.0, 0.0) as u64;
+        let ignored = rules::ignored_users();
+        if self
+            .attention
+            .as_ref()
+            .is_none_or(|cache| cache.minimum != minimum || cache.ignored != ignored)
+        {
+            // Attention uses snapshot timers and allocation. Time-dependent
+            // health only changes Free to Unknown; neither produces Attention.
+            self.attention = Some(AttentionCache {
+                minimum,
+                ignored,
+                rows: crate::users::attention(&self.data, minimum, runtime::now()),
+            });
+        }
+    }
+    pub(crate) fn benchmark_view(
+        &mut self,
+        tab: usize,
+        search: &str,
+        sort: usize,
+        job_sort: job_view::Sort,
+    ) {
+        self.tab = tab;
+        self.search = search.into();
+        self.sort = sort;
+        self.job_sort = job_sort;
+    }
     pub fn new() -> Self {
         Self::for_user(cli::current_user())
     }
@@ -757,6 +815,7 @@ impl App {
             job_baseline: None,
             own_baseline: BTreeSet::new(),
             attention_keys: BTreeSet::new(),
+            attention: None,
             usage_scroll: 0,
             down_baseline: BTreeSet::new(),
             observations: VecDeque::new(),
@@ -881,11 +940,7 @@ impl App {
         }
         self.data = data;
         self.rebuild();
-        let attention = crate::users::attention(
-            &self.data,
-            runtime::env_seconds("SLURM_GPU_TUI_WASTE_MIN_SEC", 600.0, 0.0) as u64,
-            now,
-        );
+        let attention = &self.attention.as_ref().unwrap().rows;
         let keys: BTreeSet<_> = attention
             .iter()
             .flat_map(|a| {
@@ -919,6 +974,7 @@ impl App {
         self.rebuild();
     }
     fn node_visible(&self, node: &Node) -> bool {
+        let query = self.search.to_lowercase();
         (self.partition.is_empty() || node.partition.split(',').any(|p| p == self.partition))
             && (self.search.is_empty()
                 || std::iter::once(node.name.as_str())
@@ -928,11 +984,10 @@ impl App {
                             .map(String::as_str)
                             .chain(std::iter::once(g.alloc_user.as_str()))
                     }))
-                    .any(|s| s.to_lowercase().contains(&self.search.to_lowercase())))
+                    .any(|s| s.to_lowercase().contains(&query)))
     }
-    fn gpu_visible(&self, node: &Node, gpu: &Gpu, class: Class) -> bool {
-        self.node_visible(node)
-            && (!self.free_only || class == Class::Free)
+    fn gpu_visible(&self, gpu: &Gpu, class: Class) -> bool {
+        (!self.free_only || class == Class::Free)
             && (self.user_filter().is_empty()
                 || gpu.alloc_user == self.user_filter()
                 || gpu.users.iter().any(|u| u == self.user_filter()))
@@ -1094,6 +1149,8 @@ impl App {
     }
     pub fn rebuild(&mut self) {
         self.hits.clear();
+        self.attention = None;
+        self.refresh_attention();
         let selected = self.selected().map(|r| r.key.clone());
         let now = runtime::now();
         let mut rows = Vec::new();
@@ -1119,50 +1176,45 @@ impl App {
                     self.headers
                         .extend(["Temp", "Power", "JobID", "Job name"].map(str::to_string));
                 }
-                let mut nodes: Vec<_> = self.data.nodes.iter().filter(|n| n.has_gpu).collect();
+                let ignored = rules::ignored_users();
+                let mut nodes: Vec<_> = self
+                    .data
+                    .nodes
+                    .iter()
+                    .filter(|n| n.has_gpu && self.node_visible(n))
+                    .map(|node| {
+                        let classes = rules::classes_with_ignored(node, now, &ignored);
+                        let free = classes.iter().filter(|c| **c == Class::Free).count();
+                        let peak = node
+                            .gpus
+                            .iter()
+                            .filter_map(|g| number(&g.util))
+                            .fold(0.0, f64::max);
+                        let own = node.gpus.iter().any(|g| {
+                            g.alloc_user == self.highlight_user
+                                || g.users.contains(&self.highlight_user)
+                        });
+                        (node, classes, peak, own, free)
+                    })
+                    .collect();
                 nodes.sort_by(|a, b| {
                     match self.sort {
-                        1 => {
-                            let peak = |n: &Node| {
-                                n.gpus
-                                    .iter()
-                                    .filter_map(|g| number(&g.util))
-                                    .fold(0.0, f64::max)
-                            };
-                            peak(b).total_cmp(&peak(a))
-                        }
-                        2 => {
-                            let own = |n: &Node| {
-                                n.gpus.iter().any(|g| {
-                                    g.alloc_user == self.highlight_user
-                                        || g.users.contains(&self.highlight_user)
-                                })
-                            };
-                            own(b).cmp(&own(a))
-                        }
-                        3 => {
-                            let free = |n: &Node| {
-                                rules::classes(n, now)
-                                    .iter()
-                                    .filter(|c| **c == Class::Free)
-                                    .count()
-                            };
-                            free(b).cmp(&free(a))
-                        }
-                        _ => a.name.cmp(&b.name),
+                        1 => b.2.total_cmp(&a.2),
+                        2 => b.3.cmp(&a.3),
+                        3 => b.4.cmp(&a.4),
+                        _ => a.0.name.cmp(&b.0.name),
                     }
-                    .then(a.name.cmp(&b.name))
+                    .then(a.0.name.cmp(&b.0.name))
                 });
                 if self.reverse {
                     nodes.reverse();
                 }
-                for node in nodes {
-                    let classes = rules::classes(node, now);
+                for (node, classes, _, _, _) in nodes {
                     if !node
                         .gpus
                         .iter()
                         .zip(&classes)
-                        .any(|(g, c)| self.gpu_visible(node, g, *c))
+                        .any(|(g, c)| self.gpu_visible(g, *c))
                     {
                         continue;
                     }
@@ -1170,7 +1222,7 @@ impl App {
                         .gpus
                         .iter()
                         .zip(&classes)
-                        .filter(|(g, c)| **c == Class::Free && self.gpu_visible(node, g, **c))
+                        .filter(|(g, c)| **c == Class::Free && self.gpu_visible(g, **c))
                         .count();
                     let state = if node.stale { "STALE" } else { &node.state };
                     let model = node
@@ -1189,7 +1241,7 @@ impl App {
                     let mut group_util = Meter::default();
                     let mut group_vram = Meter::default();
                     for (gpu, class) in node.gpus.iter().zip(&classes) {
-                        if self.gpu_visible(node, gpu, *class) {
+                        if self.gpu_visible(gpu, *class) {
                             group_util.push(
                                 (!node.stale)
                                     .then(|| number(&gpu.util).map(|v| (v, 100.0)))
@@ -1280,7 +1332,7 @@ impl App {
                             .iter()
                             .zip(&classes)
                             .any(|(g, c)| {
-                                self.gpu_visible(node, g, *c)
+                                self.gpu_visible(g, *c)
                                     && (g.alloc_user == self.highlight_user
                                         || (g.alloc_user.is_empty()
                                             && g.users.contains(&self.highlight_user)))
@@ -1305,7 +1357,7 @@ impl App {
                         continue;
                     }
                     for (gpu, class) in node.gpus.iter().zip(classes) {
-                        if !self.gpu_visible(node, gpu, class) {
+                        if !self.gpu_visible(gpu, class) {
                             continue;
                         }
                         let job = node.jobs.iter().find(|j| j.jobid == gpu.alloc_jobid);
@@ -1582,7 +1634,7 @@ impl App {
                 .map(str::to_string)
                 .to_vec();
                 let mut entries: Vec<_> = self.visible_jobs().collect();
-                entries.sort_by(|a, b| self.job_sort.compare(*a, *b, now, self.job_reverse));
+                self.job_sort.sort(&mut entries, now, self.job_reverse);
                 for entry in entries {
                     match entry {
                         Entry::Running(job) => {
@@ -1705,12 +1757,19 @@ impl App {
                 ]
                 .map(str::to_string)
                 .to_vec();
-                for group in crate::users::attention_in_partition(
-                    &self.data,
-                    runtime::env_seconds("SLURM_GPU_TUI_WASTE_MIN_SEC", 600.0, 0.0) as u64,
-                    now,
-                    &self.partition,
-                ) {
+                let filtered;
+                let groups = if self.partition.is_empty() {
+                    &self.attention.as_ref().unwrap().rows
+                } else {
+                    filtered = crate::users::attention_in_partition(
+                        &self.data,
+                        self.attention.as_ref().unwrap().minimum,
+                        now,
+                        &self.partition,
+                    );
+                    &filtered
+                };
+                for group in groups {
                     if !self.user_filter().is_empty() && group.user != self.user_filter() {
                         continue;
                     }
@@ -1893,7 +1952,7 @@ impl App {
             })
             .collect()
     }
-    fn draw_dashboard(&self, frame: &mut Frame, area: Rect) {
+    fn draw_dashboard(&self, frame: &mut Frame, area: Rect, views: &[NodeView]) {
         if area.height < 3 || area.width < 50 {
             return;
         }
@@ -1903,12 +1962,12 @@ impl App {
         let mut cpu = Meter::default();
         let mut memory = Meter::default();
         let mut mapped = Vec::new();
-        for node in &self.data.nodes {
+        for (node, view) in self.data.nodes.iter().zip(views) {
             let visible: Vec<_> = node
                 .gpus
                 .iter()
-                .zip(rules::classes(node, now))
-                .filter(|(gpu, class)| self.gpu_visible(node, gpu, *class))
+                .zip(view.classes.iter().copied())
+                .filter(|(gpu, class)| view.visible && self.gpu_visible(gpu, *class))
                 .collect();
             for (gpu, _) in &visible {
                 let fresh = !node.stale && node.observed_at > 0.0;
@@ -1929,7 +1988,7 @@ impl App {
             let included = if self.tab == 0 {
                 mapped.last().is_some_and(|(n, _)| n.name == node.name)
             } else {
-                self.node_visible(node)
+                view.visible
                     && (self.user_filter().is_empty()
                         || node.jobs.iter().any(|j| j.user == self.user_filter()))
             };
@@ -2039,6 +2098,7 @@ impl App {
         );
     }
     pub fn draw(&mut self, frame: &mut Frame) {
+        self.refresh_attention();
         let compact = frame.area().width < 130;
         let narrow = frame.area().width < 100;
         if compact != self.compact || narrow != self.narrow {
@@ -2100,12 +2160,26 @@ impl App {
         .map(str::to_string);
         tab_bar(frame, heading[1], &labels, self.tab, &mut self.hits, false);
         self.hits.scroll = areas[3];
-        self.draw_dashboard(frame, areas[1]);
+        let now = runtime::now();
+        let ignored = rules::ignored_users();
+        let views: Vec<_> = if self.tab == 6 {
+            Vec::new()
+        } else {
+            self.data
+                .nodes
+                .iter()
+                .map(|node| NodeView {
+                    classes: rules::classes_with_ignored(node, now, &ignored),
+                    visible: self.node_visible(node),
+                })
+                .collect()
+        };
+        self.draw_dashboard(frame, areas[1], &views);
         let mut free = 0;
         let mut total = 0;
-        for node in &self.data.nodes {
-            for (gpu, class) in node.gpus.iter().zip(rules::classes(node, runtime::now())) {
-                if self.gpu_visible(node, gpu, class) {
+        for (node, view) in self.data.nodes.iter().zip(&views) {
+            for (gpu, class) in node.gpus.iter().zip(view.classes.iter().copied()) {
+                if view.visible && self.gpu_visible(gpu, class) {
                     total += 1;
                     free += usize::from(class == Class::Free);
                 }
@@ -2248,11 +2322,7 @@ impl App {
             .iter()
             .filter(|j| j.user == self.highlight_user)
             .count();
-        let attention = crate::users::attention(
-            &self.data,
-            runtime::env_seconds("SLURM_GPU_TUI_WASTE_MIN_SEC", 600.0, 0.0) as u64,
-            runtime::now(),
-        );
+        let attention = &self.attention.as_ref().unwrap().rows;
         let attention_count: usize = attention.iter().map(|r| r.total()).sum();
         summary[0].spans.push(Span::styled(
             format!(" · ! {attention_count} [5]"),
@@ -2479,7 +2549,18 @@ impl App {
                     );
                 }
             }
+            let prepared = prepared_rows(
+                &self.table,
+                self.rows.len(),
+                table_area.height.saturating_sub(1),
+            );
             let rows = self.rows.iter().enumerate().map(|(index, row)| {
+                let margin = u16::from(
+                    spaced_rows && self.tab == 0 && index > 0 && row.key.starts_with("node:"),
+                );
+                if !prepared.iter().any(|range| range.contains(&index)) {
+                    return Row::new(std::iter::empty::<Cell>()).top_margin(margin);
+                }
                 let cells = visible_columns
                     .iter()
                     .enumerate()
@@ -2491,7 +2572,7 @@ impl App {
                         } else {
                             cli::terminal_safe(text)
                         }
-                        .replace('\n', " ");
+                        .replace(['\n', '\t'], " ");
                         let mut style = if focused {
                             Style::default().fg(FOCUS).add_modifier(Modifier::BOLD)
                         } else {
@@ -2505,7 +2586,7 @@ impl App {
                         }
                         Some(
                             Cell::from(
-                                Line::from(clipped(&text, cell_areas[position].width))
+                                Line::from(clipped_safe(&text, cell_areas[position].width))
                                     .alignment(column_alignment(self.tab, self.compact, *column)),
                             )
                             .style(style),
@@ -2520,9 +2601,7 @@ impl App {
                     } else {
                         style
                     })
-                    .top_margin(u16::from(
-                        spaced_rows && self.tab == 0 && index > 0 && row.key.starts_with("node:"),
-                    ))
+                    .top_margin(margin)
             });
             let table = Table::new(rows, widths)
                 .header(
@@ -4235,6 +4314,108 @@ mod tests {
     use super::*;
     use crate::model::Gpu;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn prepared_rows_match_native_tables_across_margins_scroll_selection_and_resize() {
+        use ratatui::{buffer::Buffer, widgets::StatefulWidget};
+        for count in [0, 1, 64] {
+            for height in [0, 1, 2, 3, 12, 35] {
+                for width in [0, 1, 30] {
+                    for offset in [0, 8, usize::MAX] {
+                        for selected in [None, Some(0), Some(33), Some(usize::MAX)] {
+                            for spaced in [false, true] {
+                                let area = Rect::new(0, 0, width, height);
+                                let initial = TableState::default()
+                                    .with_offset(offset)
+                                    .with_selected(selected);
+                                let prepared =
+                                    prepared_rows(&initial, count, height.saturating_sub(1));
+                                let render = |lazy: bool| {
+                                    let rows = (0..count).map(|i| {
+                                        let cells = if !lazy
+                                            || prepared.iter().any(|range| range.contains(&i))
+                                        {
+                                            vec![format!("row {i} 한글"), format!("value {i}")]
+                                        } else {
+                                            Vec::new()
+                                        };
+                                        Row::new(cells)
+                                            .style(Style::default().bg(if i % 2 == 0 {
+                                                PANEL
+                                            } else {
+                                                BACKGROUND
+                                            }))
+                                            .top_margin(u16::from(spaced && i > 0 && i % 9 == 0))
+                                    });
+                                    let table = Table::new(
+                                        rows,
+                                        [Constraint::Length(16), Constraint::Min(1)],
+                                    )
+                                    .header(Row::new(["name", "value"]))
+                                    .highlight_symbol("▸ ")
+                                    .highlight_spacing(HighlightSpacing::Always)
+                                    .row_highlight_style(Style::default().bg(SELECTED_BG));
+                                    let mut state = initial.clone();
+                                    let mut buffer = Buffer::empty(area);
+                                    table.render(area, &mut buffer, &mut state);
+                                    (buffer, state)
+                                };
+                                assert_eq!(
+                                    render(true),
+                                    render(false),
+                                    "count={count} size={width}x{height} offset={offset} selected={selected:?} spaced={spaced}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn attention_reuse_follows_snapshot_unknowns_and_partition_changes() {
+        let mut data = crate::benchmark::synthetic(2);
+        data.jobs[0].partition = "a".into();
+        data.jobs[1].partition = "b".into();
+        for node in &mut data.nodes {
+            for gpu in &mut node.gpus {
+                gpu.util = "0".into();
+                gpu.mem_used = "0".into();
+                gpu.users.clear();
+                gpu.idle_sec = 900;
+            }
+        }
+        let total = |app: &App| {
+            app.attention
+                .as_ref()
+                .unwrap()
+                .rows
+                .iter()
+                .map(|r| r.total())
+                .sum::<usize>()
+        };
+        let mut app = App::for_user("fixture".into());
+        app.tab = 4;
+        app.apply(data.clone());
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        assert_eq!(total(&app), 16);
+        app.partition = "a".into();
+        app.rebuild();
+        assert_eq!(app.rows[0].cells[1], "8");
+        for gpu in &mut data.nodes[0].gpus {
+            gpu.util.clear();
+        }
+        app.apply(data.clone());
+        terminal.draw(|f| app.draw(f)).unwrap();
+        assert_eq!(total(&app), 8);
+        assert!(app.rows.is_empty());
+        data.nodes[1].stale = true;
+        app.apply(data);
+        terminal.draw(|f| app.draw(f)).unwrap();
+        assert_eq!(total(&app), 0);
+    }
 
     fn jobs_snapshot() -> Snapshot {
         let submitted = |hours: i64| {

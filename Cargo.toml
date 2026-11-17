@@ -1,6 +1,6 @@
 [package]
 name = "sgpu"
-version = "2.4.2"
+version = "2.4.3"
 edition = "2024"
 rust-version = "1.93"
 description = "Monitoring, diagnostics, and everyday tools for Slurm clusters"

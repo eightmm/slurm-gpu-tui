@@ -128,13 +128,21 @@ pub fn health(gpu: &Gpu, now: f64) -> (String, u8) {
 
 pub fn classes(node: &Node, now: f64) -> Vec<Class> {
     let ignored = ignored_users();
+    classes_with_ignored(node, now, &ignored)
+}
+
+pub(crate) fn classes_with_ignored(
+    node: &Node,
+    now: f64,
+    ignored: &BTreeSet<String>,
+) -> Vec<Class> {
     node.gpus
         .iter()
         .map(|gpu| {
             if node.stale {
                 return Class::Unknown;
             }
-            let class = classify(gpu, &ignored);
+            let class = classify(gpu, ignored);
             if class == Class::Free && (!schedulable(node) || health(gpu, now).1 == 2) {
                 Class::Unknown
             } else {

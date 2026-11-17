@@ -372,6 +372,34 @@ fn cli_commands_use_local_published_state_and_preserve_personal_cpu_jobs() {
             .contains("median_update_render_ms")
     );
     assert_eq!(before, fs::read(fixture.root.path().join("calls")).unwrap());
+    let suite: serde_json::Value = serde_json::from_str(&successful(fixture.run(&[
+        "bench", "--suite", "--nodes", "2", "--jobs", "17", "--repeat", "1",
+    ])))
+    .unwrap();
+    let cases = suite.as_array().unwrap();
+    assert_eq!(cases.len(), 13);
+    let wait = cases.iter().find(|row| row["case"] == "jobs_wait").unwrap();
+    assert_eq!(wait["pending"], 17);
+    for key in [
+        "median_parse_ms",
+        "median_apply_ms",
+        "median_render_ms",
+        "median_update_render_ms",
+    ] {
+        assert!(
+            wait[key]
+                .as_f64()
+                .is_some_and(|n| n.is_finite() && n >= 0.0)
+        );
+    }
+    assert!(!fixture.run(&["bench", "--jobs", "17"]).status.success());
+    assert!(
+        !fixture
+            .run(&["bench", "--suite", "--jobs", "100001"])
+            .status
+            .success()
+    );
+    assert_eq!(before, fs::read(fixture.root.path().join("calls")).unwrap());
     let calls = String::from_utf8(before).unwrap();
     assert!(
         calls

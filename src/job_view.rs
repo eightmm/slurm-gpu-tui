@@ -130,7 +130,42 @@ pub enum Sort {
     Wait,
     Left,
 }
+struct SortKey<'a> {
+    entry: Entry<'a>,
+    priority: Option<u64>,
+    wait: Option<f64>,
+    left: Option<u64>,
+}
 impl Sort {
+    pub fn sort(self, entries: &mut [Entry<'_>], now: f64, reverse: bool) {
+        let mut keys: Vec<_> = entries
+            .iter()
+            .map(|&entry| SortKey {
+                entry,
+                priority: entry.priority(),
+                wait: (self == Self::Wait).then(|| entry.wait(now)).flatten(),
+                left: (self == Self::Left).then(|| entry.left()).flatten(),
+            })
+            .collect();
+        let descending = self.descending() ^ reverse;
+        keys.sort_by(|a, b| {
+            match self {
+                Self::Priority => optional(a.priority, b.priority, descending),
+                Self::User => optional(Some(a.entry.user()), Some(b.entry.user()), descending),
+                Self::Gpu => optional(Some(a.entry.gpus()), Some(b.entry.gpus()), descending),
+                Self::Cpu => optional(Some(a.entry.cpus()), Some(b.entry.cpus()), descending),
+                Self::Wait => optional(a.wait, b.wait, descending),
+                Self::Left => optional(a.left, b.left, descending),
+            }
+            .then_with(|| optional(a.priority, b.priority, true))
+            .then_with(|| a.entry.user().cmp(b.entry.user()))
+            .then_with(|| quickview::natural(a.entry.id(), b.entry.id()))
+        });
+        for (entry, key) in entries.iter_mut().zip(keys) {
+            *entry = key.entry;
+        }
+    }
+
     pub fn next(self) -> Self {
         match self {
             Self::Priority => Self::User,
@@ -206,14 +241,45 @@ mod tests {
         .collect();
         let mut entries: Vec<_> = jobs.iter().map(Entry::Running).collect();
         let ids = |rows: &[Entry<'_>]| rows.iter().map(|e| e.id().to_string()).collect::<Vec<_>>();
-        entries.sort_by(|a, b| Sort::Priority.compare(*a, *b, 0.0, false));
+        Sort::Priority.sort(&mut entries, 0.0, false);
         assert_eq!(ids(&entries), ["5", "2", "3", "10", "4"]);
-        entries.sort_by(|a, b| Sort::Priority.compare(*a, *b, 0.0, true));
+        Sort::Priority.sort(&mut entries, 0.0, true);
         assert_eq!(ids(&entries), ["10", "3", "2", "5", "4"]);
-        entries.sort_by(|a, b| Sort::User.compare(*a, *b, 0.0, false));
+        Sort::User.sort(&mut entries, 0.0, false);
         assert_eq!(ids(&entries), ["2", "3", "4", "5", "10"]);
-        entries.sort_by(|a, b| Sort::User.compare(*a, *b, 0.0, true));
+        Sort::User.sort(&mut entries, 0.0, true);
         assert_eq!(ids(&entries), ["5", "10", "2", "3", "4"]);
+    }
+
+    #[test]
+    fn cached_keys_match_comparison_for_all_sorts_ties_and_missing_values() {
+        let data = crate::benchmark::queued(8, 257);
+        let input: Vec<_> = data
+            .jobs
+            .iter()
+            .map(Entry::Running)
+            .chain(data.pending.iter().map(Entry::Pending))
+            .collect();
+        for sort in [
+            Sort::Priority,
+            Sort::User,
+            Sort::Gpu,
+            Sort::Cpu,
+            Sort::Wait,
+            Sort::Left,
+        ] {
+            for reverse in [false, true] {
+                let mut expected = input.clone();
+                expected.sort_by(|a, b| sort.compare(*a, *b, 0.0, reverse));
+                let mut actual = input.clone();
+                sort.sort(&mut actual, 0.0, reverse);
+                assert_eq!(
+                    actual.iter().map(|e| e.id()).collect::<Vec<_>>(),
+                    expected.iter().map(|e| e.id()).collect::<Vec<_>>(),
+                    "{sort:?} reverse={reverse}"
+                );
+            }
+        }
     }
 
     #[test]

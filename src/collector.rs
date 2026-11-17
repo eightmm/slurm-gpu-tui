@@ -284,6 +284,7 @@ impl Collector {
             .collect();
         owners.extend(sample.records.users.clone());
         let ignored = rules::ignored_users();
+        let jobs_by_node = index_jobs(&sample.jobs, &nodes);
         for node in &mut nodes {
             let kind = if node.has_gpu { "gpu" } else { "cpu" };
             let failure = match read_payload(&self.config, &node.name, kind, now) {
@@ -387,19 +388,13 @@ impl Collector {
                 &mut node.gpus,
                 &ignored,
             );
-            node.jobs = sample
-                .jobs
-                .iter()
-                .filter(|j| {
-                    scheduler::expand_nodes(&j.node).is_some_and(|nodes| nodes.contains(&node.name))
-                })
-                .cloned()
-                .map(|mut job| {
-                    let names = scheduler::expand_nodes(&job.node).unwrap_or_default();
-                    let count = names.len().max(1) as u32;
-                    let offset = names.iter().position(|n| n == &node.name).unwrap_or(0) as u32;
-                    job.cpu_count =
-                        job.cpu_count / count + u32::from(offset < job.cpu_count % count);
+            node.jobs = jobs_by_node
+                .get(&node.name)
+                .into_iter()
+                .flatten()
+                .map(|&(index, cpus)| {
+                    let mut job = sample.jobs[index].clone();
+                    job.cpu_count = cpus;
                     job.detail.clear();
                     job.script.clear();
                     job.log_out.clear();
@@ -471,6 +466,26 @@ impl Collector {
         self.usage.checkpoint(monotonic, force)?;
         Ok(())
     }
+}
+
+fn index_jobs(jobs: &[Job], nodes: &[Node]) -> BTreeMap<String, Vec<(usize, u32)>> {
+    let roster: BTreeSet<_> = nodes.iter().map(|node| node.name.as_str()).collect();
+    let mut out = BTreeMap::<String, Vec<(usize, u32)>>::new();
+    for (index, job) in jobs.iter().enumerate() {
+        let Some(names) = scheduler::expand_nodes(&job.node) else {
+            continue;
+        };
+        let count = names.len().max(1) as u32;
+        for (offset, name) in names.into_iter().enumerate() {
+            if roster.contains(name.as_str()) {
+                out.entry(name).or_default().push((
+                    index,
+                    job.cpu_count / count + u32::from((offset as u32) < job.cpu_count % count),
+                ));
+            }
+        }
+    }
+    out
 }
 
 fn skeleton(gres: &str) -> Vec<Gpu> {
@@ -563,6 +578,11 @@ fn attach_job_samples(
     observations: &BTreeMap<String, Observation>,
     now: f64,
 ) {
+    let node_indices: BTreeMap<_, _> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.name.clone(), i))
+        .collect();
     for job in jobs {
         if job.uid < 0 {
             continue;
@@ -576,10 +596,14 @@ fn attach_job_samples(
                 .unwrap_or(""),
             "JobId",
         );
-        for node in nodes
-            .iter_mut()
-            .filter(|n| expected.contains(&n.name) && !n.stale && n.error.is_empty())
-        {
+        for name in &expected {
+            let Some(&index) = node_indices.get(name) else {
+                continue;
+            };
+            let node = &mut nodes[index];
+            if node.stale || !node.error.is_empty() {
+                continue;
+            }
             let Some(obs) = observations.get(&node.name) else {
                 continue;
             };
@@ -1033,6 +1057,74 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn indexed_jobs_preserve_cpu_remainders_order_and_local_privacy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = config(tmp.path());
+        cfg.share_details = true;
+        let mut input = sample();
+        input.nodes = ["gpu1", "gpu3"]
+            .map(|name| Node {
+                name: name.into(),
+                ..Default::default()
+            })
+            .to_vec();
+        input.jobs = vec![
+            Job {
+                jobid: "42".into(),
+                node: "gpu[1-4]".into(),
+                cpu_count: 13,
+                gpu_count: 2,
+                uid: 1000,
+                detail: "private".into(),
+                script: "script".into(),
+                log_out: "/private/out".into(),
+                log_err: "/private/err".into(),
+                log_status: BTreeMap::from([("out".into(), "private".into())]),
+                ..Default::default()
+            },
+            Job {
+                jobid: "43".into(),
+                node: "gpu1".into(),
+                cpu_count: 7,
+                ..Default::default()
+            },
+            Job {
+                jobid: "44".into(),
+                node: "gpu[4-1]".into(),
+                cpu_count: 12,
+                ..Default::default()
+            },
+        ];
+        let output = Collector::new(cfg).fold(input, runtime::now());
+        assert_eq!(
+            output.nodes[0]
+                .jobs
+                .iter()
+                .map(|j| (j.jobid.as_str(), j.cpu_count))
+                .collect::<Vec<_>>(),
+            [("42", 4), ("43", 7)]
+        );
+        assert_eq!(
+            output.nodes[1]
+                .jobs
+                .iter()
+                .map(|j| (j.jobid.as_str(), j.cpu_count))
+                .collect::<Vec<_>>(),
+            [("42", 3)]
+        );
+        let local = &output.nodes[0].jobs[0];
+        assert_eq!((local.gpu_count, local.uid), (2, 1000));
+        assert!(
+            local.detail.is_empty()
+                && local.script.is_empty()
+                && local.log_out.is_empty()
+                && local.log_err.is_empty()
+                && local.log_status.is_empty()
+        );
+        assert_eq!(output.jobs[0].detail, "private");
     }
 
     #[test]

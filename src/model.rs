@@ -13,11 +13,11 @@ macro_rules! model {
         }
         impl<'de> Deserialize<'de> for $name {
             fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                let raw = Value::deserialize(deserializer)?;
+                let mut raw = Value::deserialize(deserializer)?;
                 let mut model = Self::default();
-                if let Some(fields) = raw.as_object() {
-                    $(if let Some(value) = fields.get(stringify!($field)) {
-                        if let Ok(value) = serde_json::from_value::<$ty>(value.clone()) {
+                if let Some(fields) = raw.as_object_mut() {
+                    $(if let Some(value) = fields.remove(stringify!($field)) {
+                        if let Ok(value) = serde_json::from_value::<$ty>(value) {
                             model.$field = value;
                         }
                     })*
@@ -165,6 +165,24 @@ mod tests {
         assert!(job.priority.is_empty());
         let node: Node = serde_json::from_value(json!({"has_gpu": "malformed"})).unwrap();
         assert!(node.has_gpu);
+        let nested: Snapshot = serde_json::from_value(json!({
+            "version":"bad", "nodes":[null,{"name":"n1","gpus":[{"users":[3],"util":"0","pid_jobid":{"7":"42"}}],"jobs":[{"jobid":"42","uid":1001}]}],
+            "jobs":"bad", "pending":[{"priority":"0","submit_time":null}], "future":{"large":[1,2,3]}
+        })).unwrap();
+        assert_eq!(nested.version, 1);
+        assert_eq!(nested.nodes[0], Node::default());
+        assert_eq!(nested.nodes[1].gpus[0].util, "0");
+        assert!(nested.nodes[1].gpus[0].users.is_empty());
+        assert_eq!(nested.nodes[1].gpus[0].pid_jobid["7"], "42");
+        assert_eq!(nested.nodes[1].jobs[0].uid, 1001);
+        assert!(nested.jobs.is_empty());
+        assert_eq!(nested.pending[0].priority, "0");
+        for raw in [Value::Null, json!(3), json!([])] {
+            assert_eq!(
+                serde_json::from_value::<Snapshot>(raw).unwrap(),
+                Snapshot::default()
+            );
+        }
     }
 
     #[test]

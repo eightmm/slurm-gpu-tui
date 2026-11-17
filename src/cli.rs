@@ -136,6 +136,10 @@ pub enum Command {
         repeat: usize,
         #[arg(long)]
         replay: Option<PathBuf>,
+        #[arg(long, conflicts_with = "replay")]
+        suite: bool,
+        #[arg(long, value_parser=positive, requires = "suite")]
+        jobs: Option<usize>,
     },
     Logs {
         jobid: String,
@@ -1177,7 +1181,13 @@ pub fn run(args: Args) -> Result<i32> {
             nodes,
             repeat,
             replay,
-        }) => match crate::benchmark::run(nodes, repeat, replay.as_deref()) {
+            suite,
+            jobs,
+        }) => match if suite {
+            crate::benchmark::suite(nodes, repeat, jobs.unwrap_or(1000))
+        } else {
+            crate::benchmark::run(nodes, repeat, replay.as_deref())
+        } {
             Ok(rows) => {
                 println!("{}", serde_json::to_string_pretty(&rows)?);
                 Ok(0)
