@@ -62,11 +62,18 @@ pub fn parse_csv(line: &str) -> Vec<String> {
 }
 
 pub fn parse_gpu_query(raw: &str) -> Vec<Gpu> {
+    parse_gpu_fields(raw, false)
+}
+
+fn parse_gpu_fields(raw: &str, basic: bool) -> Vec<Gpu> {
     let mut gpus = Vec::new();
     let mut seen = BTreeSet::new();
     for line in raw.lines().take(65) {
         let p = parse_csv(line);
-        if p.len() < 9 || p[0].parse::<u32>().is_err() || !seen.insert(p[0].clone()) {
+        if p.len() < if basic { 6 } else { 9 }
+            || p[0].parse::<u32>().is_err()
+            || !seen.insert(p[0].clone())
+        {
             continue;
         }
         let field = |i| p.get(i).cloned().unwrap_or_default();
@@ -89,6 +96,42 @@ pub fn parse_gpu_query(raw: &str) -> Vec<Gpu> {
         });
     }
     gpus
+}
+
+fn unsupported_nvidia_option(error: &str) -> bool {
+    let text = error.to_lowercase();
+    [
+        "not a valid field",
+        "invalid field",
+        "unknown field",
+        "unrecognized option",
+        "unknown option",
+        "invalid option",
+        "not supported",
+    ]
+    .iter()
+    .any(|message| text.contains(message))
+}
+
+fn complete_process_sample(raw: &str, gpus: &[Gpu]) -> bool {
+    let header = raw
+        .lines()
+        .filter(|line| line.trim_start().starts_with('#'))
+        .any(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            fields.contains(&"gpu") && fields.contains(&"pid")
+        });
+    let seen: BTreeSet<_> = raw
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .filter_map(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            (fields.len() >= 2
+                && (fields[1] == "-" || fields[1].parse::<u32>().is_ok_and(|pid| pid > 0)))
+            .then(|| fields[0].to_string())
+        })
+        .collect();
+    header && gpus.iter().all(|gpu| seen.contains(&gpu.index))
 }
 
 pub fn read_memory(root: &Path) -> Result<Memory> {
@@ -245,6 +288,8 @@ pub fn topology(gpus: &mut [Gpu], proc_root: &Path, sys_root: &Path) {
 }
 
 pub struct Sampler {
+    basic_gpu_query: bool,
+    process_memory: bool,
     proc_root: PathBuf,
     sys_root: PathBuf,
     telemetry: NodeSampler,
@@ -262,6 +307,8 @@ pub struct Sampler {
 impl Default for Sampler {
     fn default() -> Self {
         Self {
+            basic_gpu_query: false,
+            process_memory: true,
             proc_root: "/proc".into(),
             sys_root: "/sys".into(),
             telemetry: NodeSampler::default(),
@@ -281,22 +328,66 @@ impl Default for Sampler {
 impl Sampler {
     fn gpu(&mut self, monotonic: f64) -> Result<Vec<Gpu>> {
         let fields = "--query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,pci.bus_id,ecc.errors.uncorrected.aggregate.total,serial,clocks.sm,clocks.mem";
+        let basic = "--query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total";
         let timeout = Duration::from_secs_f64(runtime::env_seconds(
             "SLURM_GPU_TUI_AGENT_CMD_TIMEOUT_SEC",
             40.0,
             1.0,
         ));
-        let raw = process::run(
+        let query = if self.basic_gpu_query { basic } else { fields };
+        let raw = match process::run(
             Program::NvidiaSmi,
-            &[fields, "--format=csv,noheader,nounits"],
+            &[query, "--format=csv,noheader,nounits"],
             timeout,
-        )?;
-        let mut gpus = parse_gpu_query(&raw);
+        ) {
+            Err(error)
+                if !self.basic_gpu_query && unsupported_nvidia_option(&error.to_string()) =>
+            {
+                let raw = process::run(
+                    Program::NvidiaSmi,
+                    &[basic, "--format=csv,noheader,nounits"],
+                    timeout,
+                )?;
+                self.basic_gpu_query = true;
+                raw
+            }
+            result => result?,
+        };
+        let mut gpus = parse_gpu_fields(&raw, self.basic_gpu_query);
         if gpus.is_empty() || gpus.len() > 64 {
             return Err("nvidia-smi returned no GPUs or exceeded the GPU limit".into());
         }
-        let pmon = process::run(Program::NvidiaSmi, &["pmon", "-c", "1", "-s", "m"], timeout)?;
-        attach_processes(&mut gpus, &pmon, &self.proc_root);
+        // pmon covers at most sixteen devices per call. Never infer absence of
+        // processes for a GPU that was omitted or could not be sampled.
+        for chunk in gpus.chunks_mut(16) {
+            let indices = chunk
+                .iter()
+                .map(|gpu| gpu.index.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut args = vec!["pmon", "-i", &indices, "-c", "1"];
+            if self.process_memory {
+                args.extend(["-s", "m"]);
+            }
+            let raw = match process::run(Program::NvidiaSmi, &args, timeout) {
+                Err(error)
+                    if self.process_memory && unsupported_nvidia_option(&error.to_string()) =>
+                {
+                    let raw = process::run(
+                        Program::NvidiaSmi,
+                        &["pmon", "-i", &indices, "-c", "1"],
+                        timeout,
+                    )?;
+                    self.process_memory = false;
+                    raw
+                }
+                result => result?,
+            };
+            if !complete_process_sample(&raw, chunk) {
+                return Err("nvidia-smi process sample is incomplete or unsupported; GPU availability is unknown".into());
+            }
+            attach_processes(chunk, &raw, &self.proc_root);
+        }
         let unchanged = gpus.len() == self.topology_cache.len()
             && gpus.iter().all(|g| {
                 self.topology_cache

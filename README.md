@@ -116,6 +116,7 @@ estimates do not guarantee scheduler admission. See [metric interpretation](docs
 |---|---|
 | [Node setup and upgrades](docs/PUSH.md) | Shared directories, services, configuration and troubleshooting |
 | [Login summaries](docs/LOGIN.md) | Short shared/personal views and optional MOTD integration |
+| [Mixed-cluster compatibility](docs/COMPATIBILITY.md) | Slurm versions, GPU/driver fallbacks and native binaries |
 | [Slack alerts](docs/ALERTS.md) | Bot setup, daily threads and owner DMs |
 | [Prometheus metrics](docs/METRICS.md) | Textfile output and alert rules |
 

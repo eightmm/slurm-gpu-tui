@@ -86,6 +86,7 @@ fn maintained_docs_have_resolvable_local_links_and_no_removed_setup() {
         "docs/ALERTS.md",
         "docs/METRICS.md",
         "docs/LOGIN.md",
+        "docs/COMPATIBILITY.md",
     ] {
         let path = root.join(name);
         let text = fs::read_to_string(&path).unwrap();

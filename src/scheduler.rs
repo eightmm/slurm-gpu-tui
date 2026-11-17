@@ -993,6 +993,23 @@ impl Runner for SystemRunner {
 
 pub const QUEUE_FORMAT: &str = "%T|%i|%u|%U|%P|%M|%N|%b|%l|%C|%m|%r|%Q|%S|%V";
 
+fn json_unavailable(error: &str) -> bool {
+    let text = error.to_lowercase();
+    ((text.contains("unrecognized option") || text.contains("unknown option"))
+        && text.contains("json"))
+        || text.contains("invalid option -- '-'")
+        || ((text.contains("application/json") || text.contains("data_parser"))
+            && [
+                "could not find plugin",
+                "couldn't find the specified plugin",
+                "cannot find",
+                "unable to load",
+                "failed to load",
+            ]
+            .iter()
+            .any(|message| text.contains(message)))
+}
+
 #[derive(Clone, Default)]
 pub struct Sample {
     pub nodes: Vec<Node>,
@@ -1085,11 +1102,7 @@ impl Scheduler {
                     Err(error) => backend_error = error.to_string(),
                 },
                 Err(error) => {
-                    let text = error.to_string().to_lowercase();
-                    if (text.contains("unrecognized option") || text.contains("unknown option"))
-                        && text.contains("json")
-                        || text.contains("invalid option -- '-'")
-                    {
+                    if json_unavailable(&error.to_string()) {
                         self.legacy = true;
                     } else {
                         backend_error = error.to_string();
@@ -1189,7 +1202,7 @@ impl Scheduler {
             }
             .into(),
             fallback_reason: if self.legacy {
-                "scontrol --json unsupported".into()
+                "scontrol JSON support unavailable; using verified text records".into()
             } else {
                 String::new()
             },
@@ -1206,6 +1219,79 @@ impl Scheduler {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    struct BackendFixture {
+        json: std::result::Result<&'static str, &'static str>,
+        json_calls: std::sync::atomic::AtomicUsize,
+        text_calls: std::sync::atomic::AtomicUsize,
+    }
+    impl Runner for BackendFixture {
+        fn run(&self, program: Program, args: &[&str], _: Duration) -> Result<String> {
+            use std::sync::atomic::Ordering;
+            match program {
+                Program::Sinfo => Ok("gpu1|idle|16|0|65536|60000|gpu:h100:1|4/12/0/16|gpu".into()),
+                Program::Squeue => Ok(
+                    "RUNNING|42|alice|1001|gpu|00:01|gpu1|gpu:1|01:00:00|4|8G|None|1|N/A".into(),
+                ),
+                Program::Scontrol if args.contains(&"--json") => {
+                    self.json_calls.fetch_add(1, Ordering::Relaxed);
+                    self.json.map(str::to_string).map_err(Into::into)
+                }
+                Program::Scontrol if args.contains(&"job") => {
+                    self.text_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok("JobId=42 JobName=train UserId=alice(1001) JobState=RUNNING NodeList=gpu1 Nodes=gpu1 CPU_IDs=0-3 Mem=8192 GRES=gpu:1(IDX:0)".into())
+                }
+                Program::Scontrol => Ok("NodeName=gpu1 AllocMem=8192".into()),
+                _ => Err("unexpected command".into()),
+            }
+        }
+    }
+
+    #[test]
+    fn missing_json_plugins_use_stable_text_identity_but_transient_or_invalid_json_does_not() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for (reply, fallback) in [
+            (Err("scontrol: unrecognized option '--json'"), true),
+            (
+                Err("serializer_required: could not find plugin for application/json"),
+                true,
+            ),
+            (
+                Err(
+                    "Couldn't find the specified plugin name for data_parser/v0.0.40 looking at all files",
+                ),
+                true,
+            ),
+            (Err("Unable to contact slurm controller"), false),
+            (Ok("{invalid json"), false),
+        ] {
+            let fixture = Arc::new(BackendFixture {
+                json: reply,
+                json_calls: AtomicUsize::new(0),
+                text_calls: AtomicUsize::new(0),
+            });
+            let mut scheduler = Scheduler::new(fixture.clone());
+            for _ in 0..2 {
+                let sample = scheduler.sample();
+                if fallback {
+                    assert_eq!(sample.status.job_backend, "legacy-text");
+                    assert_eq!(sample.records.uids["42"], 1001);
+                    assert_eq!(sample.records.alloc["gpu1"]["0"], "42");
+                } else {
+                    assert_eq!(sample.status.job_backend, "unavailable");
+                    assert!(sample.records.uids.is_empty() && sample.records.alloc.is_empty());
+                }
+            }
+            assert_eq!(
+                fixture.json_calls.load(Ordering::Relaxed),
+                if fallback { 1 } else { 2 }
+            );
+            assert_eq!(
+                fixture.text_calls.load(Ordering::Relaxed),
+                if fallback { 2 } else { 0 }
+            );
+        }
+    }
 
     #[test]
     fn expansion_preserves_padding_and_rejects_bombs_duplicates_and_odd_names() {

@@ -18,7 +18,8 @@ numeric identity, not `$USER`. Job details and logs are never printed.
 
 ## Optional shared MOTD
 
-On a Linux controller where `/usr/local/bin/sgpu` is installed:
+On a Debian/Ubuntu controller configured to run `/etc/update-motd.d`, with
+`/usr/local/bin/sgpu` installed:
 
 ```bash
 sudo install -m 0755 scripts/login-motd.sh /etc/update-motd.d/80-sgpu
@@ -26,8 +27,12 @@ sudo install -m 0755 scripts/login-motd.sh /etc/update-motd.d/80-sgpu
 
 Enable one cluster overview hook at a time to avoid duplicate screens. Preserve
 existing site notices, quota warnings and SSH/job-adoption rules when replacing a
-site hook. The example has a two-second timeout and a one-second kill grace. It
+site hook. The example probes `welcome` and `timeout` capabilities: it uses a two-second limit
+with a one-second kill grace when `-k` works, or a two-second `KILL` limit when
+only `-s` works. It quietly skips the overview without a supported timer. It
 does not change SSH, PAM or scheduler policy. Hook installation is opt-in.
+Other distributions can use an interactive-shell hook below; creating this
+directory alone does not configure PAM to use it.
 
 Optional `/etc/sgpu/welcome.json`:
 
@@ -59,7 +64,9 @@ noninteractive shells remain quiet:
 ```sh
 case $- in
   *i*) if [ -n "${SSH_CONNECTION:-}" ] && [ -t 1 ]; then
-    timeout --kill-after=1 2 sgpu welcome --scope personal || :
+    if command -v timeout >/dev/null 2>&1 && timeout -k 1 1 sgpu welcome --help >/dev/null 2>&1; then
+      timeout -k 1 2 sgpu welcome --scope personal || :
+    fi
   fi ;;
 esac
 ```

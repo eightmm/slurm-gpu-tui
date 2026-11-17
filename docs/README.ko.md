@@ -116,6 +116,7 @@ Users의 network/load는 노드 공용 값이며 priority·여유량·예상 시
 |---|---|
 | [노드 설정·업그레이드](PUSH.md) | 공유 경로·서비스·설정·문제 해결 |
 | [로그인 요약](LOGIN.md) | 공용·개인 요약과 선택적 MOTD 연결 |
+| [혼합 클러스터 호환성](COMPATIBILITY.md) | Slurm 버전·GPU/드라이버 폴백·네이티브 바이너리 범위 |
 | [Slack 알림](ALERTS.md) | Bot 설정·일별 스레드·소유자 DM |
 | [Prometheus 지표](METRICS.md) | Textfile 출력·알림 규칙 |
 

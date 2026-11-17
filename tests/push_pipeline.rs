@@ -91,6 +91,110 @@ impl Cluster {
             .output()
             .unwrap()
     }
+
+    fn gpu_agent(&self, scenario: &str) -> Output {
+        let command = self.bin.join("nvidia-smi");
+        fs::write(&command, r#"#!/bin/sh
+printf 'nvidia-smi %s\n' "$*" >> "$SGPU_TEST_TRACE"
+case "$1" in
+  --query-gpu=*)
+    if [ "$SGPU_NVIDIA_CASE" = permission ]; then echo 'Insufficient permissions' >&2; exit 4; fi
+    case "$1" in *serial*)
+      if [ "$SGPU_NVIDIA_CASE" != many ]; then echo 'Field serial is not a valid field to query' >&2; exit 2; fi ;;
+    esac
+    count=1; [ "$SGPU_NVIDIA_CASE" != many ] || count=18
+    i=0
+    while [ "$i" -lt "$count" ]; do
+      case "$1" in
+        *serial*) printf '%s, GPU-%s, Test GPU, 0, 100, 80000, 60, 200, 300, 00000000:21:00.0, N/A, serial, 1200, 1500\n' "$i" "$i" ;;
+        *) printf '%s, GPU-%s, Test GPU, 0, 100, 80000\n' "$i" "$i" ;;
+      esac
+      i=$((i + 1))
+    done ;;
+  pmon)
+    case "$*" in *'-s m'*)
+      if [ "$SGPU_NVIDIA_CASE" != many ]; then echo 'Memory process statistics not supported' >&2; exit 3; fi ;;
+    esac
+    if [ "$SGPU_NVIDIA_CASE" = unsupported ]; then echo 'Process monitoring not supported' >&2; exit 3; fi
+    printf '# gpu pid type sm mem enc dec command\n'
+    [ "$SGPU_NVIDIA_CASE" != incomplete ] || exit 0
+    shift
+    devices=''
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = -i ]; then devices=$2; shift; fi
+      shift
+    done
+    IFS=,
+    for i in $devices; do printf '%s - - - - - - -\n' "$i"; done ;;
+  --help-query-gpu) exit 0 ;;
+  *) exit 92 ;;
+esac
+"#).unwrap();
+        fs::set_permissions(&command, fs::Permissions::from_mode(0o755)).unwrap();
+        Command::new(env!("CARGO_BIN_EXE_sgpu-agent"))
+            .args(["--mode", "gpu", "--once"])
+            .env("PATH", &self.bin)
+            .env("SGPU_TEST_TRACE", &self.trace)
+            .env("SGPU_NVIDIA_CASE", scenario)
+            .env("SLURM_GPU_TUI_AGENT_DIR", &self.agents)
+            .env(
+                "SLURM_GPU_TUI_AGENT_RUNTIME_DIR",
+                self.root.path().join("runtime"),
+            )
+            .output()
+            .unwrap()
+    }
+}
+
+#[test]
+fn gpu_agent_reduces_optional_queries_and_covers_more_than_sixteen_devices() {
+    for scenario in ["legacy", "many"] {
+        let cluster = Cluster::new();
+        let output = cluster.gpu_agent(scenario);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let files: Vec<_> = fs::read_dir(&cluster.agents).unwrap().flatten().collect();
+        assert_eq!(files.len(), 1);
+        let payload: AgentPayload =
+            serde_json::from_slice(&fs::read(files[0].path()).unwrap()).unwrap();
+        assert!(payload.mem.total.parse::<u64>().unwrap() > 0);
+        assert_eq!(payload.gpus.len(), if scenario == "many" { 18 } else { 1 });
+        let trace = fs::read_to_string(&cluster.trace).unwrap();
+        if scenario == "legacy" {
+            assert!(payload.gpus[0].temp.is_empty() && payload.gpus[0].power.is_empty());
+            assert_eq!(payload.gpus[0].mem_used, "100");
+            assert_eq!(payload.gpus[0].util, "0");
+            assert!(trace.contains("pmon -i 0 -c 1\n"));
+        } else {
+            assert_eq!(payload.gpus[0].temp, "60");
+            assert_eq!(
+                trace
+                    .lines()
+                    .filter(|line| line.starts_with("nvidia-smi pmon"))
+                    .count(),
+                2
+            );
+            assert!(trace.contains("-i 16,17"));
+        }
+        assert!(trace.lines().all(|line| line.starts_with("nvidia-smi ")));
+    }
+}
+
+#[test]
+fn unsupported_or_incomplete_process_views_and_permissions_never_publish_empty_gpu_activity() {
+    for scenario in ["unsupported", "incomplete", "permission"] {
+        let cluster = Cluster::new();
+        let output = cluster.gpu_agent(scenario);
+        assert!(!output.status.success(), "{scenario}");
+        assert_eq!(fs::read_dir(&cluster.agents).unwrap().count(), 0);
+        if scenario == "permission" {
+            let trace = fs::read_to_string(&cluster.trace).unwrap();
+            assert_eq!(trace.lines().count(), 1);
+        }
+    }
 }
 
 #[test]

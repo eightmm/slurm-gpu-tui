@@ -1,5 +1,8 @@
 # Autonomous node publication
 
+See [mixed-cluster compatibility](COMPATIBILITY.md) for Slurm, distribution,
+GPU/driver and native-binary boundaries.
+
 The only telemetry transport is node → shared filesystem → collector.
 Install a supervised publisher locally on every node. The application never
 opens a master-to-node session or repairs a publisher when data stops.
