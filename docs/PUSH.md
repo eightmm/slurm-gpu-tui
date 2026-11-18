@@ -159,15 +159,22 @@ GPU health is capability-gated and cached for at least 10s; topology is cached
 for 300s. In GPU Health, `CAP` means NVIDIA's software power cap is reducing
 clocks to stay within the power limit; the flag alone is informational.
 `THERMAL` and `SLOW` identify separate thermal/hardware clock-limit reasons.
-Power uses local RAPL and optional `ipmitool`. Run
-`scripts/setup-node-power.sh --check` locally for a read-only check, or `--apply` as root
-for local package/module setup. Missing hardware stays unavailable.
+Power uses local RAPL (nested domains including DRAM, wraparound handling, and
+non-`-mmio` preference) with `hwmon` fallbacks (`amd_energy` sockets for CPU
+power; `acpi_power_meter`, `power_meter`, `ibmpowernv` for system power when
+`ipmitool` is absent). Run `scripts/setup-node-power.sh --check` locally for a
+read-only check, or `--apply` as root for local package/module setup. Missing
+hardware stays unavailable.
 
 ## Diagnosis and removal
 
-Run `sgpu doctor` on the master. On a stale node, locally inspect
-`systemctl status sgpu-agent`, its journal, mount visibility and write permissions.
-Restart or reinstall on that node after fixing the cause. The collector does not coordinate recovery.
+Run `sgpu doctor` (or `sgpu doctor --json`) on the master. In addition to
+scheduler and stale-node summaries, it inspects `collector.pid`, `data.json` and
+`metrics.prom` age/sizes, and `SLURM_GPU_TUI_AGENT_DIR` permissions, sticky bit,
+filesystem type (local vs shared) and fresh/stale `*.json` payload counts. On a
+stale node, locally inspect `systemctl status sgpu-agent`, its journal, mount
+visibility and write permissions. Restart or reinstall on that node after fixing
+the cause. The collector does not coordinate recovery.
 
 The same setup works for a few workstations. Master installation can bootstrap
 publishers through existing administrative SSH, but identical directory names
@@ -249,19 +256,25 @@ files only and still requires root.
 
 ## Resource views
 
-The TUI adds Attention, Users and Controller tabs (`5`, `6`, `7`). Nodes are
-spaced without inserting selectable blank rows. `◆` and a teal background mark
-the highlighted account; `--highlight-user USER` sets that display preference
-for an administrator. It does not change the OS identity used for cancellation
-or private logs. `[`/`]` jump between nodes and `0` clears filters. Enter opens
-full values when narrow tables hide auxiliary columns or abbreviate long names.
+The TUI adds Attention, Users, Controller and Partitions tabs (`5`, `6`, `7`,
+`8`), plus interactive sorting (`s`/`S` and clickable `↕` headers) across GPU,
+CPU, Usage, Jobs, Users and Partitions. Nodes are spaced without inserting
+selectable blank rows. `◆` and a teal background mark the highlighted account;
+`--highlight-user USER` sets that display preference for an administrator. It
+does not change the OS identity used for cancellation or private logs. `[`/`]`
+jump between nodes and `0` clears filters. Enter opens Summary/Raw/Script/Log
+details when narrow tables hide auxiliary columns or abbreviate long names, or
+opens partition node/user/pending breakdowns in Partitions.
 
 Users sums fresh, scheduler-validated job cgroup CPU cores, current RAM and
-physical block read/write bytes per second. Block I/O comes from `io.stat`,
-not filesystem ownership scans; cache hits and network-filesystem traffic are
-outside that counter. Each metric keeps its own sampling coverage (`?` missing,
-`~` partial). A readable empty `io.stat` can report a measured zero after two
-samples. Missing files, counter resets and first samples remain unavailable.
+physical block read/write bytes per second, and credits co-owners on shared
+GPUs; Usage proportionally attributes shared-GPU allocation, busy and waste
+time across co-owners alongside live CPU/RAM usage and `sacct` backfill. Block
+I/O comes from `io.stat`, not filesystem ownership scans; cache hits and
+network-filesystem traffic are outside that counter. Each metric keeps its own
+sampling coverage (`?` missing, `~` partial). A readable empty `io.stat` can
+report a measured zero after two samples. Missing files, counter resets and
+first samples remain unavailable.
 
 Node network and load are **shared host values**, never divided into estimated
 per-user traffic. An assigned node is counted once per user even when that user
@@ -273,14 +286,17 @@ shows per-node disk/network rates and 1/5/15-minute load values.
 
 The controller samples its own `/proc` and `/sys` locally at 10-second intervals.
 Disk counters use whole physical devices, excluding partitions and virtual
-device stacks. Filesystem capacity and available VFS user-quota records are
-refreshed by one background worker every 120 seconds, bounded to 16 local
-filesystems and 128 known active/local accounts. Slow storage queries do not
+device stacks. Filesystem capacity/inodes and available VFS user-quota records
+are refreshed by one background worker every 120 seconds, bounded to 32 local or
+shared filesystems (`ext2/3/4`, `xfs`, `btrfs`, `zfs`, `overlay`, `nfs`, `nfs4`,
+`lustre`, `gpfs`, `beegfs`, `weka`, `wekafs`, `ceph`, `panfs`, `fuse.lustre`,
+`fuse.wekafs`) and 128 known active/local accounts. Slow storage queries do not
 block snapshot publication. Samples older than 300 seconds are unavailable;
-sampling limits are marked partial. Quota limits are read, never configured. Unsupported
-quota backends and missing records remain unavailable. Network mounts and
-filesystem tree scans are excluded from capacity/quota sampling. No site paths,
-module lists or policy limits are embedded in the application.
+sampling limits are marked partial. Quota limits (`Q_GETQUOTA`) are read only
+on local `/dev/` block mounts and never configured. Unsupported quota backends
+and missing records remain unavailable, and filesystem tree scans are never
+used. No site paths, module lists or policy limits are embedded in the
+application.
 
 Bootstrapped agents pull upgrades; master installation bootstraps older agents
 through administrative SSH when available. Payload v9 and snapshot

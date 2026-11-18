@@ -121,6 +121,7 @@ fn column_alignment(tab: usize, compact: bool, column: usize) -> Alignment {
         4 => matches!(column, 1..=5),
         5 => matches!(column, 1..=9),
         6 => matches!(column, 1 | 2),
+        7 => matches!(column, 1..=7),
         _ => false,
     };
     if numeric {
@@ -247,9 +248,17 @@ fn view_column_sort(tab: usize, compact: bool, column: usize) -> Option<usize> {
         (0, 0) => Some(0),
         (0, 1) if compact => Some(1),
         (0, 2) if !compact => Some(1),
+        (1, 0) => Some(0),
+        (1, 2) => Some(1),
+        (1, 3) => Some(2),
+        (1, 4) => Some(3),
         (5, 2) => Some(0),
         (5, 3) => Some(1),
         (5, 8) => Some(3),
+        (7, 0) => Some(0),
+        (7, 3) => Some(1),
+        (7, 5) => Some(2),
+        (7, 7) => Some(3),
         _ => None,
     }
 }
@@ -553,6 +562,7 @@ pub fn cancel_owned(jobid: &str) -> Result<()> {
 }
 
 fn details(job: Option<&Job>, pending: Option<&PendingJob>, node: Option<&Node>) -> Result<Popup> {
+    let now = runtime::now();
     let id = job
         .map(|j| j.jobid.as_str())
         .or_else(|| pending.map(|j| j.jobid.as_str()));
@@ -574,15 +584,218 @@ fn details(job: Option<&Job>, pending: Option<&PendingJob>, node: Option<&Node>)
                 })
                 .unwrap_or_else(|| "Scheduler detail unavailable".into())
         };
-        let mut popup = Popup::text(&format!("Job #{id}"), info);
+        let mut summary_lines = Vec::new();
+        let mut raw_body = info;
         if let Some(job) = job {
-            let summary = rules::resource_summary(
-                job,
-                &cli::snapshot().map(|s| s.nodes).unwrap_or_default(),
-                runtime::now(),
-            );
-            popup.panes[0].body.push_str(&format!("\n\nObserved resource coverage:\n{}\nSummed node peaks are not a simultaneous whole-job peak.\nCgroup RAM includes cache and descendants.",serde_json::to_string_pretty(&summary)?));
+            let left = rules::duration(&job.time_limit)
+                .zip(rules::duration(&job.elapsed))
+                .map(|(l, e)| rules::span(l.saturating_sub(e)))
+                .unwrap_or_else(|| "?".into());
+            summary_lines.push(format!("Job #{id} · {} · RUNNING", job.jobname));
+            summary_lines.push(format!(
+                "User: {} (uid {}) · Partition: {} · QOS: {} · Priority: {}",
+                job.user,
+                if job.uid >= 0 {
+                    job.uid.to_string()
+                } else {
+                    "?".into()
+                },
+                if job.partition.is_empty() {
+                    "?"
+                } else {
+                    &job.partition
+                },
+                if job.qos.is_empty() { "—" } else { &job.qos },
+                if job.priority.is_empty() {
+                    "?"
+                } else {
+                    &job.priority
+                },
+            ));
+            summary_lines.push(format!(
+                "Nodes: {}",
+                if job.node.is_empty() { "?" } else { &job.node }
+            ));
+            summary_lines.push(format!(
+                "Requested: GPUs {} · CPUs {} · RAM {} · GRES {}",
+                job.gpu_count,
+                job.cpu_count,
+                if job.mem.is_empty() { "?" } else { &job.mem },
+                if job.gres_raw.is_empty() {
+                    "—"
+                } else {
+                    &job.gres_raw
+                },
+            ));
+            summary_lines.push(format!(
+                "Runtime: elapsed {} / limit {} · remaining {}",
+                if job.elapsed.is_empty() {
+                    "?"
+                } else {
+                    &job.elapsed
+                },
+                if job.time_limit.is_empty() {
+                    "?"
+                } else {
+                    &job.time_limit
+                },
+                left,
+            ));
+            let nodes = cli::snapshot().map(|s| s.nodes).unwrap_or_default();
+            let cov = rules::resource_summary(job, &nodes, now);
+            let expected = cov.get("expected_nodes").copied().unwrap_or(0.0) as usize;
+            let sampled = cov.get("sampled_nodes").copied().unwrap_or(0.0) as usize;
+            let metric_str = |key: &str, scale: f64, unit: &str| -> String {
+                cov.get(key)
+                    .map(|v| {
+                        let nodes_seen =
+                            cov.get(&format!("{key}_nodes")).copied().unwrap_or(0.0) as usize;
+                        format!(
+                            "{}{:.1}{unit} ({nodes_seen}/{expected}n)",
+                            if nodes_seen < expected { "~" } else { "" },
+                            v / scale
+                        )
+                    })
+                    .unwrap_or_else(|| "?".into())
+            };
+            summary_lines.push(String::new());
+            summary_lines.push(format!(
+                "Observed cgroup telemetry ({sampled}/{expected} nodes fresh):"
+            ));
+            summary_lines.push(format!(
+                "  CPU: {} cores · VRAM: {} · OOM kills: {}",
+                metric_str("cpu_cores", 1.0, ""),
+                metric_str("vram_mib", 1024.0, " GiB"),
+                cov.get("oom_kill")
+                    .map(|v| format!("{v:.0}"))
+                    .unwrap_or_else(|| "?".into()),
+            ));
+            summary_lines.push(format!(
+                "  RAM current: {} · peak (summed): {} · limit: {}",
+                metric_str("mem_current_mib", 1024.0, " GiB"),
+                metric_str("mem_peak_mib", 1024.0, " GiB"),
+                metric_str("mem_limit_mib", 1024.0, " GiB"),
+            ));
+            summary_lines.push(format!(
+                "  Block I/O: read {} · write {}",
+                metric_str("io_read_bps", 1_048_576.0, " MiB/s"),
+                metric_str("io_write_bps", 1_048_576.0, " MiB/s"),
+            ));
+            summary_lines.push("Notes: Summed node peaks are not a simultaneous whole-job peak; cgroup RAM includes cache and descendants.".into());
+            if !job.log_out.is_empty() || !job.log_err.is_empty() {
+                summary_lines.push(String::new());
+                summary_lines.push(format!(
+                    "StdOut: {}",
+                    if job.log_out.is_empty() {
+                        "—"
+                    } else {
+                        &job.log_out
+                    }
+                ));
+                summary_lines.push(format!(
+                    "StdErr: {}",
+                    if job.log_err.is_empty() {
+                        "—"
+                    } else {
+                        &job.log_err
+                    }
+                ));
+            }
+            raw_body.push_str(&format!(
+                "\n\nObserved resource coverage:\n{}\nSummed node peaks are not a simultaneous whole-job peak.\nCgroup RAM includes cache and descendants.",
+                serde_json::to_string_pretty(&cov)?
+            ));
+        } else if let Some(pjob) = pending {
+            let wait = rules::pending_wait(pjob, now)
+                .map(|s| rules::span(s as u64))
+                .unwrap_or_else(|| "?".into());
+            summary_lines.push(format!("Job #{id} · {} · PENDING", pjob.jobname));
+            summary_lines.push(format!(
+                "User: {} · Partition: {} · QOS: {} · Priority: {}",
+                pjob.user,
+                if pjob.partition.is_empty() {
+                    "?"
+                } else {
+                    &pjob.partition
+                },
+                if pjob.qos.is_empty() {
+                    "—"
+                } else {
+                    &pjob.qos
+                },
+                if pjob.priority.is_empty() {
+                    "?"
+                } else {
+                    &pjob.priority
+                },
+            ));
+            summary_lines.push(format!(
+                "Requested: GPUs {} · CPUs {} · RAM {} · Time limit {}",
+                pjob.gpu_count,
+                pjob.cpu_count,
+                if pjob.mem.is_empty() { "?" } else { &pjob.mem },
+                if pjob.time_limit.is_empty() {
+                    "?"
+                } else {
+                    &pjob.time_limit
+                },
+            ));
+            summary_lines.push(format!(
+                "Reason: {} · Dependency: {}",
+                rules::pending_reason(pjob),
+                if pjob.dependency.is_empty() {
+                    "—"
+                } else {
+                    &pjob.dependency
+                },
+            ));
+            summary_lines.push(format!(
+                "Timing: waited {wait} · submit {} · eligible {} · est start {}",
+                if pjob.submit_time.is_empty() {
+                    "?"
+                } else {
+                    &pjob.submit_time
+                },
+                if pjob.eligible_time.is_empty() {
+                    "?"
+                } else {
+                    &pjob.eligible_time
+                },
+                if pjob.start_time.is_empty() {
+                    "?"
+                } else {
+                    &pjob.start_time
+                },
+            ));
         }
+        let mut popup = Popup {
+            title: format!("Job #{id}"),
+            panes: vec![
+                Pane {
+                    name: "Summary".into(),
+                    body: summary_lines.join("\n"),
+                    log: None,
+                },
+                Pane {
+                    name: "Raw".into(),
+                    body: raw_body,
+                    log: None,
+                },
+            ],
+            active: 0,
+            scroll: 0,
+            follow: false,
+            history: Vec::new(),
+            selected: 0,
+            cancel: None,
+            token: 0,
+            actions: Vec::new(),
+            source_row: None,
+            source_tab: None,
+            table: TableState::default(),
+            picker: None,
+            find: Find::default(),
+        };
         let script = job
             .map(|j| j.script.clone())
             .filter(|s| !s.is_empty())
@@ -620,10 +833,207 @@ fn details(job: Option<&Job>, pending: Option<&PendingJob>, node: Option<&Node>)
             Duration::from_secs(12),
         )
         .unwrap_or_default();
-        return Ok(Popup::text(
-            &format!("Node {}", node.name),
-            format!("{}\n\n{detail}", serde_json::to_string_pretty(node)?),
+        let fresh_tel = !node.stale && rules::telemetry_fresh(node.telemetry_observed_at, now);
+        let ignored = rules::ignored_users();
+        let classes = rules::classes_with_ignored(node, now, &ignored);
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "Node {} · Partition: {} · State: {}{}",
+            node.name,
+            if node.partition.is_empty() {
+                "(none)"
+            } else {
+                &node.partition
+            },
+            if node.state.is_empty() {
+                "?"
+            } else {
+                &node.state
+            },
+            if node.stale {
+                format!(" [STALE: {}]", node.error)
+            } else {
+                String::new()
+            }
         ));
+        lines.push(format!(
+            "Source: {} · agent age {:.1}s · scheduler age {:.1}s",
+            if node.source.is_empty() {
+                "?"
+            } else {
+                &node.source
+            },
+            node.data_age_sec,
+            node.scheduler_age_sec
+        ));
+        lines.push(format!(
+            "Scheduler: CPU alloc {}/{} · RAM alloc {}/{} MiB · Load {} · GRES {}",
+            node.cpu_alloc,
+            node.cpus,
+            node.mem_alloc,
+            node.scheduler_mem_total,
+            if node.cpu_load.is_empty() {
+                "?"
+            } else {
+                &node.cpu_load
+            },
+            if node.gres.is_empty() {
+                "—"
+            } else {
+                &node.gres
+            }
+        ));
+        let psi = |k: &str| {
+            if fresh_tel {
+                node.pressure.get(k).cloned().unwrap_or_else(|| "?".into())
+            } else {
+                "?".into()
+            }
+        };
+        lines.push(format!(
+            "Host telemetry: CPU {}% · RAM {} · PSI cpu={}% mem={}% io={}%",
+            if fresh_tel && !node.cpu_util.is_empty() {
+                &node.cpu_util
+            } else {
+                "?"
+            },
+            ram(node),
+            psi("cpu"),
+            psi("memory"),
+            psi("io"),
+        ));
+        if !node.cpu_power.is_empty() || !node.ram_power.is_empty() || !node.sys_power.is_empty() {
+            lines.push(format!(
+                "Power (W): cpu={} · ram={} · sys={}",
+                if node.cpu_power.is_empty() || node.stale {
+                    "?"
+                } else {
+                    &node.cpu_power
+                },
+                if node.ram_power.is_empty() || node.stale {
+                    "?"
+                } else {
+                    &node.ram_power
+                },
+                if node.sys_power.is_empty() || node.stale {
+                    "?"
+                } else {
+                    &node.sys_power
+                },
+            ));
+        }
+        if !node.gpus.is_empty() {
+            lines.push(String::new());
+            lines.push(format!("GPUs ({}):", node.gpus.len()));
+            for (gpu, class) in node.gpus.iter().zip(classes) {
+                let (_, class_name, _) = gpu_mark(class);
+                let health = if node.stale {
+                    "STALE".into()
+                } else {
+                    rules::health(gpu, now).0
+                };
+                let jobs = gpu.alloc_jobs_display();
+                let owners = gpu.alloc_users_display();
+                let active_users = gpu.users.join(",");
+                lines.push(format!(
+                    "  GPU{} [{}] {} · util {}% · VRAM {}/{} MiB · temp {}°C · power {}/{}W · health {} · alloc {} #{} · active [{}]",
+                    gpu.index,
+                    class_name,
+                    gpu.name,
+                    if node.stale || gpu.util.is_empty() {
+                        "?"
+                    } else {
+                        &gpu.util
+                    },
+                    if node.stale || gpu.mem_used.is_empty() {
+                        "?"
+                    } else {
+                        &gpu.mem_used
+                    },
+                    if gpu.mem_total.is_empty() {
+                        "?"
+                    } else {
+                        &gpu.mem_total
+                    },
+                    if node.stale || gpu.temp.is_empty() {
+                        "?"
+                    } else {
+                        &gpu.temp
+                    },
+                    if node.stale || gpu.power.is_empty() {
+                        "?"
+                    } else {
+                        &gpu.power
+                    },
+                    if gpu.power_cap.is_empty() {
+                        "?"
+                    } else {
+                        &gpu.power_cap
+                    },
+                    health,
+                    if owners.is_empty() { "—" } else { &owners },
+                    if jobs.is_empty() { "—" } else { &jobs },
+                    if active_users.is_empty() {
+                        "—"
+                    } else {
+                        &active_users
+                    },
+                ));
+            }
+        }
+        if !node.jobs.is_empty() {
+            lines.push(String::new());
+            lines.push(format!(
+                "Running jobs on {} ({}):",
+                node.name,
+                node.jobs.len()
+            ));
+            for j in &node.jobs {
+                lines.push(format!(
+                    "  #{} {} · {} · gpus={} cpus={} mem={} · {}/{}",
+                    j.jobid,
+                    j.user,
+                    j.jobname,
+                    j.gpu_count,
+                    j.cpu_count,
+                    if j.mem.is_empty() { "?" } else { &j.mem },
+                    j.elapsed,
+                    j.time_limit
+                ));
+            }
+        }
+        let mut popup = Popup {
+            title: format!("Node {}", node.name),
+            panes: vec![
+                Pane {
+                    name: "Summary".into(),
+                    body: lines.join("\n"),
+                    log: None,
+                },
+                Pane {
+                    name: "Raw".into(),
+                    body: format!("{}\n\n{detail}", serde_json::to_string_pretty(node)?),
+                    log: None,
+                },
+            ],
+            active: 0,
+            scroll: 0,
+            follow: false,
+            history: Vec::new(),
+            selected: 0,
+            cancel: None,
+            token: 0,
+            actions: Vec::new(),
+            source_row: None,
+            source_tab: None,
+            table: TableState::default(),
+            picker: None,
+            find: Find::default(),
+        };
+        if popup.panes[1].body.trim().is_empty() {
+            popup.panes[1].body = "No raw detail available".into();
+        }
+        return Ok(popup);
     }
     Err("select a job or node".into())
 }
@@ -643,6 +1053,7 @@ enum JobTarget {
     User(String),
     Job(String),
     Node(String),
+    Partition(String),
     Attention {
         user: String,
         jobs: BTreeSet<String>,
@@ -658,6 +1069,10 @@ impl JobTarget {
                     .is_some_and(|nodes| nodes.contains(node)),
                 Entry::Pending(_) => false,
             },
+            Self::Partition(part) => {
+                (part == "(none)" && entry.partition().is_empty())
+                    || entry.partition().split(',').any(|p| p == part)
+            }
             Self::Attention { jobs, .. } => jobs.contains(entry.id()),
         }
     }
@@ -666,6 +1081,7 @@ impl JobTarget {
             Self::User(user) => format!("user:{user}"),
             Self::Job(id) => format!("job:{id}"),
             Self::Node(node) => format!("node:{node}"),
+            Self::Partition(part) => format!("part:{part}"),
             Self::Attention { user, .. } => format!("attention:{user}"),
         }
     }
@@ -734,6 +1150,8 @@ pub struct App {
     attention_keys: BTreeSet<String>,
     attention: Option<AttentionCache>,
     usage_scroll: u16,
+    usage_daily: bool,
+    usage_days: u64,
     down_baseline: BTreeSet<String>,
     observations: VecDeque<(f64, [Option<f64>; 3])>,
     last_observation: Vec<(String, u64, bool)>,
@@ -817,6 +1235,8 @@ impl App {
             attention_keys: BTreeSet::new(),
             attention: None,
             usage_scroll: 0,
+            usage_daily: false,
+            usage_days: 7,
             down_baseline: BTreeSet::new(),
             observations: VecDeque::new(),
             last_observation: Vec::new(),
@@ -973,24 +1393,68 @@ impl App {
         self.highlight_user = user;
         self.rebuild();
     }
+    fn node_header_matches(&self, node: &Node, query: &str) -> bool {
+        query.is_empty()
+            || [
+                node.name.as_str(),
+                node.partition.as_str(),
+                node.state.as_str(),
+                node.gres.as_str(),
+            ]
+            .into_iter()
+            .any(|s| s.to_lowercase().contains(query))
+    }
+    fn gpu_matches_search(&self, node: &Node, gpu: &Gpu, query: &str) -> bool {
+        query.is_empty()
+            || gpu.name.to_lowercase().contains(query)
+            || gpu.users.iter().any(|u| u.to_lowercase().contains(query))
+            || gpu
+                .users_alloc()
+                .iter()
+                .any(|u| u.to_lowercase().contains(query))
+            || gpu.job_ids().iter().any(|id| {
+                id.to_lowercase().contains(query)
+                    || node
+                        .jobs
+                        .iter()
+                        .find(|j| j.jobid == *id)
+                        .is_some_and(|j| j.jobname.to_lowercase().contains(query))
+            })
+    }
     fn node_visible(&self, node: &Node) -> bool {
+        if !self.partition.is_empty() && !node.partition.split(',').any(|p| p == self.partition) {
+            return false;
+        }
+        if self.search.is_empty() {
+            return true;
+        }
         let query = self.search.to_lowercase();
-        (self.partition.is_empty() || node.partition.split(',').any(|p| p == self.partition))
-            && (self.search.is_empty()
-                || std::iter::once(node.name.as_str())
-                    .chain(node.gpus.iter().flat_map(|g| {
-                        g.users
-                            .iter()
-                            .map(String::as_str)
-                            .chain(std::iter::once(g.alloc_user.as_str()))
-                    }))
-                    .any(|s| s.to_lowercase().contains(&query)))
+        self.node_header_matches(node, &query)
+            || node
+                .gpus
+                .iter()
+                .any(|g| self.gpu_matches_search(node, g, &query))
+            || node.jobs.iter().any(|j| {
+                j.user.to_lowercase().contains(&query)
+                    || j.jobid.to_lowercase().contains(&query)
+                    || j.jobname.to_lowercase().contains(&query)
+            })
     }
     fn gpu_visible(&self, gpu: &Gpu, class: Class) -> bool {
         (!self.free_only || class == Class::Free)
             && (self.user_filter().is_empty()
-                || gpu.alloc_user == self.user_filter()
+                || gpu.has_user(self.user_filter())
                 || gpu.users.iter().any(|u| u == self.user_filter()))
+    }
+    fn gpu_visible_on(&self, node: &Node, gpu: &Gpu, class: Class) -> bool {
+        if !self.gpu_visible(gpu, class) {
+            return false;
+        }
+        if self.search.is_empty() || self.tab != 0 {
+            return true;
+        }
+        let query = self.search.to_lowercase();
+        self.node_header_matches(node, &query) || self.gpu_matches_search(node, gpu, &query)
     }
     fn job_visible(&self, user: &str, partition: &str, fields: &[&str]) -> bool {
         (self.user_filter().is_empty() || user == self.user_filter())
@@ -1036,6 +1500,10 @@ impl App {
                 .key
                 .strip_prefix("user:")
                 .map(|user| JobTarget::User(user.into())),
+            7 => row
+                .key
+                .strip_prefix("part:")
+                .map(|part| JobTarget::Partition(part.into())),
             0 | 1 => row
                 .job
                 .as_ref()
@@ -1047,7 +1515,7 @@ impl App {
             self.status = if self.tab == 4 {
                 "No linked Slurm jobs in current evidence · Enter to inspect"
             } else {
-                "Select a GPU, node or user · J related Jobs"
+                "Select a GPU, node, user or partition · J related Jobs"
             }
             .into();
             return;
@@ -1191,7 +1659,7 @@ impl App {
                             .filter_map(|g| number(&g.util))
                             .fold(0.0, f64::max);
                         let own = node.gpus.iter().any(|g| {
-                            g.alloc_user == self.highlight_user
+                            g.has_user(&self.highlight_user)
                                 || g.users.contains(&self.highlight_user)
                         });
                         (node, classes, peak, own, free)
@@ -1214,7 +1682,7 @@ impl App {
                         .gpus
                         .iter()
                         .zip(&classes)
-                        .any(|(g, c)| self.gpu_visible(g, *c))
+                        .any(|(g, c)| self.gpu_visible_on(node, g, *c))
                     {
                         continue;
                     }
@@ -1222,7 +1690,7 @@ impl App {
                         .gpus
                         .iter()
                         .zip(&classes)
-                        .filter(|(g, c)| **c == Class::Free && self.gpu_visible(g, **c))
+                        .filter(|(g, c)| **c == Class::Free && self.gpu_visible_on(node, g, **c))
                         .count();
                     let state = if node.stale { "STALE" } else { &node.state };
                     let model = node
@@ -1241,7 +1709,7 @@ impl App {
                     let mut group_util = Meter::default();
                     let mut group_vram = Meter::default();
                     for (gpu, class) in node.gpus.iter().zip(&classes) {
-                        if self.gpu_visible(gpu, *class) {
+                        if self.gpu_visible_on(node, gpu, *class) {
                             group_util.push(
                                 (!node.stale)
                                     .then(|| number(&gpu.util).map(|v| (v, 100.0)))
@@ -1332,9 +1800,9 @@ impl App {
                             .iter()
                             .zip(&classes)
                             .any(|(g, c)| {
-                                self.gpu_visible(g, *c)
-                                    && (g.alloc_user == self.highlight_user
-                                        || (g.alloc_user.is_empty()
+                                self.gpu_visible_on(node, g, *c)
+                                    && (g.has_user(&self.highlight_user)
+                                        || (!g.has_alloc()
                                             && g.users.contains(&self.highlight_user)))
                             })
                             .then_some(0),
@@ -1357,14 +1825,24 @@ impl App {
                         continue;
                     }
                     for (gpu, class) in node.gpus.iter().zip(classes) {
-                        if !self.gpu_visible(gpu, class) {
+                        if !self.gpu_visible_on(node, gpu, class) {
                             continue;
                         }
-                        let job = node.jobs.iter().find(|j| j.jobid == gpu.alloc_jobid);
+                        let job_ids = gpu.job_ids();
+                        let matched_jobs: Vec<_> = job_ids
+                            .iter()
+                            .filter_map(|id| node.jobs.iter().find(|j| j.jobid == *id))
+                            .collect();
                         let user = if gpu.users.is_empty() {
-                            gpu.alloc_user.clone()
+                            gpu.alloc_users_display()
                         } else {
-                            gpu.users.join(",")
+                            let mut list = gpu.users.clone();
+                            for owner in gpu.users_alloc() {
+                                if !list.iter().any(|u| u == owner) {
+                                    list.push(owner.to_string());
+                                }
+                            }
+                            list.join(",")
                         };
                         let util = mini_meter((!node.stale).then(|| number(&gpu.util)).flatten());
                         let vram = number(&gpu.mem_used)
@@ -1379,23 +1857,24 @@ impl App {
                                 }
                             })
                             .unwrap_or_else(|| "?".into());
-                        let left = job
-                            .and_then(|j| {
+                        let left = matched_jobs
+                            .iter()
+                            .filter_map(|j| {
                                 rules::duration(&j.time_limit).zip(rules::duration(&j.elapsed))
                             })
-                            .map(|(limit, elapsed)| rules::span(limit.saturating_sub(elapsed)))
+                            .map(|(limit, elapsed)| limit.saturating_sub(elapsed))
+                            .min()
+                            .map(rules::span)
                             .unwrap_or_default();
+                        let jobs_display = gpu.alloc_jobs_display();
+                        let watched = job_ids.iter().any(|id| self.watched.contains_key(*id));
                         let label = format!(
                             "{user} {}{}",
-                            if self.watched.contains_key(&gpu.alloc_jobid) {
-                                "★ "
-                            } else {
-                                ""
-                            },
-                            if gpu.alloc_jobid.is_empty() {
+                            if watched { "★ " } else { "" },
+                            if jobs_display.is_empty() {
                                 String::new()
                             } else {
-                                format!("#{}", gpu.alloc_jobid)
+                                format!("#{jobs_display}")
                             }
                         );
                         let health = if node.stale {
@@ -1424,11 +1903,17 @@ impl App {
                             ]
                         };
                         if self.details {
+                            let jobnames = matched_jobs
+                                .iter()
+                                .map(|j| j.jobname.as_str())
+                                .filter(|s| !s.is_empty())
+                                .collect::<Vec<_>>()
+                                .join(",");
                             cells.extend([
                                 gpu.temp.clone(),
                                 format!("{}/{}W", gpu.power, gpu.power_cap),
-                                gpu.alloc_jobid.clone(),
-                                job.map(|j| j.jobname.clone()).unwrap_or_default(),
+                                jobs_display,
+                                jobnames,
                             ]);
                         }
                         let style =
@@ -1436,11 +1921,10 @@ impl App {
                         rows.push(ViewRow {
                             key: format!("gpu:{}:{}", node.name, gpu.index),
                             node: node.name.clone(),
-                            job: (!gpu.alloc_jobid.is_empty()).then(|| gpu.alloc_jobid.clone()),
+                            job: job_ids.first().map(|id| (*id).to_string()),
                             cells,
-                            focus: (gpu.alloc_user == self.highlight_user
-                                || (gpu.alloc_user.is_empty()
-                                    && gpu.users.contains(&self.highlight_user)))
+                            focus: (gpu.has_user(&self.highlight_user)
+                                || (!gpu.has_alloc() && gpu.users.contains(&self.highlight_user)))
                             .then_some(if self.compact { 3 } else { 4 }),
                             accents: vec![
                                 (
@@ -1495,20 +1979,34 @@ impl App {
                                 &job.reason,
                             ],
                         ) {
-                            let mut cells = vec![
-                                format!("PD #{}", job.jobid),
-                                job.user.clone(),
-                                format!("x{}", job.gpu_count),
-                                job.partition.clone(),
-                                rules::pending_reason(job),
-                                rules::pending_wait(job, now)
-                                    .map(|s| rules::span(s as u64))
-                                    .unwrap_or_else(|| "?".into()),
-                                job.start_time.clone(),
-                            ];
-                            if self.compact {
-                                cells.remove(2);
-                            }
+                            let wait = rules::pending_wait(job, now)
+                                .map(|s| rules::span(s as u64))
+                                .unwrap_or_else(|| "?".into());
+                            let mut cells = if self.compact {
+                                let req = if job.partition.is_empty() {
+                                    format!("x{}", job.gpu_count)
+                                } else {
+                                    format!("x{} {}", job.gpu_count, job.partition)
+                                };
+                                vec![
+                                    format!("PD #{}", job.jobid),
+                                    job.user.clone(),
+                                    req,
+                                    rules::pending_reason(job),
+                                    wait,
+                                    job.start_time.clone(),
+                                ]
+                            } else {
+                                vec![
+                                    format!("PD #{}", job.jobid),
+                                    job.user.clone(),
+                                    format!("x{}", job.gpu_count),
+                                    job.partition.clone(),
+                                    rules::pending_reason(job),
+                                    wait,
+                                    job.start_time.clone(),
+                                ]
+                            };
                             if self.details {
                                 cells.resize(cells.len() + 4, String::new());
                             }
@@ -1544,19 +2042,48 @@ impl App {
                 ]
                 .map(str::to_string)
                 .to_vec();
-                for node in &self.data.nodes {
-                    if !self.partition.is_empty()
-                        && !node.partition.split(',').any(|p| p == self.partition)
-                        || !self.search.is_empty()
-                            && !node
-                                .name
-                                .to_lowercase()
-                                .contains(&self.search.to_lowercase())
-                        || !self.user_filter().is_empty()
-                            && !node.jobs.iter().any(|j| j.user == self.user_filter())
-                    {
-                        continue;
+                let mut tab_nodes: Vec<_> = self
+                    .data
+                    .nodes
+                    .iter()
+                    .filter(|node| {
+                        self.node_visible(node)
+                            && (self.user_filter().is_empty()
+                                || node.jobs.iter().any(|j| j.user == self.user_filter()))
+                    })
+                    .collect();
+                let cmp_opt = |a: Option<f64>, b: Option<f64>, rev: bool| match (a, b) {
+                    (Some(x), Some(y)) => {
+                        let ord = y.total_cmp(&x);
+                        if rev { ord.reverse() } else { ord }
                     }
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                };
+                tab_nodes.sort_by(|a, b| {
+                    let ord = match self.sort % 4 {
+                        1 => cmp_opt(number(&a.cpu_alloc), number(&b.cpu_alloc), self.reverse),
+                        2 => {
+                            let fresh_a =
+                                !a.stale && rules::telemetry_fresh(a.telemetry_observed_at, now);
+                            let fresh_b =
+                                !b.stale && rules::telemetry_fresh(b.telemetry_observed_at, now);
+                            cmp_opt(
+                                fresh_a.then(|| number(&a.cpu_util)).flatten(),
+                                fresh_b.then(|| number(&b.cpu_util)).flatten(),
+                                self.reverse,
+                            )
+                        }
+                        3 => cmp_opt(memory_percent(a), memory_percent(b), self.reverse),
+                        _ => {
+                            let o = a.name.cmp(&b.name);
+                            if self.reverse { o.reverse() } else { o }
+                        }
+                    };
+                    ord.then(a.name.cmp(&b.name))
+                });
+                for node in tab_nodes {
                     let fresh =
                         !node.stale && rules::telemetry_fresh(node.telemetry_observed_at, now);
                     let psi = ["cpu", "memory", "io"]
@@ -1868,6 +2395,260 @@ impl App {
                     });
                 }
             }
+            7 => {
+                self.headers = [
+                    "Partition",
+                    "Nodes",
+                    "Stale",
+                    "GPUs free",
+                    "Util",
+                    "CPU alloc",
+                    "RAM used",
+                    "Jobs run/pd",
+                ]
+                .map(str::to_string)
+                .to_vec();
+                #[derive(Default)]
+                struct PartAgg {
+                    nodes: usize,
+                    stale: usize,
+                    gpus_free: usize,
+                    gpus_total: usize,
+                    util: Meter,
+                    cpu_alloc: u64,
+                    cpu_total: u64,
+                    ram: Meter,
+                    running: usize,
+                    pending: usize,
+                    own: bool,
+                    node_names: Vec<String>,
+                }
+                let ignored = rules::ignored_users();
+                let mut parts = BTreeMap::<String, PartAgg>::new();
+                for node in &self.data.nodes {
+                    let user_ok = self.user_filter().is_empty()
+                        || node.jobs.iter().any(|j| j.user == self.user_filter())
+                        || node.gpus.iter().any(|g| {
+                            g.has_user(self.user_filter())
+                                || g.users.iter().any(|u| u == self.user_filter())
+                        });
+                    if !user_ok {
+                        continue;
+                    }
+                    let mut node_parts = BTreeSet::new();
+                    if node.partition.is_empty() {
+                        node_parts.insert("(none)");
+                    } else {
+                        for p in node.partition.split(',').filter(|s| !s.is_empty()) {
+                            node_parts.insert(p);
+                        }
+                        if node_parts.is_empty() {
+                            node_parts.insert("(none)");
+                        }
+                    }
+                    let classes = rules::classes_with_ignored(node, now, &ignored);
+                    let free_g = classes.iter().filter(|c| **c == Class::Free).count();
+                    let total_g = node.gpus.len();
+                    let cpu_a = node.cpu_alloc.parse::<u64>().unwrap_or(0);
+                    let cpu_t = node.cpus.parse::<u64>().unwrap_or(0);
+                    let node_ram = (!node.stale && node.observed_at > 0.0)
+                        .then(|| {
+                            let total = number(&node.mem_total)?;
+                            let used = number(&node.mem_used).or_else(|| {
+                                number(&node.mem_avail)
+                                    .or_else(|| number(&node.mem_free))
+                                    .map(|a| (total - a).max(0.0))
+                            })?;
+                            Some((used, total))
+                        })
+                        .flatten();
+                    let node_own = node.jobs.iter().any(|j| j.user == self.highlight_user)
+                        || node.gpus.iter().any(|g| {
+                            g.has_user(&self.highlight_user)
+                                || g.users.contains(&self.highlight_user)
+                        });
+                    for p in node_parts {
+                        if !self.partition.is_empty() && p != self.partition {
+                            continue;
+                        }
+                        let entry = parts.entry(p.to_string()).or_default();
+                        entry.nodes += 1;
+                        if node.stale {
+                            entry.stale += 1;
+                        }
+                        entry.gpus_free += free_g;
+                        entry.gpus_total += total_g;
+                        entry.cpu_alloc += cpu_a;
+                        entry.cpu_total += cpu_t;
+                        entry.own |= node_own;
+                        entry.node_names.push(node.name.clone());
+                        for gpu in &node.gpus {
+                            entry.util.push(
+                                (!node.stale && node.observed_at > 0.0)
+                                    .then(|| number(&gpu.util).map(|v| (v, 100.0)))
+                                    .flatten(),
+                            );
+                        }
+                        entry.ram.push(node_ram);
+                    }
+                }
+                for (is_running, user, partition) in self
+                    .data
+                    .jobs
+                    .iter()
+                    .map(|j| (true, j.user.as_str(), j.partition.as_str()))
+                    .chain(
+                        self.data
+                            .pending
+                            .iter()
+                            .map(|j| (false, j.user.as_str(), j.partition.as_str())),
+                    )
+                {
+                    if !self.user_filter().is_empty() && user != self.user_filter() {
+                        continue;
+                    }
+                    let mut job_parts = BTreeSet::new();
+                    if partition.is_empty() {
+                        job_parts.insert("(none)");
+                    } else {
+                        for p in partition.split(',').filter(|s| !s.is_empty()) {
+                            job_parts.insert(p);
+                        }
+                        if job_parts.is_empty() {
+                            job_parts.insert("(none)");
+                        }
+                    }
+                    for p in job_parts {
+                        if !self.partition.is_empty() && p != self.partition {
+                            continue;
+                        }
+                        let entry = parts.entry(p.to_string()).or_default();
+                        if is_running {
+                            entry.running += 1;
+                        } else {
+                            entry.pending += 1;
+                        }
+                        entry.own |= user == self.highlight_user;
+                    }
+                }
+                let query = self.search.to_lowercase();
+                let mut part_rows: Vec<_> = parts
+                    .into_iter()
+                    .filter(|(name, agg)| {
+                        query.is_empty()
+                            || name.to_lowercase().contains(&query)
+                            || agg
+                                .node_names
+                                .iter()
+                                .any(|n| n.to_lowercase().contains(&query))
+                    })
+                    .collect();
+                part_rows.sort_by(|a, b| {
+                    let ord = match self.sort % 4 {
+                        1 => {
+                            let o =
+                                b.1.gpus_free
+                                    .cmp(&a.1.gpus_free)
+                                    .then(b.1.gpus_total.cmp(&a.1.gpus_total));
+                            if self.reverse { o.reverse() } else { o }
+                        }
+                        2 => {
+                            let o =
+                                b.1.cpu_alloc
+                                    .cmp(&a.1.cpu_alloc)
+                                    .then(b.1.cpu_total.cmp(&a.1.cpu_total));
+                            if self.reverse { o.reverse() } else { o }
+                        }
+                        3 => {
+                            let o = (b.1.running + b.1.pending)
+                                .cmp(&(a.1.running + a.1.pending))
+                                .then(b.1.running.cmp(&a.1.running));
+                            if self.reverse { o.reverse() } else { o }
+                        }
+                        _ => {
+                            let o = a.0.cmp(&b.0);
+                            if self.reverse { o.reverse() } else { o }
+                        }
+                    };
+                    ord.then(a.0.cmp(&b.0))
+                });
+                for (name, agg) in part_rows {
+                    let util_cell = if agg.gpus_total == 0 {
+                        "—".into()
+                    } else {
+                        mini_meter(agg.util.value())
+                    };
+                    let ram_cell = agg
+                        .ram
+                        .value()
+                        .map(|_| {
+                            format!(
+                                "{}{:.0}/{:.0}G",
+                                if agg.ram.samples < agg.ram.total {
+                                    "~"
+                                } else {
+                                    ""
+                                },
+                                agg.ram.used / 1024.0,
+                                agg.ram.capacity / 1024.0
+                            )
+                        })
+                        .unwrap_or_else(|| "?".into());
+                    rows.push(ViewRow {
+                        key: format!("part:{name}"),
+                        node: String::new(),
+                        job: None,
+                        cells: vec![
+                            name,
+                            agg.nodes.to_string(),
+                            agg.stale.to_string(),
+                            format!("{}/{}", agg.gpus_free, agg.gpus_total),
+                            util_cell,
+                            format!("{}/{}", agg.cpu_alloc, agg.cpu_total),
+                            ram_cell,
+                            format!("{}/{}", agg.running, agg.pending),
+                        ],
+                        focus: agg.own.then_some(0),
+                        accents: vec![
+                            (
+                                2,
+                                Style::default().fg(if agg.stale > 0 { YELLOW } else { MUTED }),
+                            ),
+                            (
+                                3,
+                                Style::default().fg(if agg.gpus_free > 0 {
+                                    GREEN
+                                } else if agg.gpus_total > 0 {
+                                    RED
+                                } else {
+                                    MUTED
+                                }),
+                            ),
+                            (
+                                4,
+                                Style::default().fg(MetricKind::Activity.color(agg.util.value())),
+                            ),
+                            (
+                                6,
+                                Style::default().fg(MetricKind::Memory.color(agg.ram.value())),
+                            ),
+                            (
+                                7,
+                                Style::default().fg(if agg.running + agg.pending > 0 {
+                                    CYAN
+                                } else {
+                                    MUTED
+                                }),
+                            ),
+                        ],
+                        style: Style::default().fg(if agg.stale > 0 && agg.stale == agg.nodes {
+                            YELLOW
+                        } else {
+                            TEXT
+                        }),
+                    });
+                }
+            }
             _ => {
                 self.headers = [
                     "Resource",
@@ -1967,7 +2748,7 @@ impl App {
                 .gpus
                 .iter()
                 .zip(view.classes.iter().copied())
-                .filter(|(gpu, class)| view.visible && self.gpu_visible(gpu, *class))
+                .filter(|(gpu, class)| view.visible && self.gpu_visible_on(node, gpu, *class))
                 .collect();
             for (gpu, _) in &visible {
                 let fresh = !node.stale && node.observed_at > 0.0;
@@ -2150,11 +2931,11 @@ impl App {
                 .style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
             heading[0],
         );
-        let labels = if frame.area().width < 58 {
-            ["1", "2", "3", "4", "5", "6", "7"]
+        let labels = if frame.area().width < 78 {
+            ["1", "2", "3", "4", "5", "6", "7", "8"]
         } else {
             [
-                "1 GPU", "2 CPU", "3 Use", "4 Jobs", "5 Attn", "6 Users", "7 Host",
+                "1 GPU", "2 CPU", "3 Use", "4 Jobs", "5 Attn", "6 Users", "7 Host", "8 Part",
             ]
         }
         .map(str::to_string);
@@ -2179,7 +2960,7 @@ impl App {
         let mut total = 0;
         for (node, view) in self.data.nodes.iter().zip(&views) {
             for (gpu, class) in node.gpus.iter().zip(view.classes.iter().copied()) {
-                if view.visible && self.gpu_visible(gpu, class) {
+                if view.visible && self.gpu_visible_on(node, gpu, class) {
                     total += 1;
                     free += usize::from(class == Class::Free);
                 }
@@ -2199,18 +2980,28 @@ impl App {
             )),
         ])];
         let sort_label = match self.tab {
-            1 => "node",
-            2 => "GPU-hours",
+            1 => ["node", "CPU alloc", "CPU busy", "RAM"][self.sort % 4],
+            2 => {
+                if self.usage_daily && self.sort.is_multiple_of(4) {
+                    "day"
+                } else {
+                    ["GPU alloc", "GPU busy", "CPU alloc", "RAM alloc"][self.sort % 4]
+                }
+            }
             3 => self.job_sort.label(),
             4 => "priority",
-            5 => ["GPU", "CPU", "focus", "quota"][self.sort],
+            5 => ["GPU", "CPU", "focus", "quota"][self.sort % 4],
             6 => "resource",
-            _ => ["node", "util", "focus", "free"][self.sort],
+            7 => ["partition", "GPUs free", "CPU alloc", "jobs"][self.sort % 4],
+            _ => ["node", "util", "focus", "free"][self.sort % 4],
         };
         let descending = if self.tab == 3 {
             self.job_reverse ^ self.job_sort.descending()
         } else {
-            self.reverse ^ (self.tab == 5 || (self.tab == 0 && self.sort > 0))
+            self.reverse
+                ^ (self.tab == 5
+                    || (matches!(self.tab, 0 | 1 | 7) && !self.sort.is_multiple_of(4))
+                    || (self.tab == 2 && (!self.usage_daily || !self.sort.is_multiple_of(4))))
         };
         let mut chips = vec![
             Span::styled(format!(" sort:{sort_label}"), Style::default().fg(MUTED)),
@@ -2219,7 +3010,7 @@ impl App {
                 Style::default().fg(BLUE),
             ),
         ];
-        let sortable = matches!(self.tab, 0 | 3 | 5);
+        let sortable = matches!(self.tab, 0 | 1 | 2 | 3 | 5 | 7);
         let mut chip_actions = vec![
             sortable.then_some(Click::Key(KeyCode::Char('s'))),
             sortable.then_some(Click::Key(KeyCode::Char('S'))),
@@ -2238,6 +3029,21 @@ impl App {
                 ),
             );
             chip_actions.insert(0, Some(Click::Key(KeyCode::Esc)));
+        }
+        if self.tab == 2 {
+            chips.push(Span::styled(
+                format!(
+                    " view:{} [v] ",
+                    if self.usage_daily { "daily" } else { "user" }
+                ),
+                Style::default().fg(if self.usage_daily { FOCUS } else { MUTED }),
+            ));
+            chip_actions.push(Some(Click::Key(KeyCode::Char('v'))));
+            chips.push(Span::styled(
+                format!(" window:{}d [D] ", self.usage_days),
+                Style::default().fg(if self.usage_days != 7 { FOCUS } else { MUTED }),
+            ));
+            chip_actions.push(Some(Click::Key(KeyCode::Char('D'))));
         }
         if self.tab == 3 {
             chips.push(Span::styled(
@@ -2308,7 +3114,7 @@ impl App {
             .nodes
             .iter()
             .flat_map(|n| &n.gpus)
-            .filter(|g| g.alloc_user == self.highlight_user)
+            .filter(|g| g.has_user(&self.highlight_user))
             .count();
         let own_run = self
             .data
@@ -2417,11 +3223,26 @@ impl App {
             let body = self
                 .usage
                 .as_ref()
-                .map(|v| usage::render(v, 7, false))
+                .map(|v| {
+                    usage::render_with_options(
+                        v,
+                        self.usage_days,
+                        self.usage_daily,
+                        self.sort,
+                        self.reverse,
+                        self.user_filter(),
+                        &self.search,
+                    )
+                })
                 .unwrap_or_else(|| {
                     "No usage data yet. Start the collector to record usage.".into()
                 });
-            let block = panel(" GPU-hours · observation coverage ");
+            let title = format!(
+                " GPU-hours & compute usage · {}d {} · s sort · v view · D window ",
+                self.usage_days,
+                if self.usage_daily { "daily" } else { "by user" }
+            );
+            let block = panel(&title);
             let inner = block.inner(areas[3]);
             frame.render_widget(block, areas[3]);
             let paragraph = Paragraph::new(cli::terminal_safe(&body)).wrap(Wrap { trim: false });
@@ -2441,6 +3262,7 @@ impl App {
                 4 if self.narrow => vec![0, 1, 2, 3, 4, 5, 7],
                 5 if frame.area().width < 110 => vec![0, 3, 4, 5, 6, 7],
                 5 if frame.area().width < 150 => vec![0, 1, 2, 3, 4, 5, 6, 7, 10],
+                7 if frame.area().width < 95 => vec![0, 1, 3, 4, 5, 7],
                 0 if self.details => {
                     let base = if self.compact { 6 } else { 7 };
                     let reserve = if self.compact { 110 } else { 140 };
@@ -2472,7 +3294,7 @@ impl App {
                     1 => match i {
                         0 => Constraint::Length(11),
                         1 => Constraint::Length(8),
-                        2 => Constraint::Length(9),
+                        2 => Constraint::Length(10),
                         3 => Constraint::Length(15),
                         4 => Constraint::Length(11),
                         _ => Constraint::Min(9),
@@ -2515,6 +3337,14 @@ impl App {
                         8 => Constraint::Length(10),
                         9 => Constraint::Length(10),
                         _ => Constraint::Min(12),
+                    },
+                    7 => match i {
+                        0 => Constraint::Min(10),
+                        1 | 2 => Constraint::Length(6),
+                        3 | 5 => Constraint::Length(10),
+                        4 => Constraint::Length(15),
+                        6 => Constraint::Length(11),
+                        _ => Constraint::Length(12),
                     },
                     _ => match i {
                         0 => Constraint::Length(if self.narrow { 16 } else { 24 }),
@@ -2671,10 +3501,11 @@ impl App {
                 .highlight_spacing(HighlightSpacing::Always)
                 .block(panel(match self.tab {
                     0 => " GPUs · Space fold · Enter inspect ",
-                    1 => " Nodes · measured CPU / RAM ",
+                    1 => " Nodes · click ↕ header · measured CPU / RAM ",
                     3 => " Jobs · click ↕ header · s sort · S reverse · v state ",
                     4 => " Attention · sustained idle / parked allocations; unallocated processes ",
                     5 => " Users · job CPU/RAM/IO; node network/load are SHARED ",
+                    7 => " Partitions · cluster capacity & queue rollup · s sort · J jobs · Enter inspect ",
                     _ => " Host · R/W disk · RX/TX net · Enter: guide + 5m trend ",
                 }));
             frame.render_stateful_widget(table, areas[3], &mut self.table);
@@ -2753,13 +3584,13 @@ impl App {
             ];
             if self.related.is_some() {
                 bindings.push((KeyCode::Esc, "Esc Back".into()));
-            } else if matches!(self.tab, 0 | 1 | 4 | 5) {
+            } else if matches!(self.tab, 0 | 1 | 4 | 5 | 7) {
                 bindings.push((KeyCode::Char('J'), "J Jobs".into()));
             }
             if self.tab != 2 {
                 bindings.push((KeyCode::Enter, "Enter Detail".into()));
             }
-            if matches!(self.tab, 0 | 3 | 5) {
+            if matches!(self.tab, 0 | 1 | 2 | 3 | 5 | 7) {
                 bindings.extend([
                     (KeyCode::Char('s'), "s Sort".into()),
                     (KeyCode::Char('S'), "S Reverse".into()),
@@ -2767,9 +3598,10 @@ impl App {
             }
             if self.tab == 3 {
                 bindings.push((KeyCode::Char('v'), "v State".into()));
-            }
-            if self.tab == 2 {
+            } else if self.tab == 2 {
                 bindings.extend([
+                    (KeyCode::Char('v'), "v View".into()),
+                    (KeyCode::Char('D'), "D Window".into()),
                     (KeyCode::PageUp, "Pg↑".into()),
                     (KeyCode::PageDown, "Pg↓".into()),
                     (KeyCode::Home, "Home".into()),
@@ -2846,9 +3678,18 @@ impl App {
         if self.tab != 2 {
             actions.push((KeyCode::Enter, "Enter · Selected row details".into()));
         }
-        for (index, name) in ["GPU", "CPU", "Usage", "Jobs", "Attention", "Users", "Host"]
-            .iter()
-            .enumerate()
+        for (index, name) in [
+            "GPU",
+            "CPU",
+            "Usage",
+            "Jobs",
+            "Attention",
+            "Users",
+            "Host",
+            "Partitions",
+        ]
+        .iter()
+        .enumerate()
         {
             actions.push((
                 KeyCode::Char((b'1' + index as u8) as char),
@@ -2859,16 +3700,22 @@ impl App {
             (KeyCode::Char('/'), "/ · Search".into()),
             (KeyCode::Char('0'), "0 · Reset filters".into()),
         ]);
-        if matches!(self.tab, 0 | 1 | 4 | 5) {
+        if matches!(self.tab, 0 | 1 | 4 | 5 | 7) {
             actions.push((KeyCode::Char('J'), "J · Related Jobs".into()));
         }
         if self.related.is_some() {
             actions.push((KeyCode::Esc, "Esc · Back to previous view".into()));
         }
-        if matches!(self.tab, 0 | 3 | 5) {
+        if matches!(self.tab, 0 | 1 | 2 | 3 | 5 | 7) {
             actions.extend([
                 (KeyCode::Char('s'), "s · Next sort column".into()),
                 (KeyCode::Char('S'), "S · Reverse sort".into()),
+            ]);
+        }
+        if self.tab == 2 {
+            actions.extend([
+                (KeyCode::Char('v'), "v · Toggle daily/user view".into()),
+                (KeyCode::Char('D'), "D · Cycle window (7/14/30d)".into()),
             ]);
         }
         if self.tab != 6 {
@@ -3289,7 +4136,7 @@ impl App {
                 popup.source_tab = Some(self.tab);
                 self.open(popup);
             }
-            KeyCode::Char(c @ '1'..='7') => {
+            KeyCode::Char(c @ '1'..='8') => {
                 self.return_from_jobs();
                 self.tab = (c as u8 - b'1') as usize;
                 self.table = TableState::default();
@@ -3339,20 +4186,42 @@ impl App {
                 return false;
             }
             KeyCode::Esc => self.search.clear(),
-            KeyCode::Char('s') if matches!(self.tab, 0 | 5) => self.sort = (self.sort + 1) % 4,
-            KeyCode::Char('S') if matches!(self.tab, 0 | 5) => self.reverse = !self.reverse,
+            KeyCode::Char('s') if matches!(self.tab, 0 | 1 | 2 | 5 | 7) => {
+                self.sort = (self.sort + 1) % 4
+            }
+            KeyCode::Char('S') if matches!(self.tab, 0 | 1 | 2 | 5 | 7) => {
+                self.reverse = !self.reverse
+            }
             KeyCode::Char('s') if self.tab == 3 => {
                 self.job_sort = self.job_sort.next();
                 self.job_reverse = false;
                 self.status = format!("Jobs sort: {} · s next · S reverse", self.job_sort.label());
             }
             KeyCode::Char('S') if self.tab == 3 => self.job_reverse = !self.job_reverse,
-            KeyCode::Char('s' | 'S') => {
-                self.status = "Interactive sorting is available in GPU, Jobs and Users".into()
-            }
+            KeyCode::Char('s' | 'S') => self.status =
+                "Interactive sorting is available in GPU, CPU, Usage, Jobs, Users and Partitions"
+                    .into(),
             KeyCode::Char('i') => self.free_only = !self.free_only,
             KeyCode::Char('m') => self.mine = !self.mine,
             KeyCode::Char('d') => self.details = !self.details,
+            KeyCode::Char('v') if self.tab == 2 => {
+                self.usage_daily = !self.usage_daily;
+                self.usage_scroll = 0;
+                self.status = format!(
+                    "Usage view: {} · D window ({}d)",
+                    if self.usage_daily { "daily" } else { "by user" },
+                    self.usage_days
+                );
+            }
+            KeyCode::Char('D') if self.tab == 2 => {
+                self.usage_days = match self.usage_days {
+                    7 => 14,
+                    14 => 30,
+                    _ => 7,
+                };
+                self.usage_scroll = 0;
+                self.status = format!("Usage window: last {} days", self.usage_days);
+            }
             KeyCode::Char('v') if self.tab == 3 => {
                 self.job_filter = self.job_filter.next();
                 self.status = format!("Jobs state: {} · v next · 0 reset", self.job_filter.label());
@@ -3558,6 +4427,86 @@ impl App {
                                     .map(|n| format!("{:.1} GiB", n / 1073741824.0))
                                     .unwrap_or_else(|| "not set".into());
                                 body.push_str(&format!("\n\n{}: {:.2} GiB, {} files\nsoft limit {soft}; hard limit {hard}",fs["mount"].as_str().unwrap_or("?"),used/1073741824.0,q["files"]));
+                            }
+                        }
+                    }
+                    if let Some(part) = key.strip_prefix("part:") {
+                        let uf = self.user_filter();
+                        let in_part = |raw: &str| {
+                            let mut any = false;
+                            for p in raw.split(',').filter(|s| !s.is_empty()) {
+                                any = true;
+                                if p == part {
+                                    return true;
+                                }
+                            }
+                            !any && part == "(none)"
+                        };
+                        let ignored = rules::ignored_users();
+                        let now = runtime::now();
+                        let nodes: Vec<_> = self
+                            .data
+                            .nodes
+                            .iter()
+                            .filter(|n| {
+                                in_part(&n.partition)
+                                    && (uf.is_empty()
+                                        || n.jobs.iter().any(|j| j.user == uf)
+                                        || n.gpus.iter().any(|g| {
+                                            g.has_user(uf) || g.users.iter().any(|u| u == uf)
+                                        }))
+                            })
+                            .collect();
+                        body.push_str(&format!("\n\nNodes ({}):", nodes.len()));
+                        for node in nodes.iter().take(40) {
+                            let classes = rules::classes_with_ignored(node, now, &ignored);
+                            let g_free = classes.iter().filter(|c| **c == Class::Free).count();
+                            body.push_str(&format!(
+                                "\n  {} · state {} · GPU {}/{} free · CPU {}/{}",
+                                node.name,
+                                if node.stale { "STALE" } else { &node.state },
+                                g_free,
+                                node.gpus.len(),
+                                node.cpu_alloc,
+                                node.cpus
+                            ));
+                        }
+                        if nodes.len() > 40 {
+                            body.push_str(&format!("\n  … +{} more nodes", nodes.len() - 40));
+                        }
+                        let mut user_runs = BTreeMap::<&str, (usize, u64, u64)>::new();
+                        for job in &self.data.jobs {
+                            if in_part(&job.partition) && (uf.is_empty() || job.user == uf) {
+                                let e = user_runs.entry(job.user.as_str()).or_default();
+                                e.0 += 1;
+                                e.1 += u64::from(job.gpu_count);
+                                e.2 += u64::from(job.cpu_count);
+                            }
+                        }
+                        let mut top_users: Vec<_> = user_runs.into_iter().collect();
+                        top_users.sort_by(|a, b| {
+                            b.1.1.cmp(&a.1.1).then(b.1.0.cmp(&a.1.0)).then(a.0.cmp(b.0))
+                        });
+                        if !top_users.is_empty() {
+                            body.push_str("\n\nTop running users:");
+                            for (user, (jobs, gpus, cpus)) in top_users.iter().take(12) {
+                                body.push_str(&format!(
+                                    "\n  {user}: {jobs} jobs · {gpus} GPUs · {cpus} CPUs"
+                                ));
+                            }
+                        }
+                        let mut pd_reasons = BTreeMap::<String, usize>::new();
+                        for job in &self.data.pending {
+                            if in_part(&job.partition) && (uf.is_empty() || job.user == uf) {
+                                *pd_reasons.entry(rules::pending_reason(job)).or_default() += 1;
+                            }
+                        }
+                        let mut reasons: Vec<_> = pd_reasons.into_iter().collect();
+                        reasons.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                        if !reasons.is_empty() {
+                            body.push_str("\n\nPending reasons:");
+                            for (reason, count) in reasons.iter().take(10) {
+                                body.push_str(&format!("\n  {reason}: {count}"));
                             }
                         }
                     }
@@ -4053,25 +5002,39 @@ fn draw_popup(frame: &mut Frame, popup: &mut Popup, hits: &mut Hits) {
 fn ime(key: KeyCode) -> KeyCode {
     if let KeyCode::Char(c) = key {
         let mapped = match c {
-            'ㅁ' => 'a',
             'ㅂ' => 'q',
-            'ㄱ' => 'r',
-            'ㄴ' => 's',
-            'ㅕ' => 'u',
-            'ㅔ' => 'p',
-            'ㅡ' => 'm',
-            'ㅑ' => 'i',
-            'ㅇ' => 'd',
-            'ㄷ' => 'e',
+            'ㅃ' => 'Q',
             'ㅈ' => 'w',
-            'ㅗ' => 'h',
-            'ㅜ' => 'n',
-            'ㅎ' => 'g',
-            'ㅍ' => 'v',
+            'ㅉ' => 'W',
+            'ㄷ' => 'e',
+            'ㄸ' => 'E',
+            'ㄱ' => 'r',
+            'ㄲ' => 'R',
             'ㅅ' => 't',
+            'ㅆ' => 'T',
+            'ㅛ' => 'y',
+            'ㅕ' => 'u',
+            'ㅑ' => 'i',
+            'ㅐ' => 'o',
+            'ㅒ' => 'O',
+            'ㅔ' => 'p',
+            'ㅖ' => 'P',
+            'ㅁ' => 'a',
+            'ㄴ' => 's',
+            'ㅇ' => 'd',
             'ㄹ' => 'f',
+            'ㅎ' => 'g',
+            'ㅗ' => 'h',
             'ㅓ' => 'j',
             'ㅏ' => 'k',
+            'ㅣ' => 'l',
+            'ㅋ' => 'z',
+            'ㅌ' => 'x',
+            'ㅊ' => 'c',
+            'ㅍ' => 'v',
+            'ㅠ' => 'b',
+            'ㅜ' => 'n',
+            'ㅡ' => 'm',
             _ => c,
         };
         KeyCode::Char(mapped)
@@ -4254,9 +5217,11 @@ pub fn run(highlight_user: Option<String>) -> Result<i32> {
 }
 
 const HELP: &str = concat!(
-    "1/2/3/4  GPU / CPU / Usage / Jobs\n5/6/7  Attention / Users / Controller\n",
+    "1/2/3/4  GPU / CPU / Usage / Jobs\n5/6/7/8  Attention / Users / Controller / Partitions\n",
     "g Usage · v pending · t 5-minute cluster trend\nr refresh published data\n",
     "s sort · S reverse · [ / ] previous/next node · Home/End first/last row\n",
+    "CPU/Users/Usage/Partitions: s cycles sort · S reverses · click ↕ headers to sort.\n",
+    "Usage: v toggles user/daily view · D cycles 7/14/30d window · s/S sort/reverse.\n",
     "Jobs: s cycles priority / user / GPU / CPU / wait / left; S reverses.\n",
     "Jobs: click User, Priority, Req GPU or Req CPU headers to sort; click again to reverse.\n",
     "Header arrows show direction; ↕ marks clickable headers. Mouse wheel scrolls.\n",
@@ -4271,10 +5236,10 @@ const HELP: &str = concat!(
     "E explain selected pending job · F my last-24h failures (one accounting query).\n",
     "i free GPUs · 0 reset all filters · / search · Esc clear search\n",
     "d detail columns · Space fold node · z fold/unfold all\nj/k or arrows move\n",
-    "Enter full values or job/node detail · Tab info/script/stdout/stderr\n",
+    "Enter full values or Summary/Raw/Script/StdOut/StdErr detail · Tab switches panes\n",
     "Inside details/logs: / literal find · Enter apply · n/N next/previous matching line.\n",
     "Esc clears active search input; the next Esc closes. Query text stays in memory only.\n",
-    "J related Jobs from GPU/CPU/Users/Attention · Esc restores the previous view.\n",
+    "J related Jobs from GPU/CPU/Users/Attention/Partitions · Esc restores the previous view.\n",
     "Users opens all user jobs; Attention opens only jobs linked in current evidence.\n",
     "GPU/node links use exact job IDs or expanded node names; unlinked processes stay inspectable.\n",
     "0 resets the related scope; Esc still returns.\n",
@@ -4289,10 +5254,10 @@ const HELP: &str = concat!(
     "Attention groups current idle/parked allocations and unallocated GPU processes.\n",
     "Timer age includes observation gaps; inspect evidence before acting.\n",
     "Users: job CPU/RAM/block I/O; node network and load are SHARED.\n",
-    "Controller: local resources, physical device rates, filesystems and available quotas.\n",
+    "Controller: local resources, physical device rates, filesystems (local & shared) and available quotas.\n",
     "Host: R/W disk, RX/TX network; bytes scale through TiB, link speed uses bits/s.\n",
     "Host guide colors are review hints: capacity 80/90/97%, PSI 1/10%, link 80%.\n",
-    "Enter Host rows for definitions and five-minute trends; high throughput is not a fault.\n",
+    "Enter Host or Partition rows for definitions, node/user breakdowns and trends.\n",
     "Unknown/stale data is never free capacity. ? unavailable; ~ partial.\n",
     "GPU/VRAM meters sample GPUs; CPU/RAM meters sample nodes. CPU is node-wide.\n",
     "Job RAM includes cgroup cache. Summed peaks are not simultaneous whole-job peaks.\n",
@@ -4743,7 +5708,7 @@ mod tests {
         app.apply(mouse_snapshot());
         for (width, height) in [(40, 24), (80, 24), (140, 24), (80, 8)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            for tab in 0..7 {
+            for tab in 0..8 {
                 click_action(
                     &mut app,
                     &mut terminal,
@@ -5955,7 +6920,7 @@ mod tests {
         });
         for width in [80, 120, 160] {
             let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
-            for tab in 0..=6 {
+            for tab in 0..=7 {
                 app.tab = tab;
                 app.rebuild();
                 terminal.draw(|f| app.draw(f)).unwrap();
@@ -5982,7 +6947,8 @@ mod tests {
                         "Req GPU",
                         "User",
                         "User",
-                        "Resource"
+                        "Resource",
+                        "Partition"
                     ][tab]
                 ));
             }
@@ -6108,6 +7074,372 @@ mod tests {
                 .unwrap()
                 .draw(|f| app.draw(f))
                 .unwrap();
+        }
+    }
+    #[test]
+    fn tab1_cpu_sort_search_and_header_click_keep_stale_last() {
+        let now = runtime::now();
+        let worker = Worker::new();
+        let mut app = App::for_user("alice".into());
+        app.apply(Snapshot {
+            nodes: vec![
+                Node {
+                    name: "cpu1".into(),
+                    partition: "batch".into(),
+                    state: "allocated".into(),
+                    cpus: "64".into(),
+                    cpu_alloc: "16".into(),
+                    cpu_util: "90".into(),
+                    mem_total: "1000".into(),
+                    mem_used: "200".into(),
+                    observed_at: now,
+                    telemetry_observed_at: now,
+                    ..Default::default()
+                },
+                Node {
+                    name: "cpu2".into(),
+                    partition: "gpu".into(),
+                    state: "allocated".into(),
+                    cpus: "64".into(),
+                    cpu_alloc: "48".into(),
+                    cpu_util: "30".into(),
+                    mem_total: "1000".into(),
+                    mem_used: "800".into(),
+                    observed_at: now,
+                    telemetry_observed_at: now,
+                    ..Default::default()
+                },
+                Node {
+                    name: "cpu3".into(),
+                    partition: "batch".into(),
+                    state: "idle".into(),
+                    cpus: "64".into(),
+                    cpu_alloc: "0".into(),
+                    cpu_util: "100".into(),
+                    mem_total: "1000".into(),
+                    mem_used: "900".into(),
+                    stale: true,
+                    observed_at: now,
+                    telemetry_observed_at: now,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        app.tab = 1;
+        app.rebuild();
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        // Click header for CPU busy (sort 2).
+        click_action(&mut app, &mut terminal, &worker, Click::Sort(2));
+        assert_eq!(app.sort, 2);
+        assert_eq!(app.rows[0].key, "node:cpu1");
+        assert_eq!(app.rows[1].key, "node:cpu2");
+        assert_eq!(app.rows[2].key, "node:cpu3");
+        // Reversing keeps stale cpu3 last.
+        click_action(&mut app, &mut terminal, &worker, Click::Sort(2));
+        assert!(app.reverse);
+        assert_eq!(app.rows[0].key, "node:cpu2");
+        assert_eq!(app.rows[1].key, "node:cpu1");
+        assert_eq!(app.rows[2].key, "node:cpu3");
+        // RAM sort (sort 3) puts cpu2 (80%) before cpu1 (20%) and stale cpu3 last.
+        app.reverse = false;
+        click_action(&mut app, &mut terminal, &worker, Click::Sort(3));
+        assert_eq!(app.rows[0].key, "node:cpu2");
+        assert_eq!(app.rows[1].key, "node:cpu1");
+        assert_eq!(app.rows[2].key, "node:cpu3");
+        // Partition search matches node_visible.
+        app.search = "batch".into();
+        app.rebuild();
+        let keys: Vec<_> = app.rows.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, vec!["node:cpu1", "node:cpu3"]);
+    }
+    #[test]
+    fn tab2_usage_view_window_and_sort_controls_work() {
+        let worker = Worker::new();
+        let mut app = App::for_user("alice".into());
+        app.tab = 2;
+        let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let old = (chrono::Local::now() - chrono::Duration::days(10))
+            .format("%Y-%m-%d")
+            .to_string();
+        app.usage = Some(serde_json::json!({
+            "days": {
+                day: {
+                    "alice": {"alloc": 7200, "busy": 3600, "observed_alloc": 7200, "cpu_alloc_sec": 36000, "mem_alloc_mib_sec": 0}
+                },
+                old: {
+                    "bob": {"alloc": 3600, "busy": 3600, "observed_alloc": 3600}
+                }
+            }
+        }));
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("alice") && !text.contains("bob"));
+        // Cycle 7d -> 14d exposes bob.
+        app.key(KeyCode::Char('D'), &worker);
+        assert_eq!(app.usage_days, 14);
+        terminal.draw(|f| app.draw(f)).unwrap();
+        assert!(screen(&terminal).contains("bob"));
+        // Cycle 14d -> 30d -> 7d.
+        app.key(KeyCode::Char('D'), &worker);
+        assert_eq!(app.usage_days, 30);
+        app.key(KeyCode::Char('D'), &worker);
+        assert_eq!(app.usage_days, 7);
+        // Toggle daily view with 'v' and cycle sort with 's'/'S'.
+        app.key(KeyCode::Char('v'), &worker);
+        assert!(app.usage_daily);
+        app.key(KeyCode::Char('s'), &worker);
+        assert_eq!(app.sort, 1);
+        app.key(KeyCode::Char('S'), &worker);
+        assert!(app.reverse);
+        terminal.draw(|f| app.draw(f)).unwrap();
+        assert!(screen(&terminal).contains("view:daily"));
+    }
+    #[test]
+    fn tab7_partition_rollup_sort_related_jobs_and_detail_popup() {
+        let now = runtime::now();
+        let worker = Worker::new();
+        let mut app = App::for_user("alice".into());
+        app.apply(Snapshot {
+            nodes: vec![
+                Node {
+                    name: "gpu1".into(),
+                    partition: "a100,shared".into(),
+                    state: "mixed".into(),
+                    cpus: "64".into(),
+                    cpu_alloc: "32".into(),
+                    mem_total: "20480".into(),
+                    mem_used: "10240".into(),
+                    observed_at: now,
+                    telemetry_observed_at: now,
+                    has_gpu: true,
+                    gpus: vec![
+                        Gpu {
+                            index: "0".into(),
+                            util: "0".into(),
+                            ..Default::default()
+                        },
+                        Gpu {
+                            index: "1".into(),
+                            util: "80".into(),
+                            alloc_jobid: "10".into(),
+                            alloc_user: "alice".into(),
+                            ..Default::default()
+                        },
+                    ],
+                    jobs: vec![Job {
+                        jobid: "10".into(),
+                        user: "alice".into(),
+                        partition: "a100".into(),
+                        gpu_count: 1,
+                        cpu_count: 32,
+                        node: "gpu1".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                Node {
+                    name: "cpu1".into(),
+                    partition: "cpu".into(),
+                    state: "idle".into(),
+                    cpus: "32".into(),
+                    cpu_alloc: "0".into(),
+                    mem_total: "10240".into(),
+                    mem_used: "2048".into(),
+                    observed_at: now,
+                    telemetry_observed_at: now,
+                    ..Default::default()
+                },
+            ],
+            jobs: vec![Job {
+                jobid: "10".into(),
+                user: "alice".into(),
+                partition: "a100".into(),
+                gpu_count: 1,
+                cpu_count: 32,
+                node: "gpu1".into(),
+                ..Default::default()
+            }],
+            pending: vec![PendingJob {
+                jobid: "11".into(),
+                user: "bob".into(),
+                partition: "a100".into(),
+                gpu_count: 2,
+                cpu_count: 8,
+                reason: "Resources".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        app.tab = 7;
+        app.rebuild();
+        let part_keys: Vec<_> = app.rows.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(part_keys, vec!["part:a100", "part:cpu", "part:shared"]);
+        assert_eq!(app.rows[0].cells[3], "1/2");
+        assert_eq!(app.rows[0].cells[7], "1/1");
+        // Enter opens structured Partition detail popup with nodes, users, and pending reasons.
+        app.key(KeyCode::Enter, &worker);
+        let body = &app.popup.as_ref().unwrap().panes[0].body;
+        assert!(body.contains("Nodes (1):"));
+        assert!(body.contains("Top running users:"));
+        assert!(body.contains("Pending reasons:"));
+        app.key(KeyCode::Esc, &worker);
+        // J drills into Jobs filtered to part:a100 and Esc restores Tab 7.
+        app.key(KeyCode::Char('J'), &worker);
+        assert_eq!(app.tab, 3);
+        assert_eq!(app.visible_jobs().count(), 2);
+        app.key(KeyCode::Esc, &worker);
+        assert_eq!(app.tab, 7);
+    }
+    #[test]
+    fn tab0_shared_gpu_search_and_compact_pending_alignment() {
+        let now = runtime::now();
+        let mut app = App::for_user("alice".into());
+        app.compact = true;
+        app.pending = true;
+        app.apply(Snapshot {
+            nodes: vec![Node {
+                name: "gpu1".into(),
+                partition: "gpu".into(),
+                state: "mixed".into(),
+                has_gpu: true,
+                observed_at: now,
+                telemetry_observed_at: now,
+                gpus: vec![Gpu {
+                    index: "0".into(),
+                    name: "H100".into(),
+                    util: "75".into(),
+                    mem_used: "1024".into(),
+                    mem_total: "81920".into(),
+                    alloc_jobid: "42".into(),
+                    alloc_jobids: vec!["42".into(), "43".into()],
+                    alloc_user: "alice".into(),
+                    alloc_users: vec!["alice".into(), "bob".into()],
+                    ..Default::default()
+                }],
+                jobs: vec![
+                    Job {
+                        jobid: "42".into(),
+                        user: "alice".into(),
+                        jobname: "train-alpha".into(),
+                        node: "gpu1".into(),
+                        ..Default::default()
+                    },
+                    Job {
+                        jobid: "43".into(),
+                        user: "bob".into(),
+                        jobname: "eval-beta".into(),
+                        node: "gpu1".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            jobs: vec![
+                Job {
+                    jobid: "42".into(),
+                    user: "alice".into(),
+                    jobname: "train-alpha".into(),
+                    node: "gpu1".into(),
+                    ..Default::default()
+                },
+                Job {
+                    jobid: "43".into(),
+                    user: "bob".into(),
+                    jobname: "eval-beta".into(),
+                    node: "gpu1".into(),
+                    ..Default::default()
+                },
+            ],
+            pending: vec![PendingJob {
+                jobid: "99".into(),
+                user: "alice".into(),
+                partition: "gpu".into(),
+                gpu_count: 2,
+                reason: "Priority".into(),
+                start_time: "2026-01-01T00:00:00".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let gpu_row = app.rows.iter().find(|r| r.key == "gpu:gpu1:0").unwrap();
+        assert!(gpu_row.cells[3].contains("alice,bob"));
+        assert!(gpu_row.cells[3].contains("#42,43"));
+        let pd_row = app.rows.iter().find(|r| r.key == "pending:99").unwrap();
+        assert_eq!(pd_row.cells.len(), app.headers.len());
+        assert_eq!(pd_row.cells[2], "x2 gpu");
+        app.search = "eval-beta".into();
+        app.rebuild();
+        assert!(app.rows.iter().any(|r| r.key == "gpu:gpu1:0"));
+    }
+    #[test]
+    fn details_job_and_node_build_summary_and_raw_panes() {
+        let now = runtime::now();
+        let job = Job {
+            jobid: "777".into(),
+            user: "alice".into(),
+            uid: 1001,
+            jobname: "pretrain".into(),
+            partition: "h100".into(),
+            qos: "high".into(),
+            priority: "1200".into(),
+            node: "gpu1".into(),
+            gpu_count: 2,
+            cpu_count: 16,
+            mem: "128G".into(),
+            elapsed: "00:10:00".into(),
+            time_limit: "02:00:00".into(),
+            detail: "JobId=777 JobName=pretrain".into(),
+            ..Default::default()
+        };
+        let popup = details(Some(&job), None, None).unwrap();
+        assert_eq!(popup.panes[0].name, "Summary");
+        assert_eq!(popup.panes[1].name, "Raw");
+        assert!(
+            popup.panes[0]
+                .body
+                .contains("Job #777 · pretrain · RUNNING")
+        );
+        assert!(popup.panes[1].body.contains("JobId=777 JobName=pretrain"));
+
+        let node = Node {
+            name: "gpu1".into(),
+            partition: "h100".into(),
+            state: "mixed".into(),
+            cpus: "64".into(),
+            cpu_alloc: "16".into(),
+            observed_at: now,
+            telemetry_observed_at: now,
+            cpu_power: "250.0".into(),
+            ..Default::default()
+        };
+        let node_popup = details(None, None, Some(&node)).unwrap();
+        assert_eq!(node_popup.panes[0].name, "Summary");
+        assert_eq!(node_popup.panes[1].name, "Raw");
+        assert!(node_popup.panes[0].body.contains("Node gpu1"));
+        assert!(node_popup.panes[0].body.contains("Power (W): cpu=250.0"));
+    }
+    #[test]
+    fn ime_maps_all_korean_2bulsik_keys() {
+        for (ko, en) in [
+            ('ㅃ', 'Q'),
+            ('ㅉ', 'W'),
+            ('ㄸ', 'E'),
+            ('ㄲ', 'R'),
+            ('ㅆ', 'T'),
+            ('ㅛ', 'y'),
+            ('ㅐ', 'o'),
+            ('ㅒ', 'O'),
+            ('ㅖ', 'P'),
+            ('ㅣ', 'l'),
+            ('ㅋ', 'z'),
+            ('ㅌ', 'x'),
+            ('ㅊ', 'c'),
+            ('ㅠ', 'b'),
+        ] {
+            assert_eq!(ime(KeyCode::Char(ko)), KeyCode::Char(en));
         }
     }
 }

@@ -1,7 +1,7 @@
 use crate::{
     Result,
     logs::{self, Seed},
-    model::{Snapshot, number},
+    model::{Snapshot, json_number, number},
     process::Program,
     rules, runtime,
     scheduler::{self, Runner, SystemRunner},
@@ -36,6 +36,7 @@ pub struct Config {
     pub rogue_grace_sec: f64,
     pub temp_alert_c: f64,
     pub ecc_alert: bool,
+    pub oom_alert: bool,
     pub job_done_users: Vec<String>,
     pub job_fail_users: Vec<String>,
     pub dm_users: BTreeMap<String, String>,
@@ -59,6 +60,7 @@ impl Default for Config {
             rogue_grace_sec: 300.0,
             temp_alert_c: 0.0,
             ecc_alert: true,
+            oom_alert: true,
             job_done_users: Vec::new(),
             job_fail_users: Vec::new(),
             dm_users: BTreeMap::new(),
@@ -232,6 +234,7 @@ struct Persistent {
     jobs: BTreeMap<String, Tracked>,
     pend_seen: BTreeMap<String, f64>,
     last_sent: BTreeMap<String, f64>,
+    oom_kills: BTreeMap<String, u64>,
     free_was_below: bool,
     thread_day: String,
     thread_ts: String,
@@ -244,6 +247,7 @@ impl Default for Persistent {
             jobs: BTreeMap::new(),
             pend_seen: BTreeMap::new(),
             last_sent: BTreeMap::new(),
+            oom_kills: BTreeMap::new(),
             free_was_below: true,
             thread_day: String::new(),
             thread_ts: String::new(),
@@ -277,6 +281,12 @@ impl Persistent {
                     })
                     .collect();
             }
+        }
+        if let Some(map) = raw["oom_kills"].as_object() {
+            state.oom_kills = map
+                .iter()
+                .filter_map(|(k, v)| v.as_u64().filter(|&n| n > 0).map(|n| (k.clone(), n)))
+                .collect();
         }
         state.jobs = serde_json::from_value(raw["jobs"].clone()).unwrap_or_default();
         state.free_was_below = raw["free_was_below"].as_bool().unwrap_or(true);
@@ -780,6 +790,7 @@ impl Notifier {
         if clean {
             let ignored = rules::ignored_users();
             let mut rogue_live = BTreeSet::new();
+            let mut oom_live = BTreeSet::new();
             for node in snapshot
                 .nodes
                 .iter()
@@ -796,17 +807,67 @@ impl Notifier {
                         escape(&gpu.serial)
                     );
                     let age = gpu.idle_sec.max(gpu.parked_sec);
+                    let alloc_users = gpu.alloc_users_display();
+                    let alloc_jobs = gpu.alloc_jobs_display();
                     if valid_threshold(self.config.waste_alert_hours)
                         && age as f64 >= self.config.waste_alert_hours * 3600.0
                     {
+                        let job_context = gpu
+                            .job_ids()
+                            .into_iter()
+                            .filter_map(|jid| node.jobs.iter().find(|j| j.jobid == jid))
+                            .filter_map(|job| {
+                                let sample = job.telemetry.get(&node.name)?;
+                                let stamp = json_number(&sample["observed_at"])?;
+                                rules::telemetry_fresh(stamp, now)
+                                    .then(|| (job, crate::node_telemetry::clean_sample(sample)))
+                            })
+                            .filter_map(|(job, sample)| {
+                                let mut parts = Vec::new();
+                                if let Some(cpu) = rules::sample_metric(&sample, "cpu_cores") {
+                                    parts.push(format!("cpu={cpu:.1}/{}", job.cpu_count));
+                                }
+                                let io_read = rules::sample_metric(&sample, "io_read_bps");
+                                let io_write = rules::sample_metric(&sample, "io_write_bps");
+                                if io_read.is_some() || io_write.is_some() {
+                                    parts.push(format!(
+                                        "io={:.1}/{:.1}MB/s",
+                                        io_read.unwrap_or(0.0) / 1_048_576.0,
+                                        io_write.unwrap_or(0.0) / 1_048_576.0
+                                    ));
+                                }
+                                (!parts.is_empty()).then(|| {
+                                    if gpu.job_ids().len() > 1 {
+                                        format!("#{}:{}", job.jobid, parts.join(" "))
+                                    } else {
+                                        parts.join(" ")
+                                    }
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let user_display = if alloc_users.is_empty() {
+                            gpu.users.join(",")
+                        } else {
+                            alloc_users.clone()
+                        };
+                        let job_display = if alloc_jobs.is_empty() {
+                            "—".into()
+                        } else {
+                            format!("#{alloc_jobs}")
+                        };
+                        let context_suffix = if job_context.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · {job_context}")
+                        };
                         self.alert(
-                            format!("waste:{id}:{}", gpu.alloc_jobid),
+                            format!("waste:{id}:{alloc_jobs}"),
                             format!(
-                                "{} {id} · {} · {} · #{}",
+                                "{} {id} · {} · {} · {job_display}{context_suffix}",
                                 self.config.language("Wasted GPU", "GPU 낭비"),
                                 rules::span(age),
-                                escape(&gpu.alloc_user),
-                                gpu.alloc_jobid
+                                escape(&user_display),
                             ),
                             None,
                             true,
@@ -868,17 +929,21 @@ impl Notifier {
                         );
                     }
                 }
-                if valid_threshold(self.config.mem_fair_factor) && !node.gpus.is_empty() {
-                    for job in &node.jobs {
-                        if job.gpu_count == 0 {
-                            continue;
-                        }
-                        if let Some((mem, total)) =
-                            scheduler::mem_mib(&job.mem, job.cpu_count.max(1))
-                                .zip(number(&node.mem_total))
-                                .filter(|(m, t)| *m > 0.0 && *t > 0.0)
+                for job in &node.jobs {
+                    if valid_threshold(self.config.mem_fair_factor) && !node.gpus.is_empty() {
+                        let node_gpus = node.gpus.iter().filter(|g| g.has_job(&job.jobid)).count();
+                        let gpus = if node_gpus > 0 {
+                            node_gpus
+                        } else {
+                            (job.gpu_count as usize).min(node.gpus.len())
+                        };
+                        if gpus > 0
+                            && let Some((mem, total)) =
+                                scheduler::mem_mib(&job.mem, job.cpu_count.max(1))
+                                    .zip(number(&node.mem_total))
+                                    .filter(|(m, t)| *m > 0.0 && *t > 0.0)
                         {
-                            let share = total * job.gpu_count as f64 / node.gpus.len() as f64;
+                            let share = total * gpus as f64 / node.gpus.len() as f64;
                             if mem > share * self.config.mem_fair_factor {
                                 self.alert(
                                     format!("mem:{}:{}", node.name, job.jobid),
@@ -899,8 +964,55 @@ impl Notifier {
                             }
                         }
                     }
+                    if self.config.oom_alert
+                        && let Some(sample) = job.telemetry.get(&node.name)
+                        && json_number(&sample["observed_at"])
+                            .is_some_and(|stamp| rules::telemetry_fresh(stamp, now))
+                    {
+                        let cleaned = crate::node_telemetry::clean_sample(sample);
+                        if let Some(kills) = rules::sample_metric(&cleaned, "oom_kill")
+                            .filter(|v| *v >= 1.0)
+                            .map(|v| v.round() as u64)
+                        {
+                            let state_key = format!("{}:{}", job.jobid, node.name);
+                            oom_live.insert(state_key.clone());
+                            let prev = self.state.oom_kills.get(&state_key).copied().unwrap_or(0);
+                            if kills > prev {
+                                self.state.oom_kills.insert(state_key, kills);
+                                self.alert(
+                                    format!("oom:{}:{}:{}", job.jobid, node.name, kills),
+                                    format!(
+                                        "{} #{} · {} · {} · kills={kills}",
+                                        self.config.language(
+                                            "Job cgroup OOM kill",
+                                            "작업 cgroup OOM 발생"
+                                        ),
+                                        job.jobid,
+                                        escape(&job.user),
+                                        escape(&node.name)
+                                    ),
+                                    Some(&job.user),
+                                    false,
+                                    now,
+                                );
+                            }
+                        }
+                    }
                 }
             }
+            for node in snapshot
+                .nodes
+                .iter()
+                .filter(|n| n.stale || !n.error.is_empty())
+            {
+                for job in &node.jobs {
+                    let key = format!("{}:{}", job.jobid, node.name);
+                    if self.state.oom_kills.contains_key(&key) {
+                        oom_live.insert(key);
+                    }
+                }
+            }
+            self.state.oom_kills.retain(|key, _| oom_live.contains(key));
             self.pending_rogue.retain(|key, _| rogue_live.contains(key));
             let pending: BTreeSet<_> = snapshot.pending.iter().map(|p| p.jobid.clone()).collect();
             self.state.pend_seen.retain(|id, _| pending.contains(id));
@@ -1259,5 +1371,136 @@ mod tests {
                 .count(),
             2
         );
+    }
+    #[test]
+    fn multinode_mem_fair_factor_uses_node_local_gpus() {
+        let (_tmp, mut notifier, transport) = setup(json!({"mem_fair_factor": 1.0}));
+        let mut data = snapshot();
+        // Multi-node job has gpu_count = 4 total, but only 1 GPU on this 4-GPU node.
+        // Fair share on this node is 25% (32G of 128G); 64G requested must trigger 2.0x alert.
+        data.nodes.push(crate::model::Node {
+            name: "gpu1".into(),
+            mem_total: "131072".into(),
+            gpus: vec![
+                crate::model::Gpu {
+                    index: "0".into(),
+                    alloc_jobid: "77".into(),
+                    alloc_jobids: vec!["77".into()],
+                    alloc_user: "alice".into(),
+                    alloc_users: vec!["alice".into()],
+                    ..Default::default()
+                },
+                crate::model::Gpu {
+                    index: "1".into(),
+                    ..Default::default()
+                },
+                crate::model::Gpu {
+                    index: "2".into(),
+                    ..Default::default()
+                },
+                crate::model::Gpu {
+                    index: "3".into(),
+                    ..Default::default()
+                },
+            ],
+            jobs: vec![Job {
+                jobid: "77".into(),
+                user: "alice".into(),
+                gpu_count: 4,
+                cpu_count: 8,
+                mem: "64G".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        notifier.process(&data, &BTreeMap::new(), 100.0).unwrap();
+        drain(&notifier);
+        let posts = transport.0.lock().unwrap();
+        assert!(posts.iter().any(|(target, text, _)| target == "C-shared"
+            && text.contains("#77")
+            && text.contains("2.0×")));
+        assert!(
+            posts
+                .iter()
+                .any(|(target, text, _)| target == "U-owner" && text.contains("#77"))
+        );
+    }
+    #[test]
+    fn shared_gpu_waste_includes_job_telemetry_and_oom_alert_deduplicates_and_cleans_up() {
+        let (tmp, mut notifier, transport) =
+            setup(json!({"waste_alert_hours": 1.0, "oom_alert": true}));
+        let now = runtime::now();
+        let mut data = snapshot();
+        data.nodes.push(crate::model::Node {
+            name: "gpu1".into(),
+            gpus: vec![crate::model::Gpu {
+                index: "0".into(),
+                idle_sec: 7200,
+                alloc_jobid: "10".into(),
+                alloc_jobids: vec!["10".into(), "11".into()],
+                alloc_user: "alice".into(),
+                alloc_users: vec!["alice".into(), "bob".into()],
+                ..Default::default()
+            }],
+            jobs: vec![
+                Job {
+                    jobid: "10".into(),
+                    user: "alice".into(),
+                    cpu_count: 4,
+                    telemetry: BTreeMap::from([(
+                        "gpu1".into(),
+                        json!({"observed_at": now, "cpu_cores": 0.2, "io_read_bps": 1048576.0, "io_write_bps": 0.0, "oom_kill": 2}),
+                    )]),
+                    ..Default::default()
+                },
+                Job {
+                    jobid: "11".into(),
+                    user: "bob".into(),
+                    cpu_count: 2,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        notifier.process(&data, &BTreeMap::new(), now).unwrap();
+        drain(&notifier);
+        // Same OOM count on next poll should not re-alert
+        notifier
+            .process(&data, &BTreeMap::new(), now + 5.0)
+            .unwrap();
+        drain(&notifier);
+        {
+            let posts = transport.0.lock().unwrap();
+            assert!(posts.iter().any(|(target, text, _)| {
+                target == "C-shared"
+                    && text.contains("alice,bob")
+                    && text.contains("#10,11")
+                    && text.contains("cpu=0.2/4")
+            }));
+            assert_eq!(
+                posts
+                    .iter()
+                    .filter(|(target, text, _)| target == "C-shared" && text.contains("kills=2"))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                posts
+                    .iter()
+                    .filter(|(target, text, _)| target == "U-owner" && text.contains("kills=2"))
+                    .count(),
+                1
+            );
+        }
+        // State persistence round-trip
+        let reloaded = Persistent::load(&tmp.path().join("notify_state.json"));
+        assert_eq!(reloaded.oom_kills.get("10:gpu1"), Some(&2));
+        // Job ends -> OOM tracking key cleaned up
+        data.nodes[0].jobs.clear();
+        notifier
+            .process(&data, &BTreeMap::new(), now + 10.0)
+            .unwrap();
+        drain(&notifier);
+        assert!(!notifier.state.oom_kills.contains_key("10:gpu1"));
     }
 }

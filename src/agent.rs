@@ -530,15 +530,39 @@ impl Sampler {
         let mut watts = BTreeMap::<String, f64>::new();
         let root = self.sys_root.join("class/powercap");
         if let Ok(entries) = fs::read_dir(&root) {
-            for entry in entries
+            let mut candidates: Vec<(String, PathBuf)> = entries
                 .take(128)
                 .flatten()
-                .filter(|e| e.file_name().to_string_lossy().starts_with("intel-rapl:"))
-            {
-                let Ok(path) = fs::canonicalize(entry.path()) else {
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    (name.contains("rapl:") && !name.contains("..")).then(|| (name, e.path()))
+                })
+                .collect();
+            let sub_dirs: Vec<PathBuf> = candidates
+                .iter()
+                .filter(|(name, _)| name.matches(':').count() == 1)
+                .map(|(_, path)| path.clone())
+                .collect();
+            for parent in sub_dirs {
+                if let Ok(children) = fs::read_dir(parent) {
+                    for child in children.take(64).flatten() {
+                        let name = child.file_name().to_string_lossy().into_owned();
+                        if name.contains("rapl:") && !name.contains("..") {
+                            candidates.push((name, child.path()));
+                        }
+                    }
+                }
+            }
+            let has_non_mmio = candidates.iter().any(|(name, _)| !name.contains("-mmio:"));
+            let mut seen = BTreeSet::new();
+            for (raw_name, raw_path) in candidates {
+                if has_non_mmio && raw_name.contains("-mmio:") {
+                    continue;
+                }
+                let Ok(path) = fs::canonicalize(&raw_path) else {
                     continue;
                 };
-                if !path.starts_with(&self.sys_root) {
+                if !path.starts_with(&self.sys_root) || !seen.insert(path.clone()) {
                     continue;
                 }
                 let Ok(dir) = runtime::open_dir(&path) else {
@@ -547,7 +571,7 @@ impl Sampler {
                 let Ok(name) = crate::node_telemetry::text_at(&dir, "name") else {
                     continue;
                 };
-                let depth = entry.file_name().to_string_lossy().matches(':').count();
+                let depth = raw_name.matches(':').count();
                 let key = if depth == 1 {
                     "cpu"
                 } else if name.trim() == "dram" {
@@ -561,13 +585,94 @@ impl Sampler {
                 else {
                     continue;
                 };
+                let max_uj = crate::node_telemetry::text_at(&dir, "max_energy_range_uj")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .unwrap_or(0);
                 if let Some((previous_time, previous_energy)) =
                     self.rapl.insert(path, (monotonic, uj))
                     && monotonic > previous_time
-                    && uj >= previous_energy
                 {
-                    *watts.entry(key.into()).or_default() +=
-                        (uj - previous_energy) as f64 / (monotonic - previous_time) / 1e6;
+                    let delta_uj = if uj >= previous_energy {
+                        Some(uj - previous_energy)
+                    } else if max_uj > previous_energy && uj <= max_uj {
+                        Some((max_uj - previous_energy).saturating_add(uj))
+                    } else {
+                        None
+                    };
+                    if let Some(delta_uj) = delta_uj {
+                        *watts.entry(key.into()).or_default() +=
+                            delta_uj as f64 / (monotonic - previous_time) / 1e6;
+                    }
+                }
+            }
+        }
+        let mut hwmon_sys: Option<f64> = None;
+        if let Ok(entries) = fs::read_dir(self.sys_root.join("class/hwmon")) {
+            let mut entries: Vec<_> = entries.take(128).flatten().collect();
+            entries.sort_by_key(|e| e.file_name());
+            for entry in entries {
+                let Ok(path) = fs::canonicalize(entry.path()) else {
+                    continue;
+                };
+                if !path.starts_with(&self.sys_root) {
+                    continue;
+                }
+                let Ok(dir) = runtime::open_dir(&path) else {
+                    continue;
+                };
+                let Ok(chip) = crate::node_telemetry::text_at(&dir, "name") else {
+                    continue;
+                };
+                let chip = chip.trim();
+                if chip == "amd_energy" && !watts.contains_key("cpu") {
+                    if let Ok(sensors) = fs::read_dir(&path) {
+                        for sensor in sensors.take(256).flatten() {
+                            let file = sensor.file_name().to_string_lossy().into_owned();
+                            let Some(stem) = file.strip_suffix("_input") else {
+                                continue;
+                            };
+                            if !stem.starts_with("energy") {
+                                continue;
+                            }
+                            let Ok(label) =
+                                crate::node_telemetry::text_at(&dir, &format!("{stem}_label"))
+                            else {
+                                continue;
+                            };
+                            if !label.trim().starts_with("Esocket") {
+                                continue;
+                            }
+                            let Some(uj) = crate::node_telemetry::text_at(&dir, &file)
+                                .ok()
+                                .and_then(|s| s.trim().parse::<u64>().ok())
+                            else {
+                                continue;
+                            };
+                            let key_path = path.join(&file);
+                            if let Some((prev_t, prev_e)) =
+                                self.rapl.insert(key_path, (monotonic, uj))
+                                && monotonic > prev_t
+                                && uj >= prev_e
+                            {
+                                *watts.entry("cpu".into()).or_default() +=
+                                    (uj - prev_e) as f64 / (monotonic - prev_t) / 1e6;
+                            }
+                        }
+                    }
+                } else if hwmon_sys.is_none()
+                    && matches!(chip, "acpi_power_meter" | "power_meter" | "ibmpowernv")
+                {
+                    for file in ["power1_average", "power1_input"] {
+                        if let Some(uw) = crate::node_telemetry::text_at(&dir, file)
+                            .ok()
+                            .and_then(|s| number(s.trim()))
+                            .filter(|n| *n >= 0.0)
+                        {
+                            hwmon_sys = Some(uw / 1e6);
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -602,6 +707,8 @@ impl Sampler {
         }
         if !self.ipmi.is_empty() {
             power.insert("sys".into(), self.ipmi.clone());
+        } else if let Some(w) = hwmon_sys {
+            power.insert("sys".into(), format!("{w:.1}"));
         }
         power
     }
@@ -673,7 +780,7 @@ pub fn run(args: Args) -> Result<()> {
         }
     }
     let directory = runtime::agent_dir();
-    fs::create_dir_all(&directory)?;
+    runtime::prepare_agent_dir(&directory)?;
     let destination = directory.join(format!("{}.json", runtime::hostname()?));
     let interval = Duration::from_secs_f64(if args.mode == Mode::Gpu {
         runtime::env_seconds("SLURM_GPU_TUI_AGENT_SEC", 3.0, 0.1)
@@ -841,5 +948,65 @@ mod tests {
         assert_eq!(gpus[0].pid_mem["111"], "8192");
         assert_eq!(gpus[0].pid_jobid["111"], "42");
         assert_eq!(gpus[0].pids, ["111"]);
+    }
+
+    #[test]
+    fn power_handles_rapl_wraparound_mmio_skip_and_hwmon_fallbacks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sys = tmp.path().to_path_buf();
+        let rapl = sys.join("class/powercap");
+        fs::create_dir_all(rapl.join("intel-rapl:0/intel-rapl:0:0")).unwrap();
+        fs::create_dir_all(rapl.join("intel-rapl-mmio:0")).unwrap();
+        fs::create_dir_all(sys.join("class/hwmon/hwmon0")).unwrap();
+        fs::write(rapl.join("intel-rapl:0/name"), "package-0\n").unwrap();
+        fs::write(rapl.join("intel-rapl:0/max_energy_range_uj"), "15000000\n").unwrap();
+        fs::write(rapl.join("intel-rapl:0/energy_uj"), "10000000\n").unwrap();
+        fs::write(rapl.join("intel-rapl:0/intel-rapl:0:0/name"), "dram\n").unwrap();
+        fs::write(
+            rapl.join("intel-rapl:0/intel-rapl:0:0/energy_uj"),
+            "2000000\n",
+        )
+        .unwrap();
+        fs::write(rapl.join("intel-rapl-mmio:0/name"), "package-0\n").unwrap();
+        fs::write(rapl.join("intel-rapl-mmio:0/energy_uj"), "1000\n").unwrap();
+        fs::write(sys.join("class/hwmon/hwmon0/name"), "acpi_power_meter\n").unwrap();
+        fs::write(sys.join("class/hwmon/hwmon0/power1_average"), "250000000\n").unwrap();
+
+        let mut sampler = Sampler {
+            sys_root: fs::canonicalize(&sys).unwrap(),
+            ipmi_next: f64::INFINITY,
+            ..Default::default()
+        };
+        let first = sampler.power(10.0);
+        assert_eq!(first.get("sys").map(String::as_str), Some("250.0"));
+        assert!(!first.contains_key("cpu"));
+
+        fs::write(rapl.join("intel-rapl:0/energy_uj"), "1000000\n").unwrap();
+        fs::write(
+            rapl.join("intel-rapl:0/intel-rapl:0:0/energy_uj"),
+            "4000000\n",
+        )
+        .unwrap();
+        fs::write(rapl.join("intel-rapl-mmio:0/energy_uj"), "99999000\n").unwrap();
+        let second = sampler.power(12.0);
+        assert_eq!(second.get("cpu").map(String::as_str), Some("3.0"));
+        assert_eq!(second.get("ram").map(String::as_str), Some("1.0"));
+        assert_eq!(second.get("sys").map(String::as_str), Some("250.0"));
+
+        let tmp2 = tempfile::tempdir().unwrap();
+        let hwmon = tmp2.path().join("class/hwmon/hwmon0");
+        fs::create_dir_all(&hwmon).unwrap();
+        fs::write(hwmon.join("name"), "amd_energy\n").unwrap();
+        fs::write(hwmon.join("energy1_label"), "Esocket0\n").unwrap();
+        fs::write(hwmon.join("energy1_input"), "5000000\n").unwrap();
+        let mut amd = Sampler {
+            sys_root: fs::canonicalize(tmp2.path()).unwrap(),
+            ipmi_next: f64::INFINITY,
+            ..Default::default()
+        };
+        assert!(amd.power(1.0).is_empty());
+        fs::write(hwmon.join("energy1_input"), "9000000\n").unwrap();
+        let amd_second = amd.power(3.0);
+        assert_eq!(amd_second.get("cpu").map(String::as_str), Some("2.0"));
     }
 }

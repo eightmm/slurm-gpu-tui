@@ -7,11 +7,11 @@ single executable is not guaranteed to run on every host.
 | Layer | Behavior | Boundary |
 |---|---|---|
 | Linux installation | Bash bootstrap, git, C compiler and Rust 1.93+; systemd or a local background service | Build on the target OS/architecture/libc, or supply matching prebuilt binaries |
-| Slurm jobs | Prefer structured JSON; unsupported options or missing JSON/data-parser plugins select text records | Text identity/allocation still requires matching before/after numeric-UID rosters; malformed JSON and controller outages do not silently downgrade |
-| Accounting | Slurm 19.05-compatible query without `sacct --array` | Local array expansion is bounded; missing accounting stays unavailable |
+| Slurm jobs | Prefer structured JSON; unsupported options or missing JSON/data-parser plugins select text records | Text identity/allocation still requires matching before/after numeric-UID rosters and falls back to TRES GPU counts on untyped GRES; malformed JSON and controller outages do not silently downgrade |
+| Accounting | Slurm 19.05-compatible query without `sacct --array`; `sgpu logs` falls back to owner-verified `sacct` `WorkDir` when active controller records expire | Local array expansion is bounded; missing accounting stays unavailable and log reads still reject symlinks (`O_NOFOLLOW`) and foreign UIDs |
 | NVIDIA measurements | Try rich fields; explicit unsupported-field errors retry a basic identity/utilization/VRAM query | Missing temperature, power, ECC, serial and clocks remain unknown, never zero |
 | NVIDIA processes | Retry a basic process view if the memory view is unsupported; select GPUs in groups of sixteen | Every selected GPU needs a process-view row; unavailable or incomplete process data cannot count as empty activity |
-| CPU-only nodes | `--mode cpu` samples CPU/RAM/cgroups without NVIDIA commands | GPU samplers currently target NVIDIA; AMD/Intel GPU utilization backends are not implemented |
+| CPU-only nodes | `--mode cpu` samples CPU/RAM/cgroups without NVIDIA commands; power uses RAPL and `hwmon` (`amd_energy`, `acpi_power_meter`, `power_meter`, `ibmpowernv`) or `ipmitool` | GPU samplers currently target NVIDIA; AMD/Intel GPU utilization backends are not implemented |
 | Job cgroups | Per-job CPU/RAM/I/O observations use cgroup v2 | Missing v2 files, including v1-only hosts, leave those job metrics unknown; host memory and scheduler allocation are separate observations |
 | Agent updates | Check architecture, ownership, loader and version; retain the previous worker and roll back failed activation | Different libc versions may reject a candidate; local native installation remains the fallback |
 | Legacy node bootstrap | Master installer uses existing administrative SSH and tests a native bundle before migration | Matching architecture/libc, shared publication and existing root SSH or remote sudo are required; failed nodes are reported |

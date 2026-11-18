@@ -68,27 +68,31 @@ sgpu explain 12345      # 대기 사실·해석·노드 여유량
 sgpu me                 # 내 작업·사용량
 sgpu users              # 사용자별 자원
 sgpu host               # 컨트롤러 자원
-sgpu usage 7 --daily     # GPU-hours
-sgpu logs 12345 -e -f    # stderr 따라가기
-sgpu doctor             # 수집 상태 진단
+sgpu usage 7 --daily    # GPU/CPU/RAM 사용량
+sgpu fit 1 --nodes 2    # 다중 노드 적합성 (--cpu-only: CPU 전용)
+sgpu logs 12345 -e -f   # stderr 따라가기 (종료 작업 WorkDir 폴백 지원)
+sgpu doctor             # 수집·PID·공유 디렉터리 상태 진단
 sgpu welcome            # 게시된 데이터로 짧은 로그인 요약
 ```
 
 | 조작 | 동작 |
 |---|---|
-| `1`–`7` | GPU / CPU / Usage / Jobs / Attention / Users / Host |
-| `↕` 클릭 · `s` / `S` | Jobs 헤더 정렬 · 정렬 순환 / 역순 |
+| `1`–`8` | GPU / CPU / Usage / Jobs / Attention / Users / Host / Partitions |
+| `↕` 클릭 · `s` / `S` | 헤더 정렬 (GPU / CPU / Usage / Jobs / Users / Partitions) · 역순 |
 | `u` / `p` / `m` | 사용자 / 파티션 / 강조한 계정 필터 |
 | `U` / `P` | 사용자 / 파티션을 검색해서 선택 |
 | `E` / `F` | 선택한 대기 작업 설명 / 내 24시간 실패 요약 |
-| Jobs에서 `v` | 전체 / 실행 / 대기 |
-| `/` / `0` | 검색 / 필터 초기화 |
-| Enter / Tab | 상세 / 스크립트·로그 탭 |
+| `v` (Jobs / Usage) | Jobs: 전체 / 실행 / 대기 · Usage: 사용자별 / 일별 |
+| Usage에서 `D` | 7일 / 14일 / 30일 기간 전환 |
+| `/` / `0` | 검색 (두벌식 한글 조합 입력 지원) / 필터 초기화 |
+| Enter / Tab | Summary / Raw / Script / StdOut / StdErr 상세 탭 |
 | 우클릭 / `a` | Actions 메뉴: 클릭 또는 방향키 + Enter |
-| `J` / Esc | GPU·CPU·Users·Attention에서 관련 Jobs / 이전 화면 |
+| `J` / Esc | GPU·CPU·Users·Attention·Partitions에서 관련 Jobs / 이전 화면 |
 | `?` / `q` | 전체 도움말 / 종료 |
 
-전체 명령은 `sgpu --help`에서 확인합니다. `sgpu --highlight-user alice`로 계정을
+전체 명령은 `sgpu --help`에서 확인합니다. `doctor`, `host`, `users`, `me`,
+`explain`, `waste`, `usage`, `jobs`, `report`, `fit`, `queue`, `failures`에서
+`--json` 구조화 출력을 지원합니다. `sgpu --highlight-user alice`로 계정을
 강조할 수 있으며 권한은 실행 계정을 따릅니다. 세 `chk*` 명령은 공통으로
 `--color auto|always|never`와 `NO_COLOR`를 지원하며 파이프에서는 기본으로 색을 끕니다.
 청록 제목 · 초록 본인/이상 없음 · 노랑 대기/중단 · 빨강 실패/할당 포화 · 회색 보조 정보로 통일했습니다.

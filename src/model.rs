@@ -40,8 +40,55 @@ model!(Gpu {
     pid_mem: BTreeMap<String, String> = BTreeMap::new(),
     pid_jobid: BTreeMap<String, String> = BTreeMap::new(),
     alloc_jobid: String = String::new(), alloc_user: String = String::new(),
+    alloc_jobids: Vec<String> = Vec::new(), alloc_users: Vec<String> = Vec::new(),
     idle_sec: u64 = 0, parked_sec: u64 = 0
 });
+
+impl Gpu {
+    pub fn has_alloc(&self) -> bool {
+        !self.alloc_jobid.is_empty()
+            || !self.alloc_user.is_empty()
+            || !self.alloc_jobids.is_empty()
+            || !self.alloc_users.is_empty()
+    }
+    pub fn job_ids(&self) -> Vec<&str> {
+        let mut out = Vec::new();
+        for id in &self.alloc_jobids {
+            if !id.is_empty() && !out.contains(&id.as_str()) {
+                out.push(id.as_str());
+            }
+        }
+        if !self.alloc_jobid.is_empty() && !out.contains(&self.alloc_jobid.as_str()) {
+            out.push(self.alloc_jobid.as_str());
+        }
+        out
+    }
+    pub fn users_alloc(&self) -> Vec<&str> {
+        let mut out = Vec::new();
+        for user in &self.alloc_users {
+            if !user.is_empty() && !out.contains(&user.as_str()) {
+                out.push(user.as_str());
+            }
+        }
+        if !self.alloc_user.is_empty() && !out.contains(&self.alloc_user.as_str()) {
+            out.push(self.alloc_user.as_str());
+        }
+        out
+    }
+    pub fn has_job(&self, jobid: &str) -> bool {
+        !jobid.is_empty()
+            && (self.alloc_jobid == jobid || self.alloc_jobids.iter().any(|id| id == jobid))
+    }
+    pub fn has_user(&self, user: &str) -> bool {
+        !user.is_empty() && (self.alloc_user == user || self.alloc_users.iter().any(|u| u == user))
+    }
+    pub fn alloc_jobs_display(&self) -> String {
+        self.job_ids().join(",")
+    }
+    pub fn alloc_users_display(&self) -> String {
+        self.users_alloc().join(",")
+    }
+}
 
 model!(Job {
     jobid: String = String::new(), user: String = String::new(), partition: String = String::new(),

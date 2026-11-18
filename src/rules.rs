@@ -29,7 +29,7 @@ pub fn ignored_users() -> BTreeSet<String> {
 
 pub fn classify(gpu: &Gpu, ignored: &BTreeSet<String>) -> Class {
     let real = gpu.users.iter().any(|u| !ignored.contains(u));
-    if real && gpu.alloc_jobid.is_empty() {
+    if real && !gpu.has_alloc() {
         return Class::Rogue;
     }
     let Some(util) = number(&gpu.util) else {
@@ -44,7 +44,7 @@ pub fn classify(gpu: &Gpu, ignored: &BTreeSet<String>) -> Class {
     {
         return Class::Parked;
     }
-    if !gpu.alloc_jobid.is_empty() || real {
+    if gpu.has_alloc() || real {
         return Class::Idle;
     }
     Class::Free
@@ -229,7 +229,9 @@ pub fn waste(nodes: &[Node], minimum: u64) -> Vec<Waste> {
                 .filter(|u| !ignored.contains(*u))
                 .cloned()
                 .collect();
-            let (kind, sec, user, jobid) = if !real.is_empty() && gpu.alloc_jobid.is_empty() {
+            let alloc_users = gpu.alloc_users_display();
+            let alloc_jobs = gpu.alloc_jobs_display();
+            let (kind, sec, user, jobid) = if !real.is_empty() && !gpu.has_alloc() {
                 let jobid = node
                     .jobs
                     .iter()
@@ -243,22 +245,17 @@ pub fn waste(nodes: &[Node], minimum: u64) -> Vec<Waste> {
                     jobid,
                 )
             } else if gpu.idle_sec >= minimum {
-                (
-                    "idle",
-                    gpu.idle_sec,
-                    gpu.alloc_user.clone(),
-                    gpu.alloc_jobid.clone(),
-                )
+                ("idle", gpu.idle_sec, alloc_users, alloc_jobs)
             } else if gpu.parked_sec >= minimum {
                 (
                     "parked",
                     gpu.parked_sec,
-                    if gpu.alloc_user.is_empty() {
+                    if alloc_users.is_empty() {
                         gpu.users.join(",")
                     } else {
-                        gpu.alloc_user.clone()
+                        alloc_users
                     },
-                    gpu.alloc_jobid.clone(),
+                    alloc_jobs,
                 )
             } else {
                 continue;
@@ -343,9 +340,17 @@ pub fn fit(
     ram: f64,
     partition: &str,
 ) -> Vec<FitResult> {
+    let normalize = |value: &str| {
+        value
+            .to_lowercase()
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>()
+    };
+    let wanted_model = normalize(model);
     nodes
         .iter()
-        .filter(|n| n.has_gpu)
+        .filter(|n| gpus == 0 || n.has_gpu)
         .map(|node| {
             let mut reasons = Vec::new();
             if !schedulable(node) {
@@ -354,30 +359,31 @@ pub fn fit(
             if !partition.is_empty() && !node.partition.split(',').any(|p| p == partition) {
                 reasons.push("partition does not match".into());
             }
-            let normalize = |value: &str| {
-                value
-                    .to_lowercase()
-                    .chars()
-                    .filter(char::is_ascii_alphanumeric)
-                    .collect::<String>()
-            };
+            let gres_matches_model = !wanted_model.is_empty()
+                && node.gres.split(',').any(|g| {
+                    g.split('(')
+                        .next()
+                        .and_then(|s| s.split(':').nth(1))
+                        .is_some_and(|label| normalize(label) == wanted_model)
+                });
             let free = node
                 .gpus
                 .iter()
                 .zip(classes(node, runtime::now()))
                 .filter(|(gpu, class)| {
+                    let model_ok = wanted_model.is_empty()
+                        || if !gpu.name.is_empty() {
+                            normalize(&gpu.name).contains(&wanted_model)
+                        } else {
+                            gres_matches_model
+                        };
                     *class == Class::Free
                         && (vram <= 0.0
                             || number(&gpu.mem_total).is_some_and(|m| m >= vram * 1024.0))
-                        && (model.is_empty()
-                            || node.gres.split(',').any(|g| {
-                                g.split(':')
-                                    .nth(1)
-                                    .is_some_and(|label| label.eq_ignore_ascii_case(model))
-                            }) && normalize(&gpu.name).contains(&normalize(model)))
+                        && model_ok
                 })
                 .count();
-            if free < (gpus as usize) {
+            if gpus > 0 && free < (gpus as usize) {
                 reasons.push("insufficient free GPUs matching model/VRAM".into());
             }
             if cpus > 0
@@ -473,5 +479,48 @@ mod tests {
         assert_eq!(duration("03:04"), Some(184));
         assert_eq!(duration("UNLIMITED"), None);
         assert_eq!(duration("18446744073709551615-01:00:00"), None);
+    }
+    #[test]
+    fn fit_matches_untyped_gres_models_and_cpu_only_nodes() {
+        let nodes = vec![
+            Node {
+                name: "gpu1".into(),
+                state: "idle".into(),
+                has_gpu: true,
+                gres: "gpu:2".into(),
+                cpus: "32".into(),
+                cpu_alloc: "4".into(),
+                scheduler_mem_total: "131072".into(),
+                mem_alloc: "16384".into(),
+                partition: "gpu".into(),
+                gpus: vec![Gpu {
+                    index: "0".into(),
+                    name: "NVIDIA H100 80GB HBM3".into(),
+                    util: "0".into(),
+                    mem_total: "81920".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            Node {
+                name: "cpu1".into(),
+                state: "idle".into(),
+                has_gpu: false,
+                cpus: "64".into(),
+                cpu_alloc: "8".into(),
+                scheduler_mem_total: "262144".into(),
+                mem_alloc: "32768".into(),
+                partition: "cpu".into(),
+                ..Default::default()
+            },
+        ];
+        let gpu_fit = fit(&nodes, 1, 80.0, "h100", 8, 32.0, "gpu");
+        assert_eq!(gpu_fit.len(), 1);
+        assert!(gpu_fit[0].eligible);
+        let cpu_fit = fit(&nodes, 0, 0.0, "", 16, 64.0, "cpu");
+        let eligible: Vec<_> = cpu_fit.iter().filter(|r| r.eligible).collect();
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(eligible[0].node, "cpu1");
+        assert!(cpu_fit.iter().any(|r| r.node == "gpu1" && !r.eligible));
     }
 }

@@ -58,12 +58,13 @@ by other users. Keep mode 0600 for credentials.
 | `rogue_grace_sec` | `300` | Rogue use must persist this long before alerting (rides out job start/end races) |
 | `temp_alert_c` | `0` | GPU temperature ≥ N °C (`0` = off; ~90 typical) |
 | `ecc_alert` | `true` | Uncorrectable ECC errors — silent hardware failure; alert carries physical slot / /dev/nvidiaN / UUID / PCI bus / serial for RMA |
+| `oom_alert` | `true` | Live cgroup `oom_kill` increases on running jobs; posted to channel and DMed to owner |
 | `job_done_users` | `[]` | Notify when these users' jobs finish |
 | `job_fail_users` | `[]` | FAILED / OOM / TIMEOUT / NODE_FAIL alerts for these users; `["*"]` = everyone (needs sacct) |
 | `pending_alert_hours` | `0` | Job stuck `PENDING` on the scheduler ≥ N hours (`0` = off; user holds / dependencies never alert) |
 | `dm_users` | `{}` | `{"login": "U012AB..."}` Slack member ids — alerts about a user's own jobs are also DMed to them |
 | `free_gpus_min` | `0` | Notify when free-GPU count reaches N (`0` = off) |
-| `mem_fair_factor` | `0` | RAM-hog alerts: a job's **requested** RAM exceeds factor × its GPU fair share (node RAM × job GPUs ÷ node GPUs). `1.0` = strict, `0` = off. Allocation-based — catches greedy `--mem` before the memory is even touched; silent on clusters where jobs don't request memory |
+| `mem_fair_factor` | `0` | RAM-hog alerts: a job's **requested** RAM exceeds factor × its node-local GPU fair share (node RAM × node job GPUs ÷ node GPUs). `1.0` = strict, `0` = off. Allocation-based — catches greedy `--mem` before the memory is even touched; silent on clusters where jobs don't request memory |
 
 Repeated conditions are debounced (30 min for events, 6 h for standing
 conditions like waste/temp/ECC). Node-health alerts follow validated Slurm
@@ -77,8 +78,10 @@ failure does not infer node outages or finished jobs.
 - **Collection lost/restored:** a GPU node was previously reporting, Slurm still
   says it is up, but sgpu can no longer collect GPU data after
   `collect_grace_sec`.
-- **Wasted GPU:** a GPU is allocated but has no compute process, or VRAM is held
-  with near-zero utilization, for at least `waste_alert_hours`.
+- **Wasted GPU:** a GPU is allocated (including shared/MPS/multi-job
+  allocations) with no compute process, or VRAM is held with near-zero
+  utilization, for at least `waste_alert_hours`, enriched with live job details
+  when readable.
 - **Rogue GPU:** a GPU has a process but no Slurm GPU allocation, persisting
   for `rogue_grace_sec`. Jobs in `COMPLETING` state still count as allocated
   (process teardown can outlive `RUNNING`), and rogue checks are skipped on
@@ -86,6 +89,9 @@ failure does not infer node outages or finished jobs.
   both would otherwise flag legitimate users.
 - **Temp/ECC:** temperature over `temp_alert_c`, or uncorrectable ECC errors.
   ECC alerts include hardware identity fields when the driver exposes them.
+- **Live cgroup OOM kill** (`oom_alert`): fires when a running job's fresh
+  cgroup `oom_kill` count increases on a node, posting to the channel and
+  DMing the owner when `dm_users` maps them.
 - **Free GPUs:** fires when the free-GPU count crosses from below to at least
   `free_gpus_min`.
 - **Job done:** tracks currently visible jobs for `job_done_users`; when a job
@@ -97,12 +103,12 @@ failure does not infer node outages or finished jobs.
   stderr can leak paths/secrets) carries the last ~15 lines of the job's
   stderr when the file is readable.
 - **RAM over fair share** (`mem_fair_factor`): a running GPU job requests
-  more memory than factor × its share; posted to the channel and DMed to
-  the owner, re-alerted every 6 h while it persists.
+  more memory than factor × its node-local share; posted to the channel and DMed
+  to the owner, re-alerted every 6 h while it persists.
 - **Pending stuck:** a job waiting on the *scheduler* (`Resources`,
   `Priority`, …) for `pending_alert_hours`. Holds, dependencies and
   begin-times are the user's own doing and never alert.
-- **Personal DMs:** with `dm_users` set, job done/failed and
+- **Personal DMs:** with `dm_users` set, job done/failed, OOM, and
   pending-stuck alerts about a user's jobs are also sent to them directly.
 
 ## Minimal bot config
