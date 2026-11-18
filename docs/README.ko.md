@@ -77,18 +77,18 @@ sgpu welcome            # 게시된 데이터로 짧은 로그인 요약
 
 | 조작 | 동작 |
 |---|---|
-| `1`–`8` | GPU / CPU / Usage / Jobs / Attention / Users / Host / Partitions |
-| `↕` 클릭 · `s` / `S` | 헤더 정렬 (GPU / CPU / Usage / Jobs / Users / Partitions) · 역순 |
+| `1`–`8` · `Tab` / `←` / `→` | GPU / CPU / Usage / Jobs / Attention / Users / Host / Partitions |
+| `↕` 클릭 · `s` / `S` | 헤더 정렬 (모든 정렬 가능 탭·History) · 역순 |
 | `u` / `p` / `m` | 사용자 / 파티션 / 강조한 계정 필터 |
-| `U` / `P` | 사용자 / 파티션을 검색해서 선택 |
+| `U` / `P` | 사용자 / 파티션 검색 선택 (`Ctrl+U`·`[×]` 입력 지우기) |
 | `E` / `F` | 선택한 대기 작업 설명 / 내 24시간 실패 요약 |
-| `v` (Jobs / Usage) | Jobs: 전체 / 실행 / 대기 · Usage: 사용자별 / 일별 |
-| Usage에서 `D` | 7일 / 14일 / 30일 기간 전환 |
-| `/` / `0` | 검색 (두벌식 한글 조합 입력 지원) / 필터 초기화 |
-| Enter / Tab | Summary / Raw / Script / StdOut / StdErr 상세 탭 |
-| 우클릭 / `a` | Actions 메뉴: 클릭 또는 방향키 + Enter |
-| `J` / Esc | GPU·CPU·Users·Attention·Partitions에서 관련 Jobs / 이전 화면 |
-| `?` / `q` | 전체 도움말 / 종료 |
+| `v` (Jobs / Usage) · `D` | Jobs: 전체 / 실행 / 대기 · Usage: 사용자별 / 일별 · 기간 7/14/30일 |
+| `h` (History 팝업) | 필터(`/`) · `s`/`S`/`↕` 클릭 정렬 · `0` 초기화 · 더블클릭/Enter 상세 |
+| `/` / `Ctrl+U` / `0` | 검색 (두벌식 한글 조합) / 입력 지우기(`[×]`) / 필터 초기화 |
+| 더블클릭 / Enter · `1`–`9` / `Tab` | 상세 열기 · Summary / Raw / Script / StdOut / StdErr 탭 전환 |
+| 우클릭 / `a` · `x` | Actions 메뉴 (`↑↓`/`Tab`+Enter·단축키, `a`로 닫기) · 본인 작업 취소 |
+| `J` / Esc | GPU·CPU·Usage·Users·Attention·Partitions에서 관련 Jobs / 이전 화면 |
+| `?` / `q` | 전체 도움말 (`sgpu` 클릭) / 종료 |
 
 전체 명령은 `sgpu --help`에서 확인합니다. `doctor`, `host`, `users`, `me`,
 `explain`, `waste`, `usage`, `jobs`, `report`, `fit`, `queue`, `failures`에서
@@ -101,11 +101,10 @@ JSON에는 `--color always`에서도 색상 코드를 넣지 않습니다.
 마지막 탭·정렬·Jobs 상태는 `~/.sgpu/ui/preferences.json`에 저장합니다.
 검색어·계정 필터·로그·임시 관련 화면은 현재 세션에만 유지합니다.
 
-탭·행·정렬 표시가 있는 헤더·필터·버튼을 클릭할 수 있습니다.
-행 선택 후 **Detail**을 누르세요. 짧은 창에서는 상세가 화면 전체로 확장되며,
-휠·페이지 버튼으로 스크롤하고 **Follow**로 실시간 로그 따라가기를 재개합니다.
-상세·로그에서 `/`로 문자열을 찾고 `n` / `N`으로 일치하는 줄을 이동합니다.
-Enter로 검색을 적용하며, Esc는 검색 입력을 지운 뒤 팝업을 닫습니다.
+탭·행·`sgpu` 도움말·대시보드 **Resources**(5분 추세)와 **GPU map**(클릭 이동·더블클릭 상세·우클릭 메뉴)·요약/필터 칩·정렬 표시(`↕`) 헤더·`[×]` 지우기·하단 버튼을 모두 클릭할 수 있습니다.
+행을 클릭해 선택한 뒤 **Detail**·더블클릭으로 상세를 열고, 우클릭·`a`로 Actions 메뉴를 엽니다. 취소 확인창에서는 `←`/`→`/`Tab`으로 **Keep**/**Cancel**을 오가고 `Enter`·`y`·`n`·클릭으로 확정합니다.
+짧은 창에서는 상세가 화면 전체로 확장되며 휠·`↑↓`·`Space`/`b`·`PgUp`/`PgDn`·`g`/`G`·페이지 버튼으로 스크롤하고, `f`·**Follow**로 실시간 로그 따라가기를 전환합니다.
+상세·로그에서 `/`로 문자열을 찾고 `n`/`N`으로 일치하는 줄을 이동합니다. Enter로 검색을 적용하고, `Ctrl+U`·`[×]`로 입력만 지우며, Esc는 검색 입력을 먼저 지운 뒤 팝업을 닫습니다.
 
 `chkqueue` = `sgpu queue` (`--mine`, `--partition`, `--limit`, `--json`).
 `chkfail` = `sgpu failures` (`--hours 24`, `--json`): 본인 accounting만 한 번 조회하고

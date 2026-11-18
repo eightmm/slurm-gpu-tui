@@ -77,18 +77,18 @@ sgpu welcome            # Short login overview, published data only
 
 | Control | Action |
 |---|---|
-| `1`–`8` | GPU / CPU / Usage / Jobs / Attention / Users / Host / Partitions |
-| Click `↕` · `s` / `S` | Header sorting (GPU / CPU / Usage / Jobs / Users / Partitions) · reverse |
+| `1`–`8` · `Tab` / `←` / `→` | GPU / CPU / Usage / Jobs / Attention / Users / Host / Partitions |
+| Click `↕` · `s` / `S` | Header sorting (all sortable tabs & History) · reverse |
 | `u` / `p` / `m` | User / partition / highlighted-account filters |
-| `U` / `P` | Search and select a user / partition |
+| `U` / `P` | Search & select a user / partition (`Ctrl+U` or `[×]` clears query) |
 | `E` / `F` | Explain pending job / my 24h failure report |
-| `v` (Jobs / Usage) | Jobs: all / running / pending · Usage: user / daily |
-| `D` in Usage | Cycle 7d / 14d / 30d window |
-| `/` / `0` | Search (supports 2-bulsik Korean IME) / reset filters |
-| Enter / Tab | Summary / Raw / Script / StdOut / StdErr detail panes |
-| Right-click / `a` | Actions menu: mouse click or arrows + Enter |
-| `J` / Esc | Related Jobs from GPU, CPU, Users, Attention or Partitions / return |
-| `?` / `q` | Full help / quit |
+| `v` (Jobs / Usage) · `D` | Jobs: all / running / pending · Usage: user / daily · window 7d / 14d / 30d |
+| `h` (History popup) | Filter (`/`) · `s` / `S` / click `↕` sort · `0` reset · 2×click / Enter detail |
+| `/` / `Ctrl+U` / `0` | Search (2-bulsik Korean IME) / clear query (`[×]`) / reset filters |
+| 2×click / Enter · `1`–`9` / `Tab` | Open detail · switch Summary / Raw / Script / StdOut / StdErr panes |
+| Right-click / `a` · `x` | Actions menu (`↑↓`/`Tab` + Enter or hotkey, `a` closes) · cancel own job |
+| `J` / Esc | Related Jobs from GPU, CPU, Usage, Users, Attention or Partitions / return |
+| `?` / `q` | Full help (or click `sgpu`) / quit |
 
 Use `sgpu --help` for all commands. Structured `--json` output is supported on
 `doctor`, `host`, `users`, `me`, `explain`, `waste`, `usage`, `jobs`, `report`,
@@ -102,11 +102,10 @@ JSON stays uncolored, including with `--color always`.
 The last tab, sort and Jobs state are saved in `~/.sgpu/ui/preferences.json`.
 Searches, account filters, logs and temporary related views stay in the current session.
 
-Tabs, rows, marked sort headers, filter chips and buttons accept mouse clicks.
-Select a row, then click **Detail**. Short detail windows expand to the screen;
-use the wheel or paging buttons to scroll, and **Follow** to resume live logs.
-Inside details/logs, `/` finds literal text; `n` / `N` move between matching lines.
-Enter applies the search; Esc clears the search input, then closes the popup.
+Tabs, rows, `sgpu` help, dashboard **Resources** (5m trend) and **GPU map** (click jump, 2×click inspect, right-click actions), summary/filter chips, marked `↕` headers, `[×]` clear buttons and footer controls accept mouse clicks.
+Row click selects; double-click or **Detail** opens it, and right-click or `a` opens Actions. Cancel confirmation toggles **Keep** / **Cancel** with `←`/`→`/`Tab`, runs with `Enter`, or acts directly via `y`/`n`/click.
+Short detail windows expand to the screen; use the wheel, `↑↓`, `Space`/`b`, `PgUp`/`PgDn`, `g`/`G`, or paging buttons to scroll, and `f` / **Follow** to toggle live log tailing.
+Inside details/logs, `/` finds literal text; `n` / `N` move between matching lines. Enter applies, `Ctrl+U` / `[×]` clears input, and Esc clears the search first before closing the popup.
 
 `chkqueue` = `sgpu queue` (`--mine`, `--partition`, `--limit`, `--json`).
 `chkfail` = `sgpu failures` (`--hours 24`, `--json`): one owner-only accounting query,

@@ -47,6 +47,13 @@ impl Find {
         self.jump = true;
         true
     }
+    pub fn clear(&mut self) {
+        self.query.clear();
+        self.selected = 0;
+        self.rows.clear();
+        self.cached_query.clear();
+        self.jump = false;
+    }
     pub fn next(&mut self, backwards: bool) {
         if !self.rows.is_empty() {
             self.selected = if backwards {
@@ -193,5 +200,30 @@ mod tests {
         find.input(KeyCode::Esc);
         find.text(raw, 8, normal, normal, matched);
         assert!(find.rows.is_empty());
+    }
+    #[test]
+    fn clear_resets_query_selection_matches_and_jump() {
+        let mut find = Find {
+            editing: true,
+            ..Default::default()
+        };
+        for c in "hit".chars() {
+            assert!(find.input(KeyCode::Char(c)));
+        }
+        let normal = Style::default().fg(Color::White);
+        let matched = Style::default().bg(Color::Yellow);
+        let raw = "hit one\nhit two";
+        find.text(raw, 20, normal, normal, matched);
+        assert_eq!(find.rows.len(), 2);
+        find.next(false);
+        assert_eq!(find.selected, 1);
+        find.clear();
+        assert!(find.query.is_empty());
+        assert_eq!(find.selected, 0);
+        assert!(find.rows.is_empty());
+        assert_eq!(find.take_jump(), None);
+        let _ = find.text(raw, 20, normal, normal, matched);
+        assert!(find.rows.is_empty());
+        assert_eq!(find.take_jump(), None);
     }
 }

@@ -7,12 +7,15 @@ pub enum Action {
     Key(KeyCode),
     Row(String),
     Fold(String),
+    JumpNode(String),
     JobSort(job_view::Sort),
     Sort(usize),
+    HistorySort(usize),
     Pane(usize),
     History(usize),
     Menu(usize),
     Choice(usize),
+    ClearInput,
     Close,
 }
 
