@@ -437,7 +437,24 @@ pub fn render(raw: &Value, days: u64, daily: bool) -> String {
     render_with_options(raw, days, daily, 0, false, "", "")
 }
 
-pub fn render_with_options(
+#[derive(Clone, Debug)]
+pub struct TableRow {
+    pub name: String,
+    pub totals: Totals,
+    pub cells: Vec<String>,
+    pub is_total: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct TableData {
+    pub title: String,
+    pub has_compute: bool,
+    pub headers: Vec<String>,
+    pub rows: Vec<TableRow>,
+    pub note: &'static str,
+}
+
+pub fn table(
     raw: &Value,
     days: u64,
     daily: bool,
@@ -445,7 +462,7 @@ pub fn render_with_options(
     reverse: bool,
     user_filter: &str,
     search: &str,
-) -> String {
+) -> TableData {
     let cutoff = window(days);
     let (users, dates) = merge_filtered(raw, |day| day >= cutoff.as_str(), user_filter);
     let has_compute = users.values().chain(dates.values()).any(|t| {
@@ -454,10 +471,15 @@ pub fn render_with_options(
             || t.ram_alloc_gib_sec > 0.0
             || t.ram_used_gib_sec > 0.0
     });
-    let mut out = if has_compute {
-        format!(
-            "Cluster usage — last {days} days\n{:<16}{:>10}{:>10}{:>8}{:>10}{:>11}{:>11}{:>8}{:>13}\n",
-            if daily { "day" } else { "user" },
+    let first = if daily { "day" } else { "user" };
+    let title = if has_compute {
+        format!("Cluster usage — last {days} days")
+    } else {
+        format!("GPU-hours — last {days} days")
+    };
+    let headers: Vec<String> = if has_compute {
+        vec![
+            first,
             "gpu_alloc",
             "gpu_busy",
             "eff",
@@ -465,18 +487,14 @@ pub fn render_with_options(
             "cpu_alloc",
             "cpu_used",
             "cpu%",
-            "ram_used/req"
-        )
+            "ram_used/req",
+        ]
     } else {
-        format!(
-            "GPU-hours — last {days} days\n{:<16}{:>10}{:>10}{:>8}{:>10}\n",
-            if daily { "day" } else { "user" },
-            "alloc",
-            "busy",
-            "eff",
-            "waste"
-        )
-    };
+        vec![first, "alloc", "busy", "eff", "waste"]
+    }
+    .into_iter()
+    .map(Into::into)
+    .collect();
     let query = search.to_lowercase();
     let mut rows: Vec<_> = if daily { dates } else { users }
         .into_iter()
@@ -518,8 +536,7 @@ pub fn render_with_options(
     if reverse {
         rows.reverse();
     }
-    let mut total = Totals::default();
-    let format_row = |out: &mut String, name: &str, t: &Totals| {
+    let format_cells = |name: &str, t: &Totals| -> Vec<String> {
         let efficiency = if t.observed_alloc > 0.0 {
             format!("{:.0}%", 100.0 * t.busy / t.observed_alloc)
         } else {
@@ -540,44 +557,125 @@ pub fn render_with_options(
             } else {
                 "?".into()
             };
-            out.push_str(&format!(
-                "{name:<16}{:>9.1}h{:>9.1}h{efficiency:>8}{:>9.1}h{:>10.1}h{:>10.1}h{cpu_eff:>8}{ram:>13}\n",
-                t.alloc / 3600.0,
-                t.busy / 3600.0,
-                t.waste / 3600.0,
-                t.cpu_alloc / 3600.0,
-                t.cpu_busy / 3600.0,
-            ));
+            vec![
+                name.into(),
+                format!("{:.1}h", t.alloc / 3600.0),
+                format!("{:.1}h", t.busy / 3600.0),
+                efficiency,
+                format!("{:.1}h", t.waste / 3600.0),
+                format!("{:.1}h", t.cpu_alloc / 3600.0),
+                format!("{:.1}h", t.cpu_busy / 3600.0),
+                cpu_eff,
+                ram,
+            ]
         } else {
-            out.push_str(&format!(
-                "{name:<16}{:>9.1}h{:>9.1}h{efficiency:>8}{:>9.1}h\n",
-                t.alloc / 3600.0,
-                t.busy / 3600.0,
-                t.waste / 3600.0
-            ));
+            vec![
+                name.into(),
+                format!("{:.1}h", t.alloc / 3600.0),
+                format!("{:.1}h", t.busy / 3600.0),
+                efficiency,
+                format!("{:.1}h", t.waste / 3600.0),
+            ]
         }
     };
-    if rows.is_empty() {
+    let mut total = Totals::default();
+    let mut out_rows = Vec::with_capacity(rows.len() + 1);
+    for (name, t) in &rows {
+        total.alloc += t.alloc;
+        total.busy += t.busy;
+        total.observed_alloc += t.observed_alloc;
+        total.waste += t.waste;
+        total.cpu_alloc += t.cpu_alloc;
+        total.cpu_busy += t.cpu_busy;
+        total.cpu_observed_alloc += t.cpu_observed_alloc;
+        total.ram_alloc_gib_sec += t.ram_alloc_gib_sec;
+        total.ram_used_gib_sec += t.ram_used_gib_sec;
+        total.ram_observed_sec += t.ram_observed_sec;
+        out_rows.push(TableRow {
+            name: name.clone(),
+            totals: t.clone(),
+            cells: format_cells(name, t),
+            is_total: false,
+        });
+    }
+    if rows.len() > 1 {
+        out_rows.push(TableRow {
+            name: "TOTAL".into(),
+            cells: format_cells("TOTAL", &total),
+            totals: total,
+            is_total: true,
+        });
+    }
+    TableData {
+        title,
+        has_compute,
+        headers,
+        rows: out_rows,
+        note: "alloc = max(sampled, sacct); busy/eff exclude unobserved telemetry.",
+    }
+}
+
+pub fn render_with_options(
+    raw: &Value,
+    days: u64,
+    daily: bool,
+    sort: usize,
+    reverse: bool,
+    user_filter: &str,
+    search: &str,
+) -> String {
+    let data = table(raw, days, daily, sort, reverse, user_filter, search);
+    let mut out = if data.has_compute {
+        format!(
+            "{}\n{:<16}{:>10}{:>10}{:>8}{:>10}{:>11}{:>11}{:>8}{:>13}\n",
+            data.title,
+            data.headers[0],
+            data.headers[1],
+            data.headers[2],
+            data.headers[3],
+            data.headers[4],
+            data.headers[5],
+            data.headers[6],
+            data.headers[7],
+            data.headers[8],
+        )
+    } else {
+        format!(
+            "{}\n{:<16}{:>10}{:>10}{:>8}{:>10}\n",
+            data.title,
+            data.headers[0],
+            data.headers[1],
+            data.headers[2],
+            data.headers[3],
+            data.headers[4],
+        )
+    };
+    if data.rows.is_empty() {
         out.push_str("(no matching usage records in window)\n");
     } else {
-        for (name, t) in &rows {
-            total.alloc += t.alloc;
-            total.busy += t.busy;
-            total.observed_alloc += t.observed_alloc;
-            total.waste += t.waste;
-            total.cpu_alloc += t.cpu_alloc;
-            total.cpu_busy += t.cpu_busy;
-            total.cpu_observed_alloc += t.cpu_observed_alloc;
-            total.ram_alloc_gib_sec += t.ram_alloc_gib_sec;
-            total.ram_used_gib_sec += t.ram_used_gib_sec;
-            total.ram_observed_sec += t.ram_observed_sec;
-            format_row(&mut out, name, t);
-        }
-        if rows.len() > 1 {
-            format_row(&mut out, "TOTAL", &total);
+        for row in &data.rows {
+            if data.has_compute {
+                out.push_str(&format!(
+                    "{:<16}{:>10}{:>10}{:>8}{:>10}{:>11}{:>11}{:>8}{:>13}\n",
+                    row.cells[0],
+                    row.cells[1],
+                    row.cells[2],
+                    row.cells[3],
+                    row.cells[4],
+                    row.cells[5],
+                    row.cells[6],
+                    row.cells[7],
+                    row.cells[8],
+                ));
+            } else {
+                out.push_str(&format!(
+                    "{:<16}{:>10}{:>10}{:>8}{:>10}\n",
+                    row.cells[0], row.cells[1], row.cells[2], row.cells[3], row.cells[4],
+                ));
+            }
         }
     }
-    out.push_str("\nalloc = max(sampled, sacct); busy/eff exclude unobserved telemetry.\n");
+    out.push_str(&format!("\n{}\n", data.note));
     out
 }
 
@@ -687,5 +785,82 @@ mod tests {
         assert!((backfilled["charlie"].cpu_alloc - 9600.0).abs() < 1e-6);
         assert!((backfilled["charlie"].ram_alloc_gib_sec - 19200.0).abs() < 1e-6);
         assert!(render(&store.raw, 7, false).contains("cpu_alloc"));
+    }
+    #[test]
+    fn table_and_render_with_options_cover_five_and_nine_column_modes() {
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        let yesterday = (Local::now() - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let gpu_only = json!({
+            "days": {
+                &today: {
+                    "alice": {"alloc": 7200, "busy": 1800, "observed_alloc": 7200},
+                    "bob": {"alloc": 3600, "busy": 3600, "observed_alloc": 3600}
+                },
+                &yesterday: {
+                    "alice": {"alloc": 3600, "busy": 900, "observed_alloc": 3600}
+                }
+            }
+        });
+        let compact = table(&gpu_only, 7, false, 0, false, "", "");
+        assert!(!compact.has_compute);
+        assert_eq!(compact.headers, ["user", "alloc", "busy", "eff", "waste"]);
+        assert_eq!(compact.rows.len(), 3);
+        assert_eq!(compact.rows[0].name, "alice");
+        assert_eq!(compact.rows[1].name, "bob");
+        assert!(compact.rows[2].is_total);
+        assert_eq!(compact.rows[2].cells[1], "4.0h");
+        let reversed = table(&gpu_only, 7, false, 1, true, "", "");
+        assert_eq!(reversed.rows[0].name, "alice");
+        assert_eq!(reversed.rows[1].name, "bob");
+        let daily_gpu = table(&gpu_only, 7, true, 0, false, "", "");
+        assert_eq!(daily_gpu.headers[0], "day");
+        assert_eq!(daily_gpu.rows[0].name, yesterday);
+        assert_eq!(daily_gpu.rows[1].name, today);
+        assert!(daily_gpu.rows[2].is_total);
+
+        let compute = json!({
+            "days": {
+                &today: {
+                    "alice": {
+                        "alloc": 7200, "busy": 3600, "observed_alloc": 7200,
+                        "cpu_alloc": 3600, "cpu_busy": 1800, "cpu_observed_alloc": 3600,
+                        "ram_alloc_gib_sec": 3600.0, "ram_gib_sec": 1800.0
+                    },
+                    "bob": {
+                        "alloc": 3600, "busy": 3600, "observed_alloc": 3600,
+                        "cpu_alloc": 14400, "cpu_busy": 7200, "cpu_observed_alloc": 14400,
+                        "ram_alloc_gib_sec": 7200.0, "ram_gib_sec": 3600.0
+                    }
+                }
+            }
+        });
+        let by_cpu = table(&compute, 7, false, 2, false, "", "");
+        assert!(by_cpu.has_compute);
+        assert_eq!(
+            by_cpu.headers,
+            [
+                "user",
+                "gpu_alloc",
+                "gpu_busy",
+                "eff",
+                "waste",
+                "cpu_alloc",
+                "cpu_used",
+                "cpu%",
+                "ram_used/req"
+            ]
+        );
+        assert_eq!(by_cpu.rows[0].name, "bob");
+        assert_eq!(by_cpu.rows[0].cells[5], "4.0h");
+        assert_eq!(by_cpu.rows[0].cells[8], "1/2Gh");
+        assert_eq!(by_cpu.rows[2].name, "TOTAL");
+        let rendered = render_with_options(&compute, 7, false, 3, false, "", "alice");
+        assert!(rendered.contains("alice"));
+        assert!(!rendered.contains("bob"));
+        assert!(!rendered.contains("TOTAL"));
+        let empty = render_with_options(&compute, 7, false, 0, false, "", "nobody");
+        assert!(empty.contains("(no matching usage records in window)"));
     }
 }

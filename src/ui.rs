@@ -113,10 +113,35 @@ fn clipped_safe(safe: &str, width: u16) -> String {
     }
     text
 }
+
+fn tail_clipped(raw: &str, width: u16) -> String {
+    let safe = cli::terminal_safe(raw).replace(['\n', '\t'], " ");
+    if safe.width() <= width as usize {
+        return safe;
+    }
+    let mut left = (width as usize).saturating_sub(1);
+    let mut chars = Vec::new();
+    for c in safe.chars().rev() {
+        let size = c.width().unwrap_or(0);
+        if size > left {
+            break;
+        }
+        chars.push(c);
+        left -= size;
+    }
+    let mut out = if width > 0 {
+        String::from("…")
+    } else {
+        String::new()
+    };
+    out.extend(chars.into_iter().rev());
+    out
+}
 fn column_alignment(tab: usize, compact: bool, column: usize) -> Alignment {
     let numeric = match tab {
         0 => (compact && column == 4) || (!compact && column == 5),
         1 => matches!(column, 2 | 4 | 5),
+        2 => column > 0,
         3 => column == 0 || matches!(column, 3 | 4 | 6..=9 | 12),
         4 => matches!(column, 1..=5),
         5 => matches!(column, 1..=9),
@@ -243,17 +268,29 @@ fn tab_bar(
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn view_column_sort(tab: usize, compact: bool, column: usize) -> Option<usize> {
+fn view_column_sort(tab: usize, compact: bool, usage_daily: bool, column: usize) -> Option<usize> {
     match (tab, column) {
         (0, 0) => Some(0),
         (0, 1) if compact => Some(1),
         (0, 2) if !compact => Some(1),
+        (0, 3) if compact => Some(2),
+        (0, 4) if !compact => Some(2),
         (1, 0) => Some(0),
         (1, 2) => Some(1),
         (1, 3) => Some(2),
         (1, 4) => Some(3),
+        (2, 0) if usage_daily => Some(0),
+        (2, 1) if !usage_daily => Some(0),
+        (2, 2) => Some(1),
+        (2, 5) => Some(2),
+        (2, 8) => Some(3),
+        (4, 4) => Some(0),
+        (4, 1) => Some(1),
+        (4, 5) => Some(2),
+        (4, 0) => Some(3),
         (5, 2) => Some(0),
         (5, 3) => Some(1),
+        (5, 0) => Some(2),
         (5, 8) => Some(3),
         (7, 0) => Some(0),
         (7, 3) => Some(1),
@@ -263,11 +300,26 @@ fn view_column_sort(tab: usize, compact: bool, column: usize) -> Option<usize> {
     }
 }
 
-fn job_column_sort(column: usize) -> Option<job_view::Sort> {
+fn job_column_sort(
+    column: usize,
+    filter: job_view::Filter,
+    current: job_view::Sort,
+) -> Option<job_view::Sort> {
     match column {
         1 => Some(job_view::Sort::User),
         3 => Some(job_view::Sort::Gpu),
         4 => Some(job_view::Sort::Cpu),
+        9 => Some(match filter {
+            job_view::Filter::Running => job_view::Sort::Left,
+            job_view::Filter::Pending => job_view::Sort::Wait,
+            job_view::Filter::All => {
+                if current == job_view::Sort::Left {
+                    job_view::Sort::Left
+                } else {
+                    job_view::Sort::Wait
+                }
+            }
+        }),
         12 => Some(job_view::Sort::Priority),
         _ => None,
     }
@@ -367,6 +419,11 @@ pub struct Popup {
     pub selected: usize,
     pub cancel: Option<String>,
     pub token: u64,
+    is_history: bool,
+    history_query: String,
+    history_searching: bool,
+    history_sort: usize,
+    history_reverse: bool,
     actions: Vec<(KeyCode, String)>,
     source_row: Option<String>,
     source_tab: Option<usize>,
@@ -390,6 +447,11 @@ impl Popup {
             selected: 0,
             cancel: None,
             token: 0,
+            is_history: false,
+            history_query: String::new(),
+            history_searching: false,
+            history_sort: 0,
+            history_reverse: false,
             actions: Vec::new(),
             source_row: None,
             source_tab: None,
@@ -407,6 +469,69 @@ impl Popup {
             .is_some_and(|pane| pane.log.is_some());
         self.scroll = if self.follow { u16::MAX } else { 0 };
     }
+    fn visible_history(&self) -> Vec<history::Record> {
+        let query = self.history_query.to_lowercase();
+        let mut rows: Vec<_> = self
+            .history
+            .iter()
+            .filter(|row| {
+                query.is_empty()
+                    || row.jobid.to_lowercase().contains(&query)
+                    || row.state.to_lowercase().contains(&query)
+                    || row.name.to_lowercase().contains(&query)
+                    || row.partition.to_lowercase().contains(&query)
+                    || row.exit.to_lowercase().contains(&query)
+            })
+            .cloned()
+            .collect();
+        match self.history_sort % 7 {
+            0 => (),
+            1 => rows.sort_by(|a, b| crate::quickview::natural(&a.jobid, &b.jobid)),
+            2 => rows.sort_by(|a, b| {
+                a.state
+                    .cmp(&b.state)
+                    .then_with(|| crate::quickview::natural(&a.jobid, &b.jobid))
+            }),
+            3 => rows.sort_by(|a, b| {
+                a.exit
+                    .cmp(&b.exit)
+                    .then_with(|| crate::quickview::natural(&a.jobid, &b.jobid))
+            }),
+            4 => rows.sort_by(|a, b| {
+                b.elapsed
+                    .total_cmp(&a.elapsed)
+                    .then_with(|| crate::quickview::natural(&a.jobid, &b.jobid))
+            }),
+            5 => rows.sort_by(|a, b| {
+                a.partition
+                    .cmp(&b.partition)
+                    .then_with(|| crate::quickview::natural(&a.jobid, &b.jobid))
+            }),
+            _ => rows.sort_by(|a, b| {
+                a.name
+                    .cmp(&b.name)
+                    .then_with(|| crate::quickview::natural(&a.jobid, &b.jobid))
+            }),
+        }
+        if self.history_reverse {
+            rows.reverse();
+        }
+        rows
+    }
+    fn history_sort_label(&self) -> &'static str {
+        match self.history_sort % 7 {
+            1 => "JobID",
+            2 => "State",
+            3 => "Exit",
+            4 => "Elapsed",
+            5 => "Partition",
+            6 => "Name",
+            _ => "recent",
+        }
+    }
+    fn history_descending(&self) -> bool {
+        self.history_reverse ^ matches!(self.history_sort % 7, 0 | 4)
+    }
 }
 
 enum Task {
@@ -415,6 +540,7 @@ enum Task {
         job: Option<Box<Job>>,
         pending: Option<Box<PendingJob>>,
         node: Option<Box<Node>>,
+        nodes: Vec<Node>,
         explanation: Option<String>,
     },
     History,
@@ -458,23 +584,28 @@ impl Worker {
                         job,
                         pending,
                         node,
+                        nodes,
                         explanation,
                     } => Answer::popup(
-                        details(job.as_deref(), pending.as_deref(), node.as_deref()).map(
-                            |mut popup| {
-                                if let Some(body) = explanation {
-                                    popup.panes.insert(
-                                        0,
-                                        Pane {
-                                            name: "Why pending".into(),
-                                            body,
-                                            log: None,
-                                        },
-                                    );
-                                }
-                                popup
-                            },
-                        ),
+                        details_with_nodes(
+                            job.as_deref(),
+                            pending.as_deref(),
+                            node.as_deref(),
+                            &nodes,
+                        )
+                        .map(|mut popup| {
+                            if let Some(body) = explanation {
+                                popup.panes.insert(
+                                    0,
+                                    Pane {
+                                        name: "Why pending".into(),
+                                        body,
+                                        log: None,
+                                    },
+                                );
+                            }
+                            popup
+                        }),
                     ),
                     Task::Failures => Answer::popup(crate::failures::query(24).map(|report| {
                         Popup::text("My failures · last 24h", crate::failures::render(&report))
@@ -488,6 +619,7 @@ impl Worker {
                         rows.reverse();
                         let mut popup = Popup::text("My job history · 7 days", String::new());
                         popup.history = rows;
+                        popup.is_history = true;
                         Ok(popup)
                     })()),
                     Task::HistoryDetail(row) => Answer::popup((|| -> Result<Popup> {
@@ -561,7 +693,17 @@ pub fn cancel_owned(jobid: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn details(job: Option<&Job>, pending: Option<&PendingJob>, node: Option<&Node>) -> Result<Popup> {
+    details_with_nodes(job, pending, node, &[])
+}
+
+fn details_with_nodes(
+    job: Option<&Job>,
+    pending: Option<&PendingJob>,
+    node: Option<&Node>,
+    nodes: &[Node],
+) -> Result<Popup> {
     let now = runtime::now();
     let id = job
         .map(|j| j.jobid.as_str())
@@ -641,8 +783,7 @@ fn details(job: Option<&Job>, pending: Option<&PendingJob>, node: Option<&Node>)
                 },
                 left,
             ));
-            let nodes = cli::snapshot().map(|s| s.nodes).unwrap_or_default();
-            let cov = rules::resource_summary(job, &nodes, now);
+            let cov = rules::resource_summary(job, nodes, now);
             let expected = cov.get("expected_nodes").copied().unwrap_or(0.0) as usize;
             let sampled = cov.get("sampled_nodes").copied().unwrap_or(0.0) as usize;
             let metric_str = |key: &str, scale: f64, unit: &str| -> String {
@@ -769,7 +910,6 @@ fn details(job: Option<&Job>, pending: Option<&PendingJob>, node: Option<&Node>)
             ));
         }
         let mut popup = Popup {
-            title: format!("Job #{id}"),
             panes: vec![
                 Pane {
                     name: "Summary".into(),
@@ -782,19 +922,7 @@ fn details(job: Option<&Job>, pending: Option<&PendingJob>, node: Option<&Node>)
                     log: None,
                 },
             ],
-            active: 0,
-            scroll: 0,
-            follow: false,
-            history: Vec::new(),
-            selected: 0,
-            cancel: None,
-            token: 0,
-            actions: Vec::new(),
-            source_row: None,
-            source_tab: None,
-            table: TableState::default(),
-            picker: None,
-            find: Find::default(),
+            ..Popup::text(&format!("Job #{id}"), String::new())
         };
         let script = job
             .map(|j| j.script.clone())
@@ -1003,7 +1131,6 @@ fn details(job: Option<&Job>, pending: Option<&PendingJob>, node: Option<&Node>)
             }
         }
         let mut popup = Popup {
-            title: format!("Node {}", node.name),
             panes: vec![
                 Pane {
                     name: "Summary".into(),
@@ -1016,19 +1143,7 @@ fn details(job: Option<&Job>, pending: Option<&PendingJob>, node: Option<&Node>)
                     log: None,
                 },
             ],
-            active: 0,
-            scroll: 0,
-            follow: false,
-            history: Vec::new(),
-            selected: 0,
-            cancel: None,
-            token: 0,
-            actions: Vec::new(),
-            source_row: None,
-            source_tab: None,
-            table: TableState::default(),
-            picker: None,
-            find: Find::default(),
+            ..Popup::text(&format!("Node {}", node.name), String::new())
         };
         if popup.panes[1].body.trim().is_empty() {
             popup.panes[1].body = "No raw detail available".into();
@@ -1043,15 +1158,40 @@ struct ViewRow {
     key: String,
     node: String,
     job: Option<String>,
+    jobs: Vec<String>,
     cells: Vec<String>,
     style: Style,
     focus: Option<usize>,
     accents: Vec<(usize, Style)>,
 }
 
+fn job_owner<'a>(data: &'a Snapshot, id: &str) -> Option<&'a str> {
+    data.jobs
+        .iter()
+        .find(|j| j.jobid == id)
+        .map(|j| j.user.as_str())
+        .or_else(|| {
+            data.pending
+                .iter()
+                .find(|j| j.jobid == id)
+                .map(|j| j.user.as_str())
+        })
+        .or_else(|| {
+            data.nodes
+                .iter()
+                .flat_map(|n| &n.jobs)
+                .find(|j| j.jobid == id)
+                .map(|j| j.user.as_str())
+        })
+}
+
 enum JobTarget {
     User(String),
     Job(String),
+    Jobs {
+        label: String,
+        jobs: BTreeSet<String>,
+    },
     Node(String),
     Partition(String),
     Attention {
@@ -1064,6 +1204,7 @@ impl JobTarget {
         match self {
             Self::User(user) => entry.user() == user,
             Self::Job(id) => entry.id() == id,
+            Self::Jobs { jobs, .. } => jobs.contains(entry.id()),
             Self::Node(node) => match entry {
                 Entry::Running(job) => crate::scheduler::expand_nodes(&job.node)
                     .is_some_and(|nodes| nodes.contains(node)),
@@ -1080,6 +1221,7 @@ impl JobTarget {
         match self {
             Self::User(user) => format!("user:{user}"),
             Self::Job(id) => format!("job:{id}"),
+            Self::Jobs { label, .. } => format!("jobs:{label}"),
             Self::Node(node) => format!("node:{node}"),
             Self::Partition(part) => format!("part:{part}"),
             Self::Attention { user, .. } => format!("attention:{user}"),
@@ -1150,6 +1292,7 @@ pub struct App {
     attention_keys: BTreeSet<String>,
     attention: Option<AttentionCache>,
     usage_scroll: u16,
+    last_usage_scroll: u16,
     usage_daily: bool,
     usage_days: u64,
     down_baseline: BTreeSet<String>,
@@ -1157,6 +1300,7 @@ pub struct App {
     last_observation: Vec<(String, u64, bool)>,
     host_history: crate::host_view::History,
     popup_sequence: u64,
+    last_click: Option<(Instant, Click)>,
 }
 impl Default for App {
     fn default() -> Self {
@@ -1235,6 +1379,7 @@ impl App {
             attention_keys: BTreeSet::new(),
             attention: None,
             usage_scroll: 0,
+            last_usage_scroll: 0,
             usage_daily: false,
             usage_days: 7,
             down_baseline: BTreeSet::new(),
@@ -1242,6 +1387,7 @@ impl App {
             last_observation: Vec::new(),
             host_history: crate::host_view::History::default(),
             popup_sequence: 0,
+            last_click: None,
         }
     }
     fn preferences(&self) -> ui_preferences::Preferences {
@@ -1482,6 +1628,10 @@ impl App {
     }
     fn open_related_jobs(&mut self) {
         let target = self.selected().and_then(|row| match self.tab {
+            2 if !self.usage_daily => row
+                .key
+                .strip_prefix("usage_user:")
+                .map(|user| JobTarget::User(user.into())),
             4 => row.key.strip_prefix("attention:").and_then(|user| {
                 crate::users::attention_in_partition(
                     &self.data,
@@ -1504,15 +1654,34 @@ impl App {
                 .key
                 .strip_prefix("part:")
                 .map(|part| JobTarget::Partition(part.into())),
-            0 | 1 => row
-                .job
-                .as_ref()
-                .map(|id| JobTarget::Job(id.clone()))
-                .or_else(|| (!row.node.is_empty()).then(|| JobTarget::Node(row.node.clone()))),
+            0 | 1 => {
+                if row.jobs.len() > 1 {
+                    let label = if !row.node.is_empty() && row.key.starts_with("gpu:") {
+                        row.key.strip_prefix("gpu:").unwrap_or(&row.key).to_string()
+                    } else {
+                        row.jobs.join(",")
+                    };
+                    Some(JobTarget::Jobs {
+                        label,
+                        jobs: row.jobs.iter().cloned().collect(),
+                    })
+                } else {
+                    row.job
+                        .as_ref()
+                        .map(|id| JobTarget::Job(id.clone()))
+                        .or_else(|| {
+                            (!row.node.is_empty()).then(|| JobTarget::Node(row.node.clone()))
+                        })
+                }
+            }
             _ => None,
         });
         let Some(target) = target else {
-            self.status = if self.tab == 4 {
+            self.status = if self.tab == 2 && self.usage_daily {
+                "Switch to user view (v) and select a user row · J related Jobs"
+            } else if self.tab == 2 {
+                "Select a user usage row · J related Jobs"
+            } else if self.tab == 4 {
                 "No linked Slurm jobs in current evidence · Enter to inspect"
             } else {
                 "Select a GPU, node, user or partition · J related Jobs"
@@ -1614,6 +1783,106 @@ impl App {
             ),
             detail,
         ]
+    }
+    fn usage_has_compute(&self) -> bool {
+        self.usage
+            .as_ref()
+            .map(|raw| {
+                usage::table(
+                    raw,
+                    self.usage_days,
+                    self.usage_daily,
+                    self.sort,
+                    self.reverse,
+                    self.user_filter(),
+                    &self.search,
+                )
+                .has_compute
+            })
+            .unwrap_or(false)
+    }
+    fn usage_rows(&self) -> (Vec<String>, Vec<ViewRow>) {
+        let Some(raw) = &self.usage else {
+            let first = if self.usage_daily { "day" } else { "user" };
+            return (
+                [first, "alloc", "busy", "eff", "waste"]
+                    .map(str::to_string)
+                    .to_vec(),
+                Vec::new(),
+            );
+        };
+        let table = usage::table(
+            raw,
+            self.usage_days,
+            self.usage_daily,
+            self.sort,
+            self.reverse,
+            self.user_filter(),
+            &self.search,
+        );
+        let rows = table
+            .rows
+            .into_iter()
+            .map(|row| {
+                let key = if row.is_total {
+                    "usage_total".into()
+                } else if self.usage_daily {
+                    format!("usage_day:{}", row.name)
+                } else {
+                    format!("usage_user:{}", row.name)
+                };
+                let focus = (!self.usage_daily && !row.is_total && row.name == self.highlight_user)
+                    .then_some(0);
+                let style = if row.is_total {
+                    Style::default()
+                        .bg(HEADER_BG)
+                        .fg(CYAN)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(TEXT)
+                };
+                let mut accents = Vec::new();
+                if !row.is_total {
+                    let eff = (row.totals.observed_alloc > 0.0)
+                        .then(|| 100.0 * row.totals.busy / row.totals.observed_alloc);
+                    accents.push((3, Style::default().fg(MetricKind::Activity.color(eff))));
+                    if row.totals.waste > 0.0 {
+                        accents.push((4, Style::default().fg(YELLOW)));
+                    }
+                    if table.has_compute {
+                        let cpu_eff = (row.totals.cpu_observed_alloc > 0.0)
+                            .then(|| 100.0 * row.totals.cpu_busy / row.totals.cpu_observed_alloc);
+                        accents.push((7, Style::default().fg(MetricKind::Activity.color(cpu_eff))));
+                    }
+                }
+                ViewRow {
+                    key,
+                    node: String::new(),
+                    job: None,
+                    jobs: Vec::new(),
+                    cells: row.cells,
+                    style,
+                    focus,
+                    accents,
+                }
+            })
+            .collect();
+        (table.headers, rows)
+    }
+    fn rebuild_usage(&mut self) {
+        let selected = self.selected().map(|r| r.key.clone());
+        let (headers, rows) = self.usage_rows();
+        self.headers = headers;
+        self.rows = rows;
+        let index = selected
+            .and_then(|key| self.rows.iter().position(|r| r.key == key))
+            .unwrap_or_else(|| {
+                self.table
+                    .selected()
+                    .unwrap_or(0)
+                    .min(self.rows.len().saturating_sub(1))
+            });
+        self.table.select((!self.rows.is_empty()).then_some(index));
     }
     pub fn rebuild(&mut self) {
         self.hits.clear();
@@ -1794,6 +2063,7 @@ impl App {
                         key: format!("node:{}", node.name),
                         node: node.name.clone(),
                         job: None,
+                        jobs: Vec::new(),
                         cells: header,
                         focus: node
                             .gpus
@@ -1833,6 +2103,19 @@ impl App {
                             .iter()
                             .filter_map(|id| node.jobs.iter().find(|j| j.jobid == *id))
                             .collect();
+                        let preferred_job = job_ids
+                            .iter()
+                            .copied()
+                            .find(|id| {
+                                job_owner(&self.data, id) == Some(self.current_user.as_str())
+                            })
+                            .or_else(|| {
+                                job_ids.iter().copied().find(|id| {
+                                    job_owner(&self.data, id) == Some(self.highlight_user.as_str())
+                                })
+                            })
+                            .or_else(|| job_ids.first().copied())
+                            .map(str::to_string);
                         let user = if gpu.users.is_empty() {
                             gpu.alloc_users_display()
                         } else {
@@ -1921,7 +2204,8 @@ impl App {
                         rows.push(ViewRow {
                             key: format!("gpu:{}:{}", node.name, gpu.index),
                             node: node.name.clone(),
-                            job: job_ids.first().map(|id| (*id).to_string()),
+                            job: preferred_job,
+                            jobs: job_ids.iter().map(|id| (*id).to_string()).collect(),
                             cells,
                             focus: (gpu.has_user(&self.highlight_user)
                                 || (!gpu.has_alloc() && gpu.users.contains(&self.highlight_user)))
@@ -2014,6 +2298,7 @@ impl App {
                                 key: format!("pending:{}", job.jobid),
                                 node: String::new(),
                                 job: Some(job.jobid.clone()),
+                                jobs: vec![job.jobid.clone()],
                                 cells,
                                 focus: (job.user == self.highlight_user).then_some(1),
                                 accents: vec![
@@ -2101,6 +2386,7 @@ impl App {
                         key: format!("node:{}", node.name),
                         node: node.name.clone(),
                         job: None,
+                        jobs: Vec::new(),
                         cells: vec![
                             node.name.clone(),
                             if node.stale {
@@ -2140,7 +2426,9 @@ impl App {
                 }
             }
             2 => {
-                self.headers.clear();
+                let (headers, usage_rows) = self.usage_rows();
+                self.headers = headers;
+                rows = usage_rows;
             }
             3 => {
                 self.headers = [
@@ -2153,7 +2441,7 @@ impl App {
                     "CPU cores",
                     "RAM GiB",
                     "VRAM GiB",
-                    "Left / wait",
+                    "Left/wait",
                     "Reason / coverage",
                     "Name",
                     "Priority",
@@ -2194,6 +2482,7 @@ impl App {
                                 key: format!("job:{}", job.jobid),
                                 node: String::new(),
                                 job: Some(job.jobid.clone()),
+                                jobs: vec![job.jobid.clone()],
                                 cells: vec![
                                     job.jobid.clone(),
                                     job.user.clone(),
@@ -2243,6 +2532,7 @@ impl App {
                                 key: format!("pending:{}", job.jobid),
                                 node: String::new(),
                                 job: Some(job.jobid.clone()),
+                                jobs: vec![job.jobid.clone()],
                                 cells: vec![
                                     job.jobid.clone(),
                                     job.user.clone(),
@@ -2296,26 +2586,45 @@ impl App {
                     );
                     &filtered
                 };
-                for group in groups {
-                    if !self.user_filter().is_empty() && group.user != self.user_filter() {
-                        continue;
+                let query = self.search.to_lowercase();
+                let mut matching: Vec<_> = groups
+                    .iter()
+                    .filter(|group| {
+                        (self.user_filter().is_empty() || group.user == self.user_filter())
+                            && (query.is_empty()
+                                || group.user.to_lowercase().contains(&query)
+                                || group
+                                    .nodes
+                                    .iter()
+                                    .any(|n| n.to_lowercase().contains(&query)))
+                    })
+                    .collect();
+                matching.sort_by(|a, b| {
+                    match self.sort % 4 {
+                        1 => b
+                            .total()
+                            .cmp(&a.total())
+                            .then(b.rogue.cmp(&a.rogue))
+                            .then(b.longest.cmp(&a.longest)),
+                        2 => b.longest.cmp(&a.longest).then(b.total().cmp(&a.total())),
+                        3 => a.user.cmp(&b.user),
+                        _ => b
+                            .rogue
+                            .cmp(&a.rogue)
+                            .then(b.total().cmp(&a.total()))
+                            .then(b.longest.cmp(&a.longest)),
                     }
-                    if !self.search.is_empty()
-                        && !group
-                            .user
-                            .to_lowercase()
-                            .contains(&self.search.to_lowercase())
-                        && !group
-                            .nodes
-                            .iter()
-                            .any(|n| n.to_lowercase().contains(&self.search.to_lowercase()))
-                    {
-                        continue;
-                    }
+                    .then(a.user.cmp(&b.user))
+                });
+                if self.reverse {
+                    matching.reverse();
+                }
+                for group in matching {
                     rows.push(ViewRow {
                         key: format!("attention:{}", group.user),
                         node: String::new(),
                         job: None,
+                        jobs: Vec::new(),
                         focus: (group.user == self.highlight_user).then_some(0),
                         accents: vec![
                             (1, Style::default().fg(YELLOW).add_modifier(Modifier::BOLD)),
@@ -2356,7 +2665,7 @@ impl App {
                 let mut people =
                     crate::users::summarize(&self.data, now, self.user_filter(), &self.partition);
                 people.sort_by(|a, b| {
-                    match self.sort {
+                    match self.sort % 4 {
                         1 => b.cpu.value.total_cmp(&a.cpu.value),
                         2 => (b.name == self.highlight_user).cmp(&(a.name == self.highlight_user)),
                         3 => b.quota.value.total_cmp(&a.quota.value),
@@ -2384,6 +2693,7 @@ impl App {
                         key: format!("user:{}", person.name),
                         node: String::new(),
                         job: None,
+                        jobs: Vec::new(),
                         focus: (person.name == self.highlight_user).then_some(0),
                         accents: vec![
                             (2, Style::default().fg(BLUE).add_modifier(Modifier::BOLD)),
@@ -2598,6 +2908,7 @@ impl App {
                         key: format!("part:{name}"),
                         node: String::new(),
                         job: None,
+                        jobs: Vec::new(),
                         cells: vec![
                             name,
                             agg.nodes.to_string(),
@@ -2686,6 +2997,7 @@ impl App {
                         key: row.key,
                         node: String::new(),
                         job: None,
+                        jobs: Vec::new(),
                         cells: row.cells,
                         focus: None,
                         accents: vec![
@@ -2733,7 +3045,13 @@ impl App {
             })
             .collect()
     }
-    fn draw_dashboard(&self, frame: &mut Frame, area: Rect, views: &[NodeView]) {
+    fn draw_dashboard(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        views: &[NodeView],
+        hits: &mut Vec<(Rect, Click)>,
+    ) {
         if area.height < 3 || area.width < 50 {
             return;
         }
@@ -2804,6 +3122,7 @@ impl App {
         let resources = panel(" Resources · visible / ~ partial ");
         let inner = resources.inner(columns[0]);
         frame.render_widget(resources, columns[0]);
+        hits.push((columns[0], Click::Key(KeyCode::Char('t'))));
         let meters = Layout::vertical([Constraint::Ratio(1, 4); 4]).split(inner);
         for (index, (name, meter, color)) in [
             ("GPU util", &gpu_util, MetricKind::Activity),
@@ -2834,41 +3153,44 @@ impl App {
         let map = panel(&title);
         let inner = map.inner(columns[1]);
         frame.render_widget(map, columns[1]);
-        let lines = mapped
-            .iter()
-            .skip(start)
-            .take(capacity)
-            .map(|(node, gpus)| {
-                let name = cli::terminal_safe(&node.name)
-                    .chars()
-                    .take(10)
-                    .collect::<String>();
-                let mut spans = vec![Span::styled(
-                    format!(
-                        "{} {name:<10} ",
-                        if node.name == selected { "▸" } else { " " }
-                    ),
-                    Style::default().fg(if node.stale { YELLOW } else { TEXT }),
-                )];
-                let room = inner.width.saturating_sub(24) as usize;
-                for (_, class) in gpus.iter().take(room) {
-                    let (mark, _, color) = gpu_mark(*class);
-                    spans.push(Span::styled(
-                        mark,
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ));
-                }
-                if gpus.len() > room {
-                    spans.push(Span::styled("…", Style::default().fg(MUTED)));
-                }
-                let free = gpus.iter().filter(|(_, c)| *c == Class::Free).count();
-                spans.push(Span::styled(
-                    format!(" {free}/{} free", gpus.len()),
-                    Style::default().fg(if node.stale { YELLOW } else { MUTED }),
+        let mut lines = Vec::new();
+        for (offset, (node, gpus)) in mapped.iter().skip(start).take(capacity).enumerate() {
+            let y = inner.y.saturating_add(offset.min(u16::MAX as usize) as u16);
+            if y < inner.bottom() {
+                hits.push((
+                    Rect::new(inner.x, y, inner.width, 1),
+                    Click::JumpNode(node.name.clone()),
                 ));
-                Line::from(spans)
-            })
-            .collect::<Vec<_>>();
+            }
+            let name = cli::terminal_safe(&node.name)
+                .chars()
+                .take(10)
+                .collect::<String>();
+            let mut spans = vec![Span::styled(
+                format!(
+                    "{} {name:<10} ",
+                    if node.name == selected { "▸" } else { " " }
+                ),
+                Style::default().fg(if node.stale { YELLOW } else { TEXT }),
+            )];
+            let room = inner.width.saturating_sub(24) as usize;
+            for (_, class) in gpus.iter().take(room) {
+                let (mark, _, color) = gpu_mark(*class);
+                spans.push(Span::styled(
+                    mark,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ));
+            }
+            if gpus.len() > room {
+                spans.push(Span::styled("…", Style::default().fg(MUTED)));
+            }
+            let free = gpus.iter().filter(|(_, c)| *c == Class::Free).count();
+            spans.push(Span::styled(
+                format!(" {free}/{} free", gpus.len()),
+                Style::default().fg(if node.stale { YELLOW } else { MUTED }),
+            ));
+            lines.push(Line::from(spans));
+        }
         frame.render_widget(
             Paragraph::new(if lines.is_empty() {
                 vec![Line::from("No GPU matches these filters")]
@@ -2886,6 +3208,8 @@ impl App {
             self.compact = compact;
             self.narrow = narrow;
             self.rebuild();
+        } else if self.tab == 2 {
+            self.rebuild_usage();
         }
         self.hits.reset(Scope::Main {
             tab: self.tab,
@@ -2931,6 +3255,7 @@ impl App {
                 .style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
             heading[0],
         );
+        self.hits.add(heading[0], Click::Key(KeyCode::Char('?')));
         let labels = if frame.area().width < 78 {
             ["1", "2", "3", "4", "5", "6", "7", "8"]
         } else {
@@ -2955,7 +3280,11 @@ impl App {
                 })
                 .collect()
         };
-        self.draw_dashboard(frame, areas[1], &views);
+        let mut dashboard_hits = Vec::new();
+        self.draw_dashboard(frame, areas[1], &views, &mut dashboard_hits);
+        for (rect, click) in dashboard_hits {
+            self.hits.add(rect, click);
+        }
         let mut free = 0;
         let mut total = 0;
         for (node, view) in self.data.nodes.iter().zip(&views) {
@@ -2967,29 +3296,50 @@ impl App {
             }
         }
         let fresh = self.data.nodes.iter().filter(|n| !n.stale).count();
-        let mut summary = vec![Line::from(vec![
+        let attention = &self.attention.as_ref().unwrap().rows;
+        let attention_count: usize = attention.iter().map(|r| r.total()).sum();
+        let line0_spans = vec![
             Span::styled(
                 format!("GPU {free}/{total} FREE"),
                 Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
             ),
+            Span::raw(" · cluster: "),
             Span::raw(format!(
-                " · cluster: {} run / {} pd · fresh {fresh}/{}",
+                "{} run / {} pd",
                 self.data.jobs.len(),
-                self.data.pending.len(),
-                self.data.nodes.len()
+                self.data.pending.len()
             )),
-        ])];
+            Span::raw(format!(" · fresh {fresh}/{}", self.data.nodes.len())),
+            Span::styled(
+                format!(" · ! {attention_count} [5]"),
+                Style::default().fg(if attention_count > 0 { YELLOW } else { MUTED }),
+            ),
+        ];
+        if self.tab != 6 && areas[2].height > 0 {
+            self.hits.spans(
+                Rect::new(areas[2].x, areas[2].y, areas[2].width, 1),
+                &line0_spans,
+                &[
+                    Some(Click::Key(KeyCode::Char('i'))),
+                    None,
+                    Some(Click::Key(KeyCode::Char('4'))),
+                    Some(Click::Key(KeyCode::Char('2'))),
+                    Some(Click::Key(KeyCode::Char('5'))),
+                ],
+            );
+        }
+        let mut summary = vec![Line::from(line0_spans)];
         let sort_label = match self.tab {
             1 => ["node", "CPU alloc", "CPU busy", "RAM"][self.sort % 4],
             2 => {
                 if self.usage_daily && self.sort.is_multiple_of(4) {
                     "day"
                 } else {
-                    ["GPU alloc", "GPU busy", "CPU alloc", "RAM alloc"][self.sort % 4]
+                    ["GPU alloc", "GPU busy", "CPU alloc", "RAM req"][self.sort % 4]
                 }
             }
             3 => self.job_sort.label(),
-            4 => "priority",
+            4 => ["rogue/sev", "GPUs", "longest", "user"][self.sort % 4],
             5 => ["GPU", "CPU", "focus", "quota"][self.sort % 4],
             6 => "resource",
             7 => ["partition", "GPUs free", "CPU alloc", "jobs"][self.sort % 4],
@@ -3001,7 +3351,8 @@ impl App {
             self.reverse
                 ^ (self.tab == 5
                     || (matches!(self.tab, 0 | 1 | 7) && !self.sort.is_multiple_of(4))
-                    || (self.tab == 2 && (!self.usage_daily || !self.sort.is_multiple_of(4))))
+                    || (self.tab == 2 && (!self.usage_daily || !self.sort.is_multiple_of(4)))
+                    || (self.tab == 4 && !matches!(self.sort % 4, 3)))
         };
         let mut chips = vec![
             Span::styled(format!(" sort:{sort_label}"), Style::default().fg(MUTED)),
@@ -3010,7 +3361,7 @@ impl App {
                 Style::default().fg(BLUE),
             ),
         ];
-        let sortable = matches!(self.tab, 0 | 1 | 2 | 3 | 5 | 7);
+        let sortable = matches!(self.tab, 0 | 1 | 2 | 3 | 4 | 5 | 7);
         let mut chip_actions = vec![
             sortable.then_some(Click::Key(KeyCode::Char('s'))),
             sortable.then_some(Click::Key(KeyCode::Char('S'))),
@@ -3128,13 +3479,7 @@ impl App {
             .iter()
             .filter(|j| j.user == self.highlight_user)
             .count();
-        let attention = &self.attention.as_ref().unwrap().rows;
-        let attention_count: usize = attention.iter().map(|r| r.total()).sum();
-        summary[0].spans.push(Span::styled(
-            format!(" · ! {attention_count} [5]"),
-            Style::default().fg(if attention_count > 0 { YELLOW } else { MUTED }),
-        ));
-        summary.push(Line::from(vec![
+        let line2_spans = vec![
             Span::styled(
                 format!(
                     "◆ {}: {own_gpu} GPUs · {own_run} run · {own_pending} pending",
@@ -3146,7 +3491,25 @@ impl App {
                 format!(" · viewer {}", clipped(&self.current_user, 12)),
                 Style::default().fg(MUTED),
             ),
-        ]));
+        ];
+        if self.tab != 6 && areas[2].height > 2 {
+            if self.tab == 3 {
+                self.hits.add(
+                    Rect::new(areas[2].x, areas[2].y + 2, areas[2].width, 1),
+                    Click::Key(KeyCode::Char('v')),
+                );
+            } else {
+                self.hits.spans(
+                    Rect::new(areas[2].x, areas[2].y + 2, areas[2].width, 1),
+                    &line2_spans,
+                    &[
+                        Some(Click::Key(KeyCode::Char('m'))),
+                        Some(Click::Key(KeyCode::Char('U'))),
+                    ],
+                );
+            }
+        }
+        summary.push(Line::from(line2_spans));
         if self.data.errors.is_empty() {
             summary.push(Line::from(vec![
                 Span::styled("● busy ", Style::default().fg(CYAN)),
@@ -3156,6 +3519,12 @@ impl App {
                 Span::styled("× rogue ", Style::default().fg(RED)),
                 Span::styled("? unknown", Style::default().fg(MUTED)),
             ]));
+            if self.tab != 6 && areas[2].height > 3 {
+                self.hits.add(
+                    Rect::new(areas[2].x, areas[2].y + 3, areas[2].width, 1),
+                    Click::Key(KeyCode::Char(if self.tab == 3 { 'v' } else { '?' })),
+                );
+            }
         } else {
             summary.push(Line::styled(
                 format!(
@@ -3164,6 +3533,12 @@ impl App {
                 ),
                 Style::default().fg(RED),
             ));
+            if self.tab != 6 && areas[2].height > 3 {
+                self.hits.add(
+                    Rect::new(areas[2].x, areas[2].y + 3, areas[2].width, 1),
+                    Click::Key(KeyCode::Char('r')),
+                );
+            }
         }
         if self.tab == 3 {
             let [counts, reasons] = self.job_summary(runtime::now());
@@ -3173,6 +3548,7 @@ impl App {
             }
         }
         if self.trend {
+            let base = summary.len();
             summary.extend([
                 Line::styled(
                     format!("5m GPU% {}", self.spark(0)),
@@ -3187,6 +3563,17 @@ impl App {
                     Style::default().fg(YELLOW),
                 ),
             ]);
+            if self.tab != 6 {
+                for offset in 0..3 {
+                    let row_y = areas[2].y + (base + offset) as u16;
+                    if row_y < areas[2].bottom() {
+                        self.hits.add(
+                            Rect::new(areas[2].x, row_y, areas[2].width, 1),
+                            Click::Key(KeyCode::Char('t')),
+                        );
+                    }
+                }
+            }
         }
         if self.tab == 6 {
             let host = &self.data.controller;
@@ -3196,6 +3583,38 @@ impl App {
                 .unwrap_or_else(|| "?".into());
             let fresh = crate::model::json_number(&host["observed_at"])
                 .is_some_and(|t| rules::telemetry_fresh(t, now));
+            let line2_spans = vec![
+                Span::styled(
+                    format!("/ search:{}", cli::terminal_safe(&self.search)),
+                    Style::default().fg(if self.search.is_empty() { MUTED } else { FOCUS }),
+                ),
+                Span::styled(" · ", Style::default().fg(MUTED)),
+                Span::styled(
+                    "Enter full values, guides + recent trends",
+                    Style::default().fg(MUTED),
+                ),
+                Span::styled(" · ", Style::default().fg(MUTED)),
+                Span::styled("0 reset", Style::default().fg(MUTED)),
+            ];
+            if areas[2].height > 0 {
+                self.hits.add(
+                    Rect::new(areas[2].x, areas[2].y, areas[2].width, 1),
+                    Click::Key(KeyCode::Char('r')),
+                );
+            }
+            if areas[2].height > 2 {
+                self.hits.spans(
+                    Rect::new(areas[2].x, areas[2].y + 2, areas[2].width, 1),
+                    &line2_spans,
+                    &[
+                        Some(Click::Key(KeyCode::Char('/'))),
+                        None,
+                        Some(Click::Key(KeyCode::Enter)),
+                        None,
+                        Some(Click::Key(KeyCode::Char('0'))),
+                    ],
+                );
+            }
             summary = vec![
                 Line::styled(
                     format!(
@@ -3209,347 +3628,384 @@ impl App {
                     "Capacity 80/90/97% · PSI 1/10% · link 80%: review hints, not diagnoses",
                     Style::default().fg(MUTED),
                 ),
-                Line::styled(
-                    format!(
-                        "/ search:{} · Enter full values, guides + recent trends · 0 reset",
-                        cli::terminal_safe(&self.search)
-                    ),
-                    Style::default().fg(MUTED),
-                ),
+                Line::from(line2_spans),
             ];
         }
         frame.render_widget(Paragraph::new(summary), areas[2]);
-        if self.tab == 2 {
-            let body = self
-                .usage
-                .as_ref()
-                .map(|v| {
-                    usage::render_with_options(
-                        v,
-                        self.usage_days,
-                        self.usage_daily,
-                        self.sort,
-                        self.reverse,
-                        self.user_filter(),
-                        &self.search,
-                    )
-                })
-                .unwrap_or_else(|| {
-                    "No usage data yet. Start the collector to record usage.".into()
-                });
-            let title = format!(
-                " GPU-hours & compute usage · {}d {} · s sort · v view · D window ",
-                self.usage_days,
-                if self.usage_daily { "daily" } else { "by user" }
-            );
-            let block = panel(&title);
-            let inner = block.inner(areas[3]);
-            frame.render_widget(block, areas[3]);
-            let paragraph = Paragraph::new(cli::terminal_safe(&body)).wrap(Wrap { trim: false });
-            let max = paragraph
-                .line_count(inner.width)
-                .saturating_sub(inner.height as usize)
-                .min(u16::MAX as usize) as u16;
-            self.usage_scroll = self.usage_scroll.min(max);
-            frame.render_widget(paragraph.scroll((self.usage_scroll, 0)), inner);
-        } else {
-            let visible_columns: Vec<usize> = match self.tab {
-                0 if self.narrow => vec![0, 1, 2, 3, 5],
-                1 if frame.area().width < 110 => vec![0, 1, 2, 3, 4, 7],
-                3 if frame.area().width < 100 => vec![0, 1, 2, 12, 3, 4, 9, 10],
-                3 if frame.area().width < 140 => vec![0, 1, 2, 12, 3, 4, 5, 9, 10, 11],
-                3 => vec![0, 1, 2, 12, 3, 4, 5, 6, 7, 8, 9, 10, 11],
-                4 if self.narrow => vec![0, 1, 2, 3, 4, 5, 7],
-                5 if frame.area().width < 110 => vec![0, 3, 4, 5, 6, 7],
-                5 if frame.area().width < 150 => vec![0, 1, 2, 3, 4, 5, 6, 7, 10],
-                7 if frame.area().width < 95 => vec![0, 1, 3, 4, 5, 7],
-                0 if self.details => {
-                    let base = if self.compact { 6 } else { 7 };
-                    let reserve = if self.compact { 110 } else { 140 };
-                    let extra = (frame.area().width.saturating_sub(reserve) / 13).min(4) as usize;
-                    (0..(base + extra)).collect()
-                }
-                _ => (0..self.headers.len()).collect(),
-            };
-            let widths: Vec<_> = visible_columns
-                .iter()
-                .map(|i| match self.tab {
-                    0 if self.compact => match i {
-                        0 => Constraint::Length(11),
-                        1 => Constraint::Length(15),
-                        2 => Constraint::Length(if self.narrow { 16 } else { 28 }),
-                        3 => Constraint::Min(15),
-                        4 => Constraint::Length(7),
-                        _ => Constraint::Length(9),
-                    },
-                    0 => match i {
-                        0 => Constraint::Length(15),
-                        1 => Constraint::Length(18),
-                        2 => Constraint::Length(15),
-                        3 => Constraint::Length(28),
-                        4 => Constraint::Min(20),
-                        5 => Constraint::Length(8),
-                        _ => Constraint::Length(12),
-                    },
-                    1 => match i {
-                        0 => Constraint::Length(11),
-                        1 => Constraint::Length(8),
-                        2 => Constraint::Length(10),
-                        3 => Constraint::Length(15),
-                        4 => Constraint::Length(11),
-                        _ => Constraint::Min(9),
-                    },
-                    3 => match i {
-                        0 => Constraint::Length(if self.narrow { 7 } else { 10 }),
-                        1 => Constraint::Length(if self.narrow { 8 } else { 12 }),
-                        2 => Constraint::Length(7),
-                        3 | 4 => Constraint::Length(8),
-                        5 => Constraint::Length(8),
-                        6..=8 => Constraint::Length(9),
-                        9 => Constraint::Length(10),
-                        10 => Constraint::Min(if self.narrow { 8 } else { 18 }),
-                        12 => Constraint::Length(9),
-                        _ => Constraint::Min(12),
-                    },
-                    4 => match i {
-                        0 => Constraint::Length(15),
-                        1..=4 => Constraint::Length(6),
-                        5 => Constraint::Length(9),
-                        _ => Constraint::Min(12),
-                    },
-                    5 if self.narrow => match i {
-                        0 => Constraint::Length(12),
-                        3 => Constraint::Length(9),
-                        4 => Constraint::Length(8),
-                        5 => Constraint::Length(13),
-                        6 => Constraint::Length(15),
-                        _ => Constraint::Min(8),
-                    },
-                    5 => match i {
-                        0 => Constraint::Length(14),
-                        1 => Constraint::Length(7),
-                        2 => Constraint::Length(5),
-                        3 => Constraint::Length(9),
-                        4 => Constraint::Length(9),
-                        5 => Constraint::Length(13),
-                        6 => Constraint::Length(16),
-                        7 => Constraint::Length(10),
-                        8 => Constraint::Length(10),
-                        9 => Constraint::Length(10),
-                        _ => Constraint::Min(12),
-                    },
-                    7 => match i {
-                        0 => Constraint::Min(10),
-                        1 | 2 => Constraint::Length(6),
-                        3 | 5 => Constraint::Length(10),
-                        4 => Constraint::Length(15),
-                        6 => Constraint::Length(11),
-                        _ => Constraint::Length(12),
-                    },
-                    _ => match i {
-                        0 => Constraint::Length(if self.narrow { 16 } else { 24 }),
-                        1 | 2 => Constraint::Length(12),
-                        3 => Constraint::Length(15),
-                        _ => Constraint::Min(15),
-                    },
-                })
-                .collect();
-            let table_area = panel("").inner(areas[3]);
-            let [_, columns_area] =
-                Layout::horizontal([Constraint::Length(2), Constraint::Fill(0)]).areas(table_area);
-            let cell_areas = Layout::horizontal(widths.clone())
-                .flex(Flex::Start)
-                .spacing(1)
-                .split(columns_area);
-            if self.tab == 3 && !table_area.is_empty() {
-                for (column, area) in visible_columns.iter().zip(cell_areas.iter()) {
-                    if let Some(sort) = job_column_sort(*column) {
-                        self.hits.add(
-                            Rect::new(area.x, table_area.y, area.width, 1),
-                            Click::JobSort(sort),
-                        );
-                    }
-                }
+        let usage_compute = self.tab == 2 && self.usage_has_compute();
+        let visible_columns: Vec<usize> = match self.tab {
+            0 if self.narrow => vec![0, 1, 2, 3, 5],
+            1 if frame.area().width < 110 => vec![0, 1, 2, 3, 4, 7],
+            2 if usage_compute && frame.area().width < 100 => vec![0, 1, 2, 3, 5, 8],
+            2 if usage_compute && frame.area().width < 120 => vec![0, 1, 2, 3, 4, 5, 6, 8],
+            3 if frame.area().width < 100 => vec![0, 1, 2, 12, 3, 4, 9, 10],
+            3 if frame.area().width < 140 => vec![0, 1, 2, 12, 3, 4, 5, 9, 10, 11],
+            3 => vec![0, 1, 2, 12, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            4 if self.narrow => vec![0, 1, 2, 3, 4, 5, 7],
+            5 if frame.area().width < 110 => vec![0, 3, 4, 5, 6, 7],
+            5 if frame.area().width < 150 => vec![0, 1, 2, 3, 4, 5, 6, 7, 10],
+            7 if frame.area().width < 95 => vec![0, 1, 3, 4, 5, 7],
+            0 if self.details => {
+                let base = if self.compact { 6 } else { 7 };
+                let reserve = if self.compact { 110 } else { 140 };
+                let extra = (frame.area().width.saturating_sub(reserve) / 13).min(4) as usize;
+                (0..(base + extra)).collect()
             }
-            for (column, area) in visible_columns.iter().zip(cell_areas.iter()) {
-                if let Some(sort) = view_column_sort(self.tab, self.compact, *column) {
-                    self.hits.add(
-                        Rect::new(area.x, table_area.y, area.width, table_area.height.min(1)),
-                        Click::Sort(sort),
-                    );
-                }
-            }
-            let prepared = prepared_rows(
-                &self.table,
-                self.rows.len(),
-                table_area.height.saturating_sub(1),
-            );
-            let rows = self.rows.iter().enumerate().map(|(index, row)| {
-                let margin = u16::from(
-                    spaced_rows && self.tab == 0 && index > 0 && row.key.starts_with("node:"),
-                );
-                if !prepared.iter().any(|range| range.contains(&index)) {
-                    return Row::new(std::iter::empty::<Cell>()).top_margin(margin);
-                }
-                let cells = visible_columns
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(position, column)| {
-                        let text = row.cells.get(*column)?;
-                        let focused = row.focus == Some(*column);
-                        let text = if focused {
-                            format!("◆ {}", cli::terminal_safe(text))
-                        } else {
-                            cli::terminal_safe(text)
-                        }
-                        .replace(['\n', '\t'], " ");
-                        let mut style = if focused {
-                            Style::default().fg(FOCUS).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default()
-                        };
-                        if let Some((_, accent)) = row.accents.iter().find(|(i, _)| i == column) {
-                            style = style.patch(*accent);
-                        }
-                        if matches!(text.trim(), "?" | "—") {
-                            style = style.fg(MUTED);
-                        }
-                        Some(
-                            Cell::from(
-                                Line::from(clipped_safe(&text, cell_areas[position].width))
-                                    .alignment(column_alignment(self.tab, self.compact, *column)),
-                            )
-                            .style(style),
-                        )
-                    });
-                let style = Style::default()
-                    .bg(if index % 2 == 0 { BACKGROUND } else { PANEL })
-                    .patch(row.style);
-                Row::new(cells)
-                    .style(if row.focus.is_some() {
-                        style.bg(FOCUS_BG)
+            _ => (0..self.headers.len()).collect(),
+        };
+        let widths: Vec<_> = visible_columns
+            .iter()
+            .map(|i| match self.tab {
+                0 if self.compact => match i {
+                    0 => Constraint::Length(11),
+                    1 => Constraint::Length(15),
+                    2 => Constraint::Length(if self.narrow { 16 } else { 28 }),
+                    3 => Constraint::Min(15),
+                    4 => Constraint::Length(7),
+                    _ => Constraint::Length(9),
+                },
+                0 => match i {
+                    0 => Constraint::Length(15),
+                    1 => Constraint::Length(18),
+                    2 => Constraint::Length(15),
+                    3 => Constraint::Length(28),
+                    4 => Constraint::Min(20),
+                    5 => Constraint::Length(8),
+                    _ => Constraint::Length(12),
+                },
+                1 => match i {
+                    0 => Constraint::Length(11),
+                    1 => Constraint::Length(8),
+                    2 => Constraint::Length(10),
+                    3 => Constraint::Length(15),
+                    4 => Constraint::Length(11),
+                    _ => Constraint::Min(9),
+                },
+                2 if usage_compute => match i {
+                    0 => Constraint::Length(if self.narrow {
+                        12
+                    } else if self.compact {
+                        14
                     } else {
-                        style
-                    })
-                    .top_margin(margin)
-            });
-            let table = Table::new(rows, widths)
-                .header(
-                    Row::new(
-                        visible_columns
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(position, i)| {
-                                self.headers.get(*i).map(|text| {
-                                    let sort =
-                                        (self.tab == 3).then(|| job_column_sort(*i)).flatten();
-                                    let view_sort = view_column_sort(self.tab, self.compact, *i);
-                                    let active_sort =
-                                        sort == Some(self.job_sort) || view_sort == Some(self.sort);
-                                    let clickable = sort.is_some() || view_sort.is_some();
-                                    let text = if clickable {
-                                        format!(
-                                            "{}{}",
-                                            clipped(
-                                                text,
-                                                cell_areas[position].width.saturating_sub(1)
-                                            ),
-                                            if active_sort {
-                                                if descending { "↓" } else { "↑" }
-                                            } else {
-                                                "↕"
-                                            }
-                                        )
-                                    } else {
-                                        text.clone()
-                                    };
-                                    Cell::from(
-                                        Line::from(clipped(&text, cell_areas[position].width))
-                                            .alignment(column_alignment(
-                                                self.tab,
-                                                self.compact,
-                                                *i,
-                                            )),
-                                    )
-                                    .style(if active_sort {
-                                        Style::default()
-                                            .fg(FOCUS)
-                                            .bg(SELECTED_BG)
-                                            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-                                    } else if clickable {
-                                        Style::default().fg(BLUE)
-                                    } else {
-                                        Style::default().fg(MUTED)
-                                    })
-                                })
-                            }),
-                    )
-                    .style(
-                        Style::default()
-                            .fg(CYAN)
-                            .bg(HEADER_BG)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                )
-                .column_spacing(1)
-                .row_highlight_style(
-                    Style::default()
-                        .bg(SELECTED_BG)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .highlight_symbol("▸ ")
-                .highlight_spacing(HighlightSpacing::Always)
-                .block(panel(match self.tab {
-                    0 => " GPUs · Space fold · Enter inspect ",
-                    1 => " Nodes · click ↕ header · measured CPU / RAM ",
-                    3 => " Jobs · click ↕ header · s sort · S reverse · v state ",
-                    4 => " Attention · sustained idle / parked allocations; unallocated processes ",
-                    5 => " Users · job CPU/RAM/IO; node network/load are SHARED ",
-                    7 => " Partitions · cluster capacity & queue rollup · s sort · J jobs · Enter inspect ",
-                    _ => " Host · R/W disk · RX/TX net · Enter: guide + 5m trend ",
-                }));
-            frame.render_stateful_widget(table, areas[3], &mut self.table);
-            let mut y = table_area.y.saturating_add(1);
-            for (index, row) in self.rows.iter().enumerate().skip(self.table.offset()) {
-                if spaced_rows && self.tab == 0 && index > 0 && row.key.starts_with("node:") {
-                    y = y.saturating_add(1);
-                }
-                if y >= table_area.bottom() {
-                    break;
-                }
-                let rect = Rect::new(table_area.x, y, table_area.width, 1);
-                self.hits.add(rect, Click::Row(row.key.clone()));
-                if self.tab == 0
-                    && row.key.starts_with("node:")
-                    && let Some(area) = cell_areas.first()
-                {
+                        16
+                    }),
+                    1 => Constraint::Length(10),
+                    2 => Constraint::Length(9),
+                    3 => Constraint::Length(5),
+                    4 => Constraint::Length(8),
+                    5 => Constraint::Length(10),
+                    6 => Constraint::Length(9),
+                    7 => Constraint::Length(6),
+                    _ => Constraint::Min(13),
+                },
+                2 => match i {
+                    0 => Constraint::Length(if self.narrow { 16 } else { 20 }),
+                    1 => Constraint::Length(11),
+                    2 => Constraint::Length(10),
+                    3 => Constraint::Length(7),
+                    _ => Constraint::Min(9),
+                },
+                3 => match i {
+                    0 => Constraint::Length(if self.narrow { 7 } else { 10 }),
+                    1 => Constraint::Length(if self.narrow { 8 } else { 12 }),
+                    2 => Constraint::Length(7),
+                    3 | 4 => Constraint::Length(8),
+                    5 => Constraint::Length(8),
+                    6..=8 => Constraint::Length(9),
+                    9 => Constraint::Length(10),
+                    10 => Constraint::Min(if self.narrow { 8 } else { 18 }),
+                    12 => Constraint::Length(9),
+                    _ => Constraint::Min(12),
+                },
+                4 => match i {
+                    0 => Constraint::Length(15),
+                    1..=4 => Constraint::Length(6),
+                    5 => Constraint::Length(9),
+                    _ => Constraint::Min(12),
+                },
+                5 if self.narrow => match i {
+                    0 => Constraint::Length(12),
+                    3 => Constraint::Length(9),
+                    4 => Constraint::Length(8),
+                    5 => Constraint::Length(13),
+                    6 => Constraint::Length(15),
+                    _ => Constraint::Min(8),
+                },
+                5 => match i {
+                    0 => Constraint::Length(14),
+                    1 => Constraint::Length(7),
+                    2 => Constraint::Length(5),
+                    3 => Constraint::Length(9),
+                    4 => Constraint::Length(9),
+                    5 => Constraint::Length(13),
+                    6 => Constraint::Length(16),
+                    7 => Constraint::Length(10),
+                    8 => Constraint::Length(10),
+                    9 => Constraint::Length(10),
+                    _ => Constraint::Min(12),
+                },
+                7 => match i {
+                    0 => Constraint::Min(10),
+                    1 | 2 => Constraint::Length(6),
+                    3 | 5 => Constraint::Length(10),
+                    4 => Constraint::Length(15),
+                    6 => Constraint::Length(11),
+                    _ => Constraint::Length(12),
+                },
+                _ => match i {
+                    0 => Constraint::Length(if self.narrow { 16 } else { 24 }),
+                    1 | 2 => Constraint::Length(12),
+                    3 => Constraint::Length(15),
+                    _ => Constraint::Min(15),
+                },
+            })
+            .collect();
+        let table_area = panel("").inner(areas[3]);
+        let [_, columns_area] =
+            Layout::horizontal([Constraint::Length(2), Constraint::Fill(0)]).areas(table_area);
+        let cell_areas = Layout::horizontal(widths.clone())
+            .flex(Flex::Start)
+            .spacing(1)
+            .split(columns_area);
+        if self.tab == 3 && !table_area.is_empty() {
+            for (column, area) in visible_columns.iter().zip(cell_areas.iter()) {
+                if let Some(sort) = job_column_sort(*column, self.job_filter, self.job_sort) {
                     self.hits.add(
-                        Rect::new(area.x, y, area.width.min(1), 1),
-                        Click::Fold(row.key.clone()),
+                        Rect::new(area.x, table_area.y, area.width, 1),
+                        Click::JobSort(sort),
                     );
                 }
+            }
+        }
+        for (column, area) in visible_columns.iter().zip(cell_areas.iter()) {
+            if let Some(sort) = view_column_sort(self.tab, self.compact, self.usage_daily, *column)
+            {
+                self.hits.add(
+                    Rect::new(area.x, table_area.y, area.width, table_area.height.min(1)),
+                    Click::Sort(sort),
+                );
+            }
+        }
+        if self.tab == 2
+            && self.usage_scroll != self.last_usage_scroll
+            && table_area.height > 1
+            && !self.rows.is_empty()
+        {
+            let visible = usize::from(table_area.height - 1).max(1);
+            let max_offset = self.rows.len().saturating_sub(visible);
+            let target = usize::from(self.usage_scroll).min(max_offset);
+            *self.table.offset_mut() = target;
+            let last_visible = (target + visible - 1).min(self.rows.len() - 1);
+            let selected = self.table.selected().unwrap_or(target);
+            if self.usage_scroll == u16::MAX {
+                self.table.select(Some(last_visible));
+            } else if selected < target {
+                self.table.select(Some(target));
+            } else if selected > last_visible {
+                self.table.select(Some(last_visible));
+            }
+        }
+        let prepared = prepared_rows(
+            &self.table,
+            self.rows.len(),
+            table_area.height.saturating_sub(1),
+        );
+        let rows = self.rows.iter().enumerate().map(|(index, row)| {
+            let margin = u16::from(
+                spaced_rows && self.tab == 0 && index > 0 && row.key.starts_with("node:"),
+            );
+            if !prepared.iter().any(|range| range.contains(&index)) {
+                return Row::new(std::iter::empty::<Cell>()).top_margin(margin);
+            }
+            let cells = visible_columns
+                .iter()
+                .enumerate()
+                .filter_map(|(position, column)| {
+                    let text = row.cells.get(*column)?;
+                    let focused = row.focus == Some(*column);
+                    let text = if focused {
+                        format!("◆ {}", cli::terminal_safe(text))
+                    } else {
+                        cli::terminal_safe(text)
+                    }
+                    .replace(['\n', '\t'], " ");
+                    let mut style = if focused {
+                        Style::default().fg(FOCUS).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+                    if let Some((_, accent)) = row.accents.iter().find(|(i, _)| i == column) {
+                        style = style.patch(*accent);
+                    }
+                    if matches!(text.trim(), "?" | "—") {
+                        style = style.fg(MUTED);
+                    }
+                    Some(
+                        Cell::from(
+                            Line::from(clipped_safe(&text, cell_areas[position].width))
+                                .alignment(column_alignment(self.tab, self.compact, *column)),
+                        )
+                        .style(style),
+                    )
+                });
+            let style = Style::default()
+                .bg(if index % 2 == 0 { BACKGROUND } else { PANEL })
+                .patch(row.style);
+            Row::new(cells)
+                .style(if row.focus.is_some() {
+                    style.bg(FOCUS_BG)
+                } else {
+                    style
+                })
+                .top_margin(margin)
+        });
+        let usage_title = format!(
+            " GPU-hours & compute usage · {}d {} · click ↕ header · Enter detail ",
+            self.usage_days,
+            if self.usage_daily { "daily" } else { "by user" }
+        );
+        let table = Table::new(rows, widths)
+            .header(
+                Row::new(
+                    visible_columns
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(position, i)| {
+                            self.headers.get(*i).map(|text| {
+                                let sort = (self.tab == 3)
+                                    .then(|| job_column_sort(*i, self.job_filter, self.job_sort))
+                                    .flatten();
+                                let view_sort = view_column_sort(
+                                    self.tab,
+                                    self.compact,
+                                    self.usage_daily,
+                                    *i,
+                                );
+                                let active_sort = sort == Some(self.job_sort)
+                                    || view_sort == Some(self.sort % 4);
+                                let header_label = if self.tab == 3 && *i == 9 {
+                                    if self.job_filter == job_view::Filter::Running
+                                        || self.job_sort == job_view::Sort::Left
+                                    {
+                                        "Left"
+                                    } else if self.job_filter == job_view::Filter::Pending
+                                        || sort == Some(self.job_sort)
+                                    {
+                                        "Wait"
+                                    } else {
+                                        text.as_str()
+                                    }
+                                } else {
+                                    text.as_str()
+                                };
+                                let clickable = sort.is_some() || view_sort.is_some();
+                                let text = if clickable {
+                                    format!(
+                                        "{}{}",
+                                        clipped(
+                                            header_label,
+                                            cell_areas[position].width.saturating_sub(1)
+                                        ),
+                                        if active_sort {
+                                            if descending { "↓" } else { "↑" }
+                                        } else {
+                                            "↕"
+                                        }
+                                    )
+                                } else {
+                                    header_label.to_string()
+                                };
+                                Cell::from(
+                                    Line::from(clipped(&text, cell_areas[position].width))
+                                        .alignment(column_alignment(self.tab, self.compact, *i)),
+                                )
+                                .style(if active_sort {
+                                    Style::default()
+                                        .fg(FOCUS)
+                                        .bg(SELECTED_BG)
+                                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                                } else if clickable {
+                                    Style::default().fg(BLUE)
+                                } else {
+                                    Style::default().fg(MUTED)
+                                })
+                            })
+                        }),
+                )
+                .style(
+                    Style::default()
+                        .fg(CYAN)
+                        .bg(HEADER_BG)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            )
+            .column_spacing(1)
+            .row_highlight_style(
+                Style::default()
+                    .bg(SELECTED_BG)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▸ ")
+            .highlight_spacing(HighlightSpacing::Always)
+            .block(panel(match self.tab {
+                0 => " GPUs · Space fold · Enter/2×click inspect ",
+                1 => " Nodes · click ↕ header · measured CPU / RAM ",
+                2 => &usage_title,
+                3 => " Jobs · click ↕ header · s sort · S reverse · v state ",
+                4 => " Attention · click ↕ header · sustained waste & unallocated processes ",
+                5 => " Users · job CPU/RAM/IO; node network/load are SHARED ",
+                7 => " Partitions · cluster capacity & queue rollup · s sort · J jobs · Enter inspect ",
+                _ => " Host · R/W disk · RX/TX net · Enter: guide + 5m trend ",
+            }));
+        frame.render_stateful_widget(table, areas[3], &mut self.table);
+        if self.tab == 2 {
+            self.usage_scroll = self.table.offset().min(u16::MAX as usize) as u16;
+            self.last_usage_scroll = self.usage_scroll;
+        }
+        let mut y = table_area.y.saturating_add(1);
+        for (index, row) in self.rows.iter().enumerate().skip(self.table.offset()) {
+            if spaced_rows && self.tab == 0 && index > 0 && row.key.starts_with("node:") {
                 y = y.saturating_add(1);
             }
-            if self.rows.is_empty() && areas[3].height > 3 {
-                let message = match self.tab {
-                    4 => "No confirmed sustained waste matches these filters",
-                    6 => {
-                        "Controller telemetry unavailable; update/start the collector on the controller"
-                    }
-                    _ => "No matching items · 0 reset filters",
-                };
-                frame.render_widget(
-                    Paragraph::new(message)
-                        .style(Style::default().fg(MUTED))
-                        .wrap(Wrap { trim: false }),
-                    Rect::new(
-                        areas[3].x + 2,
-                        areas[3].y + 2,
-                        areas[3].width.saturating_sub(4),
-                        areas[3].height.saturating_sub(3),
-                    ),
+            if y >= table_area.bottom() {
+                break;
+            }
+            let rect = Rect::new(table_area.x, y, table_area.width, 1);
+            self.hits.add(rect, Click::Row(row.key.clone()));
+            if self.tab == 0
+                && row.key.starts_with("node:")
+                && let Some(area) = cell_areas.first()
+            {
+                self.hits.add(
+                    Rect::new(area.x, y, area.width.min(1), 1),
+                    Click::Fold(row.key.clone()),
                 );
             }
+            y = y.saturating_add(1);
+        }
+        if self.rows.is_empty() && areas[3].height > 3 {
+            let message = match self.tab {
+                2 if self.usage.is_none() => {
+                    "No usage data yet. Start the collector to record usage."
+                }
+                2 => "No matching usage records in window · v view · D window · 0 reset",
+                4 => "No confirmed sustained waste matches these filters",
+                6 => {
+                    "Controller telemetry unavailable; update/start the collector on the controller"
+                }
+                _ => "No matching items · 0 reset filters",
+            };
+            frame.render_widget(
+                Paragraph::new(message)
+                    .style(Style::default().fg(MUTED))
+                    .wrap(Wrap { trim: false }),
+                Rect::new(
+                    areas[3].x + 2,
+                    areas[3].y + 2,
+                    areas[3].width.saturating_sub(4),
+                    areas[3].height.saturating_sub(3),
+                ),
+            );
         }
         let [status_area, buttons_area] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(areas[4]);
@@ -3558,11 +4014,22 @@ impl App {
                 tab: self.tab,
                 searching: true,
             });
-            frame.render_widget(
-                Paragraph::new(format!("Search: {}▏", cli::terminal_safe(&self.search)))
-                    .style(Style::default().fg(YELLOW)),
-                status_area,
-            );
+            let room = status_area.width.saturating_sub(13);
+            let prefix = format!("Search: {}▏", tail_clipped(&self.search, room));
+            if !self.search.is_empty() && status_area.width >= 20 {
+                let spans = vec![
+                    Span::styled(prefix, Style::default().fg(YELLOW)),
+                    Span::styled(" [×]", Style::default().fg(CYAN)),
+                ];
+                self.hits
+                    .spans(status_area, &spans, &[None, Some(Click::Key(KeyCode::Esc))]);
+                frame.render_widget(Paragraph::new(Line::from(spans)), status_area);
+            } else {
+                frame.render_widget(
+                    Paragraph::new(prefix).style(Style::default().fg(YELLOW)),
+                    status_area,
+                );
+            }
             vec![
                 (KeyCode::Enter, "Enter Apply".into()),
                 (KeyCode::Esc, "Esc Clear".into()),
@@ -3584,13 +4051,12 @@ impl App {
             ];
             if self.related.is_some() {
                 bindings.push((KeyCode::Esc, "Esc Back".into()));
-            } else if matches!(self.tab, 0 | 1 | 4 | 5 | 7) {
+            } else if matches!(self.tab, 0 | 1 | 4 | 5 | 7) || (self.tab == 2 && !self.usage_daily)
+            {
                 bindings.push((KeyCode::Char('J'), "J Jobs".into()));
             }
-            if self.tab != 2 {
-                bindings.push((KeyCode::Enter, "Enter Detail".into()));
-            }
-            if matches!(self.tab, 0 | 1 | 2 | 3 | 5 | 7) {
+            bindings.push((KeyCode::Enter, "Enter Detail".into()));
+            if matches!(self.tab, 0 | 1 | 2 | 3 | 4 | 5 | 7) {
                 bindings.extend([
                     (KeyCode::Char('s'), "s Sort".into()),
                     (KeyCode::Char('S'), "S Reverse".into()),
@@ -3602,10 +4068,6 @@ impl App {
                 bindings.extend([
                     (KeyCode::Char('v'), "v View".into()),
                     (KeyCode::Char('D'), "D Window".into()),
-                    (KeyCode::PageUp, "Pg↑".into()),
-                    (KeyCode::PageDown, "Pg↓".into()),
-                    (KeyCode::Home, "Home".into()),
-                    (KeyCode::End, "End".into()),
                 ]);
             }
             bindings.extend([
@@ -3624,9 +4086,81 @@ impl App {
     fn open(&mut self, mut popup: Popup) {
         self.searching = false;
         self.hits.clear();
+        self.last_click = None;
         self.popup_sequence += 1;
         popup.token = self.popup_sequence;
+        popup.is_history |= !popup.history.is_empty();
+        if popup.cancel.is_some() {
+            popup.selected = 1;
+        }
         self.popup = Some(popup);
+    }
+    fn open_usage_detail(&mut self) {
+        let Some(row) = self.selected().cloned() else {
+            return;
+        };
+        let Some(raw) = &self.usage else {
+            self.status = "No usage data loaded".into();
+            return;
+        };
+        let title = row.cells.first().cloned().unwrap_or_else(|| "Usage".into());
+        let mut body = self
+            .headers
+            .iter()
+            .zip(&row.cells)
+            .map(|(h, c)| format!("{h}: {c}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Some(user) = row.key.strip_prefix("usage_user:") {
+            let run_jobs = self.data.jobs.iter().filter(|j| j.user == user).count();
+            let pd_jobs = self.data.pending.iter().filter(|j| j.user == user).count();
+            body.push_str(&format!(
+                "\n\nCurrent queue: {run_jobs} running · {pd_jobs} pending · J related Jobs"
+            ));
+            let breakdown =
+                usage::render_with_options(raw, self.usage_days, true, 0, false, user, "");
+            body.push_str(&format!(
+                "\n\nDaily breakdown ({}d for {user}):\n{breakdown}",
+                self.usage_days
+            ));
+        } else if let Some(day) = row.key.strip_prefix("usage_day:") {
+            let mut single = serde_json::Map::new();
+            for field in ["days", "sacct_days", "sacct_cpu_days", "sacct_mem_days"] {
+                if let Some(day_val) = raw.get(field).and_then(|v| v.get(day)) {
+                    single.insert(field.into(), serde_json::json!({ day: day_val }));
+                }
+            }
+            let day_raw = serde_json::Value::Object(single);
+            let breakdown = usage::render_with_options(
+                &day_raw,
+                self.usage_days,
+                false,
+                self.sort,
+                self.reverse,
+                self.user_filter(),
+                "",
+            );
+            body.push_str(&format!("\n\nUsers on {day}:\n{breakdown}"));
+        } else if row.key == "usage_total" {
+            let breakdown = usage::render_with_options(
+                raw,
+                self.usage_days,
+                !self.usage_daily,
+                self.sort,
+                self.reverse,
+                self.user_filter(),
+                &self.search,
+            );
+            body.push_str(&format!(
+                "\n\n{}:\n{breakdown}",
+                if self.usage_daily {
+                    "By-user breakdown"
+                } else {
+                    "Daily breakdown"
+                }
+            ));
+        }
+        self.open(Popup::text(&title, body));
     }
     fn open_picker(&mut self, kind: PickerKind) {
         let current = match kind {
@@ -3670,14 +4204,14 @@ impl App {
             }
             self.popup = None;
             self.table = TableState::default();
+            self.usage_scroll = 0;
+            self.last_usage_scroll = 0;
+            self.last_click = None;
             self.rebuild();
         }
     }
     fn actions(&self) -> Vec<(KeyCode, String)> {
-        let mut actions = Vec::new();
-        if self.tab != 2 {
-            actions.push((KeyCode::Enter, "Enter · Selected row details".into()));
-        }
+        let mut actions = vec![(KeyCode::Enter, "Enter · Selected row details".into())];
         for (index, name) in [
             "GPU",
             "CPU",
@@ -3700,13 +4234,13 @@ impl App {
             (KeyCode::Char('/'), "/ · Search".into()),
             (KeyCode::Char('0'), "0 · Reset filters".into()),
         ]);
-        if matches!(self.tab, 0 | 1 | 4 | 5 | 7) {
+        if matches!(self.tab, 0 | 1 | 4 | 5 | 7) || (self.tab == 2 && !self.usage_daily) {
             actions.push((KeyCode::Char('J'), "J · Related Jobs".into()));
         }
         if self.related.is_some() {
             actions.push((KeyCode::Esc, "Esc · Back to previous view".into()));
         }
-        if matches!(self.tab, 0 | 1 | 2 | 3 | 5 | 7) {
+        if matches!(self.tab, 0 | 1 | 2 | 3 | 4 | 5 | 7) {
             actions.extend([
                 (KeyCode::Char('s'), "s · Next sort column".into()),
                 (KeyCode::Char('S'), "S · Reverse sort".into()),
@@ -3753,7 +4287,10 @@ impl App {
                 (KeyCode::Char(']'), "] · Next node".into()),
             ]);
         }
-        if self.selected().is_some_and(|row| row.job.is_some()) {
+        if self
+            .selected()
+            .is_some_and(|row| row.job.is_some() || !row.jobs.is_empty())
+        {
             actions.extend([
                 (KeyCode::Char('n'), "n · Watch/unwatch selected job".into()),
                 (KeyCode::Char('x'), "x · Cancel my own job…".into()),
@@ -3780,6 +4317,7 @@ impl App {
         actions
     }
     fn menu_action(&mut self, index: usize, worker: &Worker) -> bool {
+        self.last_click = None;
         let Some(popup) = self.popup.take() else {
             return false;
         };
@@ -3803,12 +4341,11 @@ impl App {
         self.key(*key, worker)
     }
     fn move_selection(&mut self, down: bool) {
-        if self.tab == 2 {
-            self.usage_scroll = if down {
-                self.usage_scroll.saturating_add(1)
-            } else {
-                self.usage_scroll.saturating_sub(1)
-            };
+        if self.rows.is_empty() && self.tab == 2 && self.usage.is_some() {
+            self.rebuild_usage();
+        }
+        if self.rows.is_empty() {
+            self.table.select(None);
             return;
         }
         if down {
@@ -3845,6 +4382,9 @@ impl App {
         }
     }
     fn mouse(&mut self, mouse: MouseEvent, worker: &Worker) -> bool {
+        self.mouse_at(mouse, worker, Instant::now())
+    }
+    fn mouse_at(&mut self, mouse: MouseEvent, worker: &Worker, now: Instant) -> bool {
         let scope = self.popup.as_ref().map_or(
             Scope::Main {
                 tab: self.tab,
@@ -3859,10 +4399,26 @@ impl App {
             && self.popup.is_none()
             && !self.searching
         {
-            if let Some(Click::Row(key) | Click::Fold(key)) = self.hits.at(mouse.column, mouse.row)
-            {
-                self.table
-                    .select(self.rows.iter().position(|row| row.key == key));
+            self.last_click = None;
+            match self.hits.at(mouse.column, mouse.row) {
+                Some(Click::Row(key) | Click::Fold(key)) => {
+                    self.table
+                        .select(self.rows.iter().position(|row| row.key == key));
+                }
+                Some(Click::JumpNode(node)) => {
+                    if self.tab > 1 {
+                        self.return_from_jobs();
+                        self.tab = 0;
+                        self.table = TableState::default();
+                        self.usage_scroll = 0;
+                        self.last_usage_scroll = 0;
+                        self.rebuild();
+                    }
+                    let target = format!("node:{node}");
+                    self.table
+                        .select(self.rows.iter().position(|row| row.key == target));
+                }
+                _ => (),
             }
             self.key(KeyCode::Char('a'), worker);
             return true;
@@ -3874,6 +4430,7 @@ impl App {
             if !self.hits.scroll.contains((mouse.column, mouse.row).into()) {
                 return false;
             }
+            self.last_click = None;
             self.key(
                 if mouse.kind == MouseEventKind::ScrollDown {
                     KeyCode::Down
@@ -3888,9 +4445,23 @@ impl App {
             return false;
         }
         let Some(action) = self.hits.at(mouse.column, mouse.row) else {
+            self.last_click = None;
             return false;
         };
         self.hits.clear();
+        let can_double = matches!(
+            &action,
+            Click::Row(_) | Click::History(_) | Click::JumpNode(_)
+        );
+        let double_click = can_double
+            && self.last_click.as_ref().is_some_and(|(at, prev)| {
+                *prev == action && now.saturating_duration_since(*at) <= Duration::from_millis(450)
+            });
+        self.last_click = if double_click || !can_double {
+            None
+        } else {
+            Some((now, action.clone()))
+        };
         match action {
             Click::Key(key) => self.quit_requested = self.key(key, worker),
             Click::Row(ref key) | Click::Fold(ref key) => {
@@ -3900,6 +4471,24 @@ impl App {
                 self.table.select(Some(index));
                 if matches!(action, Click::Fold(_)) {
                     self.key(KeyCode::Char(' '), worker);
+                } else if double_click {
+                    self.key(KeyCode::Enter, worker);
+                }
+            }
+            Click::JumpNode(node) => {
+                if self.tab > 1 {
+                    self.return_from_jobs();
+                    self.tab = 0;
+                    self.table = TableState::default();
+                    self.usage_scroll = 0;
+                    self.last_usage_scroll = 0;
+                    self.rebuild();
+                }
+                let target = format!("node:{node}");
+                self.table
+                    .select(self.rows.iter().position(|row| row.key == target));
+                if double_click {
+                    self.key(KeyCode::Enter, worker);
                 }
             }
             Click::JobSort(sort) => {
@@ -3924,6 +4513,17 @@ impl App {
                 }
                 self.rebuild();
             }
+            Click::HistorySort(col) => {
+                if let Some(popup) = &mut self.popup {
+                    if popup.history_sort == col {
+                        popup.history_reverse = !popup.history_reverse;
+                    } else {
+                        popup.history_sort = col;
+                        popup.history_reverse = false;
+                    }
+                    popup.selected = 0;
+                }
+            }
             Click::Pane(index) => {
                 if let Some(popup) = &mut self.popup {
                     popup.pane(index);
@@ -3931,19 +4531,49 @@ impl App {
             }
             Click::History(index) => {
                 if let Some(popup) = &mut self.popup {
-                    popup.selected = index.min(popup.history.len().saturating_sub(1));
+                    let count = popup.visible_history().len();
+                    popup.selected = index.min(count.saturating_sub(1));
+                    if double_click && count > 0 {
+                        popup.history_searching = false;
+                        self.key(KeyCode::Enter, worker);
+                    }
                 }
             }
             Click::Menu(index) => {
                 self.quit_requested = self.menu_action(index, worker);
             }
             Click::Choice(index) => self.choose(index),
+            Click::ClearInput => {
+                if let Some(popup) = &mut self.popup {
+                    if let Some(picker) = &mut popup.picker {
+                        picker.query.clear();
+                        popup.selected = 0;
+                    } else if popup.is_history {
+                        popup.history_query.clear();
+                        popup.history_searching = false;
+                        popup.selected = 0;
+                    } else {
+                        popup.find.clear();
+                        popup.find.editing = false;
+                        popup.follow = false;
+                    }
+                } else if self.searching {
+                    self.search.clear();
+                    self.searching = false;
+                    self.rebuild();
+                }
+            }
             Click::Close => self.popup = None,
         }
         true
     }
     fn key(&mut self, key: KeyCode, worker: &Worker) -> bool {
+        self.key_event(key, KeyModifiers::NONE, worker)
+    }
+    fn key_event(&mut self, key: KeyCode, modifiers: KeyModifiers, worker: &Worker) -> bool {
         self.hits.clear();
+        self.last_click = None;
+        let ctrl = modifiers.contains(KeyModifiers::CONTROL);
         if self.searching && self.popup.is_none() {
             match key {
                 KeyCode::Esc => {
@@ -3951,53 +4581,80 @@ impl App {
                     self.searching = false;
                 }
                 KeyCode::Enter => self.searching = false,
+                KeyCode::Char('u') if ctrl => {
+                    self.search.clear();
+                }
                 KeyCode::Backspace => {
                     self.search.pop();
                 }
-                KeyCode::Char(c) if !c.is_control() => self.search.push(c),
+                KeyCode::Char(c) if !c.is_control() && !ctrl => self.search.push(c),
                 _ => (),
             }
             self.rebuild();
             return false;
         }
         if let Some(popup) = &mut self.popup {
-            if popup.find.input(key) {
-                popup.follow = false;
-                return false;
+            if popup.find.editing {
+                if ctrl && key == KeyCode::Char('u') {
+                    popup.find.clear();
+                    popup.follow = false;
+                    return false;
+                }
+                if !ctrl && popup.find.input(key) {
+                    popup.follow = false;
+                    return false;
+                }
             }
             if let Some(picker) = &mut popup.picker {
+                let count = picker.choices().len();
                 match key {
                     KeyCode::Enter => {
                         let index = popup.selected;
                         self.choose(index);
-                        return false;
                     }
-                    KeyCode::Esc => {
-                        self.popup = None;
-                        return false;
+                    KeyCode::Esc => self.popup = None,
+                    KeyCode::Char('u') if ctrl => {
+                        picker.query.clear();
+                        popup.selected = 0;
                     }
                     KeyCode::Backspace => {
                         picker.query.pop();
                         popup.selected = 0;
-                        return false;
                     }
-                    KeyCode::Char(c) if !c.is_control() => {
+                    KeyCode::Char(c) if !c.is_control() && !ctrl => {
                         if picker.query.len() + c.len_utf8() <= 256 {
                             picker.query.push(c);
                         }
                         popup.selected = 0;
-                        return false;
                     }
+                    KeyCode::Down | KeyCode::Tab | KeyCode::Right if count > 0 => {
+                        popup.selected = (popup.selected + 1).min(count - 1);
+                    }
+                    KeyCode::Up | KeyCode::BackTab | KeyCode::Left if count > 0 => {
+                        popup.selected = popup.selected.saturating_sub(1);
+                    }
+                    KeyCode::PageDown if count > 0 => {
+                        popup.selected = popup.selected.saturating_add(20).min(count - 1);
+                    }
+                    KeyCode::PageUp if count > 0 => {
+                        popup.selected = popup.selected.saturating_sub(20);
+                    }
+                    KeyCode::Home => popup.selected = 0,
+                    KeyCode::End if count > 0 => popup.selected = count - 1,
                     _ => (),
                 }
-            }
-            if !popup.actions.is_empty() && key == KeyCode::Enter {
-                let index = popup.selected;
-                return self.menu_action(index, worker);
+                return false;
             }
             if let Some(id) = popup.cancel.clone() {
                 match key {
-                    KeyCode::Char('y') | KeyCode::Enter => {
+                    KeyCode::Tab
+                    | KeyCode::BackTab
+                    | KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Char('h' | 'l') => {
+                        popup.selected = usize::from(popup.selected == 0);
+                    }
+                    KeyCode::Char('y') => {
                         self.status = if worker.send(Task::Cancel(id)) {
                             "Cancelling…"
                         } else {
@@ -4005,103 +4662,197 @@ impl App {
                         }
                         .into();
                         self.popup = None;
-                        return false;
                     }
-                    KeyCode::Esc | KeyCode::Char('n' | 'q') => {
+                    KeyCode::Enter => {
+                        if popup.selected == 1 {
+                            self.status = if worker.send(Task::Cancel(id)) {
+                                "Cancelling…"
+                            } else {
+                                "Worker busy"
+                            }
+                            .into();
+                        }
                         self.popup = None;
-                        return false;
                     }
+                    KeyCode::Esc | KeyCode::Char('n' | 'q') => self.popup = None,
                     _ => (),
                 }
+                return false;
             }
-            let row_count = if let Some(picker) = &popup.picker {
-                picker.choices().len()
-            } else if popup.actions.is_empty() {
-                popup.history.len()
-            } else {
-                popup.actions.len()
-            };
-            if row_count == 0 && popup.cancel.is_none() && popup.picker.is_none() {
+            if !popup.actions.is_empty() {
+                let count = popup.actions.len();
                 match key {
-                    KeyCode::Char('/') => {
-                        popup.find.editing = true;
-                        popup.follow = false;
-                        return false;
+                    KeyCode::Esc | KeyCode::Char('a') => self.popup = None,
+                    KeyCode::Enter => {
+                        let index = popup.selected;
+                        return self.menu_action(index, worker);
                     }
-                    KeyCode::Char('n' | 'N') if !popup.find.query.is_empty() => {
-                        popup.find.next(key == KeyCode::Char('N'));
-                        popup.follow = false;
-                        return false;
+                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab | KeyCode::Right => {
+                        popup.selected = (popup.selected + 1).min(count - 1);
+                    }
+                    KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab | KeyCode::Left => {
+                        popup.selected = popup.selected.saturating_sub(1);
+                    }
+                    KeyCode::PageDown => {
+                        popup.selected = popup.selected.saturating_add(20).min(count - 1);
+                    }
+                    KeyCode::PageUp => {
+                        popup.selected = popup.selected.saturating_sub(20);
+                    }
+                    KeyCode::Home => popup.selected = 0,
+                    KeyCode::End => popup.selected = count - 1,
+                    other if !ctrl => {
+                        if let Some(index) = popup.actions.iter().position(|(k, _)| *k == other) {
+                            return self.menu_action(index, worker);
+                        }
                     }
                     _ => (),
                 }
+                return false;
+            }
+            if popup.is_history {
+                if popup.history_searching {
+                    match key {
+                        KeyCode::Esc => {
+                            popup.history_query.clear();
+                            popup.history_searching = false;
+                            popup.selected = 0;
+                        }
+                        KeyCode::Enter => popup.history_searching = false,
+                        KeyCode::Char('u') if ctrl => {
+                            popup.history_query.clear();
+                            popup.selected = 0;
+                        }
+                        KeyCode::Backspace => {
+                            popup.history_query.pop();
+                            popup.selected = 0;
+                        }
+                        KeyCode::Char(c) if !c.is_control() && !ctrl => {
+                            if popup.history_query.len() + c.len_utf8() <= 256 {
+                                popup.history_query.push(c);
+                            }
+                            popup.selected = 0;
+                        }
+                        _ => (),
+                    }
+                    return false;
+                }
+                let visible = popup.visible_history();
+                let row_count = visible.len();
+                match key {
+                    KeyCode::Esc if !popup.history_query.is_empty() => {
+                        popup.history_query.clear();
+                        popup.selected = 0;
+                    }
+                    KeyCode::Esc | KeyCode::Char('q' | 'h') => self.popup = None,
+                    KeyCode::Char('/') => popup.history_searching = true,
+                    KeyCode::Char('0') => {
+                        popup.history_query.clear();
+                        popup.history_sort = 0;
+                        popup.history_reverse = false;
+                        popup.selected = 0;
+                    }
+                    KeyCode::Char('s') => {
+                        popup.history_sort = (popup.history_sort + 1) % 7;
+                        popup.selected = 0;
+                    }
+                    KeyCode::Char('S') => {
+                        popup.history_reverse = !popup.history_reverse;
+                        popup.selected = 0;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab | KeyCode::Right
+                        if row_count > 0 =>
+                    {
+                        popup.selected = (popup.selected + 1).min(row_count - 1);
+                    }
+                    KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab | KeyCode::Left
+                        if row_count > 0 =>
+                    {
+                        popup.selected = popup.selected.saturating_sub(1);
+                    }
+                    KeyCode::PageDown if row_count > 0 => {
+                        popup.selected = popup.selected.saturating_add(20).min(row_count - 1);
+                    }
+                    KeyCode::PageUp if row_count > 0 => {
+                        popup.selected = popup.selected.saturating_sub(20);
+                    }
+                    KeyCode::Home => popup.selected = 0,
+                    KeyCode::End if row_count > 0 => popup.selected = row_count - 1,
+                    KeyCode::Enter => {
+                        if let Some(row) = visible.get(popup.selected).cloned() {
+                            if worker.send(Task::HistoryDetail(row)) {
+                                self.status = "Loading history detail…".into();
+                            } else {
+                                self.status = "Worker busy".into();
+                            }
+                        }
+                    }
+                    _ => (),
+                }
+                return false;
             }
             match key {
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => self.popup = None,
-                KeyCode::Tab | KeyCode::Right => {
-                    if row_count > 0 {
-                        popup.selected = (popup.selected + 1).min(row_count - 1);
-                    } else {
-                        popup.pane((popup.active + 1) % popup.panes.len().max(1));
+                KeyCode::Char('/') => {
+                    popup.find.editing = true;
+                    popup.follow = false;
+                }
+                KeyCode::Char('n' | 'N') if !popup.find.query.is_empty() => {
+                    popup.find.next(key == KeyCode::Char('N'));
+                    popup.follow = false;
+                }
+                KeyCode::Char('f')
+                    if popup
+                        .panes
+                        .get(popup.active)
+                        .is_some_and(|pane| pane.log.is_some()) =>
+                {
+                    popup.follow = !popup.follow;
+                    if popup.follow {
+                        popup.scroll = u16::MAX;
                     }
+                }
+                KeyCode::Char(c @ '1'..='9') if !ctrl => {
+                    let index = (c as u8 - b'1') as usize;
+                    if index < popup.panes.len() {
+                        popup.pane(index);
+                    }
+                }
+                KeyCode::Esc if !popup.find.query.is_empty() => {
+                    popup.find.clear();
+                    popup.follow = false;
+                }
+                KeyCode::Esc | KeyCode::Char('q' | 'h') | KeyCode::Enter => self.popup = None,
+                KeyCode::Tab | KeyCode::Right => {
+                    popup.pane((popup.active + 1) % popup.panes.len().max(1));
                 }
                 KeyCode::Left | KeyCode::BackTab => {
-                    if row_count > 0 {
-                        popup.selected = popup.selected.saturating_sub(1);
-                    } else {
-                        popup.pane(
-                            (popup.active + popup.panes.len().max(1) - 1)
-                                % popup.panes.len().max(1),
-                        );
-                    }
+                    popup.pane(
+                        (popup.active + popup.panes.len().max(1) - 1) % popup.panes.len().max(1),
+                    );
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    if row_count == 0 {
-                        popup.scroll = popup.scroll.saturating_add(1);
-                        popup.follow = false;
-                    } else {
-                        popup.selected = (popup.selected + 1).min(row_count - 1);
-                    }
+                    popup.scroll = popup.scroll.saturating_add(1);
+                    popup.follow = false;
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    if row_count == 0 {
-                        popup.scroll = popup.scroll.saturating_sub(1);
-                        popup.follow = false;
-                    } else {
-                        popup.selected = popup.selected.saturating_sub(1);
-                    }
+                    popup.scroll = popup.scroll.saturating_sub(1);
+                    popup.follow = false;
                 }
-                KeyCode::PageDown if row_count > 0 => {
-                    popup.selected = popup.selected.saturating_add(20).min(row_count - 1)
-                }
-                KeyCode::PageUp if row_count > 0 => {
-                    popup.selected = popup.selected.saturating_sub(20)
-                }
-                KeyCode::End if row_count > 0 => popup.selected = row_count - 1,
-                KeyCode::Home if row_count > 0 => popup.selected = 0,
-                KeyCode::PageDown => {
+                KeyCode::PageDown | KeyCode::Char(' ') => {
                     popup.scroll = popup.scroll.saturating_add(20);
                     popup.follow = false;
                 }
-                KeyCode::PageUp => {
+                KeyCode::PageUp | KeyCode::Char('b') => {
                     popup.scroll = popup.scroll.saturating_sub(20);
                     popup.follow = false;
                 }
-                KeyCode::End => {
+                KeyCode::End | KeyCode::Char('G') => {
                     popup.scroll = u16::MAX;
                     popup.follow = true;
                 }
-                KeyCode::Home => {
+                KeyCode::Home | KeyCode::Char('g') => {
                     popup.scroll = 0;
                     popup.follow = false;
-                }
-                KeyCode::Enter => {
-                    if let Some(row) = popup.history.get(popup.selected).cloned() {
-                        worker.send(Task::HistoryDetail(row));
-                        self.status = "Loading history detail…".into();
-                    } else {
-                        self.popup = None;
-                    }
                 }
                 _ => (),
             }
@@ -4136,14 +4887,33 @@ impl App {
                 popup.source_tab = Some(self.tab);
                 self.open(popup);
             }
+            KeyCode::Tab | KeyCode::Right => {
+                self.return_from_jobs();
+                self.tab = (self.tab + 1) % 8;
+                self.table = TableState::default();
+                self.usage_scroll = 0;
+                self.last_usage_scroll = 0;
+            }
+            KeyCode::BackTab | KeyCode::Left => {
+                self.return_from_jobs();
+                self.tab = (self.tab + 7) % 8;
+                self.table = TableState::default();
+                self.usage_scroll = 0;
+                self.last_usage_scroll = 0;
+            }
             KeyCode::Char(c @ '1'..='8') => {
                 self.return_from_jobs();
                 self.tab = (c as u8 - b'1') as usize;
                 self.table = TableState::default();
+                self.usage_scroll = 0;
+                self.last_usage_scroll = 0;
             }
             KeyCode::Char('g') => {
                 self.return_from_jobs();
                 self.tab = 2;
+                self.table = TableState::default();
+                self.usage_scroll = 0;
+                self.last_usage_scroll = 0;
             }
             KeyCode::Char('J') => self.open_related_jobs(),
             KeyCode::Char(']') => self.jump_node(true),
@@ -4155,19 +4925,28 @@ impl App {
                 self.free_only = false;
                 self.search.clear();
                 self.job_filter = job_view::Filter::All;
+                self.usage_scroll = 0;
+                self.last_usage_scroll = 0;
                 if let Some(related) = &mut self.related {
                     related.target = None;
                 }
                 self.status = "Filters cleared".into();
             }
-            KeyCode::Home if self.tab != 2 => {
-                self.table.select((!self.rows.is_empty()).then_some(0))
+            KeyCode::Home => {
+                if self.rows.is_empty() && self.tab == 2 && self.usage.is_some() {
+                    self.rebuild_usage();
+                }
+                self.usage_scroll = 0;
+                self.last_usage_scroll = 0;
+                self.table.select((!self.rows.is_empty()).then_some(0));
             }
-            KeyCode::End if self.tab != 2 => self
-                .table
-                .select((!self.rows.is_empty()).then_some(self.rows.len().saturating_sub(1))),
-            KeyCode::Home if self.tab == 2 => self.usage_scroll = 0,
-            KeyCode::End if self.tab == 2 => self.usage_scroll = u16::MAX,
+            KeyCode::End => {
+                if self.rows.is_empty() && self.tab == 2 && self.usage.is_some() {
+                    self.rebuild_usage();
+                }
+                self.table
+                    .select((!self.rows.is_empty()).then_some(self.rows.len().saturating_sub(1)));
+            }
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(true),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(false),
             KeyCode::PageDown => {
@@ -4186,10 +4965,10 @@ impl App {
                 return false;
             }
             KeyCode::Esc => self.search.clear(),
-            KeyCode::Char('s') if matches!(self.tab, 0 | 1 | 2 | 5 | 7) => {
+            KeyCode::Char('s') if matches!(self.tab, 0 | 1 | 2 | 4 | 5 | 7) => {
                 self.sort = (self.sort + 1) % 4
             }
-            KeyCode::Char('S') if matches!(self.tab, 0 | 1 | 2 | 5 | 7) => {
+            KeyCode::Char('S') if matches!(self.tab, 0 | 1 | 2 | 4 | 5 | 7) => {
                 self.reverse = !self.reverse
             }
             KeyCode::Char('s') if self.tab == 3 => {
@@ -4199,7 +4978,7 @@ impl App {
             }
             KeyCode::Char('S') if self.tab == 3 => self.job_reverse = !self.job_reverse,
             KeyCode::Char('s' | 'S') => self.status =
-                "Interactive sorting is available in GPU, CPU, Usage, Jobs, Users and Partitions"
+                "Interactive sorting is available in GPU, CPU, Usage, Jobs, Attention, Users and Partitions"
                     .into(),
             KeyCode::Char('i') => self.free_only = !self.free_only,
             KeyCode::Char('m') => self.mine = !self.mine,
@@ -4207,6 +4986,7 @@ impl App {
             KeyCode::Char('v') if self.tab == 2 => {
                 self.usage_daily = !self.usage_daily;
                 self.usage_scroll = 0;
+                self.last_usage_scroll = 0;
                 self.status = format!(
                     "Usage view: {} · D window ({}d)",
                     if self.usage_daily { "daily" } else { "by user" },
@@ -4220,6 +5000,7 @@ impl App {
                     _ => 7,
                 };
                 self.usage_scroll = 0;
+                self.last_usage_scroll = 0;
                 self.status = format!("Usage window: last {} days", self.usage_days);
             }
             KeyCode::Char('v') if self.tab == 3 => {
@@ -4293,7 +5074,10 @@ impl App {
                 self.status = "Loading my history…".into();
             }
             KeyCode::Char('n') => {
-                if let Some(id) = self.selected().and_then(|r| r.job.clone()) {
+                if let Some(id) = self
+                    .selected()
+                    .and_then(|r| r.job.clone().or_else(|| r.jobs.first().cloned()))
+                {
                     if self.watched.remove(&id).is_some() {
                         self.status = format!("Stopped watching #{id}");
                     } else {
@@ -4304,35 +5088,35 @@ impl App {
                 }
             }
             KeyCode::Char('x') => {
-                if let Some(id) = self.selected().and_then(|r| r.job.clone()) {
-                    let owner = self
-                        .data
+                if let Some(row) = self.selected() {
+                    let candidate = row
                         .jobs
                         .iter()
-                        .find(|j| j.jobid == id)
-                        .map(|j| j.user.as_str())
-                        .or_else(|| {
-                            self.data
-                                .pending
-                                .iter()
-                                .find(|j| j.jobid == id)
-                                .map(|j| j.user.as_str())
-                        });
-                    if owner == Some(&self.current_user) {
-                        let mut popup = Popup::text(
-                            "Confirm cancellation",
-                            format!(
-                                "Cancel your job #{id}?\n\ny / Enter: cancel · n / Esc: keep running"
-                            ),
-                        );
-                        popup.cancel = Some(id);
-                        self.open(popup);
-                    } else {
-                        self.status = "Only your own jobs can be cancelled".into();
+                        .find(|id| job_owner(&self.data, id) == Some(self.current_user.as_str()))
+                        .cloned()
+                        .or_else(|| row.job.clone());
+                    if let Some(id) = candidate {
+                        if job_owner(&self.data, &id) == Some(self.current_user.as_str()) {
+                            let mut popup = Popup::text(
+                                "Confirm cancellation",
+                                format!(
+                                    "Cancel your job #{id}?\n\ny / Enter: cancel · n / Esc: keep running"
+                                ),
+                            );
+                            popup.cancel = Some(id);
+                            self.open(popup);
+                        } else {
+                            self.status = "Only your own jobs can be cancelled".into();
+                        }
                     }
                 }
             }
             KeyCode::Enter => {
+                if self.tab == 2 {
+                    self.rebuild_usage();
+                    self.open_usage_detail();
+                    return false;
+                }
                 if self.tab >= 4 {
                     self.rebuild();
                 }
@@ -4533,6 +5317,20 @@ impl App {
                         .find(|n| n.name == row.node)
                         .cloned()
                         .map(Box::new);
+                    let nodes = if let Some(ref running) = job {
+                        let expanded = crate::scheduler::expand_nodes(&running.node);
+                        self.data
+                            .nodes
+                            .iter()
+                            .filter(|n| {
+                                expanded.as_ref().is_some_and(|set| set.contains(&n.name))
+                                    || n.jobs.iter().any(|nj| nj.jobid == running.jobid)
+                            })
+                            .cloned()
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     let explanation = pending
                         .as_ref()
                         .map(|job| crate::explain::pending(&self.data, job));
@@ -4540,6 +5338,7 @@ impl App {
                         job,
                         pending,
                         node,
+                        nodes,
                         explanation,
                     });
                     self.status = "Loading detail…".into();
@@ -4696,7 +5495,14 @@ fn draw_popup(frame: &mut Frame, popup: &mut Popup, hits: &mut Hits) {
         );
         hits.add(close, Click::Close);
     }
-    let finding = popup.find.editing || !popup.find.query.is_empty();
+    let history = popup.is_history;
+    let menu = !popup.actions.is_empty();
+    let picker = popup.picker.is_some();
+    let finding = !history
+        && popup.cancel.is_none()
+        && !picker
+        && !menu
+        && (popup.find.editing || !popup.find.query.is_empty());
     let [heading, findbar, body, footer] = Layout::vertical([
         Constraint::Length(u16::from(inner.height >= if finding { 4 } else { 3 })),
         Constraint::Length(u16::from(finding && inner.height >= 3)),
@@ -4704,28 +5510,74 @@ fn draw_popup(frame: &mut Frame, popup: &mut Popup, hits: &mut Hits) {
         Constraint::Length(u16::from(inner.height >= 2)),
     ])
     .areas(inner);
-    let mut bindings = if popup.cancel.is_some() {
-        vec![
+    if popup.cancel.is_some() {
+        if !heading.is_empty() {
+            frame.render_widget(
+                Paragraph::new("←/→ or Tab switch · Enter confirm · Esc keep")
+                    .style(Style::default().fg(MUTED)),
+                heading,
+            );
+        }
+        if let Some(pane) = popup.panes.first() {
+            let safe = cli::terminal_safe(&pane.body);
+            frame.render_widget(
+                Paragraph::new(safe)
+                    .style(Style::default().fg(TEXT))
+                    .wrap(Wrap { trim: false }),
+                body,
+            );
+        }
+        let active = popup.selected % 2;
+        let cancel_buttons = [
             (
                 KeyCode::Char('n'),
-                if inner.width < 24 { "No" } else { "n Keep" }.into(),
+                if inner.width < 24 { "No" } else { "n Keep" },
             ),
             (
                 KeyCode::Char('y'),
-                if inner.width < 24 { "Yes" } else { "y Cancel" }.into(),
+                if inner.width < 24 { "Yes" } else { "y Cancel" },
             ),
-        ]
-    } else {
-        vec![(
-            KeyCode::Esc,
-            if popup.find.editing { "Clear" } else { "Close" }.into(),
-        )]
-    };
-    if popup.cancel.is_none()
-        && popup.picker.is_none()
-        && popup.actions.is_empty()
-        && popup.history.is_empty()
-    {
+        ];
+        let mut x = footer.x;
+        for (index, (key, label)) in cancel_buttons.iter().enumerate() {
+            let text = if footer.width < 32 {
+                (*label).into()
+            } else {
+                format!(" {label} ")
+            };
+            let width = text.width().min(u16::MAX as usize) as u16;
+            let remaining = footer.right().saturating_sub(x);
+            if width > remaining && index > 0 {
+                continue;
+            }
+            let btn_rect = Rect::new(x, footer.y, width.min(remaining), footer.height.min(1));
+            let style = if index == active {
+                Style::default()
+                    .fg(FOCUS)
+                    .bg(SELECTED_BG)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                Style::default()
+                    .fg(CYAN)
+                    .bg(HEADER_BG)
+                    .add_modifier(Modifier::BOLD)
+            };
+            frame.render_widget(Paragraph::new(text).style(style), btn_rect);
+            hits.add(btn_rect, Click::Key(*key));
+            x = btn_rect.right().saturating_add(1).min(footer.right());
+        }
+        return;
+    }
+    let mut bindings = vec![(
+        KeyCode::Esc,
+        if popup.find.editing || popup.history_searching {
+            "Clear"
+        } else {
+            "Close"
+        }
+        .into(),
+    )];
+    if !picker && !menu && !history {
         if popup.find.editing {
             bindings.push((KeyCode::Enter, "Apply".into()));
         } else {
@@ -4747,27 +5599,101 @@ fn draw_popup(frame: &mut Frame, popup: &mut Popup, hits: &mut Hits) {
             }
         }
     }
-    if !popup.actions.is_empty() || !popup.history.is_empty() || popup.picker.is_some() {
-        let menu = !popup.actions.is_empty();
-        let picker = popup.picker.is_some();
+    if menu || picker || history {
         if !heading.is_empty() {
-            frame.render_widget(
-                Paragraph::new(
-                    popup
-                        .picker
-                        .as_ref()
-                        .map(|picker| {
-                            format!(
-                                "Search: {}▏ · Enter select",
-                                cli::terminal_safe(&picker.query)
-                            )
-                        })
-                        .unwrap_or_else(|| "↑↓ / wheel · Enter opens selection".into()),
-                )
-                .style(Style::default().fg(MUTED)),
-                heading,
-            );
+            if let Some(picker) = &popup.picker {
+                if !picker.query.is_empty() && heading.width >= 16 {
+                    let hint = if heading.width >= 32 {
+                        " · Enter select"
+                    } else {
+                        ""
+                    };
+                    let room = heading.width.saturating_sub(13 + hint.len() as u16).max(4);
+                    let spans = vec![
+                        Span::styled(
+                            format!("Search: {}▏", tail_clipped(&picker.query, room)),
+                            Style::default().fg(YELLOW),
+                        ),
+                        Span::styled(" [×]", Style::default().fg(CYAN)),
+                        Span::styled(hint, Style::default().fg(MUTED)),
+                    ];
+                    hits.spans(heading, &spans, &[None, Some(Click::ClearInput), None]);
+                    frame.render_widget(Paragraph::new(Line::from(spans)), heading);
+                } else {
+                    frame.render_widget(
+                        Paragraph::new(format!(
+                            "Search: {}▏ · Enter select",
+                            tail_clipped(&picker.query, heading.width.saturating_sub(24).max(4))
+                        ))
+                        .style(Style::default().fg(MUTED)),
+                        heading,
+                    );
+                }
+            } else if menu {
+                frame.render_widget(
+                    Paragraph::new("↑↓ / Tab · Enter or press hotkey to run")
+                        .style(Style::default().fg(MUTED)),
+                    heading,
+                );
+            } else {
+                let mut spans = Vec::new();
+                let mut span_actions = Vec::new();
+                if popup.history_searching {
+                    let room = heading.width.saturating_sub(32).max(6);
+                    spans.push(Span::styled(
+                        format!("Filter: {}▏", tail_clipped(&popup.history_query, room)),
+                        Style::default().fg(YELLOW),
+                    ));
+                    span_actions.push(None);
+                    spans.push(Span::styled(" [×]", Style::default().fg(CYAN)));
+                    span_actions.push(Some(Click::ClearInput));
+                } else if !popup.history_query.is_empty() {
+                    spans.push(Span::styled(
+                        format!("Filter:{}", clipped(&popup.history_query, 16)),
+                        Style::default().fg(FOCUS),
+                    ));
+                    span_actions.push(Some(Click::Key(KeyCode::Char('/'))));
+                    spans.push(Span::styled(" [×]", Style::default().fg(CYAN)));
+                    span_actions.push(Some(Click::ClearInput));
+                } else {
+                    spans.push(Span::styled("/ Filter", Style::default().fg(MUTED)));
+                    span_actions.push(Some(Click::Key(KeyCode::Char('/'))));
+                }
+                spans.push(Span::styled(" · ", Style::default().fg(MUTED)));
+                span_actions.push(None);
+                spans.push(Span::styled(
+                    format!("sort:{}", popup.history_sort_label()),
+                    Style::default().fg(MUTED),
+                ));
+                span_actions
+                    .push((!popup.history_searching).then_some(Click::Key(KeyCode::Char('s'))));
+                spans.push(Span::styled(
+                    if popup.history_descending() {
+                        "↓"
+                    } else {
+                        "↑"
+                    },
+                    Style::default().fg(BLUE),
+                ));
+                span_actions
+                    .push((!popup.history_searching).then_some(Click::Key(KeyCode::Char('S'))));
+                if !popup.history_query.is_empty()
+                    || !popup.history_sort.is_multiple_of(7)
+                    || popup.history_reverse
+                {
+                    spans.push(Span::styled(" · 0 reset", Style::default().fg(MUTED)));
+                    span_actions
+                        .push((!popup.history_searching).then_some(Click::Key(KeyCode::Char('0'))));
+                }
+                hits.spans(heading, &spans, &span_actions);
+                frame.render_widget(Paragraph::new(Line::from(spans)), heading);
+            }
         }
+        let visible_history = if history {
+            popup.visible_history()
+        } else {
+            Vec::new()
+        };
         let rows: Vec<Row> = if let Some(picker) = &popup.picker {
             picker
                 .choices()
@@ -4787,8 +5713,7 @@ fn draw_popup(frame: &mut Frame, popup: &mut Popup, hits: &mut Hits) {
                 .map(|(_, label)| Row::new([label.clone()]))
                 .collect()
         } else {
-            popup
-                .history
+            visible_history
                 .iter()
                 .map(|row| {
                     let cells = if body.width < 85 {
@@ -4838,22 +5763,62 @@ fn draw_popup(frame: &mut Frame, popup: &mut Popup, hits: &mut Hits) {
         popup
             .table
             .select((row_count > 0).then_some(popup.selected));
-        let mut table = Table::new(rows, widths).row_highlight_style(
-            Style::default()
-                .fg(FOCUS)
-                .bg(SELECTED_BG)
-                .add_modifier(Modifier::BOLD),
-        );
-        let header = !menu && !picker && body.height > 1;
-        if header {
-            table = table.header(
-                Row::new(if body.width < 85 {
-                    vec!["JobID", "State", "Name"]
-                } else {
-                    vec!["JobID", "State", "Exit", "Elapsed", "Partition", "Name"]
-                })
-                .style(Style::default().fg(BLUE).bg(HEADER_BG)),
+        let mut table = Table::new(rows, widths.clone())
+            .column_spacing(1)
+            .row_highlight_style(
+                Style::default()
+                    .fg(FOCUS)
+                    .bg(SELECTED_BG)
+                    .add_modifier(Modifier::BOLD),
             );
+        let header = history && body.height > 1;
+        if header {
+            let cols: &[(usize, &str)] = if body.width < 85 {
+                &[(1, "JobID"), (2, "State"), (6, "Name")]
+            } else {
+                &[
+                    (1, "JobID"),
+                    (2, "State"),
+                    (3, "Exit"),
+                    (4, "Elapsed"),
+                    (5, "Partition"),
+                    (6, "Name"),
+                ]
+            };
+            let active = popup.history_sort % 7;
+            let desc = popup.history_descending();
+            let col_areas = Layout::horizontal(widths)
+                .flex(Flex::Start)
+                .spacing(1)
+                .split(body);
+            let cells = cols
+                .iter()
+                .zip(col_areas.iter())
+                .map(|((col, label), col_area)| {
+                    hits.add(
+                        Rect::new(col_area.x, body.y, col_area.width, 1),
+                        Click::HistorySort(*col),
+                    );
+                    let is_active = active == *col;
+                    let text = format!(
+                        "{}{}",
+                        clipped(label, col_area.width.saturating_sub(1)),
+                        if is_active {
+                            if desc { "↓" } else { "↑" }
+                        } else {
+                            "↕"
+                        }
+                    );
+                    Cell::from(text).style(if is_active {
+                        Style::default()
+                            .fg(FOCUS)
+                            .bg(SELECTED_BG)
+                            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                    } else {
+                        Style::default().fg(BLUE)
+                    })
+                });
+            table = table.header(Row::new(cells).style(Style::default().fg(BLUE).bg(HEADER_BG)));
         }
         frame.render_stateful_widget(table, body, &mut popup.table);
         for (line, index) in (popup.table.offset()..row_count).enumerate() {
@@ -4875,23 +5840,54 @@ fn draw_popup(frame: &mut Frame, popup: &mut Popup, hits: &mut Hits) {
                 },
             );
         }
-        if row_count == 0 && picker {
+        if row_count == 0 && (picker || history) {
+            let empty_area = Rect::new(
+                body.x,
+                body.y.saturating_add(u16::from(header)),
+                body.width,
+                body.height.saturating_sub(u16::from(header)),
+            );
             frame.render_widget(
-                Paragraph::new("No matching choices").style(Style::default().fg(MUTED)),
-                body,
+                Paragraph::new(if picker {
+                    "No matching choices"
+                } else {
+                    "No matching history records · 0 reset"
+                })
+                .style(Style::default().fg(MUTED)),
+                empty_area,
             );
         }
-        bindings.push((
-            KeyCode::Enter,
-            if picker {
-                "Apply"
-            } else if menu {
-                "Run"
-            } else {
-                "Open"
+        if history && popup.history_searching {
+            bindings.push((KeyCode::Enter, "Apply".into()));
+        } else {
+            bindings.push((
+                KeyCode::Enter,
+                if picker {
+                    "Apply"
+                } else if menu {
+                    "Run"
+                } else {
+                    "Open"
+                }
+                .into(),
+            ));
+            if history {
+                bindings.extend([
+                    (
+                        KeyCode::Char('/'),
+                        if inner.width < 40 { "/" } else { "/ Filter" }.into(),
+                    ),
+                    (
+                        KeyCode::Char('s'),
+                        if inner.width < 48 { "s" } else { "s Sort" }.into(),
+                    ),
+                    (
+                        KeyCode::Char('S'),
+                        if inner.width < 48 { "S" } else { "S Rev" }.into(),
+                    ),
+                ]);
             }
-            .into(),
-        ));
+        }
     } else {
         if popup.panes.len() > 1 {
             let labels = popup
@@ -4925,10 +5921,8 @@ fn draw_popup(frame: &mut Frame, popup: &mut Popup, hits: &mut Hits) {
                 popup.follow = false;
             }
             if finding {
-                let label = format!(
-                    "Find: {}{} · line {}/{}",
-                    cli::terminal_safe(&popup.find.query),
-                    if popup.find.editing { "▏" } else { "" },
+                let count = format!(
+                    " · line {}/{}",
                     if popup.find.rows.is_empty() {
                         0
                     } else {
@@ -4936,12 +5930,37 @@ fn draw_popup(frame: &mut Frame, popup: &mut Popup, hits: &mut Hits) {
                     },
                     popup.find.rows.len()
                 );
-                frame.render_widget(
-                    Paragraph::new(label).style(Style::default().fg(YELLOW)),
-                    findbar,
+                let clearable = !popup.find.query.is_empty() && findbar.width >= 24;
+                let reserve = 7 + count.width() + if clearable { 4 } else { 0 };
+                let room = findbar.width.saturating_sub(reserve as u16).max(4);
+                let label = format!(
+                    "Find: {}{}{}",
+                    tail_clipped(&popup.find.query, room),
+                    if popup.find.editing { "▏" } else { "" },
+                    count
                 );
-                if !popup.find.editing {
-                    hits.add(findbar, Click::Key(KeyCode::Char('/')));
+                if clearable {
+                    let spans = vec![
+                        Span::styled(label, Style::default().fg(YELLOW)),
+                        Span::styled(" [×]", Style::default().fg(CYAN)),
+                    ];
+                    hits.spans(
+                        findbar,
+                        &spans,
+                        &[
+                            (!popup.find.editing).then_some(Click::Key(KeyCode::Char('/'))),
+                            Some(Click::ClearInput),
+                        ],
+                    );
+                    frame.render_widget(Paragraph::new(Line::from(spans)), findbar);
+                } else {
+                    frame.render_widget(
+                        Paragraph::new(label).style(Style::default().fg(YELLOW)),
+                        findbar,
+                    );
+                    if !popup.find.editing {
+                        hits.add(findbar, Click::Key(KeyCode::Char('/')));
+                    }
                 }
             }
             let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
@@ -4971,28 +5990,30 @@ fn draw_popup(frame: &mut Frame, popup: &mut Popup, hits: &mut Hits) {
     if popup.panes.len() > 1 && heading.is_empty() {
         bindings.extend([(KeyCode::BackTab, "←".into()), (KeyCode::Tab, "→".into())]);
     }
-    bindings.extend([
-        (
-            KeyCode::End,
-            if inner.width < 32 {
-                "End"
-            } else if popup
-                .panes
-                .get(popup.active)
-                .is_some_and(|pane| pane.log.is_some())
-            {
-                if popup.follow { "Follow ✓" } else { "Follow" }
-            } else {
-                "End"
-            }
-            .into(),
-        ),
-        (KeyCode::Up, "↑".into()),
-        (KeyCode::Down, "↓".into()),
-        (KeyCode::Home, "Home".into()),
-        (KeyCode::PageUp, "Pg↑".into()),
-        (KeyCode::PageDown, "Pg↓".into()),
-    ]);
+    if !(history && popup.history_searching) {
+        bindings.extend([
+            (
+                KeyCode::End,
+                if inner.width < 32 {
+                    "End"
+                } else if popup
+                    .panes
+                    .get(popup.active)
+                    .is_some_and(|pane| pane.log.is_some())
+                {
+                    if popup.follow { "Follow ✓" } else { "Follow" }
+                } else {
+                    "End"
+                }
+                .into(),
+            ),
+            (KeyCode::Up, "↑".into()),
+            (KeyCode::Down, "↓".into()),
+            (KeyCode::Home, "Home".into()),
+            (KeyCode::PageUp, "Pg↑".into()),
+            (KeyCode::PageDown, "Pg↓".into()),
+        ]);
+    }
     if popup.panes.len() > 1 && !heading.is_empty() {
         bindings.extend([(KeyCode::BackTab, "←".into()), (KeyCode::Tab, "→".into())]);
     }
@@ -5174,17 +6195,18 @@ pub fn run(highlight_user: Option<String>) -> Result<i32> {
                         {
                             return Ok(0);
                         }
-                        let code = if app.searching
-                            || app
-                                .popup
-                                .as_ref()
-                                .is_some_and(|popup| popup.picker.is_some() || popup.find.editing)
-                        {
+                        let text_input = app.searching
+                            || app.popup.as_ref().is_some_and(|popup| {
+                                popup.picker.is_some()
+                                    || popup.find.editing
+                                    || popup.history_searching
+                            });
+                        let code = if text_input || key.modifiers.contains(KeyModifiers::CONTROL) {
                             key.code
                         } else {
                             ime(key.code)
                         };
-                        if app.key(code, &worker) {
+                        if app.key_event(code, key.modifiers, &worker) {
                             return Ok(0);
                         }
                         dirty = true;
@@ -5197,6 +6219,7 @@ pub fn run(highlight_user: Option<String>) -> Result<i32> {
                     }
                     Event::Resize(_, _) => {
                         app.hits.clear();
+                        app.last_click = None;
                         dirty = true;
                     }
                     _ => (),
@@ -5218,35 +6241,37 @@ pub fn run(highlight_user: Option<String>) -> Result<i32> {
 
 const HELP: &str = concat!(
     "1/2/3/4  GPU / CPU / Usage / Jobs\n5/6/7/8  Attention / Users / Controller / Partitions\n",
-    "g Usage · v pending · t 5-minute cluster trend\nr refresh published data\n",
-    "s sort · S reverse · [ / ] previous/next node · Home/End first/last row\n",
-    "CPU/Users/Usage/Partitions: s cycles sort · S reverses · click ↕ headers to sort.\n",
-    "Usage: v toggles user/daily view · D cycles 7/14/30d window · s/S sort/reverse.\n",
-    "Jobs: s cycles priority / user / GPU / CPU / wait / left; S reverses.\n",
-    "Jobs: click User, Priority, Req GPU or Req CPU headers to sort; click again to reverse.\n",
+    "Tab/BackTab or ←/→ switch tabs · g Usage · v pending/view/state · t 5-minute trend\n",
+    "r refresh published data · s sort · S reverse · [ / ] prev/next node · Home/End first/last\n",
+    "CPU/Users/Usage/Attention/Partitions: s cycles sort · S reverses · click ↕ headers.\n",
+    "Usage: v toggles user/daily · D cycles 7/14/30d · s/S sort · Enter/2×click detail · J Jobs.\n",
+    "Jobs: s cycles priority / user / GPU / CPU / wait / left; S reverses · click ↕ headers.\n",
     "Header arrows show direction; ↕ marks clickable headers. Mouse wheel scrolls.\n",
-    "Mouse: click tabs, rows, marked headers, filter chips and footer buttons.\n",
-    "Row click selects; Detail opens. Right-click or a opens Actions for every command.\n",
-    "Actions: ↑↓ / Tab select · Enter runs · Esc closes. Terminal selection may use Shift-drag.\n",
-    "Short detail windows expand to the screen; wheel/↑↓/PgUp/PgDn/Home/End scroll.\n",
-    "Popup tabs, Close and paging buttons are clickable. Follow resumes logs; scrolling up pauses.\n",
+    "Mouse: click tabs, sgpu (?), dashboard Resources/GPU map (2×click inspect), summary chips,\n",
+    "filter chips, rows, marked headers, search [×] clear buttons and footer buttons.\n",
+    "Row click selects; 2×click or Enter/Detail opens. Right-click or a opens Actions.\n",
+    "Actions: ↑↓ / Tab select · Enter or hotkey runs · Esc/a closes. Shift-drag for terminal copy.\n",
+    "Cancel confirm: ←/→ or Tab switch Keep/Cancel · Enter confirm · y/n/Esc direct or click.\n",
+    "Short detail windows expand to the screen; wheel/↑↓/Space/b/g/G/PgUp/PgDn/Home/End scroll.\n",
+    "Popup panes: 1..9 or Tab/←/→ or click tabs; f/Follow toggles live logs (scroll pauses).\n",
     "Jobs: v cycles all / running / pending; 0 clears state and other filters.\n",
     "u user filter (highlight first) · p partition · m highlighted user's jobs\n",
-    "U/P search user/partition · type, ↑↓, Enter or click to select · Esc cancels.\n",
+    "U/P search user/partition · ↑↓, Enter or click · Ctrl+U or [×] clears query · Esc cancels.\n",
     "E explain selected pending job · F my last-24h failures (one accounting query).\n",
-    "i free GPUs · 0 reset all filters · / search · Esc clear search\n",
-    "d detail columns · Space fold node · z fold/unfold all\nj/k or arrows move\n",
-    "Enter full values or Summary/Raw/Script/StdOut/StdErr detail · Tab switches panes\n",
-    "Inside details/logs: / literal find · Enter apply · n/N next/previous matching line.\n",
+    "i free GPUs · 0 reset filters · / search (Ctrl+U/[×] clear) · Esc clear search\n",
+    "d detail columns · Space fold node · z fold/unfold all · j/k or arrows move\n",
+    "Enter full values or Summary/Raw/Script/StdOut/StdErr detail · Ctrl+C quits anytime.\n",
+    "Inside details/logs: / literal find · Enter apply · n/N next/prev · Ctrl+U or Esc clears find.\n",
     "Esc clears active search input; the next Esc closes. Query text stays in memory only.\n",
-    "J related Jobs from GPU/CPU/Users/Attention/Partitions · Esc restores the previous view.\n",
-    "Users opens all user jobs; Attention opens only jobs linked in current evidence.\n",
+    "J related Jobs from GPU/CPU/Usage/Users/Attention/Partitions · Esc restores the previous view.\n",
+    "Users/Usage opens user jobs; Attention opens only jobs linked in current evidence.\n",
     "GPU/node links use exact job IDs or expanded node names; unlinked processes stay inspectable.\n",
     "0 resets the related scope; Esc still returns.\n",
     "Tab, sort and Jobs state are saved on exit in ~/.sgpu/ui/preferences.json.\n",
     "Related views, user/partition/search filters, logs and job data are not saved.\n",
-    "w wasted GPUs · f free capacity · h my job history (PageUp/Down supported)\n",
-    "n watch job · x cancel my own job (confirmation required)\ne export JSON · ? help · q quit\n\n",
+    "w wasted GPUs · f free capacity · e export JSON · ? help · q quit\n",
+    "h my job history · / filter · s/S or ↕ headers sort · 0 reset · 2×click/Enter opens detail\n",
+    "n watch job · x cancel my own job (confirmation required)\n\n",
     "◆ + teal background: highlighted account. Cursor selection is separate.\n",
     "--highlight-user changes display/filtering; OS ownership still controls cancel/private logs.\n",
     "Util: dim → blue → cyan → green as activity rises.\n",
@@ -7441,5 +8466,807 @@ mod tests {
         ] {
             assert_eq!(ime(KeyCode::Char(ko)), KeyCode::Char(en));
         }
+    }
+
+    #[test]
+    fn shared_gpu_second_owner_watch_cancel_and_related_jobs() {
+        let (sender, _requests) = mpsc::sync_channel(8);
+        let (_, receiver) = mpsc::sync_channel(8);
+        let worker = Worker { sender, receiver };
+        let data = Snapshot {
+            nodes: vec![Node {
+                name: "gpu1".into(),
+                state: "mixed".into(),
+                has_gpu: true,
+                gpus: vec![Gpu {
+                    index: "0".into(),
+                    name: "H100".into(),
+                    util: "70".into(),
+                    alloc_jobid: "42".into(),
+                    alloc_jobids: vec!["42".into(), "43".into()],
+                    alloc_user: "alice".into(),
+                    alloc_users: vec!["alice".into(), "bob".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            jobs: vec![
+                Job {
+                    jobid: "42".into(),
+                    user: "alice".into(),
+                    node: "gpu1".into(),
+                    partition: "gpu".into(),
+                    ..Default::default()
+                },
+                Job {
+                    jobid: "43".into(),
+                    user: "bob".into(),
+                    node: "gpu1".into(),
+                    partition: "gpu".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mut bob_app = App::for_user("bob".into());
+        bob_app.apply(data.clone());
+        let gpu_idx = bob_app
+            .rows
+            .iter()
+            .position(|r| r.key == "gpu:gpu1:0")
+            .unwrap();
+        bob_app.table.select(Some(gpu_idx));
+        // Even if row.job pointed to alice's job, 'x' resolves bob's own job on the shared GPU.
+        bob_app.rows[gpu_idx].job = Some("42".into());
+        bob_app.key(KeyCode::Char('x'), &worker);
+        assert_eq!(
+            bob_app.popup.as_ref().unwrap().cancel.as_deref(),
+            Some("43")
+        );
+
+        let mut charlie_app = App::for_user("charlie".into());
+        charlie_app.apply(data.clone());
+        charlie_app.table.select(Some(gpu_idx));
+        charlie_app.key(KeyCode::Char('x'), &worker);
+        assert!(charlie_app.popup.is_none());
+        assert!(charlie_app.status.contains("Only your own jobs"));
+
+        let mut alice_app = App::for_user("alice".into());
+        alice_app.apply(data);
+        alice_app.table.select(Some(gpu_idx));
+        alice_app.key(KeyCode::Char('n'), &worker);
+        assert!(alice_app.watched.contains_key("42"));
+        assert!(alice_app.rows[gpu_idx].cells[4].contains("★"));
+        alice_app.key(KeyCode::Char('n'), &worker);
+        assert!(!alice_app.watched.contains_key("42"));
+
+        // Clear single preferred job on a multi-job row to verify JobTarget::Jobs fallback.
+        alice_app.rows[gpu_idx].job = None;
+        alice_app.key(KeyCode::Char('J'), &worker);
+        assert_eq!(alice_app.tab, 3);
+        let ids: Vec<_> = alice_app
+            .rows
+            .iter()
+            .filter_map(|r| r.job.as_deref())
+            .collect();
+        assert_eq!(ids, vec!["42", "43"]);
+        alice_app.key(KeyCode::Esc, &worker);
+        assert_eq!(alice_app.tab, 0);
+    }
+
+    #[test]
+    fn mouse_double_click_timing_and_fold_exclusion() {
+        let (sender, requests) = mpsc::sync_channel(8);
+        let (_, receiver) = mpsc::sync_channel(8);
+        let worker = Worker { sender, receiver };
+        let mut app = App::for_user("alice".into());
+        app.apply(mouse_snapshot());
+        let mut terminal = Terminal::new(TestBackend::new(120, 28)).unwrap();
+        let t0 = Instant::now();
+
+        let hit_for = |app: &App, target: Click| {
+            app.hits
+                .items
+                .iter()
+                .rev()
+                .find(|(_, c)| *c == target)
+                .unwrap()
+                .0
+        };
+        let click =
+            |app: &mut App, terminal: &mut Terminal<TestBackend>, rect: Rect, at: Instant| {
+                terminal.draw(|f| app.draw(f)).unwrap();
+                assert!(app.mouse_at(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: rect.x,
+                        row: rect.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &worker,
+                    at,
+                ));
+            };
+
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let fold_rect = hit_for(&app, Click::Fold("node:gpu1".into()));
+        click(&mut app, &mut terminal, fold_rect, t0);
+        assert!(app.collapsed.contains("gpu1"));
+        assert!(requests.try_recv().is_err());
+        click(
+            &mut app,
+            &mut terminal,
+            fold_rect,
+            t0 + Duration::from_millis(120),
+        );
+        assert!(!app.collapsed.contains("gpu1"));
+        assert!(
+            requests.try_recv().is_err(),
+            "rapid clicks on Fold must never trigger Detail"
+        );
+
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let row_rect = hit_for(&app, Click::Row("node:gpu1".into()));
+        // Too slow (>450ms) does not open Detail.
+        click(&mut app, &mut terminal, row_rect, t0);
+        click(
+            &mut app,
+            &mut terminal,
+            row_rect,
+            t0 + Duration::from_millis(600),
+        );
+        assert!(requests.try_recv().is_err());
+        // Within 450ms triggers Detail.
+        click(
+            &mut app,
+            &mut terminal,
+            row_rect,
+            t0 + Duration::from_millis(800),
+        );
+        assert!(matches!(
+            requests.try_recv().unwrap(),
+            Task::Detail { node: Some(n), .. } if n.name == "gpu1"
+        ));
+
+        // Double-click on GPU map node switches & opens Detail.
+        app.tab = 5;
+        app.rebuild();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let map_rect = hit_for(&app, Click::JumpNode("gpu2".into()));
+        click(&mut app, &mut terminal, map_rect, t0);
+        assert_eq!(app.tab, 0);
+        assert_eq!(app.selected().unwrap().key, "node:gpu2");
+        assert!(requests.try_recv().is_err());
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let map_rect = hit_for(&app, Click::JumpNode("gpu2".into()));
+        click(
+            &mut app,
+            &mut terminal,
+            map_rect,
+            t0 + Duration::from_millis(200),
+        );
+        assert!(matches!(
+            requests.try_recv().unwrap(),
+            Task::Detail { node: Some(n), .. } if n.name == "gpu2"
+        ));
+
+        // Double-click on History item opens Task::HistoryDetail.
+        let mut popup = Popup::text("History", String::new());
+        popup.history = vec![
+            history::Record {
+                jobid: "101".into(),
+                state: "COMPLETED".into(),
+                name: "one".into(),
+                ..Default::default()
+            },
+            history::Record {
+                jobid: "102".into(),
+                state: "FAILED".into(),
+                name: "two".into(),
+                ..Default::default()
+            },
+        ];
+        app.open(popup);
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let hist_rect = hit_for(&app, Click::History(1));
+        click(&mut app, &mut terminal, hist_rect, t0);
+        assert!(requests.try_recv().is_err());
+        click(
+            &mut app,
+            &mut terminal,
+            hist_rect,
+            t0 + Duration::from_millis(150),
+        );
+        assert!(matches!(
+            requests.try_recv().unwrap(),
+            Task::HistoryDetail(r) if r.jobid == "102"
+        ));
+    }
+
+    #[test]
+    fn dashboard_gpu_map_resources_chips_host_and_main_navigation() {
+        let worker = Worker::new();
+        let mut app = App::for_user("alice".into());
+        app.apply(mouse_snapshot());
+        let mut terminal = Terminal::new(TestBackend::new(120, 32)).unwrap();
+
+        // GPU map right-click opens Actions on that node from another tab.
+        app.tab = 5;
+        app.rebuild();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let map_rect = app
+            .hits
+            .items
+            .iter()
+            .find(|(_, c)| *c == Click::JumpNode("gpu2".into()))
+            .unwrap()
+            .0;
+        assert!(app.mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: map_rect.x,
+                row: map_rect.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &worker,
+        ));
+        assert_eq!(app.tab, 0);
+        assert_eq!(
+            app.popup.as_ref().unwrap().source_row.as_deref(),
+            Some("node:gpu2")
+        );
+        app.key(KeyCode::Esc, &worker);
+
+        // Resources panel toggles 5m trend, and trend strip click toggles it back.
+        assert!(!app.trend);
+        click_action(
+            &mut app,
+            &mut terminal,
+            &worker,
+            Click::Key(KeyCode::Char('t')),
+        );
+        assert!(app.trend);
+        click_action(
+            &mut app,
+            &mut terminal,
+            &worker,
+            Click::Key(KeyCode::Char('t')),
+        );
+        assert!(!app.trend);
+
+        // Clicking sgpu logo opens help popup; Esc closes.
+        click_action(
+            &mut app,
+            &mut terminal,
+            &worker,
+            Click::Key(KeyCode::Char('?')),
+        );
+        assert_eq!(app.popup.as_ref().unwrap().title, "sgpu help");
+        app.key(KeyCode::Esc, &worker);
+
+        // Summary line chips work: MINE and Attention jump.
+        click_action(
+            &mut app,
+            &mut terminal,
+            &worker,
+            Click::Key(KeyCode::Char('m')),
+        );
+        assert!(app.mine);
+        click_action(
+            &mut app,
+            &mut terminal,
+            &worker,
+            Click::Key(KeyCode::Char('5')),
+        );
+        assert_eq!(app.tab, 4);
+
+        // Main Tab / BackTab / Right / Left cycle all 8 tabs and exit related view.
+        app.tab = 0;
+        app.rebuild();
+        for expected in 1..8 {
+            app.key(KeyCode::Tab, &worker);
+            assert_eq!(app.tab, expected);
+        }
+        app.key(KeyCode::Right, &worker);
+        assert_eq!(app.tab, 0);
+        app.key(KeyCode::Left, &worker);
+        assert_eq!(app.tab, 7);
+        app.key(KeyCode::Char('J'), &worker);
+        assert!(app.related.is_some());
+        assert_eq!(app.tab, 3);
+        app.key(KeyCode::BackTab, &worker);
+        assert!(app.related.is_none());
+        assert_eq!(app.tab, 6);
+
+        // Tab 6 Host summary search line & Ctrl+U + clickable [×] button work.
+        click_action(
+            &mut app,
+            &mut terminal,
+            &worker,
+            Click::Key(KeyCode::Char('/')),
+        );
+        for c in "eth".chars() {
+            app.key(KeyCode::Char(c), &worker);
+        }
+        assert_eq!(app.search, "eth");
+        app.key_event(KeyCode::Char('u'), KeyModifiers::CONTROL, &worker);
+        assert!(app.search.is_empty());
+        assert!(app.searching);
+        for c in "nvme".chars() {
+            app.key(KeyCode::Char(c), &worker);
+        }
+        terminal.draw(|f| app.draw(f)).unwrap();
+        assert!(screen(&terminal).contains("[×]"));
+        click_action(&mut app, &mut terminal, &worker, Click::Key(KeyCode::Esc));
+        assert!(app.search.is_empty());
+        assert!(!app.searching);
+    }
+
+    #[test]
+    fn tab2_usage_nine_column_click_sort_detail_and_related_jobs() {
+        let worker = Worker::new();
+        let mut app = App::for_user("alice".into());
+        app.apply(jobs_snapshot());
+        let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let day2 = (chrono::Local::now() - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        app.usage = Some(serde_json::json!({
+            "days": {
+                &day: {
+                    "alice": {
+                        "alloc": 7200, "busy": 3600, "observed_alloc": 7200,
+                        "cpu_alloc": 3600, "cpu_busy": 1800, "cpu_observed_alloc": 3600,
+                        "ram_alloc_gib_sec": 3600.0, "ram_gib_sec": 1800.0
+                    },
+                    "bob": {
+                        "alloc": 3600, "busy": 3600, "observed_alloc": 3600,
+                        "cpu_alloc": 14400, "cpu_busy": 7200, "cpu_observed_alloc": 14400,
+                        "ram_alloc_gib_sec": 7200.0, "ram_gib_sec": 3600.0
+                    }
+                },
+                &day2: {
+                    "alice": {"alloc": 3600, "busy": 1800, "observed_alloc": 3600}
+                }
+            }
+        }));
+        app.tab = 2;
+        app.rebuild();
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let rendered = screen(&terminal);
+        for col in ["gpu_alloc", "cpu_alloc", "ram_used/req", "TOTAL"] {
+            assert!(rendered.contains(col), "missing {col} in Tab 2");
+        }
+        assert_eq!(app.rows.len(), 3);
+        assert_eq!(app.rows[0].key, "usage_user:alice");
+        assert_eq!(app.rows[2].key, "usage_total");
+
+        // Sort by CPU alloc (Sort(2)) puts bob first and keeps TOTAL last.
+        click_action(&mut app, &mut terminal, &worker, Click::Sort(2));
+        assert_eq!(app.sort, 2);
+        assert_eq!(app.rows[0].key, "usage_user:bob");
+        assert_eq!(app.rows[2].key, "usage_total");
+        // Reverse sort keeps TOTAL last.
+        click_action(&mut app, &mut terminal, &worker, Click::Sort(2));
+        assert!(app.reverse);
+        assert_eq!(app.rows[0].key, "usage_user:alice");
+        assert_eq!(app.rows[2].key, "usage_total");
+
+        // Enter on user row opens detail with daily breakdown and active queue counts.
+        app.key(KeyCode::Home, &worker);
+        app.key(KeyCode::Enter, &worker);
+        let user_popup = app.popup.as_ref().unwrap();
+        assert_eq!(user_popup.title, "alice");
+        assert!(
+            user_popup.panes[0]
+                .body
+                .contains("Current queue: 1 running · 1 pending · J related Jobs")
+        );
+        assert!(
+            user_popup.panes[0]
+                .body
+                .contains("Daily breakdown (7d for alice)")
+        );
+        app.key(KeyCode::Esc, &worker);
+
+        // End selects TOTAL row and Enter opens overall breakdown.
+        app.key(KeyCode::End, &worker);
+        assert_eq!(app.selected().unwrap().key, "usage_total");
+        app.key(KeyCode::Enter, &worker);
+        let total_popup = app.popup.as_ref().unwrap();
+        assert_eq!(total_popup.title, "TOTAL");
+        assert!(total_popup.panes[0].body.contains("Daily breakdown:"));
+        app.key(KeyCode::Esc, &worker);
+
+        // Daily view opens day breakdown, and J hints switching back to user view.
+        app.key(KeyCode::Char('v'), &worker);
+        assert!(app.usage_daily);
+        app.key(KeyCode::Home, &worker);
+        app.key(KeyCode::Char('J'), &worker);
+        assert_eq!(app.tab, 2);
+        assert!(app.status.contains("Switch to user view (v)"));
+        app.key(KeyCode::Enter, &worker);
+        assert!(
+            app.popup.as_ref().unwrap().panes[0]
+                .body
+                .contains("Users on ")
+        );
+        app.key(KeyCode::Esc, &worker);
+
+        // Back in user view, J drills into related Jobs and Esc restores Tab 2.
+        app.key(KeyCode::Char('v'), &worker);
+        app.key(KeyCode::Home, &worker);
+        assert_eq!(app.selected().unwrap().key, "usage_user:alice");
+        app.key(KeyCode::Char('J'), &worker);
+        assert_eq!(app.tab, 3);
+        assert!(app.visible_jobs().all(|j| j.user() == "alice"));
+        app.key(KeyCode::Esc, &worker);
+        assert_eq!(app.tab, 2);
+    }
+
+    #[test]
+    fn tab4_attention_sort_and_tab3_left_wait_header() {
+        let now = runtime::now();
+        let worker = Worker::new();
+        let mut data = jobs_snapshot();
+        data.jobs[0].time_limit = "01:00:00".into();
+        data.jobs[0].elapsed = "00:10:00".into();
+        data.jobs[1].time_limit = "01:00:00".into();
+        data.jobs[1].elapsed = "00:55:00".into();
+        data.nodes = vec![
+            Node {
+                name: "gpu1".into(),
+                state: "allocated".into(),
+                observed_at: now,
+                gpus: vec![Gpu {
+                    index: "0".into(),
+                    util: "0".into(),
+                    mem_used: "0".into(),
+                    mem_total: "100".into(),
+                    alloc_jobid: "42".into(),
+                    alloc_user: "alice".into(),
+                    idle_sec: 1200,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            Node {
+                name: "gpu2".into(),
+                state: "idle".into(),
+                observed_at: now,
+                gpus: vec![Gpu {
+                    index: "0".into(),
+                    util: "50".into(),
+                    users: vec!["bob".into()],
+                    pids: vec!["99".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ];
+        let mut app = App::for_user("alice".into());
+        app.tab = 4;
+        app.apply(data);
+        // Default sort 0 (rogue/sev): bob has 1 rogue > alice 0 rogue.
+        assert_eq!(app.rows[0].key, "attention:bob");
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        // Sort by longest (Sort(2)): alice idle_sec 1200 > bob 0.
+        click_action(&mut app, &mut terminal, &worker, Click::Sort(2));
+        assert_eq!(app.rows[0].key, "attention:alice");
+        // Sort by user asc (Sort(3) then reverse):
+        app.key(KeyCode::Char('s'), &worker);
+        assert_eq!(app.sort, 3);
+        assert_eq!(app.rows[0].key, "attention:alice");
+        app.key(KeyCode::Char('S'), &worker);
+        assert_eq!(app.rows[0].key, "attention:bob");
+
+        // Tab 3 Left/wait column sorting & dynamic header label.
+        app.tab = 3;
+        app.job_filter = job_view::Filter::All;
+        app.rebuild();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        assert!(screen(&terminal).contains("Left/wait↕"));
+        click_action(
+            &mut app,
+            &mut terminal,
+            &worker,
+            Click::JobSort(job_view::Sort::Wait),
+        );
+        assert_eq!(app.job_sort, job_view::Sort::Wait);
+        terminal.draw(|f| app.draw(f)).unwrap();
+        assert!(screen(&terminal).contains("Wait"));
+
+        // Running filter maps column 9 to Sort::Left and orders shortest remaining first.
+        app.key(KeyCode::Char('v'), &worker);
+        assert_eq!(app.job_filter, job_view::Filter::Running);
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let (col, row) = header_position(&terminal, "Left");
+        assert!(app.mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: col,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            &worker,
+        ));
+        assert_eq!(app.job_sort, job_view::Sort::Left);
+        // bob #43 has 5m left, alice #42 has 50m left -> ascending Left puts #43 first.
+        let running_ids: Vec<_> = app.rows.iter().map(|r| r.cells[0].as_str()).collect();
+        assert_eq!(running_ids, vec!["43", "42"]);
+    }
+
+    #[test]
+    fn popup_full_keyboard_and_mouse_parity() {
+        let (sender, requests) = mpsc::sync_channel(16);
+        let (_, receiver) = mpsc::sync_channel(16);
+        let worker = Worker { sender, receiver };
+        let mut app = App::for_user("alice".into());
+        let mut data = mouse_snapshot();
+        data.nodes[0].scheduler_available = true;
+        data.nodes[0].scheduler_age_sec = 0.0;
+        data.jobs[0].telemetry = BTreeMap::from([(
+            "gpu1".into(),
+            serde_json::json!({
+                "observed_at": runtime::now(),
+                "cpu_cores": 6.5,
+                "mem_current_mib": 8192.0,
+            }),
+        )]);
+        app.tab = 3;
+        app.apply(data);
+        let mut terminal = Terminal::new(TestBackend::new(110, 26)).unwrap();
+
+        // 1. Running job Detail passes matched nodes so Summary populates live cgroup telemetry.
+        let job_idx = app
+            .rows
+            .iter()
+            .position(|r| r.job.as_deref() == Some("42"))
+            .unwrap();
+        app.table.select(Some(job_idx));
+        app.key(KeyCode::Enter, &worker);
+        let Ok(Task::Detail {
+            job,
+            pending,
+            node,
+            nodes,
+            ..
+        }) = requests.try_recv()
+        else {
+            panic!("expected Detail task");
+        };
+        assert!(!nodes.is_empty());
+        let built = details_with_nodes(job.as_deref(), pending.as_deref(), node.as_deref(), &nodes)
+            .unwrap();
+        assert!(
+            built.panes[0]
+                .body
+                .contains("Observed cgroup telemetry (1/1 nodes fresh)")
+        );
+        assert!(built.panes[0].body.contains("CPU: 6.5 (1/1n) cores"));
+
+        // 2. Actions popup: direct hotkey 'm' works, and 'a' closes Actions cleanly.
+        app.key(KeyCode::Char('a'), &worker);
+        assert!(app.popup.is_some());
+        app.key(KeyCode::Char('a'), &worker);
+        assert!(app.popup.is_none());
+        app.key(KeyCode::Char('a'), &worker);
+        app.key(KeyCode::Char('m'), &worker);
+        assert!(app.popup.is_none());
+        assert!(app.mine);
+        app.key(KeyCode::Char('0'), &worker);
+
+        // 3. Cancel confirmation: Left/Right/Tab toggle Keep (0) vs Cancel (1), Enter respects active button.
+        let job_idx = app
+            .rows
+            .iter()
+            .position(|r| r.job.as_deref() == Some("42"))
+            .unwrap();
+        app.table.select(Some(job_idx));
+        app.key(KeyCode::Char('x'), &worker);
+        assert_eq!(app.popup.as_ref().unwrap().selected, 1);
+        app.key(KeyCode::Left, &worker);
+        assert_eq!(app.popup.as_ref().unwrap().selected, 0);
+        app.key(KeyCode::Enter, &worker);
+        assert!(app.popup.is_none());
+        assert!(requests.try_recv().is_err(), "Keep should not cancel");
+
+        app.key(KeyCode::Char('x'), &worker);
+        app.key(KeyCode::Tab, &worker);
+        assert_eq!(app.popup.as_ref().unwrap().selected, 0);
+        app.key(KeyCode::Char('l'), &worker);
+        assert_eq!(app.popup.as_ref().unwrap().selected, 1);
+        app.key(KeyCode::Enter, &worker);
+        assert!(matches!(requests.try_recv().unwrap(), Task::Cancel(id) if id == "42"));
+
+        // 4. Picker popup: Ctrl+U & Click::ClearInput clear query while keeping Picker open.
+        app.key(KeyCode::Char('U'), &worker);
+        for c in "alice".chars() {
+            app.key(KeyCode::Char(c), &worker);
+        }
+        terminal.draw(|f| app.draw(f)).unwrap();
+        assert!(screen(&terminal).contains("[×]"));
+        app.key_event(KeyCode::Char('u'), KeyModifiers::CONTROL, &worker);
+        assert!(app.popup.is_some());
+        assert!(
+            app.popup
+                .as_ref()
+                .unwrap()
+                .picker
+                .as_ref()
+                .unwrap()
+                .query
+                .is_empty()
+        );
+        for c in "bo".chars() {
+            app.key(KeyCode::Char(c), &worker);
+        }
+        click_action(&mut app, &mut terminal, &worker, Click::ClearInput);
+        assert!(app.popup.is_some());
+        assert!(
+            app.popup
+                .as_ref()
+                .unwrap()
+                .picker
+                .as_ref()
+                .unwrap()
+                .query
+                .is_empty()
+        );
+        app.key(KeyCode::Down, &worker);
+        app.key(KeyCode::End, &worker);
+        app.key(KeyCode::Home, &worker);
+        app.key(KeyCode::Esc, &worker);
+
+        // 5. History popup: filter, empty msg, Ctrl+U, ClearInput, header clicks (<85 and >=85), Enter opens filtered item.
+        let mut hpopup = Popup::text("My history", String::new());
+        hpopup.history = vec![
+            history::Record {
+                jobid: "10".into(),
+                state: "FAILED".into(),
+                exit: "1:0".into(),
+                elapsed: 60.0,
+                partition: "gpu".into(),
+                name: "zeta".into(),
+                ..Default::default()
+            },
+            history::Record {
+                jobid: "2".into(),
+                state: "COMPLETED".into(),
+                exit: "0:0".into(),
+                elapsed: 300.0,
+                partition: "cpu".into(),
+                name: "alpha".into(),
+                ..Default::default()
+            },
+        ];
+        app.open(hpopup);
+        assert!(app.popup.as_ref().unwrap().is_history);
+        for width in [76_u16, 110_u16] {
+            let mut term = Terminal::new(TestBackend::new(width, 16)).unwrap();
+            click_action(&mut app, &mut term, &worker, Click::HistorySort(1));
+            assert_eq!(app.popup.as_ref().unwrap().visible_history()[0].jobid, "2");
+            // Click actual rendered State header cell.
+            term.draw(|f| app.draw(f)).unwrap();
+            let buf = term.backend().buffer();
+            let (sx, sy) = (0..16_u16)
+                .find_map(|y| {
+                    let row_str: String = (0..width).map(|x| buf[(x, y)].symbol()).collect();
+                    (row_str.contains("JobID") && row_str.contains("State")).then(|| {
+                        let x = (0..width)
+                            .find(|x| {
+                                (*x..width)
+                                    .map(|c| buf[(c, y)].symbol())
+                                    .collect::<String>()
+                                    .starts_with("State")
+                            })
+                            .unwrap();
+                        (x, y)
+                    })
+                })
+                .unwrap();
+            assert!(app.mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: sx,
+                    row: sy,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &worker,
+            ));
+            assert_eq!(app.popup.as_ref().unwrap().history_sort, 2);
+            assert_eq!(
+                app.popup.as_ref().unwrap().visible_history()[0].state,
+                "COMPLETED"
+            );
+        }
+        // Filter to non-matching shows empty message; ClearInput clears back.
+        app.key(KeyCode::Char('/'), &worker);
+        for c in "nope".chars() {
+            app.key(KeyCode::Char(c), &worker);
+        }
+        terminal.draw(|f| app.draw(f)).unwrap();
+        assert!(screen(&terminal).contains("No matching history records · 0 reset"));
+        app.key_event(KeyCode::Char('u'), KeyModifiers::CONTROL, &worker);
+        assert!(app.popup.as_ref().unwrap().history_query.is_empty());
+        for c in "zeta".chars() {
+            app.key(KeyCode::Char(c), &worker);
+        }
+        app.key(KeyCode::Enter, &worker);
+        assert!(!app.popup.as_ref().unwrap().history_searching);
+        // Pressing Enter on filtered view opens job 10 ("zeta"), not index 0 pre-filter.
+        app.key(KeyCode::Enter, &worker);
+        assert!(matches!(
+            requests.try_recv().unwrap(),
+            Task::HistoryDetail(r) if r.jobid == "10"
+        ));
+        click_action(&mut app, &mut terminal, &worker, Click::ClearInput);
+        assert!(app.popup.as_ref().unwrap().history_query.is_empty());
+        app.key(KeyCode::Char('0'), &worker);
+        assert_eq!(app.popup.as_ref().unwrap().history_sort, 0);
+        app.key(KeyCode::Char('q'), &worker);
+        assert!(app.popup.is_none());
+
+        // 6. Text/Log popup: 1..=3 panes, 'f' follow toggle, Space/b/g/G, Ctrl+U find clear, double Esc.
+        let mut lpopup = Popup::text("Log viewer", "alpha\nbeta".into());
+        lpopup.panes.push(Pane {
+            name: "Script".into(),
+            body: "echo hi".into(),
+            log: None,
+        });
+        lpopup.panes.push(Pane {
+            name: "StdOut".into(),
+            body: (0..60).map(|i| format!("line {i}\n")).collect(),
+            log: Some(cli::LogView {
+                path: "/tmp/out.log".into(),
+                owner: None,
+                shared: false,
+                merged: false,
+            }),
+        });
+        app.open(lpopup);
+        app.key(KeyCode::Char('2'), &worker);
+        assert_eq!(app.popup.as_ref().unwrap().active, 1);
+        app.key(KeyCode::Char('3'), &worker);
+        assert_eq!(app.popup.as_ref().unwrap().active, 2);
+        assert!(app.popup.as_ref().unwrap().follow);
+        app.key(KeyCode::Char('f'), &worker);
+        assert!(!app.popup.as_ref().unwrap().follow);
+        app.key(KeyCode::Char('f'), &worker);
+        assert!(app.popup.as_ref().unwrap().follow);
+        app.key(KeyCode::Char('g'), &worker);
+        assert_eq!(app.popup.as_ref().unwrap().scroll, 0);
+        assert!(!app.popup.as_ref().unwrap().follow);
+        app.key(KeyCode::Char(' '), &worker);
+        assert_eq!(app.popup.as_ref().unwrap().scroll, 20);
+        app.key(KeyCode::Char('b'), &worker);
+        assert_eq!(app.popup.as_ref().unwrap().scroll, 0);
+        app.key(KeyCode::Char('G'), &worker);
+        assert!(app.popup.as_ref().unwrap().follow);
+        app.key(KeyCode::Char('/'), &worker);
+        for c in "line 5".chars() {
+            app.key(KeyCode::Char(c), &worker);
+        }
+        app.key(KeyCode::Enter, &worker);
+        terminal.draw(|f| app.draw(f)).unwrap();
+        click_action(&mut app, &mut terminal, &worker, Click::ClearInput);
+        assert!(app.popup.as_ref().unwrap().find.query.is_empty());
+        app.key(KeyCode::Char('/'), &worker);
+        for c in "line".chars() {
+            app.key(KeyCode::Char(c), &worker);
+        }
+        app.key_event(KeyCode::Char('u'), KeyModifiers::CONTROL, &worker);
+        assert!(app.popup.as_ref().unwrap().find.query.is_empty());
+        for c in "line".chars() {
+            app.key(KeyCode::Char(c), &worker);
+        }
+        app.key(KeyCode::Enter, &worker);
+        app.key(KeyCode::Esc, &worker);
+        assert!(app.popup.is_some());
+        assert!(app.popup.as_ref().unwrap().find.query.is_empty());
+        app.key(KeyCode::Esc, &worker);
+        assert!(app.popup.is_none());
     }
 }
