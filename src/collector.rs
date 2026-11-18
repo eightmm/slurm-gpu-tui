@@ -378,12 +378,13 @@ impl Collector {
                     }
                 }
             }
-            scheduler::reconcile(
+            scheduler::reconcile_records(
                 sample
                     .records
                     .alloc
                     .get(&node.name)
                     .unwrap_or(&BTreeMap::new()),
+                sample.records.shared_alloc.get(&node.name),
                 &owners,
                 &mut node.gpus,
                 &ignored,
@@ -395,6 +396,13 @@ impl Collector {
                 .map(|&(index, cpus)| {
                     let mut job = sample.jobs[index].clone();
                     job.cpu_count = cpus;
+                    if let Some(&gpus) = sample
+                        .records
+                        .node_gpus
+                        .get(&(job.jobid.clone(), node.name.clone()))
+                    {
+                        job.gpu_count = gpus;
+                    }
                     job.detail.clear();
                     job.script.clear();
                     job.log_out.clear();
@@ -520,22 +528,24 @@ fn skeleton(gres: &str) -> Vec<Gpu> {
 
 fn track_waste(idle: &mut Value, node: &str, gpu: &mut Gpu, now: f64, stale: bool) {
     let key = format!("{node}:{}", gpu.index);
+    let jobs_key = gpu.alloc_jobs_display();
     if stale {
-        gpu.idle_sec = if idle["idle"][&key]["jobid"].as_str() == Some(&gpu.alloc_jobid) {
-            json_number(&idle["idle"][&key]["since"])
-                .map(|t| (now - t).max(0.0) as u64)
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        gpu.idle_sec =
+            if !jobs_key.is_empty() && idle["idle"][&key]["jobid"].as_str() == Some(&jobs_key) {
+                json_number(&idle["idle"][&key]["since"])
+                    .map(|t| (now - t).max(0.0) as u64)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
         gpu.parked_sec = json_number(&idle["parked"][&key]["since"])
             .map(|t| (now - t).max(0.0) as u64)
             .unwrap_or(0);
         return;
     }
-    if !gpu.alloc_jobid.is_empty() && gpu.users.is_empty() {
-        if idle["idle"][&key]["jobid"].as_str() != Some(&gpu.alloc_jobid) {
-            idle["idle"][&key] = json!({"jobid":gpu.alloc_jobid,"since":now});
+    if gpu.has_alloc() && gpu.users.is_empty() {
+        if idle["idle"][&key]["jobid"].as_str() != Some(&jobs_key) {
+            idle["idle"][&key] = json!({"jobid":jobs_key,"since":now});
         }
         gpu.idle_sec = json_number(&idle["idle"][&key]["since"])
             .map(|t| (now - t).max(0.0) as u64)
@@ -546,8 +556,8 @@ fn track_waste(idle: &mut Value, node: &str, gpu: &mut Gpu, now: f64, stale: boo
         }
         gpu.idle_sec = 0;
     }
-    let owner = if !gpu.alloc_jobid.is_empty() {
-        gpu.alloc_jobid.clone()
+    let owner = if !jobs_key.is_empty() {
+        jobs_key
     } else {
         gpu.users.join(",")
     };

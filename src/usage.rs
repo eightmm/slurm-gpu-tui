@@ -1,7 +1,7 @@
 use crate::{
     Result,
     model::{Node, json_number, number},
-    rules, runtime,
+    rules, runtime, scheduler,
 };
 use chrono::{Days, Local, TimeZone};
 use serde::Serialize;
@@ -49,8 +49,9 @@ pub struct Store {
 }
 impl Store {
     pub fn load(path: PathBuf, candidates: &[PathBuf]) -> Self {
-        let raw = read_freshest("usage.json", candidates)
-            .unwrap_or_else(|| json!({"days":{},"meta":{},"telemetry":{},"sacct_days":{}}));
+        let raw = read_freshest("usage.json", candidates).unwrap_or_else(
+            || json!({"days":{},"meta":{},"telemetry":{},"sacct_days":{},"sacct_cpu_days":{},"sacct_mem_days":{}}),
+        );
         Self {
             raw,
             path,
@@ -71,7 +72,14 @@ impl Store {
             return;
         };
         let day = date.format("%Y-%m-%d").to_string();
-        for key in ["days", "meta", "telemetry", "sacct_days"] {
+        for key in [
+            "days",
+            "meta",
+            "telemetry",
+            "sacct_days",
+            "sacct_cpu_days",
+            "sacct_mem_days",
+        ] {
             if !self.raw[key].is_object() {
                 self.raw[key] = json!({});
             }
@@ -86,29 +94,37 @@ impl Store {
         let minimum = runtime::env_seconds("SLURM_GPU_TUI_WASTE_MIN_SEC", 600.0, 0.0) as u64;
         for node in nodes {
             for gpu in &node.gpus {
-                let user = if !gpu.alloc_user.is_empty() {
-                    &gpu.alloc_user
-                } else if let Some(user) = gpu.users.first() {
-                    user
-                } else {
-                    continue;
-                };
-                let entry = &mut self.raw["days"][&day][user];
-                if !entry.is_object() {
-                    *entry = json!({"alloc":0.0,"busy":0.0,"observed_alloc":0.0});
-                }
-                if entry["observed_alloc"].is_null() {
-                    entry["observed_alloc"] = json!(n(entry, "alloc"));
-                }
-                add(entry, "alloc", dt);
-                let fresh = !node.stale && number(&gpu.util).is_some();
-                if fresh {
-                    add(entry, "observed_alloc", dt);
-                    if number(&gpu.util).is_some_and(|u| u > 5.0) {
-                        add(entry, "busy", dt);
+                let owners: Vec<String> = {
+                    let alloc = gpu.users_alloc();
+                    if !alloc.is_empty() {
+                        alloc.into_iter().map(str::to_string).collect()
+                    } else if let Some(user) = gpu.users.first() {
+                        vec![user.clone()]
+                    } else {
+                        continue;
                     }
-                    if gpu.idle_sec.max(gpu.parked_sec) >= minimum {
-                        add(entry, "waste", dt);
+                };
+                let share = dt / owners.len() as f64;
+                let fresh = !node.stale && number(&gpu.util).is_some();
+                let busy = fresh && number(&gpu.util).is_some_and(|u| u > 5.0);
+                let wasted = fresh && gpu.idle_sec.max(gpu.parked_sec) >= minimum;
+                for user in &owners {
+                    let entry = &mut self.raw["days"][&day][user];
+                    if !entry.is_object() {
+                        *entry = json!({"alloc":0.0,"busy":0.0,"observed_alloc":0.0});
+                    }
+                    if entry["observed_alloc"].is_null() {
+                        entry["observed_alloc"] = json!(n(entry, "alloc"));
+                    }
+                    add(entry, "alloc", share);
+                    if fresh {
+                        add(entry, "observed_alloc", share);
+                        if busy {
+                            add(entry, "busy", share);
+                        }
+                        if wasted {
+                            add(entry, "waste", share);
+                        }
                     }
                 }
                 add(
@@ -121,6 +137,38 @@ impl Store {
                     dt,
                 );
             }
+            let node_clean = !node.stale && node.error.is_empty();
+            for job in &node.jobs {
+                if job.user.is_empty() {
+                    continue;
+                }
+                let entry = &mut self.raw["days"][&day][&job.user];
+                if !entry.is_object() {
+                    *entry = json!({"alloc":0.0,"busy":0.0,"observed_alloc":0.0});
+                }
+                if job.cpu_count > 0 {
+                    add(entry, "cpu_alloc", job.cpu_count as f64 * dt);
+                }
+                if let Some(mem_mib) = scheduler::mem_mib(&job.mem, job.cpu_count.max(1)) {
+                    add(entry, "ram_alloc_gib_sec", (mem_mib / 1024.0) * dt);
+                }
+                if node_clean
+                    && let Some(sample) = job.telemetry.get(&node.name)
+                    && json_number(&sample["observed_at"])
+                        .is_some_and(|stamp| rules::telemetry_fresh(stamp, now))
+                {
+                    if let Some(cores) = rules::sample_metric(sample, "cpu_cores") {
+                        if job.cpu_count > 0 {
+                            add(entry, "cpu_observed_alloc", job.cpu_count as f64 * dt);
+                        }
+                        add(entry, "cpu_busy", cores * dt);
+                    }
+                    if let Some(mem_mib) = rules::sample_metric(sample, "mem_current_mib") {
+                        add(entry, "ram_gib_sec", (mem_mib / 1024.0) * dt);
+                        add(entry, "ram_observed_sec", dt);
+                    }
+                }
+            }
         }
         let keep = runtime::env_seconds("SLURM_GPU_TUI_USAGE_KEEP_DAYS", 30.0, 1.0) as u64;
         let cutoff = date
@@ -128,7 +176,14 @@ impl Store {
             .checked_sub_days(Days::new(keep))
             .unwrap_or(date.date_naive())
             .to_string();
-        for key in ["days", "meta", "telemetry", "sacct_days"] {
+        for key in [
+            "days",
+            "meta",
+            "telemetry",
+            "sacct_days",
+            "sacct_cpu_days",
+            "sacct_mem_days",
+        ] {
             if let Some(days) = self.raw[key].as_object_mut() {
                 days.retain(|day, _| day >= &cutoff);
             }
@@ -163,13 +218,17 @@ impl Store {
             .unwrap_or(date.date_naive())
             .to_string();
         let mut days = BTreeMap::<String, BTreeMap<String, f64>>::new();
+        let mut cpu_days = BTreeMap::<String, BTreeMap<String, f64>>::new();
+        let mut mem_days = BTreeMap::<String, BTreeMap<String, f64>>::new();
         for line in raw.lines() {
             let parts: Vec<_> = line.split('|').collect();
             if parts.len() != 4 || parts[0].is_empty() {
                 continue;
             }
             let count = tres_gpus(parts[1]);
-            if count == 0 {
+            let cpus = tres_cpus(parts[1]);
+            let mem_gib = tres_mem_gib(parts[1]);
+            if count == 0 && cpus == 0 && mem_gib <= 0.0 {
                 continue;
             }
             let Some(mut start) = rules::parse_timestamp(parts[2]) else {
@@ -209,16 +268,36 @@ impl Store {
                     break;
                 }
                 if day.to_string() >= cutoff {
-                    *days
-                        .entry(day.to_string())
-                        .or_default()
-                        .entry(parts[0].into())
-                        .or_default() += count as f64 * (end.min(next) - start);
+                    let span = end.min(next) - start;
+                    let day_key = day.to_string();
+                    if count > 0 {
+                        *days
+                            .entry(day_key.clone())
+                            .or_default()
+                            .entry(parts[0].into())
+                            .or_default() += count as f64 * span;
+                    }
+                    if cpus > 0 {
+                        *cpu_days
+                            .entry(day_key.clone())
+                            .or_default()
+                            .entry(parts[0].into())
+                            .or_default() += cpus as f64 * span;
+                    }
+                    if mem_gib > 0.0 {
+                        *mem_days
+                            .entry(day_key)
+                            .or_default()
+                            .entry(parts[0].into())
+                            .or_default() += mem_gib * span;
+                    }
                 }
                 start = next;
             }
         }
         self.raw["sacct_days"] = json!(days);
+        self.raw["sacct_cpu_days"] = json!(cpu_days);
+        self.raw["sacct_mem_days"] = json!(mem_days);
         self.raw["sacct_ts"] = json!(now);
         self.dirty = true;
         Ok(())
@@ -226,20 +305,30 @@ impl Store {
 }
 
 pub fn tres_gpus(raw: &str) -> u32 {
-    let mut typed = 0u32;
-    for field in raw.split(',') {
-        if let Some((key, value)) = field.split_once('=')
-            && let Ok(value) = value.parse::<u32>()
-        {
-            if key == "gres/gpu" {
-                return value;
-            }
-            if key.starts_with("gres/gpu:") {
-                typed = typed.saturating_add(value);
-            }
-        }
-    }
-    typed
+    scheduler::parse_tres_gpus(raw)
+}
+
+pub fn tres_cpus(raw: &str) -> u32 {
+    raw.split(',')
+        .filter_map(|field| field.trim().split_once('='))
+        .find_map(|(k, v)| {
+            (k.trim() == "cpu")
+                .then(|| v.trim().parse::<u32>().ok())
+                .flatten()
+        })
+        .unwrap_or(0)
+}
+
+pub fn tres_mem_gib(raw: &str) -> f64 {
+    raw.split(',')
+        .filter_map(|field| field.trim().split_once('='))
+        .find_map(|(k, v)| {
+            (k.trim() == "mem")
+                .then(|| scheduler::mem_mib(v.trim(), 1).map(|m| m / 1024.0))
+                .flatten()
+        })
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(0.0)
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -248,26 +337,48 @@ pub struct Totals {
     pub busy: f64,
     pub observed_alloc: f64,
     pub waste: f64,
+    pub cpu_alloc: f64,
+    pub cpu_busy: f64,
+    pub cpu_observed_alloc: f64,
+    pub ram_alloc_gib_sec: f64,
+    pub ram_used_gib_sec: f64,
+    pub ram_observed_sec: f64,
 }
 
 pub fn merge(
     raw: &Value,
     keep: impl Fn(&str) -> bool,
 ) -> (BTreeMap<String, Totals>, BTreeMap<String, Totals>) {
+    merge_filtered(raw, keep, "")
+}
+
+pub fn merge_filtered(
+    raw: &Value,
+    keep: impl Fn(&str) -> bool,
+    only_user: &str,
+) -> (BTreeMap<String, Totals>, BTreeMap<String, Totals>) {
     let mut users = BTreeMap::<String, Totals>::new();
     let mut daily = BTreeMap::<String, Totals>::new();
-    let days: BTreeMap<String, ()> = ["days", "sacct_days"]
+    let days: BTreeMap<String, ()> = ["days", "sacct_days", "sacct_cpu_days", "sacct_mem_days"]
         .iter()
         .filter_map(|k| raw[*k].as_object())
         .flat_map(|m| m.keys().map(|s| (s.clone(), ())))
         .collect();
     for day in days.keys().filter(|day| keep(day)) {
-        let names: BTreeMap<String, ()> = [&raw["days"][day], &raw["sacct_days"][day]]
-            .iter()
-            .filter_map(|v| v.as_object())
-            .flat_map(|m| m.keys().map(|s| (s.clone(), ())))
-            .collect();
-        for user in names.keys() {
+        let names: BTreeMap<String, ()> = [
+            &raw["days"][day],
+            &raw["sacct_days"][day],
+            &raw["sacct_cpu_days"][day],
+            &raw["sacct_mem_days"][day],
+        ]
+        .iter()
+        .filter_map(|v| v.as_object())
+        .flat_map(|m| m.keys().map(|s| (s.clone(), ())))
+        .collect();
+        for user in names
+            .keys()
+            .filter(|user| only_user.is_empty() || user.as_str() == only_user)
+        {
             let sampled = &raw["days"][day][user];
             let alloc = n(sampled, "alloc").max(
                 json_number(&raw["sacct_days"][day][user])
@@ -277,6 +388,20 @@ pub fn merge(
             let busy = n(sampled, "busy");
             let observed = json_number(&sampled["observed_alloc"]).unwrap_or(n(sampled, "alloc"));
             let waste = n(sampled, "waste");
+            let cpu_alloc = n(sampled, "cpu_alloc").max(
+                json_number(&raw["sacct_cpu_days"][day][user])
+                    .filter(|n| *n >= 0.0)
+                    .unwrap_or(0.0),
+            );
+            let cpu_busy = n(sampled, "cpu_busy");
+            let cpu_observed_alloc = n(sampled, "cpu_observed_alloc");
+            let ram_alloc_gib_sec = n(sampled, "ram_alloc_gib_sec").max(
+                json_number(&raw["sacct_mem_days"][day][user])
+                    .filter(|n| *n >= 0.0)
+                    .unwrap_or(0.0),
+            );
+            let ram_used_gib_sec = n(sampled, "ram_gib_sec");
+            let ram_observed_sec = n(sampled, "ram_observed_sec");
             for entry in [
                 users.entry(user.clone()).or_default(),
                 daily.entry(day.clone()).or_default(),
@@ -285,6 +410,12 @@ pub fn merge(
                 entry.busy += busy;
                 entry.observed_alloc += observed;
                 entry.waste += waste;
+                entry.cpu_alloc += cpu_alloc;
+                entry.cpu_busy += cpu_busy;
+                entry.cpu_observed_alloc += cpu_observed_alloc;
+                entry.ram_alloc_gib_sec += ram_alloc_gib_sec;
+                entry.ram_used_gib_sec += ram_used_gib_sec;
+                entry.ram_observed_sec += ram_observed_sec;
             }
         }
     }
@@ -303,36 +434,148 @@ pub fn read() -> Option<Value> {
 }
 
 pub fn render(raw: &Value, days: u64, daily: bool) -> String {
+    render_with_options(raw, days, daily, 0, false, "", "")
+}
+
+pub fn render_with_options(
+    raw: &Value,
+    days: u64,
+    daily: bool,
+    sort: usize,
+    reverse: bool,
+    user_filter: &str,
+    search: &str,
+) -> String {
     let cutoff = window(days);
-    let (users, dates) = merge(raw, |day| day >= cutoff.as_str());
-    let mut out = format!(
-        "GPU-hours — last {days} days\n{:<16}{:>10}{:>10}{:>8}{:>10}\n",
-        if daily { "day" } else { "user" },
-        "alloc",
-        "busy",
-        "eff",
-        "waste"
-    );
-    let mut rows: Vec<_> = if daily {
-        dates.into_iter().collect()
+    let (users, dates) = merge_filtered(raw, |day| day >= cutoff.as_str(), user_filter);
+    let has_compute = users.values().chain(dates.values()).any(|t| {
+        t.cpu_alloc > 0.0
+            || t.cpu_busy > 0.0
+            || t.ram_alloc_gib_sec > 0.0
+            || t.ram_used_gib_sec > 0.0
+    });
+    let mut out = if has_compute {
+        format!(
+            "Cluster usage — last {days} days\n{:<16}{:>10}{:>10}{:>8}{:>10}{:>11}{:>11}{:>8}{:>13}\n",
+            if daily { "day" } else { "user" },
+            "gpu_alloc",
+            "gpu_busy",
+            "eff",
+            "waste",
+            "cpu_alloc",
+            "cpu_used",
+            "cpu%",
+            "ram_used/req"
+        )
     } else {
-        users.into_iter().collect()
+        format!(
+            "GPU-hours — last {days} days\n{:<16}{:>10}{:>10}{:>8}{:>10}\n",
+            if daily { "day" } else { "user" },
+            "alloc",
+            "busy",
+            "eff",
+            "waste"
+        )
     };
+    let query = search.to_lowercase();
+    let mut rows: Vec<_> = if daily { dates } else { users }
+        .into_iter()
+        .filter(|(name, _)| query.is_empty() || name.to_lowercase().contains(&query))
+        .collect();
     if !daily {
-        rows.sort_by(|a, b| b.1.alloc.total_cmp(&a.1.alloc).then(a.0.cmp(&b.0)));
+        rows.sort_by(|a, b| {
+            match sort % 4 {
+                1 => b.1.busy.total_cmp(&a.1.busy),
+                2 => b.1.cpu_alloc.total_cmp(&a.1.cpu_alloc),
+                3 => {
+                    b.1.ram_alloc_gib_sec
+                        .total_cmp(&a.1.ram_alloc_gib_sec)
+                        .then_with(|| b.1.ram_used_gib_sec.total_cmp(&a.1.ram_used_gib_sec))
+                }
+                _ => {
+                    b.1.alloc
+                        .total_cmp(&a.1.alloc)
+                        .then_with(|| b.1.cpu_alloc.total_cmp(&a.1.cpu_alloc))
+                }
+            }
+            .then(a.0.cmp(&b.0))
+        });
+    } else if !sort.is_multiple_of(4) {
+        rows.sort_by(|a, b| {
+            match sort % 4 {
+                1 => b.1.busy.total_cmp(&a.1.busy),
+                2 => b.1.cpu_alloc.total_cmp(&a.1.cpu_alloc),
+                3 => {
+                    b.1.ram_alloc_gib_sec
+                        .total_cmp(&a.1.ram_alloc_gib_sec)
+                        .then_with(|| b.1.ram_used_gib_sec.total_cmp(&a.1.ram_used_gib_sec))
+                }
+                _ => a.0.cmp(&b.0),
+            }
+            .then(a.0.cmp(&b.0))
+        });
     }
-    for (name, t) in rows {
+    if reverse {
+        rows.reverse();
+    }
+    let mut total = Totals::default();
+    let format_row = |out: &mut String, name: &str, t: &Totals| {
         let efficiency = if t.observed_alloc > 0.0 {
             format!("{:.0}%", 100.0 * t.busy / t.observed_alloc)
         } else {
             "?".into()
         };
-        out.push_str(&format!(
-            "{name:<16}{:>9.1}h{:>9.1}h{efficiency:>8}{:>9.1}h\n",
-            t.alloc / 3600.0,
-            t.busy / 3600.0,
-            t.waste / 3600.0
-        ));
+        if has_compute {
+            let cpu_eff = if t.cpu_observed_alloc > 0.0 {
+                format!("{:.0}%", 100.0 * t.cpu_busy / t.cpu_observed_alloc)
+            } else {
+                "?".into()
+            };
+            let ram = if t.ram_used_gib_sec > 0.0 || t.ram_alloc_gib_sec > 0.0 {
+                format!(
+                    "{:.0}/{:.0}Gh",
+                    t.ram_used_gib_sec / 3600.0,
+                    t.ram_alloc_gib_sec / 3600.0
+                )
+            } else {
+                "?".into()
+            };
+            out.push_str(&format!(
+                "{name:<16}{:>9.1}h{:>9.1}h{efficiency:>8}{:>9.1}h{:>10.1}h{:>10.1}h{cpu_eff:>8}{ram:>13}\n",
+                t.alloc / 3600.0,
+                t.busy / 3600.0,
+                t.waste / 3600.0,
+                t.cpu_alloc / 3600.0,
+                t.cpu_busy / 3600.0,
+            ));
+        } else {
+            out.push_str(&format!(
+                "{name:<16}{:>9.1}h{:>9.1}h{efficiency:>8}{:>9.1}h\n",
+                t.alloc / 3600.0,
+                t.busy / 3600.0,
+                t.waste / 3600.0
+            ));
+        }
+    };
+    if rows.is_empty() {
+        out.push_str("(no matching usage records in window)\n");
+    } else {
+        for (name, t) in &rows {
+            total.alloc += t.alloc;
+            total.busy += t.busy;
+            total.observed_alloc += t.observed_alloc;
+            total.waste += t.waste;
+            total.cpu_alloc += t.cpu_alloc;
+            total.cpu_busy += t.cpu_busy;
+            total.cpu_observed_alloc += t.cpu_observed_alloc;
+            total.ram_alloc_gib_sec += t.ram_alloc_gib_sec;
+            total.ram_used_gib_sec += t.ram_used_gib_sec;
+            total.ram_observed_sec += t.ram_observed_sec;
+            format_row(&mut out, name, t);
+        }
+        if rows.len() > 1 {
+            format_row(&mut out, "TOTAL", &total);
+        }
     }
     out.push_str("\nalloc = max(sampled, sacct); busy/eff exclude unobserved telemetry.\n");
     out
@@ -345,7 +588,7 @@ pub fn save_json(path: &Path, raw: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Gpu;
+    use crate::model::{Gpu, Job};
     #[test]
     fn merging_keeps_efficiency_on_the_observed_denominator() {
         let raw = json!({"days":{"2026-07-01":{"alice":{"alloc":100,"busy":60,"observed_alloc":80}}},"sacct_days":{"2026-07-01":{"alice":900,"bob":12}}});
@@ -381,5 +624,68 @@ mod tests {
         store.path = tmp.path().join("usage.json");
         assert!(store.checkpoint(4.0, false).unwrap());
         assert!(!store.dirty);
+    }
+    #[test]
+    fn shared_gpu_cpu_and_ram_usage_and_sacct_backfill_are_tracked() {
+        let tmp = tempfile::tempdir().unwrap();
+        runtime::secure_dir(tmp.path(), 0o700).unwrap();
+        let mut store = Store::load(tmp.path().join("usage.json"), &[]);
+        let now = runtime::now();
+        let node = Node {
+            name: "gpu1".into(),
+            gpus: vec![Gpu {
+                index: "0".into(),
+                util: "80".into(),
+                alloc_user: "alice".into(),
+                alloc_users: vec!["alice".into(), "bob".into()],
+                ..Default::default()
+            }],
+            jobs: vec![
+                Job {
+                    jobid: "1".into(),
+                    user: "alice".into(),
+                    cpu_count: 4,
+                    mem: "8G".into(),
+                    telemetry: BTreeMap::from([(
+                        "gpu1".into(),
+                        json!({"observed_at": now + 10.0, "cpu_cores": 2.0, "mem_current_mib": 4096.0}),
+                    )]),
+                    ..Default::default()
+                },
+                Job {
+                    jobid: "2".into(),
+                    user: "charlie".into(),
+                    cpu_count: 8,
+                    mem: "16G".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        store.sample(std::slice::from_ref(&node), now);
+        store.sample(&[node], now + 10.0);
+        let (users, _) = merge(&store.raw, |_| true);
+        assert_eq!(users["alice"].alloc, 5.0);
+        assert_eq!(users["bob"].alloc, 5.0);
+        assert_eq!(users["alice"].cpu_alloc, 40.0);
+        assert_eq!(users["alice"].cpu_busy, 20.0);
+        assert_eq!(users["alice"].cpu_observed_alloc, 40.0);
+        assert_eq!(users["alice"].ram_alloc_gib_sec, 80.0);
+        assert_eq!(users["alice"].ram_used_gib_sec, 40.0);
+        assert_eq!(users["charlie"].cpu_alloc, 80.0);
+
+        let date = Local.timestamp_opt(now as i64, 0).single().unwrap();
+        let day_start = date.format("%Y-%m-%dT00:00:00").to_string();
+        let day_mid = date.format("%Y-%m-%dT00:10:00").to_string();
+        store
+            .backfill(
+                &format!("charlie|cpu=16,mem=32G,node=1|{day_start}|{day_mid}\n"),
+                now + 3600.0,
+            )
+            .unwrap();
+        let (backfilled, _) = merge(&store.raw, |_| true);
+        assert!((backfilled["charlie"].cpu_alloc - 9600.0).abs() < 1e-6);
+        assert!((backfilled["charlie"].ram_alloc_gib_sec - 19200.0).abs() < 1e-6);
+        assert!(render(&store.raw, 7, false).contains("cpu_alloc"));
     }
 }

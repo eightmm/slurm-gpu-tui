@@ -17,10 +17,11 @@ Important series include:
 | `sgpu_node_data_age_seconds`, `sgpu_node_scheduler_age_seconds` | Observation ages; -1 means unknown |
 | `sgpu_gpus_total`, `sgpu_gpus_allocated`, `sgpu_gpus_free` | GPU inventory/allocation/schedulable free capacity |
 | `sgpu_jobs_running`, `sgpu_jobs_pending` | Full snapshot counts |
-| `sgpu_gpu_*`, `sgpu_node_*` | GPU utilization/health, RAM, CPU, PSI, power and identity |
-| `sgpu_job_*` | Validated job resources, requested RAM/fair-share and observation coverage |
+| `sgpu_gpu_*`, `sgpu_node_*` | GPU utilization/health, RAM, CPU, PSI, power and identity; `sgpu_gpu_allocated` joins co-owners on shared GPUs |
+| `sgpu_gpu_job_info` | Per-(node, gpu, user, jobid, jobname) allocation mapping across exclusive and shared GPUs |
+| `sgpu_job_*` | Validated job resources, node-local requested RAM/fair-share (`sgpu_job_mem_mib`, `sgpu_job_mem_fair_ratio`), OOM kills and coverage |
 | `sgpu_pending_job_info`, `sgpu_pending_wait_seconds` | Bounded per-job pending details |
-| `sgpu_collector_*`, `sgpu_command_*` | Cycle/phase duration, bounded queue depths and fixed-label local command counters |
+| `sgpu_collector_*`, `sgpu_command_*` | Cycle/phase duration (`collect`, `logs`, `write`, `idle`, `usage`, `metrics`, `notify`), bounded queue depths and fixed-label local command counters |
 | `sgpu_master_*` | Local master's CPU, memory, disk, network, filesystem and hardware observations |
 
 Unsupported, unverified or stale optional measurements are omitted; they are

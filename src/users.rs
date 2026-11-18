@@ -2,9 +2,10 @@ use crate::{
     model::{Snapshot, json_number, number},
     rules, scheduler,
 };
+use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize)]
 pub struct Measure {
     pub value: f64,
     pub samples: usize,
@@ -34,7 +35,7 @@ impl Measure {
         }
     }
 }
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize)]
 pub struct User {
     pub name: String,
     pub running: usize,
@@ -152,7 +153,7 @@ pub fn summarize(data: &Snapshot, now: f64, user: &str, partition: &str) -> Vec<
             row.gpus += node
                 .gpus
                 .iter()
-                .filter(|g| g.alloc_user == row.name && row.jobs.contains(&g.alloc_jobid))
+                .filter(|g| g.job_ids().iter().any(|id| row.jobs.contains(*id)))
                 .count();
             let fresh = !node.stale && rules::telemetry_fresh(node.telemetry_observed_at, now);
             for (key, target) in [("net_rx_bps", &mut row.rx), ("net_tx_bps", &mut row.tx)] {
@@ -258,7 +259,7 @@ pub fn attention_in_partition(
             let included = if waste.jobid.is_empty() {
                 node.partition.split(',').any(|p| p == partition)
             } else {
-                included_jobs.contains(waste.jobid.as_str())
+                waste.jobid.split(',').any(|id| included_jobs.contains(id))
             };
             if !included {
                 continue;
@@ -275,8 +276,9 @@ pub fn attention_in_partition(
         ) {
             continue;
         }
-        let user = if !node.gpus[index].alloc_user.is_empty() {
-            node.gpus[index].alloc_user.clone()
+        let alloc_users = node.gpus[index].alloc_users_display();
+        let user = if !alloc_users.is_empty() {
+            alloc_users
         } else if waste.user.is_empty() {
             "(unattributed)".into()
         } else {
@@ -443,5 +445,51 @@ mod tests {
         data.nodes[0].gpus[0].util = "0".into();
         data.nodes[0].stale = true;
         assert!(attention(&data, 600, now).is_empty());
+    }
+    #[test]
+    fn shared_gpu_attributes_each_co_scheduled_user() {
+        let now = crate::runtime::now();
+        let data = Snapshot {
+            nodes: vec![Node {
+                name: "gpu1".into(),
+                state: "allocated".into(),
+                partition: "gpu".into(),
+                gpus: vec![Gpu {
+                    index: "0".into(),
+                    util: "0".into(),
+                    alloc_jobid: "1".into(),
+                    alloc_user: "alice".into(),
+                    alloc_jobids: vec!["1".into(), "2".into()],
+                    alloc_users: vec!["alice".into(), "bob".into()],
+                    idle_sec: 1200,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            jobs: vec![
+                Job {
+                    jobid: "1".into(),
+                    user: "alice".into(),
+                    partition: "gpu".into(),
+                    node: "gpu1".into(),
+                    ..Default::default()
+                },
+                Job {
+                    jobid: "2".into(),
+                    user: "bob".into(),
+                    partition: "gpu".into(),
+                    node: "gpu1".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let rows = summarize(&data, now, "", "");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].gpus, 1);
+        assert_eq!(rows[1].gpus, 1);
+        let attn = attention(&data, 600, now);
+        assert_eq!(attn.len(), 1);
+        assert_eq!(attn[0].user, "alice,bob");
     }
 }

@@ -158,7 +158,7 @@ pub fn format(snapshot: &Snapshot, now: f64) -> String {
         let classes = rules::classes(node, now);
         for (gpu, class) in node.gpus.iter().zip(classes) {
             total += 1;
-            if !gpu.alloc_jobid.is_empty() || !gpu.alloc_user.is_empty() {
+            if gpu.has_alloc() {
                 allocated += 1;
             }
             if class == Class::Free {
@@ -206,24 +206,25 @@ pub fn format(snapshot: &Snapshot, now: f64) -> String {
             {
                 out.emit("sgpu_gpu_mem_used_percent", &labels, used / total * 100.0);
             }
+            let alloc_users = gpu.alloc_users_display();
             out.emit(
                 "sgpu_gpu_allocated",
                 &[
                     ("node", &node.name),
                     ("gpu", &gpu.index),
-                    ("user", &gpu.alloc_user),
+                    ("user", &alloc_users),
                 ],
-                f64::from(!gpu.alloc_jobid.is_empty() || !gpu.alloc_user.is_empty()),
+                f64::from(gpu.has_alloc()),
             );
-            if !gpu.alloc_jobid.is_empty() {
-                let job = snapshot.jobs.iter().find(|j| j.jobid == gpu.alloc_jobid);
+            for jobid in gpu.job_ids() {
+                let job = snapshot.jobs.iter().find(|j| j.jobid == jobid);
                 out.emit(
                     "sgpu_gpu_job_info",
                     &[
                         ("node", &node.name),
                         ("gpu", &gpu.index),
-                        ("user", &gpu.alloc_user),
-                        ("jobid", &gpu.alloc_jobid),
+                        ("user", job.map(|j| j.user.as_str()).unwrap_or(&alloc_users)),
+                        ("jobid", jobid),
                         ("jobname", job.map(|j| j.jobname.as_str()).unwrap_or("")),
                     ],
                     1.0,
@@ -268,28 +269,50 @@ pub fn format(snapshot: &Snapshot, now: f64) -> String {
         }
     }
     for job in &snapshot.jobs {
-        let memory = scheduler::mem_mib(&job.mem, job.cpu_count.max(1));
-        if let Some(node) = snapshot.nodes.iter().find(|n| n.name == job.node)
-            && job.gpu_count > 0
-            && !node.gpus.is_empty()
-            && let Some((mem, total)) = memory
-                .zip(number(&node.mem_total))
-                .filter(|(m, t)| *m > 0.0 && *t > 0.0)
-        {
-            let labels = [
-                ("jobid", job.jobid.as_str()),
-                ("user", job.user.as_str()),
-                ("node", node.name.as_str()),
-                ("gpus", &job.gpu_count.to_string()),
-            ];
-            out.emit("sgpu_job_mem_mib", &labels, mem);
-            out.emit(
-                "sgpu_job_mem_fair_ratio",
-                &labels,
-                mem / (total * job.gpu_count as f64 / node.gpus.len() as f64),
-            );
-        }
         let expected = scheduler::expand_nodes(&job.node).unwrap_or_default();
+        let node_count = expected.len().max(1);
+        for node_name in &expected {
+            if let Some(node) = snapshot.nodes.iter().find(|n| n.name == *node_name)
+                && !node.gpus.is_empty()
+            {
+                let assigned = node.gpus.iter().filter(|g| g.has_job(&job.jobid)).count() as u32;
+                let node_gpus = if assigned > 0 {
+                    assigned
+                } else if node_count <= 1 || !node.gpus.iter().any(|g| g.has_alloc()) {
+                    job.gpu_count
+                } else {
+                    0
+                };
+                if node_gpus == 0 {
+                    continue;
+                }
+                let node_cpus = node
+                    .jobs
+                    .iter()
+                    .find(|j| j.jobid == job.jobid)
+                    .map(|j| j.cpu_count)
+                    .unwrap_or_else(|| (job.cpu_count / node_count as u32).max(1))
+                    .max(1);
+                if let Some((mem, total)) = scheduler::mem_mib(&job.mem, node_cpus)
+                    .zip(number(&node.mem_total))
+                    .filter(|(m, t)| *m > 0.0 && *t > 0.0)
+                {
+                    let gpus_text = node_gpus.to_string();
+                    let labels = [
+                        ("jobid", job.jobid.as_str()),
+                        ("user", job.user.as_str()),
+                        ("node", node.name.as_str()),
+                        ("gpus", &gpus_text),
+                    ];
+                    out.emit("sgpu_job_mem_mib", &labels, mem);
+                    out.emit(
+                        "sgpu_job_mem_fair_ratio",
+                        &labels,
+                        mem / (total * node_gpus as f64 / node.gpus.len() as f64),
+                    );
+                }
+            }
+        }
         for (node, sample) in &job.telemetry {
             if !expected.contains(node)
                 || !snapshot.nodes.iter().any(|n| {
@@ -328,7 +351,7 @@ pub fn format(snapshot: &Snapshot, now: f64) -> String {
         for (phase, value) in phases {
             if matches!(
                 phase.as_str(),
-                "collect" | "write" | "idle" | "usage" | "metrics" | "notify"
+                "collect" | "logs" | "write" | "idle" | "usage" | "metrics" | "notify"
             ) && let Some(value) = json_number(value)
             {
                 out.emit("sgpu_collector_phase_seconds", &[("phase", phase)], value);
@@ -600,5 +623,95 @@ mod tests {
         assert!(text.contains("sgpu_gpu_mem_total_mib{"));
         assert!(text.contains("sgpu_gpus_free 0\n"));
         assert!(text.contains("sgpu_gpus_idle 0\n"));
+    }
+    #[test]
+    fn multinode_job_memory_uses_node_local_shares_and_exports_shared_gpu_jobs() {
+        let data = Snapshot {
+            nodes: vec![
+                Node {
+                    name: "gpu1".into(),
+                    mem_total: "65536".into(),
+                    jobs: vec![crate::model::Job {
+                        jobid: "42".into(),
+                        cpu_count: 2,
+                        gpu_count: 2,
+                        ..Default::default()
+                    }],
+                    gpus: vec![
+                        Gpu {
+                            index: "0".into(),
+                            util: "50".into(),
+                            alloc_jobid: "42".into(),
+                            alloc_user: "alice".into(),
+                            alloc_jobids: vec!["42".into(), "43".into()],
+                            alloc_users: vec!["alice".into(), "bob".into()],
+                            ..Default::default()
+                        },
+                        Gpu {
+                            index: "1".into(),
+                            util: "50".into(),
+                            alloc_jobid: "42".into(),
+                            alloc_user: "alice".into(),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+                Node {
+                    name: "gpu2".into(),
+                    mem_total: "131072".into(),
+                    jobs: vec![crate::model::Job {
+                        jobid: "42".into(),
+                        cpu_count: 4,
+                        gpu_count: 1,
+                        ..Default::default()
+                    }],
+                    gpus: (0..4)
+                        .map(|i| Gpu {
+                            index: i.to_string(),
+                            util: "10".into(),
+                            alloc_jobid: if i == 0 { "42".into() } else { "99".into() },
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+            ],
+            jobs: vec![
+                crate::model::Job {
+                    jobid: "42".into(),
+                    user: "alice".into(),
+                    node: "gpu[1-2]".into(),
+                    cpu_count: 6,
+                    gpu_count: 2,
+                    mem: "4Gc".into(),
+                    ..Default::default()
+                },
+                crate::model::Job {
+                    jobid: "43".into(),
+                    user: "bob".into(),
+                    node: "gpu1".into(),
+                    cpu_count: 1,
+                    gpu_count: 1,
+                    ..Default::default()
+                },
+            ],
+            collector: serde_json::json!({"phase_seconds":{"collect":0.1,"logs":0.2}}),
+            ..Default::default()
+        };
+        let text = format(&data, 100.0);
+        assert!(text.contains(
+            "sgpu_job_mem_mib{jobid=\"42\",user=\"alice\",node=\"gpu1\",gpus=\"2\"} 8192"
+        ));
+        assert!(text.contains(
+            "sgpu_job_mem_mib{jobid=\"42\",user=\"alice\",node=\"gpu2\",gpus=\"1\"} 16384"
+        ));
+        assert!(text.contains(
+            "sgpu_gpu_job_info{node=\"gpu1\",gpu=\"0\",user=\"alice\",jobid=\"42\",jobname=\"\"} 1"
+        ));
+        assert!(text.contains(
+            "sgpu_gpu_job_info{node=\"gpu1\",gpu=\"0\",user=\"bob\",jobid=\"43\",jobname=\"\"} 1"
+        ));
+        assert!(text.contains("sgpu_collector_phase_seconds{phase=\"logs\"} 0.2"));
     }
 }

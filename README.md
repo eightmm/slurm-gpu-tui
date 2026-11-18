@@ -68,29 +68,34 @@ sgpu explain 12345      # Pending facts, interpretation and node headroom
 sgpu me                 # My jobs and usage
 sgpu users              # Per-user resources
 sgpu host               # Controller resources
-sgpu usage 7 --daily     # GPU-hours
-sgpu logs 12345 -e -f    # Follow stderr
-sgpu doctor             # Collection checks
+sgpu usage 7 --daily    # GPU/CPU/RAM usage
+sgpu fit 1 --nodes 2    # Multi-node fit (--cpu-only for CPU jobs)
+sgpu logs 12345 -e -f   # Follow stderr (with finished-job WorkDir fallback)
+sgpu doctor             # Collection, PID, and shared-dir checks
 sgpu welcome            # Short login overview, published data only
 ```
 
 | Control | Action |
 |---|---|
-| `1`–`7` | GPU / CPU / Usage / Jobs / Attention / Users / Host |
-| Click `↕` · `s` / `S` | Jobs header sorting · cycle sort / reverse |
+| `1`–`8` | GPU / CPU / Usage / Jobs / Attention / Users / Host / Partitions |
+| Click `↕` · `s` / `S` | Header sorting (GPU / CPU / Usage / Jobs / Users / Partitions) · reverse |
 | `u` / `p` / `m` | User / partition / highlighted-account filters |
 | `U` / `P` | Search and select a user / partition |
 | `E` / `F` | Explain pending job / my 24h failure report |
-| `v` in Jobs | All / running / pending |
-| `/` / `0` | Search / reset filters |
-| Enter / Tab | Details / script and log tabs |
+| `v` (Jobs / Usage) | Jobs: all / running / pending · Usage: user / daily |
+| `D` in Usage | Cycle 7d / 14d / 30d window |
+| `/` / `0` | Search (supports 2-bulsik Korean IME) / reset filters |
+| Enter / Tab | Summary / Raw / Script / StdOut / StdErr detail panes |
 | Right-click / `a` | Actions menu: mouse click or arrows + Enter |
-| `J` / Esc | Related Jobs from GPU, CPU, Users or Attention / return |
+| `J` / Esc | Related Jobs from GPU, CPU, Users, Attention or Partitions / return |
 | `?` / `q` | Full help / quit |
 
-Use `sgpu --help` for all commands. Highlight an account with `sgpu --highlight-user alice`;
-permissions still follow the executing account. All three `chk*` commands share
-`--color auto|always|never`, respect `NO_COLOR`, and omit colors in pipes by default.
+Use `sgpu --help` for all commands. Structured `--json` output is supported on
+`doctor`, `host`, `users`, `me`, `explain`, `waste`, `usage`, `jobs`, `report`,
+`fit`, `queue`, and `failures`. Highlight an account with
+`sgpu --highlight-user alice`; permissions still follow the executing account. All
+three `chk*` commands share `--color auto|always|never`, respect `NO_COLOR`, and
+omit colors in pipes by default.
 Cyan headings · green own jobs/clear results · yellow waiting/stopped · red failures/full capacity · grey context.
 JSON stays uncolored, including with `--color always`.
 

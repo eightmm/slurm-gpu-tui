@@ -741,3 +741,195 @@ fn interactive_terminal_opens_handles_tabs_and_restores_terminal_mode() {
         after.c_lflag & (libc::ICANON | libc::ECHO)
     );
 }
+
+#[test]
+fn json_subcommands_fit_options_and_doctor_diagnostics_follow_contracts() {
+    let fixture = Fixture::new();
+    let path = fixture.data.join("data.json");
+    let mut snapshot: Snapshot = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let mut gpu2 = snapshot.nodes[0].clone();
+    gpu2.name = "gpu2".into();
+    let cpu1 = Node {
+        name: "cpu1".into(),
+        state: "idle".into(),
+        partition: "cpu".into(),
+        source: "agent".into(),
+        has_gpu: false,
+        cpus: "64".into(),
+        cpu_alloc: "8".into(),
+        scheduler_mem_total: "262144".into(),
+        mem_alloc: "32768".into(),
+        ..Default::default()
+    };
+    snapshot.nodes.push(gpu2);
+    snapshot.nodes.push(cpu1);
+    fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+
+    let agents_dir = fixture.root.path().join("agents");
+    fs::create_dir(&agents_dir).unwrap();
+    fs::set_permissions(&agents_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(agents_dir.join("gpu1.json"), b"{}").unwrap();
+    let stale_payload = agents_dir.join("gpu2.json");
+    fs::write(&stale_payload, b"{}").unwrap();
+    let old = std::time::SystemTime::now() - Duration::from_secs(120);
+    fs::File::open(&stale_payload)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(old))
+        .unwrap();
+    fs::write(fixture.data.join("metrics.prom"), "# dummy\n").unwrap();
+
+    let doctor_out = successful(fixture.run(&["doctor", "--json"]));
+    assert!(!doctor_out.contains('\x1b'));
+    let doctor_json: serde_json::Value = serde_json::from_str(&doctor_out).unwrap();
+    assert_eq!(doctor_json["ok"], true);
+    assert_eq!(doctor_json["problems"], 0);
+    assert_eq!(doctor_json["data_file"]["exists"], true);
+    assert_eq!(doctor_json["metrics_file"]["exists"], true);
+    assert_eq!(doctor_json["agent_dir"]["exists"], true);
+    assert_eq!(doctor_json["agent_dir"]["fresh_payloads"], 1);
+    assert_eq!(doctor_json["agent_dir"]["stale_payloads"], 1);
+    let calls = fs::read_to_string(fixture.root.path().join("calls")).unwrap();
+    assert_eq!(calls.lines().collect::<Vec<_>>(), ["sinfo", "sacct"]);
+
+    for (args, key) in [
+        (vec!["host", "--json"], "rows"),
+        (vec!["users", "--json"], "users"),
+        (vec!["me", "--json"], "running"),
+        (vec!["explain", "43", "--json"], "nodes"),
+        (vec!["waste", "--json"], "waste"),
+        (vec!["usage", "7", "--json"], "users"),
+        (vec!["jobs", "7", "--json"], "jobs"),
+    ] {
+        let out = successful(fixture.run(&args));
+        assert!(!out.contains('\x1b'), "ANSI leak in {args:?}");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["version"], 1, "{args:?}");
+        assert!(!parsed[key].is_null(), "missing {key} in {args:?}");
+    }
+
+    let month = chrono::Local::now().format("%Y-%m").to_string();
+    let report_out = successful(fixture.run(&["report", &month, "--json"]));
+    assert!(!report_out.contains('\x1b'));
+    let report_json: serde_json::Value = serde_json::from_str(&report_out).unwrap();
+    assert_eq!(report_json["month"], month);
+    assert!(report_json["users"].is_object() && report_json["daily"].is_object());
+
+    let explain_json: serde_json::Value =
+        serde_json::from_str(&successful(fixture.run(&["explain", "43", "--json"]))).unwrap();
+    assert_eq!(explain_json["job"]["jobid"], "43");
+    assert_eq!(explain_json["reason_full"], "Resources");
+    assert_eq!(explain_json["nodes"].as_array().unwrap().len(), 3);
+
+    let fit_cpu: serde_json::Value = serde_json::from_str(&successful(fixture.run(&[
+        "fit",
+        "--cpu-only",
+        "--cpus",
+        "8",
+        "--ram",
+        "16",
+        "--json",
+    ])))
+    .unwrap();
+    assert_eq!(fit_cpu["satisfied"], true);
+    let cpu_sbatch = fit_cpu["sbatch"].as_str().unwrap();
+    assert!(cpu_sbatch.contains("-p cpu") && !cpu_sbatch.contains("--gres=gpu"));
+
+    let fit_multi: serde_json::Value = serde_json::from_str(&successful(
+        fixture.run(&["fit", "1", "--nodes", "2", "--cpus", "4", "--json"]),
+    ))
+    .unwrap();
+    assert_eq!(fit_multi["satisfied"], true);
+    let multi_sbatch = fit_multi["sbatch"].as_str().unwrap();
+    assert!(multi_sbatch.contains("-N 2") && multi_sbatch.contains("--gres=gpu:1"));
+    assert!(multi_sbatch.contains("gpu1,gpu2"));
+
+    let fit_miss = fixture.run(&["fit", "1", "--nodes", "3", "--json"]);
+    assert_eq!(fit_miss.status.code(), Some(1));
+    let miss_json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(fit_miss.stdout).unwrap()).unwrap();
+    assert_eq!(miss_json["satisfied"], false);
+    assert!(miss_json["sbatch"].is_null());
+
+    snapshot.nodes[0].gpus[0].alloc_user = fixture.user.clone();
+    snapshot.nodes[0].gpus[0].alloc_jobid = "42".into();
+    snapshot.nodes[0].gpus[0].alloc_jobids = vec!["42".into()];
+    snapshot.nodes[0].gpus[0].alloc_users = vec![fixture.user.clone()];
+    snapshot.nodes[0].gpus[0].idle_sec = 1200;
+    fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    let waste_hit = fixture.run(&["waste", "--verbose", "--json"]);
+    assert_eq!(waste_hit.status.code(), Some(1));
+    let waste_json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(waste_hit.stdout).unwrap()).unwrap();
+    assert_eq!(waste_json["waste"].as_array().unwrap().len(), 1);
+    assert!(waste_json["waste"][0]["details"]["42"].is_string());
+
+    let mut exited = Command::new("/bin/true").spawn().unwrap();
+    let dead_pid = exited.id();
+    let _ = exited.wait();
+    let pid_file = fixture.data.join("collector.pid");
+    fs::write(&pid_file, format!("{dead_pid}\n")).unwrap();
+    fs::set_permissions(&pid_file, fs::Permissions::from_mode(0o600)).unwrap();
+    let stale_doctor = fixture.run(&["doctor", "--json"]);
+    assert_eq!(stale_doctor.status.code(), Some(1));
+    let stale_doctor_json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(stale_doctor.stdout).unwrap()).unwrap();
+    assert_eq!(stale_doctor_json["collector_pid"]["status"], "stale");
+}
+
+#[test]
+fn logs_falls_back_to_sacct_workdir_and_enforces_owner_and_symlink_guards() {
+    let fixture = Fixture::new();
+    let uid = runtime::euid();
+    let workdir = fixture.root.path().join("jobwork");
+    fs::create_dir(&workdir).unwrap();
+    let out_path = workdir.join("slurm-55.out");
+    let err_path = workdir.join("slurm-55.err");
+    fs::write(&out_path, "stdout from sacct fallback\n").unwrap();
+
+    let scontrol_path = fixture.bin.join("scontrol");
+    fs::write(&scontrol_path, "#!/bin/sh\nprintf '{\"jobs\":[]}\\n'\n").unwrap();
+    let sacct_path = fixture.bin.join("sacct");
+    let write_sacct = |row: String| {
+        fs::write(
+            &sacct_path,
+            format!("#!/bin/sh\ncase \"$*\" in --version) echo 'slurm fixture';; *) printf '%s\\n' '{row}';; esac\n"),
+        )
+        .unwrap();
+    };
+    write_sacct(format!("55|{uid}|{}", workdir.display()));
+
+    assert_eq!(
+        successful(fixture.run(&["logs", "55"])),
+        "stdout from sacct fallback\n"
+    );
+    let merged_err = fixture.run(&["logs", "55", "-e"]);
+    assert!(merged_err.status.success());
+    assert_eq!(
+        String::from_utf8(merged_err.stdout).unwrap(),
+        "stdout from sacct fallback\n"
+    );
+    assert!(String::from_utf8_lossy(&merged_err.stderr).contains("stderr is merged into stdout"));
+
+    fs::write(&err_path, "stderr from sacct fallback\n").unwrap();
+    let separate_err = fixture.run(&["logs", "55", "-e"]);
+    assert!(separate_err.status.success());
+    assert_eq!(
+        String::from_utf8(separate_err.stdout).unwrap(),
+        "stderr from sacct fallback\n"
+    );
+    assert!(
+        !String::from_utf8_lossy(&separate_err.stderr).contains("stderr is merged into stdout")
+    );
+
+    fs::remove_file(&out_path).unwrap();
+    std::os::unix::fs::symlink("/etc/passwd", &out_path).unwrap();
+    assert!(!fixture.run(&["logs", "55"]).status.success());
+
+    fs::remove_file(&out_path).unwrap();
+    fs::write(&out_path, "stdout from sacct fallback\n").unwrap();
+    write_sacct(format!("55|{}|{}", uid + 1, workdir.display()));
+    assert!(!fixture.run(&["logs", "55"]).status.success());
+
+    write_sacct(format!("55|{uid}|relative/workdir"));
+    assert!(!fixture.run(&["logs", "55"]).status.success());
+}

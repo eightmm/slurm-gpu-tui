@@ -29,6 +29,7 @@ impl Cluster {
         let trace = root.path().join("calls");
         fs::create_dir(&bin).unwrap();
         fs::create_dir(&agents).unwrap();
+        fs::set_permissions(&agents, fs::Permissions::from_mode(0o755)).unwrap();
         let user = "fixture";
         let uid = runtime::euid();
         let json=serde_json::json!({"jobs":[{"job_id":42,"user_name":user,"user_id":uid,"job_state":["RUNNING"],"name":"train","nodes":"gpu1","job_resources":{"nodes":{"allocation":[{"index":0,"name":"gpu1"}]}},"gres_detail":["gpu:h100:1(IDX:0)"],"standard_output":"/private/owner/log","current_working_directory":"/private/owner"}]}).to_string();

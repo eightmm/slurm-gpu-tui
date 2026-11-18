@@ -399,6 +399,62 @@ fn mount_path(raw: &str) -> Option<String> {
     }
     Some(out)
 }
+pub fn is_shared_fs(fstype: &str) -> bool {
+    matches!(
+        fstype,
+        "nfs"
+            | "nfs4"
+            | "lustre"
+            | "gpfs"
+            | "beegfs"
+            | "weka"
+            | "wekafs"
+            | "ceph"
+            | "panfs"
+            | "fuse.lustre"
+            | "fuse.wekafs"
+    )
+}
+pub fn mount_fstype(path: &std::path::Path) -> Option<(String, String, bool)> {
+    let target = std::fs::canonicalize(path)
+        .or_else(|_| {
+            path.parent()
+                .map(std::fs::canonicalize)
+                .transpose()
+                .map(|p| p.unwrap_or_else(|| path.to_path_buf()))
+        })
+        .unwrap_or_else(|_| path.to_path_buf());
+    let target_str = target.to_string_lossy();
+    let raw = runtime::read_regular(
+        &PathBuf::from(format!("/proc/{}/mounts", std::process::id())),
+        1024 * 1024,
+        None,
+    )
+    .ok()
+    .and_then(|(b, _)| String::from_utf8(b).ok())?;
+    let mut best: Option<(usize, String, String)> = None;
+    for line in raw.lines().take(4096) {
+        let p: Vec<_> = line.split_whitespace().collect();
+        if p.len() < 3 {
+            continue;
+        }
+        let Some(mount) = mount_path(p[1]) else {
+            continue;
+        };
+        let matches = mount == "/"
+            || target_str == mount
+            || target_str
+                .strip_prefix(&mount)
+                .is_some_and(|rest| rest.starts_with('/'));
+        if matches && best.as_ref().is_none_or(|(len, _, _)| mount.len() > *len) {
+            best = Some((mount.len(), mount, p[2].to_string()));
+        }
+    }
+    best.map(|(_, mount, fstype)| {
+        let shared = is_shared_fs(&fstype);
+        (mount, fstype, shared)
+    })
+}
 pub fn storage(users: &BTreeMap<String, u32>) -> Value {
     let mut users = users.clone();
     let mut truncated = users.len() > 128;
@@ -431,12 +487,15 @@ pub fn storage(users: &BTreeMap<String, u32>) -> Value {
     truncated |= raw.lines().count() > 4096;
     for line in raw.lines().take(4096) {
         let p: Vec<_> = line.split_whitespace().collect();
-        if p.len() < 3
-            || !matches!(
-                p[2],
-                "ext2" | "ext3" | "ext4" | "xfs" | "btrfs" | "zfs" | "overlay"
-            )
-        {
+        if p.len() < 3 {
+            continue;
+        }
+        let is_local = matches!(
+            p[2],
+            "ext2" | "ext3" | "ext4" | "xfs" | "btrfs" | "zfs" | "overlay"
+        );
+        let is_network = is_shared_fs(p[2]);
+        if !is_local && !is_network {
             continue;
         }
         let Some(mount) = mount_path(p[1]) else {
@@ -449,7 +508,7 @@ pub fn storage(users: &BTreeMap<String, u32>) -> Value {
         if !devices.insert(st.dev()) {
             continue;
         }
-        if out.len() >= 16 {
+        if out.len() >= 32 {
             truncated = true;
             break;
         }
@@ -464,7 +523,11 @@ pub fn storage(users: &BTreeMap<String, u32>) -> Value {
         }
         let stats = unsafe { stats.assume_init() };
         let mut quotas = json!({});
-        if let Ok(device) = CString::new(p[0]) {
+        if is_local
+            && p[2] != "overlay"
+            && p[0].starts_with("/dev/")
+            && let Ok(device) = CString::new(p[0])
+        {
             for (name, uid) in users.iter().take(128) {
                 let mut quota = std::mem::MaybeUninit::<libc::dqblk>::zeroed();
                 let command = ((libc::Q_GETQUOTA as u32) << 8) | libc::USRQUOTA as u32;

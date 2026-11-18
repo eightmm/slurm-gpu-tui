@@ -1,8 +1,10 @@
 use crate::{model::json_number as number, rules, users};
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Level {
     Info,
     Good,
@@ -11,6 +13,7 @@ pub enum Level {
     Critical,
     Unknown,
 }
+#[derive(Serialize)]
 pub struct Row {
     pub key: String,
     pub cells: Vec<String>,
@@ -353,7 +356,7 @@ pub fn rows(host: &Value, collector: &Value, history: &History, now: f64) -> Vec
             .as_array()
             .into_iter()
             .flatten()
-            .take(16)
+            .take(32)
         {
             let mount = fs["mount"].as_str().unwrap_or("?");
             let used = number(&fs["used_bytes"]);

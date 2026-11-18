@@ -146,6 +146,19 @@ pub fn secure_dir(path: &Path, mode: u32) -> Result<()> {
     check_directory(&file, false)
 }
 
+pub fn prepare_agent_dir(path: &Path) -> Result<()> {
+    let existed = fs::symlink_metadata(path).is_ok();
+    fs::create_dir_all(path)?;
+    if !existed {
+        let file = open_directory(path)?;
+        let st = file.metadata()?;
+        if st.uid() == euid() && unsafe { libc::fchmod(file.as_raw_fd(), 0o755) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
+}
+
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static TEMP_NAMESPACE: OnceLock<u64> = OnceLock::new();
 

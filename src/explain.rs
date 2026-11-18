@@ -3,6 +3,29 @@ use crate::{
     model::{Node, PendingJob, Snapshot, number},
     rules, runtime,
 };
+use serde::Serialize;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct NodeObservation {
+    pub node: String,
+    pub partition: String,
+    pub fresh: bool,
+    pub has_gpu: bool,
+    pub free_gpus: Option<usize>,
+    pub free_cpus: Option<f64>,
+    pub free_ram_gib: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Report {
+    pub version: u32,
+    pub job: PendingJob,
+    pub reason_full: String,
+    pub interpretation: String,
+    pub wait_seconds: Option<u64>,
+    pub snapshot: String,
+    pub nodes: Vec<NodeObservation>,
+}
 
 fn meaning(reason: &str) -> &'static str {
     if reason.starts_with("DependencyNeverSatisfied") {
@@ -34,11 +57,16 @@ fn meaning(reason: &str) -> &'static str {
     }
 }
 
-fn headroom(total: &str, allocated: &str, scale: f64) -> String {
+fn headroom_num(total: &str, allocated: &str, scale: f64) -> Option<f64> {
     number(total)
         .zip(number(allocated))
         .filter(|(total, used)| *total >= 0.0 && *used >= 0.0)
-        .map(|(total, used)| format!("{:.1}", (total - used).max(0.0) / scale))
+        .map(|(total, used)| (total - used).max(0.0) / scale)
+}
+
+fn headroom(total: &str, allocated: &str, scale: f64) -> String {
+    headroom_num(total, allocated, scale)
+        .map(|v| format!("{v:.1}"))
         .unwrap_or_else(|| "?".into())
 }
 
@@ -48,6 +76,54 @@ fn partitions_match(node: &Node, requested: &str) -> bool {
             .partition
             .split(',')
             .any(|part| requested.split(',').any(|want| part == want))
+}
+
+pub fn report(data: &Snapshot, job: &PendingJob) -> Report {
+    let now = runtime::now();
+    let mut matching: Vec<_> = data
+        .nodes
+        .iter()
+        .filter(|node| partitions_match(node, &job.partition))
+        .collect();
+    matching.sort_by(|a, b| a.name.cmp(&b.name));
+    let nodes = matching
+        .into_iter()
+        .map(|node| {
+            let fresh = data.errors.is_empty() && rules::schedulable(node);
+            let free_gpus = if fresh && node.has_gpu {
+                Some(
+                    rules::classes(node, now)
+                        .iter()
+                        .filter(|class| **class == rules::Class::Free)
+                        .count(),
+                )
+            } else {
+                None
+            };
+            NodeObservation {
+                node: node.name.clone(),
+                partition: node.partition.clone(),
+                fresh,
+                has_gpu: node.has_gpu,
+                free_gpus,
+                free_cpus: fresh
+                    .then(|| headroom_num(&node.cpus, &node.cpu_alloc, 1.0))
+                    .flatten(),
+                free_ram_gib: fresh
+                    .then(|| headroom_num(&node.scheduler_mem_total, &node.mem_alloc, 1024.0))
+                    .flatten(),
+            }
+        })
+        .collect();
+    Report {
+        version: 1,
+        job: job.clone(),
+        reason_full: rules::pending_reason(job),
+        interpretation: meaning(&job.reason).into(),
+        wait_seconds: rules::pending_wait(job, now).map(|wait| wait as u64),
+        snapshot: data.ts.clone(),
+        nodes,
+    }
 }
 
 pub fn pending(data: &Snapshot, job: &PendingJob) -> String {

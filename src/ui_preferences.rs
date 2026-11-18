@@ -34,7 +34,7 @@ impl Default for Preferences {
 
 impl Preferences {
     fn validate(&self) -> Result<()> {
-        if self.version != 1 || self.tab >= 7 || self.sort >= 4 {
+        if self.version != 1 || self.tab >= 8 || self.sort >= 4 {
             return Err("unsupported or invalid view settings".into());
         }
         Ok(())
@@ -103,6 +103,15 @@ mod tests {
             fs::metadata(path.parent().unwrap()).unwrap().mode() & 0o777,
             0o700
         );
+        save(
+            &path,
+            &Preferences {
+                tab: 7,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(load(&path).unwrap().tab, 7);
         save(&path, &Preferences::default()).unwrap();
         assert_eq!(load(&path).unwrap(), Preferences::default());
     }
@@ -113,7 +122,7 @@ mod tests {
         let path = tmp.path().join("preferences.json");
         for bytes in [
             r#"{"version":2}"#,
-            r#"{"tab":7}"#,
+            r#"{"tab":8}"#,
             r#"{"sort":4}"#,
             r#"{"job_sort":"unknown"}"#,
             "[",

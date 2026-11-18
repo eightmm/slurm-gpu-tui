@@ -156,6 +156,81 @@ pub fn gpu_count(gres: &str) -> u32 {
         .fold(0u32, u32::saturating_add)
 }
 
+pub fn parse_tres_gpus(spec: &str) -> u32 {
+    let mut exact = 0u32;
+    let mut typed = 0u32;
+    for part in top_level(spec).unwrap_or_default() {
+        let part = part.trim().split('(').next().unwrap_or("").trim();
+        let part = part
+            .strip_prefix("gres/")
+            .or_else(|| part.strip_prefix("gres:"))
+            .unwrap_or(part);
+        if let Some(value) = part
+            .strip_prefix("gpu=")
+            .and_then(|v| v.parse::<u32>().ok())
+        {
+            exact = exact.max(value);
+        } else if let Some(rest) = part.strip_prefix("gpu:") {
+            let num = rest
+                .rsplit_once('=')
+                .map(|(_, v)| v)
+                .or_else(|| rest.rsplit(':').next());
+            if let Some(value) = num.and_then(|v| v.parse::<u32>().ok()) {
+                typed = typed.saturating_add(value);
+            }
+        }
+    }
+    if exact > 0 { exact } else { typed }
+}
+
+fn infer_gpu_count(detail: &str, expanded_nodes: u32, pending: bool) -> u32 {
+    if detail.is_empty() {
+        return 0;
+    }
+    let nodes = detail_field(detail, "NumNodes")
+        .split('-')
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(expanded_nodes.max(1))
+        .max(1);
+    let per_node = parse_tres_gpus(&detail_field(detail, "TresPerNode"));
+    if per_node > 0 {
+        return per_node;
+    }
+    if !pending {
+        let alloc = parse_tres_gpus(&detail_field(detail, "AllocTRES"));
+        if alloc > 0 {
+            return alloc.div_ceil(nodes);
+        }
+    }
+    let req = parse_tres_gpus(&detail_field(detail, "ReqTRES"));
+    if req > 0 {
+        return req.div_ceil(nodes);
+    }
+    let per_job = parse_tres_gpus(&detail_field(detail, "TresPerJob"));
+    if per_job > 0 {
+        return per_job.div_ceil(nodes);
+    }
+    let per_task = parse_tres_gpus(&detail_field(detail, "TresPerTask"));
+    if per_task > 0 {
+        let tasks = detail_field(detail, "NumTasks")
+            .parse::<u32>()
+            .unwrap_or(nodes)
+            .max(1);
+        return per_task.saturating_mul(tasks).div_ceil(nodes);
+    }
+    let per_socket = parse_tres_gpus(&detail_field(detail, "TresPerSocket"));
+    if per_socket > 0 {
+        let socks = detail_field(detail, "Socks/Node")
+            .parse::<u32>()
+            .unwrap_or(1)
+            .max(1);
+        return per_socket.saturating_mul(socks);
+    }
+    0
+}
+
 pub fn mem_mib(raw: &str, cpus: u32) -> Option<f64> {
     let mut text = raw.trim();
     let per_cpu = text.ends_with('c');
@@ -324,6 +399,8 @@ pub struct LogSpec {
 #[derive(Clone, Default)]
 pub struct JobRecords {
     pub alloc: BTreeMap<String, BTreeMap<String, String>>,
+    pub shared_alloc: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+    pub node_gpus: BTreeMap<(String, String), u32>,
     pub users: BTreeMap<String, String>,
     pub uids: BTreeMap<String, u32>,
     pub details: BTreeMap<String, String>,
@@ -678,24 +755,43 @@ pub fn parse_structured(raw: &str) -> Result<JobRecords> {
             continue;
         };
         for (node, gres) in nodes.iter().zip(gres) {
-            let Some(indices) = gres.as_str().and_then(gpu_indices) else {
+            let Some(gres_str) = gres.as_str() else {
                 continue;
             };
+            let Some(indices) = gpu_indices(gres_str) else {
+                continue;
+            };
+            let count = gpu_count(gres_str).max(indices.len() as u32);
+            if count > 0 && !out.rejected.contains(&ids[0]) {
+                for id in &ids {
+                    out.node_gpus
+                        .insert((id.clone(), (*node).to_string()), count);
+                }
+            }
             for index in indices {
-                claims
-                    .entry((node.to_string(), index))
-                    .or_default()
-                    .push(ids[0].clone());
+                let list = claims.entry((node.to_string(), index)).or_default();
+                if !list.contains(&ids[0]) {
+                    list.push(ids[0].clone());
+                }
             }
         }
     }
     for ((node, index), ids) in claims {
-        if ids.len() == 1 && !out.rejected.contains(&ids[0]) {
-            out.alloc
-                .entry(node)
-                .or_default()
-                .insert(index, ids[0].clone());
+        let clean: Vec<_> = ids
+            .into_iter()
+            .filter(|id| !out.rejected.contains(id))
+            .collect();
+        if clean.is_empty() {
+            continue;
         }
+        out.alloc
+            .entry(node.clone())
+            .or_default()
+            .insert(index.clone(), clean[0].clone());
+        out.shared_alloc
+            .entry(node)
+            .or_default()
+            .insert(index, clean);
     }
     for id in &out.rejected {
         out.users.remove(id);
@@ -877,28 +973,40 @@ pub fn parse_legacy(
         if !matches!(anchor.state.as_str(), "RUNNING" | "COMPLETING") {
             continue;
         }
-        let valid_claims = (|| -> Option<Vec<(String, String)>> {
+        type ValidClaims = (Vec<(String, String)>, Vec<(String, u32)>);
+        let valid_claims = (|| -> Option<ValidClaims> {
             let mut covered = BTreeSet::new();
             let mut node_claims = Vec::new();
+            let mut node_counts = Vec::new();
             let matches: Vec<_> = segments.captures_iter(line).collect();
             if matches.is_empty() {
-                return Some(node_claims);
+                return Some((node_claims, node_counts));
             }
             for segment in matches {
                 let nodes = expand_nodes(&segment[1])?;
                 let indices = gpu_indices(&segment[2])?;
+                let count = gpu_count(&segment[2]).max(indices.len() as u32);
                 for node in nodes {
                     if !anchor.nodes.contains(&node) || !covered.insert(node.clone()) {
                         return None;
+                    }
+                    if count > 0 {
+                        node_counts.push((node.clone(), count));
                     }
                     for index in &indices {
                         node_claims.push((node.clone(), index.clone()));
                     }
                 }
             }
-            (covered.into_iter().collect::<Vec<_>>() == anchor.nodes).then_some(node_claims)
+            (covered.into_iter().collect::<Vec<_>>() == anchor.nodes)
+                .then_some((node_claims, node_counts))
         })();
-        if let Some(node_claims) = valid_claims {
+        if let Some((node_claims, node_counts)) = valid_claims {
+            for (node, count) in node_counts {
+                for id in &ids {
+                    out.node_gpus.insert((id.clone(), node.clone()), count);
+                }
+            }
             for key in node_claims {
                 claims
                     .entry(key)
@@ -909,52 +1017,127 @@ pub fn parse_legacy(
             out.rejected.extend(ids);
         }
     }
-    for ((node, index), mut entries) in claims {
-        if entries.len() == 1 {
-            out.alloc
-                .entry(node)
-                .or_default()
-                .insert(index, entries.remove(0).0);
-        } else {
-            for (_, ids) in entries {
-                out.rejected.extend(ids);
+    for ((node, index), entries) in claims {
+        let mut clean = Vec::new();
+        for (id, _) in entries {
+            if !out.rejected.contains(&id) && !clean.contains(&id) {
+                clean.push(id);
             }
         }
+        if clean.is_empty() {
+            continue;
+        }
+        out.alloc
+            .entry(node.clone())
+            .or_default()
+            .insert(index.clone(), clean[0].clone());
+        out.shared_alloc
+            .entry(node)
+            .or_default()
+            .insert(index, clean);
     }
     Ok(out)
 }
 
-pub fn reconcile(
+fn assign_gpu(gpu: &mut Gpu, ids: Vec<String>, users: &BTreeMap<String, String>) {
+    let mut unique_ids = Vec::new();
+    for id in ids {
+        if !id.is_empty() && !unique_ids.contains(&id) {
+            unique_ids.push(id);
+        }
+    }
+    let mut unique_users = Vec::new();
+    for id in &unique_ids {
+        if let Some(user) = users.get(id)
+            && !user.is_empty()
+            && !unique_users.contains(user)
+        {
+            unique_users.push(user.clone());
+        }
+    }
+    gpu.alloc_jobid = unique_ids.first().cloned().unwrap_or_default();
+    gpu.alloc_user = unique_users.first().cloned().unwrap_or_default();
+    gpu.alloc_jobids = unique_ids;
+    gpu.alloc_users = unique_users;
+}
+
+pub fn reconcile_records(
     alloc: &BTreeMap<String, String>,
+    shared: Option<&BTreeMap<String, Vec<String>>>,
     users: &BTreeMap<String, String>,
     gpus: &mut [Gpu],
     ignored: &BTreeSet<String>,
 ) {
-    let mut remaining: Vec<_> = alloc.values().cloned().collect();
+    let mut remaining = Vec::<(String, Vec<String>)>::new();
+    if let Some(shared) = shared {
+        for (index, ids) in shared {
+            let ids: Vec<_> = ids.iter().filter(|s| !s.is_empty()).cloned().collect();
+            if !ids.is_empty() {
+                remaining.push((index.clone(), ids));
+            }
+        }
+        for (index, id) in alloc {
+            if !shared.contains_key(index) && !id.is_empty() {
+                remaining.push((index.clone(), vec![id.clone()]));
+            }
+        }
+    } else {
+        for (index, id) in alloc {
+            if !id.is_empty() {
+                remaining.push((index.clone(), vec![id.clone()]));
+            }
+        }
+    }
     for gpu in gpus.iter_mut() {
         gpu.alloc_jobid.clear();
         gpu.alloc_user.clear();
+        gpu.alloc_jobids.clear();
+        gpu.alloc_users.clear();
     }
     for gpu in gpus.iter_mut() {
-        if let Some(pos) = remaining
+        let key = if gpu.minor.is_empty() {
+            &gpu.index
+        } else {
+            &gpu.minor
+        };
+        let pos = remaining
             .iter()
-            .position(|id| gpu.pid_jobid.values().any(|j| j == id))
-        {
-            gpu.alloc_jobid = remaining.remove(pos);
-            gpu.alloc_user = users.get(&gpu.alloc_jobid).cloned().unwrap_or_default();
+            .position(|(slot, ids)| {
+                slot == key && ids.iter().any(|id| gpu.pid_jobid.values().any(|j| j == id))
+            })
+            .or_else(|| {
+                remaining.iter().position(|(_, ids)| {
+                    ids.iter().any(|id| gpu.pid_jobid.values().any(|j| j == id))
+                })
+            });
+        if let Some(pos) = pos {
+            let (_, ids) = remaining.remove(pos);
+            assign_gpu(gpu, ids, users);
         }
     }
     for gpu in gpus.iter_mut().filter(|g| g.alloc_jobid.is_empty()) {
-        if let Some(pos) = remaining.iter().position(|id| {
-            users
-                .get(id)
-                .is_some_and(|u| !ignored.contains(u) && gpu.users.contains(u))
-        }) {
-            gpu.alloc_jobid = remaining.remove(pos);
-            gpu.alloc_user = users.get(&gpu.alloc_jobid).cloned().unwrap_or_default();
+        let key = if gpu.minor.is_empty() {
+            &gpu.index
+        } else {
+            &gpu.minor
+        };
+        let matches_user = |ids: &[String]| {
+            ids.iter().any(|id| {
+                users
+                    .get(id)
+                    .is_some_and(|u| !ignored.contains(u) && gpu.users.contains(u))
+            })
+        };
+        let pos = remaining
+            .iter()
+            .position(|(slot, ids)| slot == key && matches_user(ids))
+            .or_else(|| remaining.iter().position(|(_, ids)| matches_user(ids)));
+        if let Some(pos) = pos {
+            let (_, ids) = remaining.remove(pos);
+            assign_gpu(gpu, ids, users);
         }
     }
-    for id in remaining {
+    for (slot_key, ids) in remaining {
         let free: Vec<_> = gpus
             .iter()
             .enumerate()
@@ -966,19 +1149,29 @@ pub fn reconcile(
         let preferred = free
             .iter()
             .find(|i| {
-                alloc.get(if gpus[**i].minor.is_empty() {
-                    &gpus[**i].index
+                let g = &gpus[**i];
+                let key = if g.minor.is_empty() {
+                    &g.index
                 } else {
-                    &gpus[**i].minor
-                }) == Some(&id)
+                    &g.minor
+                };
+                key == &slot_key
             })
             .copied()
             .or_else(|| free.first().copied());
         if let Some(i) = preferred {
-            gpus[i].alloc_jobid = id.clone();
-            gpus[i].alloc_user = users.get(&id).cloned().unwrap_or_default();
+            assign_gpu(&mut gpus[i], ids, users);
         }
     }
+}
+
+pub fn reconcile(
+    alloc: &BTreeMap<String, String>,
+    users: &BTreeMap<String, String>,
+    gpus: &mut [Gpu],
+    ignored: &BTreeSet<String>,
+) {
+    reconcile_records(alloc, None, users, gpus, ignored);
 }
 
 pub trait Runner: Send + Sync {
@@ -1143,6 +1336,20 @@ impl Scheduler {
             }
             job.jobname = detail_field(&job.detail, "JobName");
             job.qos = detail_field(&job.detail, "QOS");
+            if job.gpu_count == 0 {
+                let nodes = expand_nodes(&job.node).map_or(1, |n| n.len().max(1) as u32);
+                job.gpu_count = infer_gpu_count(&job.detail, nodes, false);
+            }
+            if job.gpu_count == 0 {
+                job.gpu_count = sample
+                    .records
+                    .node_gpus
+                    .iter()
+                    .filter(|((id, _), _)| id == &job.jobid)
+                    .map(|(_, &c)| c)
+                    .max()
+                    .unwrap_or(0);
+            }
         }
         for job in &mut sample.pending {
             let parent = job.jobid.split('_').next().unwrap_or("");
@@ -1160,6 +1367,9 @@ impl Scheduler {
             let submit = detail_field(&job.detail, "SubmitTime");
             if !submit.is_empty() {
                 job.submit_time = submit;
+            }
+            if job.gpu_count == 0 {
+                job.gpu_count = infer_gpu_count(&job.detail, 1, true);
             }
         }
         if stamp >= self.mem_next
@@ -1405,5 +1615,106 @@ mod tests {
         assert_eq!(gpus[0].alloc_jobid, "11");
         assert_eq!(gpus[1].alloc_jobid, "10");
         assert!(gpus[2].alloc_jobid.is_empty());
+    }
+
+    #[test]
+    fn shared_gpu_allocations_preserve_all_co_scheduled_jobs_and_users() {
+        let structured = json!({
+            "jobs": [
+                {
+                    "job_id": 10,
+                    "user_id": 1001,
+                    "user_name": "alice",
+                    "job_state": ["RUNNING"],
+                    "nodes": "gpu1",
+                    "job_resources": {"allocated_nodes": [{"nodename": "gpu1"}]},
+                    "gres_detail": ["gpu:1(IDX:0)"]
+                },
+                {
+                    "job_id": 11,
+                    "user_id": 1002,
+                    "user_name": "bob",
+                    "job_state": ["RUNNING"],
+                    "nodes": "gpu1",
+                    "job_resources": {"allocated_nodes": [{"nodename": "gpu1"}]},
+                    "gres_detail": ["gpu:1(IDX:0)"]
+                }
+            ]
+        })
+        .to_string();
+        let records = parse_structured(&structured).unwrap();
+        assert_eq!(records.shared_alloc["gpu1"]["0"], vec!["10", "11"]);
+        let mut gpus = vec![Gpu {
+            index: "0".into(),
+            ..Default::default()
+        }];
+        reconcile_records(
+            &records.alloc["gpu1"],
+            records.shared_alloc.get("gpu1"),
+            &records.users,
+            &mut gpus,
+            &BTreeSet::new(),
+        );
+        assert_eq!(gpus[0].alloc_jobids, vec!["10", "11"]);
+        assert_eq!(gpus[0].alloc_users, vec!["alice", "bob"]);
+        assert_eq!(gpus[0].alloc_jobs_display(), "10,11");
+
+        let queue = parse_queue(
+            "RUNNING|10|alice|1001|gpu|00:01|gpu1|gpu:1|01:00:00|2|4G|None|1|N/A\nRUNNING|11|bob|1002|gpu|00:01|gpu1|gpu:1|01:00:00|2|4G|None|1|N/A",
+        );
+        let legacy = "JobId=10 JobName=a UserId=alice(1001) JobState=RUNNING NodeList=gpu1 Nodes=gpu1 CPU_IDs=0-1 Mem=4096 GRES=gpu:1(IDX:0) WorkDir=/home/alice\nJobId=11 JobName=b UserId=bob(1002) JobState=RUNNING NodeList=gpu1 Nodes=gpu1 CPU_IDs=2-3 Mem=4096 GRES=gpu:1(IDX:0) WorkDir=/home/bob";
+        let leg = parse_legacy(legacy, &queue.anchors, &queue.anchors).unwrap();
+        assert_eq!(leg.shared_alloc["gpu1"]["0"], vec!["10", "11"]);
+    }
+
+    #[test]
+    fn tres_gpu_inference_handles_gpus_without_squeue_gres() {
+        struct TresRunner;
+        impl Runner for TresRunner {
+            fn run(&self, program: Program, _args: &[&str], _: Duration) -> Result<String> {
+                match program {
+                    Program::Sinfo => {
+                        Ok("gpu1|mixed|32|1|65536|60000|gpu:h100:4|8/24/0/32|gpu\ngpu2|mixed|32|1|65536|60000|gpu:h100:4|8/24/0/32|gpu".into())
+                    }
+                    Program::Squeue => Ok(concat!(
+                        "RUNNING|101|alice|1001|gpu|00:05|gpu[1-2]|N/A|01:00:00|8|16G|None|10|2026-07-01T00:00:00\n",
+                        "PENDING|102|bob|1002|gpu|00:00|N/A|N/A|01:00:00|4|8G|Resources|10|N/A"
+                    )
+                    .into()),
+                    Program::Scontrol => Ok(json!({
+                        "jobs": [
+                            {
+                                "job_id": 101,
+                                "user_id": 1001,
+                                "user_name": "alice",
+                                "job_state": ["RUNNING"],
+                                "nodes": "gpu[1-2]",
+                                "node_count": {"set": true, "number": 2},
+                                "tres_alloc_str": "cpu=8,mem=32G,node=2,gres/gpu=4,gres/gpu:h100=4",
+                                "job_resources": {"allocated_nodes": [{"nodename": "gpu1"}, {"nodename": "gpu2"}]},
+                                "gres_detail": ["gpu:h100:2(IDX:0-1)", "gpu:h100:2(IDX:0-1)"]
+                            },
+                            {
+                                "job_id": 102,
+                                "user_id": 1002,
+                                "user_name": "bob",
+                                "job_state": ["PENDING"],
+                                "node_count": {"set": true, "number": 1},
+                                "tasks": {"set": true, "number": 2},
+                                "tres_per_task": "gpu:h100:1"
+                            }
+                        ]
+                    })
+                    .to_string()),
+                    _ => Err("unexpected".into()),
+                }
+            }
+        }
+        assert_eq!(parse_tres_gpus("cpu=8,gres/gpu=4,gres/gpu:h100=4"), 4);
+        assert_eq!(parse_tres_gpus("gres/gpu:h100=2,gres/gpu:l40=1"), 3);
+        let mut sched = Scheduler::new(Arc::new(TresRunner));
+        let sample = sched.sample();
+        assert_eq!(sample.jobs[0].gpu_count, 2);
+        assert_eq!(sample.pending[0].gpu_count, 2);
     }
 }
